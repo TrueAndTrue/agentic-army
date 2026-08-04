@@ -270,7 +270,7 @@ export interface UnlandedWork {
 
 /**
  * Ignored paths a release may destroy without asking. Dependency and build output is
- * regenerable by definition — and treehouse's `post_create` warms exactly these, so treating
+ * regenerable by definition — and the pool's `post_create` warms exactly these, so treating
  * `node_modules/` as precious would deadlock the pool on the very thing the pool is for.
  * Matched per path SEGMENT, so `packages/api/dist/` matches too.
  */

@@ -664,7 +664,7 @@ test('rung 0: durable in the army mirror, and YOUR REPO IS UNTOUCHED', async () 
 
   // And the lease is now safe to return, which is the entire point of treating the push as
   // durability rather than as delivery.
-  const released = await s.provider.tryRelease({
+  const released = await s.provider.release({
     path: s.worktree,
     leaseId: s.provider.listLeases()[0]!.leaseId,
     leaseHolder: 'cpt-03',

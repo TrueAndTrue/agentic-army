@@ -57,7 +57,7 @@ import { asciiFold, glyphsFor } from './render.ts';
  * is the direction that would make the view layer un-reusable. `test/command.test.ts` pins the two
  * unions equal, so the copy cannot drift without a red test.
  */
-export const PROGRESS_LEASE_STATES = ['never-acquired', 'released', 'retained'] as const;
+export const PROGRESS_LEASE_STATES = ['never-acquired', 'released', 'retained', 'not-held'] as const;
 export type ProgressLeaseState = (typeof PROGRESS_LEASE_STATES)[number];
 
 /**
@@ -232,7 +232,10 @@ export function renderProgressEvent(event: ProgressEvent, style: ProgressStyle):
 
     case 'lease-settled': {
       if (event.state === 'never-acquired') return '';
-      const mark = event.state === 'retained' ? g.warn : g.bullet;
+      // `not-held` earns the warn mark alongside `retained`: in both, a tree this run leased did
+      // NOT come back the way it should have, and both want an operator's eye. Only `released` is
+      // the quiet, expected ending.
+      const mark = event.state === 'released' ? g.bullet : g.warn;
       const where = event.path === null ? '' : ` ${g.arrow} ${event.path}`;
       return fold(
         `${INDENT}${mark} worktree ${event.state}${where} ${g.dash} ${quotable(event.reason, 80)}`,

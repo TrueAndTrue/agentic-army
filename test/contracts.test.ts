@@ -54,6 +54,7 @@ import {
   SOLDIER_EVENT_TYPES,
   HARNESS_IDS,
   // worktree
+  RELEASE_OUTCOMES,
   WORKTREE_PROVIDER_IDS,
   armyBranch,
 } from '../src/contracts/index.ts';
@@ -755,6 +756,11 @@ test('archive and harness value domains are pinned, member for member', () => {
   assert.deepEqual([...SIGNAL_KINDS], ['order', 'report', 'query', 'answer', 'broadcast', 'status']);
   assert.deepEqual([...HARNESS_IDS], ['claude', 'codex']);
   assert.deepEqual([...WORKTREE_PROVIDER_IDS], ['treehouse', 'cold']);
+  // `release` reports which of four things happened, and only one of them means the tree came
+  // back. Pinned member for member because a caller BRANCHES on this — `src/command/campaign.ts`
+  // settles the lease as `not-held` on any of the three no-ops — so a member silently added or
+  // renamed would fall into the wrong branch rather than failing to compile.
+  assert.deepEqual([...RELEASE_OUTCOMES], ['released', 'stale-lease', 'no-record', 'missing-tree']);
   // Every normalised event type is representable; `unknown` exists so no line is ever dropped.
   assert.ok(SOLDIER_EVENT_TYPES.includes('unknown'));
   assert.ok(SOLDIER_EVENT_TYPES.includes('subagent_text'));

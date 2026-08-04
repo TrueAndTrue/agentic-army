@@ -1,10 +1,13 @@
 /**
  * The pooled worktree provider.
  *
- * THE ONE PROVIDER. treehouse was dropped as a dependency and warm pooling was brought in-house;
- * the file keeps the name `cold.ts` and the id `cold` only because `WorktreeProviderId` is frozen
- * in `src/contracts/worktree.ts` and `src/command/campaign.ts` imports this path. The name is now
- * a lie in exactly one respect — trees are handed back WARM — and that is the whole feature.
+ * THE ONE PROVIDER. treehouse was dropped as a dependency and warm pooling was brought in-house.
+ * The file keeps the name `cold.ts` and the id `cold`, and the reason is a decision rather than an
+ * obstacle: `cold` is an INPUT. It is what `--provider` accepts on a command line and what
+ * `Lease.provider` carries on every live lease, so renaming it invalidates a shipped flag and
+ * every lease in flight to buy a better adjective. The name is a lie in exactly one respect —
+ * trees are handed back WARM — and that is the whole feature, so it is stated here, at the top,
+ * where the name is read. See `WORKTREE_PROVIDER_IDS` in `src/contracts/worktree.ts`.
  *
  * Four guarantees, none of which may regress:
  *
@@ -13,7 +16,8 @@
  *     lease is returned.
  *
  *  2. **ABA-safe conditional release.** A lease record file per slot plays the part
- *     `treehouse return --if-lease-id` played: a stale lease id is a NO-OP, never a destructive
+ *     the retired tool's `--if-lease-id` flag played — the guard here is a comparison against
+ *     that file, not a flag on any command line: a stale lease id is a NO-OP, never a destructive
  *     release of a tree someone else has since acquired — and that holds under `force` too.
  *     Slots are REUSED (releasing frees `wt-03`, the next acquire hands `wt-03` back out with a
  *     fresh lease id), which is what makes the guard load-bearing rather than theoretical.
@@ -33,7 +37,8 @@
  * THE SAFETY INTERACTION, stated once because it is easy to get subtly wrong: the release gate
  * blocks on ignored-but-present files that `clean -fdx` would silently delete, but must NOT
  * block on the dependency directories a warm release deliberately keeps. Those two lists are not
- * maintained separately — the preserved set is PASSED to the gate as `expendableIgnored`.
+ * maintained separately — the preserved set is PASSED to the gate, as its `preserved` argument,
+ * and the gate unions it with `expendableIgnored` internally.
  *
  * That is only half of it, and the missing half was a real hole: `git clean -e` speaks full
  * gitignore syntax while the gate matches whole path segments, so `preserve = ["bazel-out/"]` or
@@ -67,7 +72,13 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { realpathOrResolve } from '../config/paths.ts';
-import type { Lease, WorktreeProvider, WorktreeProviderId } from '../contracts/worktree.ts';
+import type {
+  Lease,
+  ReleaseOutcome,
+  ReleaseResult as ContractReleaseResult,
+  WorktreeProvider,
+  WorktreeProviderId,
+} from '../contracts/worktree.ts';
 import { gitAvailable, repoToplevel, revParse, runGit } from '../delivery/git.ts';
 import { inspectUnlandedWork } from '../delivery/durability.ts';
 import type { UnlandedWork } from '../delivery/durability.ts';
@@ -199,7 +210,7 @@ export class UnlandedWorkError extends Error {
 }
 
 /**
- * A lease, plus everything provisioning learned. `Lease` is frozen in the contract and has no
+ * A lease, plus everything provisioning learned. `Lease` is the contract's shape and has no
  * room for any of this, so the provider returns a structural widening: a caller typed against
  * `Lease` is unaffected, a caller that wants the diagnostics narrows to `PooledLease`.
  *
@@ -212,11 +223,15 @@ export class UnlandedWorkError extends Error {
  * The caller decides — proceed, or `release()` and escalate.
  */
 export interface PooledLease extends Lease {
-  /** Pool slot, `wt-<slot>`. */
+  /** Pool slot. The directory is zero-padded — slot 1 is `wt-01`. */
   slot: number;
   /** True when this tree was reused with its dependency directories intact. */
   warm: boolean;
-  /** `post_create`, run after provision AND after every warm reset. Never throws; always here. */
+  /**
+   * `post_create`, run on EVERY acquire — provisioned or warm. NOT on release: the warm reset
+   * happens there and only `pre_destroy` runs with it, so the tree is warmed for its next holder
+   * by that holder's own acquire. Never throws; always here.
+   */
   hooks: HookOutcome;
   /** The dependency directories this tree's releases will preserve. */
   preserved: string[];
@@ -228,12 +243,10 @@ export interface PooledLease extends Lease {
   warnings: string[];
 }
 
-export const RELEASE_OUTCOMES = ['released', 'stale-lease', 'no-record', 'missing-tree'] as const;
-export type ReleaseOutcome = (typeof RELEASE_OUTCOMES)[number];
-
 export interface ReleaseOptions {
   /**
-   * Skip the unlanded-work gate. Still `--if-lease-id`-guarded: a stale lease remains a no-op.
+   * Skip the unlanded-work gate. The lease-id comparison is NOT skipped — force buys past
+   * "this tree holds work", never past "this tree is not yours", so a stale lease stays a no-op.
    * Use when the holder process is gone and its work is already durable.
    */
   force?: boolean;
@@ -244,17 +257,22 @@ export interface ReleaseOptions {
   discard?: boolean;
 }
 
-export interface ReleaseResult {
-  outcome: ReleaseOutcome;
-  /** False for every no-op outcome. Nothing was destroyed. */
-  released: boolean;
+/**
+ * The contract's release result, plus what pooling learned on the way out.
+ *
+ * The same structural widening `PooledLease` is: `outcome`, `released` and `message` are the
+ * contract, and a caller typed against `WorktreeProvider` sees only those. The three extra fields
+ * are pool-specific — whether the tree came back warm, which dependency directories survived it,
+ * and what `pre_destroy` did — and exist because a warm release that silently fell back to
+ * destroying the tree is a 1–3 minute install the next holder pays and nobody predicted.
+ */
+export interface ReleaseResult extends ContractReleaseResult {
   /** True when the tree was kept and reset warm; false when it was destroyed. */
   warm: boolean;
   /** Dependency directories the warm reset preserved. Empty when the tree was destroyed. */
   preserved: string[];
   /** `pre_destroy`, run before the reset. Null when there was no tree to run it in. */
   hooks: HookOutcome | null;
-  message: string;
 }
 
 const LEASES_DIRNAME = 'leases';
@@ -647,7 +665,7 @@ export class ColdWorktreeProvider implements WorktreeProvider {
     }
     // Last, so that the reset's own `checkout` entries go too and the tree is handed over with
     // no history but the one its next holder writes. A failure here is fatal to the WARM path on
-    // purpose: `#provision` and `tryRelease` both fall back to destroying the tree, and a cold
+    // purpose: `#provision` and `release` both fall back to destroying the tree, and a cold
     // checkout has an empty reflog by construction — so the invariant holds either way.
     const expire = await runGit(['reflog', 'expire', '--expire=now', 'HEAD'], {
       cwd: path,
@@ -683,15 +701,20 @@ export class ColdWorktreeProvider implements WorktreeProvider {
   // -------------------------------------------------------------------------------------------
 
   /**
-   * Contract entry point. Throws `UnlandedWorkError` when returning the lease would destroy
-   * work; a stale or unknown lease is a silent no-op, per the contract.
+   * Contract entry point.
+   *
+   * ONE METHOD. There used to be two: a `release` that returned `void` to satisfy the contract,
+   * and a `tryRelease` beside it that returned the outcome — so the honest answer existed and the
+   * contract pointed every caller at the one that threw it away. Now that the contract returns a
+   * result, the second method has nothing left to add, and two spellings of one operation is how
+   * the next caller ends up on the lossy one.
+   *
+   * Throws `UnlandedWorkError` when returning the lease would destroy work, and `ColdWorktreeError`
+   * for a lease this provider did not mint. Everything else — including the ABA refusal — comes
+   * back as a `ReleaseResult`, because a stale lease is an ordinary thing for a crash-recovering
+   * supervisor to find and ordinary outcomes are returned, not thrown.
    */
-  async release(lease: Lease, opts?: ReleaseOptions): Promise<void> {
-    await this.tryRelease(lease, opts);
-  }
-
-  /** Same as `release`, but reports which of the no-op cases happened and what was preserved. */
-  async tryRelease(lease: Lease, opts?: ReleaseOptions): Promise<ReleaseResult> {
+  async release(lease: Lease, opts?: ReleaseOptions): Promise<ReleaseResult> {
     if (lease.provider !== this.id) {
       throw new ColdWorktreeError(
         `lease ${lease.leaseId} was minted by \`${lease.provider}\`; a lease is only releasable ` +

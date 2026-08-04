@@ -8,16 +8,19 @@
 
 import * as path from 'node:path';
 
-import { archiveDurabilityNote } from '../archive/archive.ts';
+import { AgentIdInUseError, archiveDurabilityNote } from '../archive/archive.ts';
 import { RUNG_LABEL, RUNGS } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
+import { WORKTREE_PROVIDER_IDS } from '../contracts/worktree.ts';
+import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import { invokedAs } from '../setup/checks.ts';
 import { renderFix } from '../setup/fixes.ts';
+import type { Fix } from '../setup/fixes.ts';
 import { detectCharset } from '../view/index.ts';
 import { createProgressSink } from '../view/progress.ts';
 import type { ProgressSink } from '../view/progress.ts';
 
-import { CampaignSetupError, runCampaign } from './campaign.ts';
+import { CampaignSetupError, agentIdInUseFix, runCampaign } from './campaign.ts';
 import type { CampaignNote, CampaignOptions, CampaignResult, WriteStream } from './campaign.ts';
 
 export * from './campaign.ts';
@@ -84,7 +87,7 @@ export interface CampaignArgs {
   requestedRung?: Rung;
   maxAttempts?: number;
   cwd?: string;
-  provider?: 'treehouse' | 'cold';
+  provider?: WorktreeProviderId;
   campaignId?: string;
   json: boolean;
   help: boolean;
@@ -144,11 +147,17 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
         break;
       }
       case '--provider': {
+        // Validated AGAINST THE CONTRACT's own list rather than two literals repeated here.
+        // The literals were a second copy of a value domain that `test/contracts.test.ts` pins
+        // member for member, so a provider added there arrived rejected by both commands.
         const value = next();
-        if (value !== 'treehouse' && value !== 'cold') {
-          throw new UsageError(`--provider expects treehouse or cold, got ${JSON.stringify(value ?? '')}`);
+        if (!(WORKTREE_PROVIDER_IDS as readonly string[]).includes(value ?? '')) {
+          throw new UsageError(
+            `--provider expects one of ${WORKTREE_PROVIDER_IDS.join(', ')}, ` +
+              `got ${JSON.stringify(value ?? '')}`,
+          );
         }
-        args.provider = value;
+        args.provider = value as WorktreeProviderId;
         break;
       }
       case '--id': {
@@ -330,6 +339,25 @@ function progressSinkFor(
   });
 }
 
+/**
+ * The `fix:` line a refusal that escaped `runCampaign` owes, or nothing when there is not one.
+ *
+ * Two conditions reach here, both of them refusals that happen BEFORE a campaign exists to hang a
+ * note on: no git repository, and `--id` naming a campaign that already has agents in it. The
+ * second one used to come back as an `aborted` result with a note instead of a throw, and it moved
+ * here when the archive started refusing it before its first append — a run that writes nothing has
+ * no campaign to report a note in.
+ *
+ * The twin of `fixForChatFailure` in `chat.ts`, deliberately: same two types, same rule that a
+ * genuinely undiagnosed throw prints its sentence alone rather than being handed an invented
+ * command. Keyed on TYPES so that rewording either message is not a silent regression.
+ */
+function fixForCampaignFailure(error: unknown): Fix | undefined {
+  if (error instanceof CampaignSetupError) return error.fix;
+  if (error instanceof AgentIdInUseError) return agentIdInUseFix(error, 'campaign');
+  return undefined;
+}
+
 export async function campaignCommand(
   argv: readonly string[],
   deps: CampaignCommandDeps = {},
@@ -374,9 +402,11 @@ export async function campaignCommand(
     // error printed over a half-drawn spinner frame is an error the reader cannot read.
     sink.close();
     stderr.write(`${self} campaign: ${error instanceof Error ? error.message : String(error)}\n`);
-    // The one refusal that happens before there is a campaign to hang a note on. It carries its
-    // own fix rather than leaving this the single path where a bare sentence escapes.
-    if (error instanceof CampaignSetupError) stderr.write(`  ${renderFix(error.fix)}\n`);
+    // The refusals that happen before there is a campaign to hang a note on. Keyed on the error
+    // TYPE, never on the words, exactly as `chatCommand` does it — this is the same pair of
+    // conditions and it must not be the path where a bare sentence escapes.
+    const fix = fixForCampaignFailure(error);
+    if (fix !== undefined) stderr.write(`  ${renderFix(fix)}\n`);
     return 1;
   }
   sink.close();

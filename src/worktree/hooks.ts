@@ -228,7 +228,7 @@ export interface WorktreePoolConfig {
   maxTrees: number;
   /** Directory names a warm release preserves. */
   preserve: string[];
-  /** False disables warm reuse entirely: releases clean everything, like a cold tree. */
+  /** False disables warm reuse entirely: a release DESTROYS the tree instead of resetting it. */
   warm: boolean;
   hookTimeoutMs: number;
   /** Settings the user wrote that are NOT in effect. Never silently dropped. */
@@ -385,8 +385,9 @@ function parsePositiveInt(raw: unknown, where: string, warnings: string[]): numb
  * preserved (slower), and the gate goes on treating it normally (correct).
  *
  * Rejected deliberately: anything containing `/` after one optional trailing slash (anchors and
- * nested paths), glob metacharacters, a leading `!` (negation, which would UN-preserve), and
- * `.`/`..`.
+ * nested paths), glob metacharacters, `!` anywhere in the entry (negation, which would
+ * UN-preserve — rejected at any position, not only leading, because the check is a character
+ * class), and `.`/`..`.
  */
 export function isSupportedPreservePattern(entry: string): boolean {
   const trimmed = entry.trim().replace(/\/$/, '');

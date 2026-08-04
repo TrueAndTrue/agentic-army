@@ -3479,3 +3479,381 @@ describe('check titles match reality', () => {
     assert.equal(classifyApiKey(undefined).id, 'anthropic-api-key');
   });
 });
+
+// ===========================================================================
+// FIXTURE HYGIENE — a recorded fixture must not carry the recorder's machine
+//
+// Every `.jsonl` under `test/fixtures/` is a TRANSCRIPT of a live session, because recording one
+// is the only honest way to get a fixture that matches what the harness really emits. That is
+// also why this keeps happening: the first line of a claude session is a `system/init` frame
+// that inventories the recording machine — its home directory, the MCP servers it had connected,
+// the skills and slash commands and plugins it had installed, the memory files it had loaded —
+// and a straight `>` into a fixture file commits all of it. It has been scrubbed by hand twice.
+// The third time nobody will remember, because the person recording the fixture will be in the
+// middle of something else and will have no idea any of this history exists.
+//
+// So the message below is written for THAT reader: it names the file, the line, what was found,
+// and what to replace it with. A guard that only says "leak detected" hands the problem back.
+//
+// THE DETECTION RULE, stated once:
+//
+//   1. HOME PATHS — `/Users/<name>`, `/home/<name>`, `C:\Users\<name>`, and the `-Users-<name>-`
+//      form Claude Code mangles a cwd into for its scratchpad directory. Flagged unless `<name>`
+//      is one of the placeholders a scrubbed fixture is supposed to use. Additionally, the
+//      running machine's OWN home is matched literally, which covers the case where a real
+//      account happens to be named like a placeholder.
+//   2. ENVIRONMENT INVENTORY — the keys `mcp_servers`, `slash_commands`, `skills`, `plugins`,
+//      `memory_paths` carrying CONTENT. Empty (`[]`, `{}`, `null`) is the scrubbed form and is
+//      the only accepted one. Checked structurally against the parsed JSON of each line, so a
+//      key name appearing inside a string value can never be mistaken for the field.
+//   3. MCP TOOL NAMES — any `mcp__<server>__<tool>` token. These name servers the recorder had
+//      connected and appear in `tools` arrays and in tool-use blocks, which is a place the
+//      inventory check does not look.
+//   4. CREDENTIALS — an `sk-ant-…` token. Cheap, and the one leak class that is not merely
+//      embarrassing.
+//
+// What it deliberately does NOT do: flag ordinary fixture content. Tool names, agent names,
+// session uuids, model ids, token counts, file paths under `/private/tmp` or `/tmp`, and prose
+// that happens to use the words "skills" or "plugins" are all legitimate and all pass.
+// ===========================================================================
+
+describe('no fixture carries the environment of the machine that recorded it', () => {
+  const repoRoot = nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), '..');
+  const fixturesDir = nodePath.join(repoRoot, 'test', 'fixtures');
+
+  type LeakKind = 'home-path' | 'environment-inventory' | 'mcp-tool' | 'credential';
+  type Leak = { file: string; line: number; kind: LeakKind; found: string };
+
+  /**
+   * Account names a scrubbed fixture is allowed to spell.
+   *
+   * Deliberately short. Every entry is a name no real machine in this project has, and adding to
+   * it is how the guard gets neutered — the rule is "replace the account name", not "add yours
+   * here". `runner` and `ci` are NOT on it: a fixture carrying a CI home is still a fixture
+   * carrying somebody's home.
+   */
+  const PLACEHOLDER_ACCOUNTS = new Set(['example', 'user', 'someone', 'test', 'you']);
+
+  /**
+   * Home-path shapes. Three, because a home directory reaches a transcript three different ways:
+   * verbatim in a `cwd`, escaped inside a JSON string on Windows, and mangled into a single
+   * path segment by Claude Code's own scratchpad naming (`-Users-alice-projects-thing`).
+   *
+   * The mangled form's capture excludes `-`, since `-` is the separator there; the POSIX and
+   * Windows forms capture up to their own separator and may contain `-`.
+   */
+  const HOME_SHAPES: ReadonlyArray<{ what: string; re: RegExp }> = [
+    { what: 'posix home', re: /(?:\/Users|\/home)\/([A-Za-z0-9][A-Za-z0-9._-]*)/g },
+    { what: 'windows home', re: /[A-Za-z]:\\{1,2}Users\\{1,2}([A-Za-z0-9][A-Za-z0-9._-]*)/g },
+    { what: 'mangled home', re: /-Users-([A-Za-z0-9][A-Za-z0-9._]*)/g },
+  ];
+
+  /** Fields of the `system/init` frame that inventory the recording machine. */
+  const INVENTORY_KEYS = ['mcp_servers', 'slash_commands', 'skills', 'plugins', 'memory_paths'];
+
+  /**
+   * The same five keys, for a line that did not parse as JSON. The lookahead accepts exactly the
+   * three scrubbed spellings and nothing else, so `"skills":[]` passes and `"skills":["x"]` does
+   * not. The structural check below is the authoritative one; this only covers what it cannot
+   * reach.
+   */
+  const INVENTORY_TEXT = new RegExp(
+    `"(${INVENTORY_KEYS.join('|')})"\\s*:\\s*(?!\\[\\s*\\]|\\{\\s*\\}|null)`,
+    'g',
+  );
+
+  const MCP_TOOL = /\bmcp__[A-Za-z0-9_.-]+/g;
+  const CREDENTIAL = /\bsk-ant-[A-Za-z0-9_-]{8,}/g;
+
+  /**
+   * The running machine's own home, when its account name is not already a placeholder.
+   *
+   * Null on a machine whose account IS named like a placeholder — there the structural rule
+   * already permits the string, and matching it literally would fail a correctly scrubbed
+   * fixture. Losing the extra coverage on such a machine is the right trade: the structural rule
+   * is the one that runs everywhere.
+   */
+  const OWN_HOME: string | null = (() => {
+    const home = os.homedir();
+    const account = nodePath.basename(home);
+    return PLACEHOLDER_ACCOUNTS.has(account.toLowerCase()) ? null : home;
+  })();
+
+  /** Non-empty means the field carries the recorder's environment. `null` is scrubbed. */
+  function carriesContent(value: unknown): boolean {
+    if (value === null || value === undefined) return false;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'string') return value.trim().length > 0;
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+  }
+
+  /** Every inventory key carrying content anywhere in a parsed line, however deeply nested. */
+  function inventoryLeaks(parsed: unknown): string[] {
+    const found: string[] = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        value.forEach(walk);
+        return;
+      }
+      if (value === null || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value)) {
+        if (INVENTORY_KEYS.includes(key) && carriesContent(child)) {
+          found.push(`${key}: ${JSON.stringify(child).slice(0, 120)}`);
+        }
+        walk(child);
+      }
+    };
+    walk(parsed);
+    return found;
+  }
+
+  /**
+   * The detector, over the text of one file. Shared by the real scan and by the self-test below,
+   * so the fixture that proves it fires and the scan that keeps the tree clean can never drift
+   * apart.
+   *
+   * `.jsonl` lines that parse are examined structurally for the inventory keys and textually for
+   * everything else; a line that does not parse falls back to the text pattern for all four, so
+   * a malformed line cannot become a hiding place.
+   */
+  function leaksIn(relative: string, text: string): Leak[] {
+    const found: Leak[] = [];
+    const jsonl = relative.endsWith('.jsonl');
+
+    text.split('\n').forEach((raw, index) => {
+      const line = index + 1;
+      const add = (kind: LeakKind, what: string): void => {
+        found.push({ file: relative, line, kind, found: what });
+      };
+
+      for (const shape of HOME_SHAPES) {
+        shape.re.lastIndex = 0;
+        for (const match of raw.matchAll(shape.re)) {
+          const account = match[1] ?? '';
+          if (PLACEHOLDER_ACCOUNTS.has(account.toLowerCase())) continue;
+          add('home-path', `${shape.what} ${match[0]}`);
+        }
+      }
+      if (OWN_HOME !== null && raw.includes(OWN_HOME)) {
+        add('home-path', `this machine's home directory ${OWN_HOME}`);
+      }
+
+      for (const match of raw.matchAll(MCP_TOOL)) add('mcp-tool', match[0]);
+      for (const match of raw.matchAll(CREDENTIAL)) add('credential', match[0]);
+
+      let parsed: unknown;
+      let parsedOk = false;
+      if (jsonl && raw.trim().length > 0) {
+        try {
+          parsed = JSON.parse(raw);
+          parsedOk = true;
+        } catch {
+          parsedOk = false;
+        }
+      }
+      if (parsedOk) {
+        for (const leak of inventoryLeaks(parsed)) add('environment-inventory', leak);
+      } else {
+        for (const match of raw.matchAll(INVENTORY_TEXT)) {
+          add('environment-inventory', `${match[1]} carries content`);
+        }
+      }
+    });
+
+    return found;
+  }
+
+  /**
+   * What the person who trips this has to do. Printed IN the assertion message, because they are
+   * mid-task, they did not know any of this was a rule, and the fix is not guessable from the
+   * word "leak".
+   */
+  const HOW_TO_SCRUB = [
+    'A fixture under test/fixtures/ carries the environment of the machine that recorded it.',
+    'Recording is how these files are meant to be made, so this is not your mistake — but the',
+    'recording has to be scrubbed before it is committed. In every offending line:',
+    '',
+    '  home paths          replace the account name with `example`, everywhere it appears —',
+    '                      including the `-Users-<you>-…` form inside a scratchpad path.',
+    '  mcp_servers         set to []',
+    '  slash_commands      set to []',
+    '  skills              set to []',
+    '  plugins             set to []',
+    '  memory_paths        set to {}',
+    '  mcp__* tool names   drop them from `tools` arrays, and drop any frame that calls one.',
+    '  sk-ant-… tokens     remove, and rotate the key.',
+    '',
+    'The fixture stays valid: nothing under test/ asserts on any of these fields.',
+  ].join('\n');
+
+  function fixtureFilesUnder(dir: string): string[] {
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = nodePath.join(dir, entry.name);
+      return entry.isDirectory() ? fixtureFilesUnder(full) : [full];
+    });
+  }
+
+  const scanned = fixtureFilesUnder(fixturesDir).sort();
+  const read = scanned.map((file) => ({
+    relative: nodePath.relative(repoRoot, file).split(nodePath.sep).join('/'),
+    text: fs.readFileSync(file, 'utf8'),
+  }));
+
+  // =========================================================================================
+  // CAN THIS TEST FAIL?
+  //
+  // Three vacuous passes to rule out: the scan finds no files, the `.jsonl` lines do not parse
+  // (so the structural half sees nothing), and the detector never fires on anything. All three
+  // are asserted, so the guard is falsifiable on every run.
+  // =========================================================================================
+  it('actually reads every fixture it claims to guard', () => {
+    assert.ok(scanned.length >= 8, `only ${scanned.length} fixture files scanned`);
+    for (const expected of [
+      'test/fixtures/claude-subagent.jsonl',
+      'test/fixtures/claude-duplex.jsonl',
+      'test/fixtures/codex-run.jsonl',
+      'test/fixtures/fake-claude.mjs',
+    ]) {
+      assert.ok(
+        read.some((entry) => entry.relative === expected),
+        `${expected} was not scanned`,
+      );
+    }
+    // A directory walk, not a hard-coded list: whatever is added next is guarded without
+    // anybody remembering to add it here.
+    assert.ok(
+      read.some((entry) => entry.relative.endsWith('.jsonl')),
+      'no transcript fixture was scanned, and transcripts are the only ones that leak',
+    );
+  });
+
+  it('the transcript lines parse, so the structural half of the rule is actually running', () => {
+    const unparsed: string[] = [];
+    let lines = 0;
+    for (const entry of read) {
+      if (!entry.relative.endsWith('.jsonl')) continue;
+      entry.text.split('\n').forEach((raw, index) => {
+        if (raw.trim().length === 0) return;
+        lines += 1;
+        try {
+          JSON.parse(raw);
+        } catch {
+          unparsed.push(`${entry.relative}:${index + 1}`);
+        }
+      });
+    }
+    assert.ok(lines > 100, `only ${lines} transcript lines seen`);
+    assert.deepEqual(unparsed, [], 'these lines are invisible to the structural inventory check');
+  });
+
+  it('the detector fires on every leak class, and names the file, the line and the field', () => {
+    // A realistic `system/init` frame, of exactly the shape that has twice been committed
+    // unscrubbed, plus the two leak classes that live outside that frame.
+    const planted = [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        cwd: '/Users/alice/code/agentic-army',
+        tools: ['Read', 'mcp__datadog-mcp__search_datadog_logs'],
+        mcp_servers: [{ name: 'datadog-mcp', status: 'connected' }],
+        slash_commands: ['ship-it', 'standup'],
+        skills: ['diagnose', 'handoff'],
+        plugins: [{ name: 'acme-tools', path: '/Users/alice/.claude/plugins/cache/acme' }],
+        memory_paths: { user: '/Users/alice/.claude/CLAUDE.md' },
+      }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        cwd: '/private/tmp/claude-501/-Users-alice-code-agentic-army/abc/scratchpad',
+      }),
+      JSON.stringify({ type: 'note', token: 'sk-ant-api03-AAAABBBBCCCCDDDD' }),
+    ].join('\n');
+
+    const found = leaksIn('test/fixtures/planted.jsonl', planted);
+    const kinds = new Set(found.map((leak) => leak.kind));
+    for (const kind of ['home-path', 'environment-inventory', 'mcp-tool', 'credential']) {
+      assert.ok(kinds.has(kind as LeakKind), `the detector missed ${kind}: ${JSON.stringify(found)}`);
+    }
+
+    // Every inventory field individually, so a rule that happened to catch one of them is not
+    // mistaken for a rule that catches all five.
+    //
+    // SPELLED OUT, not iterated over `INVENTORY_KEYS`. Looping the constant under test was a
+    // vacuous pass and was watched to be one: deleting `memory_paths` from `INVENTORY_KEYS`
+    // deleted it from the assertion at the same time, so the detector went blind to a whole leak
+    // class and this test stayed green. A guard's own fixture may not be derived from the thing
+    // it guards.
+    const fields = found.filter((leak) => leak.kind === 'environment-inventory').map((leak) => leak.found);
+    for (const key of ['mcp_servers', 'slash_commands', 'skills', 'plugins', 'memory_paths']) {
+      assert.ok(
+        fields.some((entry) => entry.startsWith(`${key}:`)),
+        `${key} carrying content was not reported: ${JSON.stringify(fields)}`,
+      );
+    }
+    // And the constant itself, member for member, so shrinking it is a red test rather than a
+    // silently narrower rule.
+    assert.deepEqual(
+      [...INVENTORY_KEYS].sort(),
+      ['mcp_servers', 'memory_paths', 'plugins', 'skills', 'slash_commands'],
+      'the set of environment-inventory fields changed',
+    );
+
+    // Line numbers, because "somewhere in this file" is not actionable in a 68-line transcript.
+    assert.ok(
+      found.some((leak) => leak.line === 2 && leak.found.includes('-Users-alice')),
+      'the mangled scratchpad form was missed, or reported on the wrong line',
+    );
+    assert.ok(
+      found.some((leak) => leak.line === 3 && leak.kind === 'credential'),
+      'the credential was missed, or reported on the wrong line',
+    );
+    assert.ok(found.every((leak) => leak.file === 'test/fixtures/planted.jsonl'));
+  });
+
+  it('the detector is silent on a correctly scrubbed transcript and on ordinary content', () => {
+    // The other half. A rule broad enough to fail on legitimate fixture content would be turned
+    // off within a week, so the shapes that must NOT fire are pinned here.
+    const clean = [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        cwd: '/private/tmp/claude-501/-Users-example-organizations-personal-agentic-army/e8/scratchpad',
+        tools: ['Task', 'Bash', 'Read', 'Write', 'WebSearch'],
+        mcp_servers: [],
+        slash_commands: [],
+        skills: [],
+        plugins: [],
+        memory_paths: {},
+        model: 'claude-haiku-4-5-20251001',
+        session_id: 'a8ef720b-df10-4684-bde5-3d2deeb95e5b',
+        agents: ['claude', 'Explore', 'general-purpose'],
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'text', text: 'I will check which skills and plugins are installed.' },
+            { type: 'tool_use', name: 'Read', input: { file_path: '/tmp/calc.py' } },
+          ],
+        },
+      }),
+      JSON.stringify({ type: 'item.completed', item: { command: '/bin/zsh -lc ls' } }),
+    ].join('\n');
+
+    assert.deepEqual(
+      leaksIn('test/fixtures/clean.jsonl', clean),
+      [],
+      'the rule is too broad — it fails on legitimate fixture content',
+    );
+  });
+
+  it('no fixture in the tree carries recorder-environment leakage', () => {
+    const leaks = read.flatMap((entry) => leaksIn(entry.relative, entry.text));
+    assert.deepEqual(
+      leaks.map((leak) => `${leak.file}:${leak.line}  [${leak.kind}]  ${leak.found}`),
+      [],
+      HOW_TO_SCRUB,
+    );
+  });
+});

@@ -88,7 +88,7 @@ import {
   validateReport,
   validateVerdict,
 } from '../contracts/report.ts';
-import type { Lease } from '../contracts/worktree.ts';
+import type { Lease, ReleaseResult } from '../contracts/worktree.ts';
 import { armyBranch } from '../contracts/worktree.ts';
 
 import {
@@ -158,18 +158,42 @@ import {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * What became of the worktree. There is no fourth value, and in particular there is no "unknown":
- * release is destructive, so a supervisor that cannot say what it did to a tree has already
- * failed the only safety property that matters there.
+ * What became of the worktree. There is no "unknown": release is destructive, so a supervisor
+ * that cannot say what it did to a tree has already failed the only safety property that matters
+ * there.
+ *
+ *   `never-acquired`  no lease was ever taken. Nothing to settle.
+ *   `released`        this run returned the tree. It is back in the pool.
+ *   `retained`        this run still HOLDS the tree, deliberately, because releasing it would
+ *                     have destroyed work no durable ref can reach. `reason` is what a human
+ *                     needs to recover it, and `path` is where.
+ *   `not-held`        this run neither returned the tree nor holds it. The lease went stale
+ *                     (the slot has been re-leased and `path` belongs to another holder now),
+ *                     or the record was already gone, or the tree was.
+ *
+ * `not-held` is the newest and it exists because `release` started telling the truth. The
+ * provider distinguishes released / stale-lease / no-record / missing-tree; `release` used to
+ * return `void`, so this file collapsed all four into `released` and narrated `worktree
+ * released: <path>` — for a path that, in the stale case, belongs to somebody else's Engineer.
+ * A crash-recovering operator reading that line would go looking in the wrong tree, and, worse,
+ * would believe a slot had been freed that was never this run's to free.
+ *
+ * It is deliberately ONE state rather than three. What a reader does about it is identical in all
+ * three cases — nothing, the work is already durable — and the difference between them is a
+ * sentence, which is what `reason` is for.
  */
-export const LEASE_STATES = ['never-acquired', 'released', 'retained'] as const;
+export const LEASE_STATES = ['never-acquired', 'released', 'retained', 'not-held'] as const;
 export type LeaseState = (typeof LEASE_STATES)[number];
 
 export interface LeaseDisposition {
   state: LeaseState;
   path: string | null;
   leaseId: string | null;
-  /** Always populated. For `retained`, this is what a human needs in order to recover the work. */
+  /**
+   * Always populated. For `retained`, this is what a human needs in order to recover the work;
+   * for `not-held`, it is the provider's own sentence about which of the three no-ops happened
+   * and who holds the tree now.
+   */
   reason: string;
 }
 
@@ -678,6 +702,34 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     project,
     title: options.objective,
   });
+
+  /**
+   * WHERE THE ARCHIVE REFUSES A RE-RUN. Before this run's first append, not at its first soldier.
+   *
+   * `recordAgentAttempt` already refuses a duplicate agent id, and by the time this campaign got
+   * there it had opened a task and appended four signals into an archive it does not own. Those
+   * files are append-only — that is the point of them — so those rows could not be taken back, and
+   * a reader of the first run's campaign saw a task and four status signals from a run that did
+   * literally nothing. Measured: `tasks.jsonl` 7 → 9 lines, `signals.jsonl` 9 → 13.
+   *
+   * Append-only is exactly why the answer is "ask earlier" rather than "clean up after". There is
+   * no cleaning up after; the only moment at which the extra rows can be prevented is before the
+   * first one exists. So the availability of `cpt-01` — which is where every run collides, because
+   * ids are minted from 01 — is asked here, one statement after the archive opens and one
+   * statement before it is written to.
+   *
+   * The consequence, stated because it is a real behaviour change and not an accident: this
+   * refusal THROWS out of `runCampaign` instead of coming back as an `aborted` result with a note.
+   * It has to. A note is narrated into a campaign, and narrating anything is the thing being
+   * prevented. That puts it in the same class as `${cwd} is not inside a git repository` above —
+   * a setup-time refusal, reported by the throw and given its `fix:` line by the command layer —
+   * which is the honest class for it: nothing started, so there is no campaign to report on.
+   *
+   * `AgentIdInUseError` carries the id, the campaign and the time the first attempt started, and
+   * `src/command/index.ts` and `src/command/chat.ts` both key on that type for the `fix:` line, so
+   * the reader loses nothing by the diagnosis moving.
+   */
+  archive.assertAgentIdAvailable(agentIdFor(1));
 
   /**
    * Whether THIS run is the one entitled to write this campaign's terminal status.
@@ -1736,7 +1788,10 @@ function diagnoseDeliveryFailure(error: unknown, ctx: DeliveryContext): Fix {
 
 interface SettleLeaseInput {
   archive: CampaignArchive;
-  provider: { release(lease: Lease, opts?: { force?: boolean }): Promise<void>; id: string };
+  provider: {
+    release(lease: Lease, opts?: { force?: boolean }): Promise<ReleaseResult>;
+    id: string;
+  };
   lease: Lease;
   branch: string;
   project: string;
@@ -1845,12 +1900,38 @@ async function settleLease(input: SettleLeaseInput): Promise<LeaseDisposition> {
  *
  * The provider is fail-closed and refuses to destroy unlanded work. A refusal here is
  * therefore a SECOND opinion on the durability step above, from the code that owns the tree — and
- * it wins, because it is the one about to run `reset --hard` + `clean -fdx`.
+ * it wins, because it is the one about to reset it.
+ *
+ * THE OUTCOME IS READ. `release` reports four things and only one of them means the tree came
+ * back; this used to `await` it for its exceptions alone and then announce `worktree released`
+ * regardless. The stale-lease case is the one that made that a real defect rather than an
+ * imprecision: the slot has been re-leased, `lease.path` is another holder's Engineer's tree, and
+ * the line this campaign wrote into `signals.jsonl` told an operator recovering from a crash that
+ * it had returned it. Both halves of that are wrong — the tree was never returned by this run,
+ * and the path names somebody else's work.
+ *
+ * So the no-op outcomes come back as `not-held`, at `warn`, carrying the PROVIDER'S OWN sentence
+ * rather than a re-derivation of it: the provider is the only thing that knows who holds the slot
+ * now, and it already puts that in `message`.
+ *
+ * What is deliberately NOT done: no `retainedTreeFix`. That fix tells a human where their work is
+ * and how to inspect it, and for every one of these three outcomes the answer is "not there" —
+ * pointing them at a path this run does not hold is worse than saying nothing. The work is
+ * durable by the time this function runs; that is the whole precondition of calling it.
  */
 async function releaseLease(input: SettleLeaseInput, why: string): Promise<LeaseDisposition> {
   const { lease, note, provider } = input;
   try {
-    await provider.release(lease);
+    const result = await provider.release(lease);
+    if (!result.released) {
+      note('warn', 'lease', `worktree NOT released: ${result.message}`);
+      return {
+        state: 'not-held',
+        path: lease.path,
+        leaseId: lease.leaseId,
+        reason: result.message,
+      };
+    }
     note('info', 'lease', `worktree released: ${lease.path}`);
     return { state: 'released', path: lease.path, leaseId: lease.leaseId, reason: why };
   } catch (error) {

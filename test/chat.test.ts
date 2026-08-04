@@ -1904,6 +1904,26 @@ describe('army chat — the command', () => {
       'the first session recorded no commander, so there is nothing to collide with',
     );
 
+    /**
+     * The append-only files, as bytes, before the refused session runs.
+     *
+     * `campaign.json` alone was never the whole record. A refused session used to open a task and
+     * append signals into the first conversation's `tasks.jsonl` and `signals.jsonl` before the
+     * collision on `col-01` threw, and those files are append-only — the rows could not be taken
+     * back, so a reader of that conversation saw work from a session that exchanged no words at
+     * all. Asserted non-empty first, because comparing two files this test failed to find would
+     * pass without proving anything.
+     */
+    const appendOnly = ['tasks.jsonl', 'signals.jsonl'];
+    const rows = (): Record<string, string> =>
+      Object.fromEntries(
+        appendOnly.map((name) => [name, fs.readFileSync(path.join(first.campaignRoot, name), 'utf8')]),
+      );
+    const rowsBefore = rows();
+    for (const name of appendOnly) {
+      assert.ok((rowsBefore[name] ?? '').trim().length > 0, `${name} is empty — nothing to grow`);
+    }
+
     let err = '';
     const code = await chatCommand(['--id', first.campaignId], {
       stdout: { write: () => undefined },
@@ -1920,6 +1940,16 @@ describe('army chat — the command', () => {
         charset: 'unicode',
       },
     });
+
+    // FIRST, and before anything about the message: a refusal that happens too late still
+    // refuses, so every assertion below this one goes green either way and would mask the
+    // property that actually matters. Compared before them, a regression in WHERE the archive
+    // refuses fails as itself, with the rows the refused session left behind in the diff.
+    assert.deepEqual(
+      rows(),
+      rowsBefore,
+      'a refused session appended to the append-only files of the conversation it was refused from',
+    );
 
     assert.equal(code, 1, `the refused session exited ${String(code)}:\n${err}`);
     // The diagnosis, about their conversation rather than about a table they have never seen.

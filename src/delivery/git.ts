@@ -105,7 +105,7 @@ function run(file: string, args: readonly string[], opts: RunOptions = {}): Prom
   });
 }
 
-/** Exported so the treehouse adapter can shell out through the same non-interactive plumbing. */
+/** Exported so a worktree provider can shell out through the same non-interactive plumbing. */
 export function runBinary(
   file: string,
   args: readonly string[],

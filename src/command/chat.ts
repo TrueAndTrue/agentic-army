@@ -11,6 +11,8 @@ import * as path from 'node:path';
 
 import { RUNGS } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
+import { WORKTREE_PROVIDER_IDS } from '../contracts/worktree.ts';
+import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import { AgentIdInUseError } from '../archive/archive.ts';
 import { CampaignSetupError, agentIdInUseFix } from './campaign.ts';
 import type { WriteStream } from './campaign.ts';
@@ -99,7 +101,7 @@ export interface ChatArgs {
   maxAttempts?: number;
   cwd?: string;
   model?: string;
-  provider?: 'treehouse' | 'cold';
+  provider?: WorktreeProviderId;
   campaignId?: string;
   help: boolean;
 }
@@ -146,11 +148,17 @@ export function parseChatArgs(argv: readonly string[]): ChatArgs {
         break;
       }
       case '--provider': {
+        // Validated AGAINST THE CONTRACT's own list rather than two literals repeated here.
+        // The literals were a second copy of a value domain that `test/contracts.test.ts` pins
+        // member for member, so a provider added there arrived rejected by both commands.
         const value = next();
-        if (value !== 'treehouse' && value !== 'cold') {
-          throw new UsageError(`--provider expects treehouse or cold, got ${JSON.stringify(value ?? '')}`);
+        if (!(WORKTREE_PROVIDER_IDS as readonly string[]).includes(value ?? '')) {
+          throw new UsageError(
+            `--provider expects one of ${WORKTREE_PROVIDER_IDS.join(', ')}, ` +
+              `got ${JSON.stringify(value ?? '')}`,
+          );
         }
-        args.provider = value;
+        args.provider = value as WorktreeProviderId;
         break;
       }
       case '--id': {

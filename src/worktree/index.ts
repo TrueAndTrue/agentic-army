@@ -8,9 +8,12 @@
  * and the next thing that wants to own worktrees (a devcontainer, a remote builder, a
  * copy-on-write snapshot on APFS or btrfs) will arrive through the same door.
  *
- * `WorktreeProviderId` still spells `'treehouse'` because `src/contracts/worktree.ts` is frozen.
- * Asking for it is not an error and not a downgrade — there is nothing to downgrade FROM — but it
- * is worth a warning, because a caller that asks for a provider it does not get should be told.
+ * `WorktreeProviderId` still spells `'treehouse'`, and this file is why. Keeping the retired id a
+ * recognised member is what lets `--provider treehouse` be answered with the paragraph below —
+ * what replaced it and what that gives you — instead of a usage error listing the tokens it is
+ * not. Asking for it is not an error and not a downgrade — there is nothing to downgrade FROM —
+ * but it is worth a warning, because a caller that asks for a provider it does not get should be
+ * told.
  */
 
 import type { WorktreeProvider, WorktreeProviderId } from '../contracts/worktree.ts';
@@ -37,8 +40,9 @@ export interface WorktreeSelection {
 
 export interface SelectWorktreeProviderOptions {
   /**
-   * Options for the pooled provider. Still named `cold` because that is the frozen provider id
-   * and the key `src/command/campaign.ts` passes.
+   * Options for the pooled provider. Still named `cold` because that is the provider id — see
+   * `WORKTREE_PROVIDER_IDS` for why the id is not renamed — and the key `src/command/campaign.ts`
+   * passes.
    */
   cold: ColdWorktreeProviderOptions;
   /** Defaults to `cold`, which is the only provider there is. */
@@ -83,7 +87,7 @@ export async function selectWorktreeProvider(
       code: preferred === 'cold' && options.prefer !== undefined ? 'provider-forced' : 'provider-selected',
       message:
         'pooled git worktrees: warm reuse with preserved dependency directories, `post_create` ' +
-        'after provision and after every reset, ABA-safe conditional release.',
+        'on every acquire whether the tree was provisioned or reused, ABA-safe conditional release.',
     },
   };
 }

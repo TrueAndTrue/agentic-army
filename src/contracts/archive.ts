@@ -132,7 +132,7 @@ export interface AgentRow {
   status: AgentStatus;
   /** Absolute path of the leased worktree; null for read-only roles. */
   worktree_path: string | null;
-  /** treehouse lease id — required for an ABA-safe conditional return. */
+  /** Worktree lease id — required for an ABA-safe conditional return. See `Lease.leaseId`. */
   lease_id: string | null;
   /** Agent directory relative to the campaign root: `agents/cpt-03`. */
   dir: string;

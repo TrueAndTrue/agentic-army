@@ -246,7 +246,7 @@ test('warm reuse: a release preserves node_modules and resets everything else', 
   // And an untracked scratch file, which a release is allowed to destroy.
   writeFileSync(join(first.path, 'scratch.txt'), 'notes\n');
 
-  const released = await provider.tryRelease(first, { force: true });
+  const released = await provider.release(first, { force: true });
   assert.equal(released.outcome, 'released');
   assert.equal(released.warm, true, 'a release must keep the tree, not delete it');
   assert.ok(released.preserved.includes('node_modules'));
@@ -321,7 +321,7 @@ test('warm reuse survives repetition, and `warm = false` opts out of it entirely
   mkdirSync(join(cold.path, 'node_modules'), { recursive: true });
   writeFileSync(join(cold.path, 'node_modules', 'dep.js'), 'dep\n');
   assert.deepEqual(cold.preserved, [], 'nothing is preserved when warm is off');
-  const releasedCold = await coldProvider.tryRelease(cold);
+  const releasedCold = await coldProvider.release(cold);
   assert.equal(releasedCold.warm, false);
   assert.equal(existsSync(cold.path), false, 'warm = false destroys the tree, as it used to');
 });
@@ -355,7 +355,7 @@ test('a warm slot does not inherit the previous holder\'s reflog — the pool mu
   sh(first.path, 'add', '-A');
   sh(first.path, 'commit', '--quiet', '-m', 'take the hill');
   await ensureDurable({ worktree: first.path, branch, project: repo, archiveRoot });
-  assert.equal((await provider.tryRelease(first)).outcome, 'released');
+  assert.equal((await provider.release(first)).outcome, 'released');
 
   // Holder 2 inherits the slot. Its own work is trivial and entirely durable.
   const second = await provider.acquire('cpt-02', repo);
@@ -370,7 +370,7 @@ test('a warm slot does not inherit the previous holder\'s reflog — the pool mu
     "the gate must see nothing but this lease's own base — no ghost of cpt-01",
   );
 
-  const releasedSecond = await provider.tryRelease(second);
+  const releasedSecond = await provider.release(second);
   assert.equal(
     releasedSecond.outcome,
     'released',
@@ -393,7 +393,7 @@ test('a warm slot does not inherit the previous holder\'s reflog — the pool mu
       await provider.release(lease, { force: true });
     } else {
       await ensureDurable({ worktree: lease.path, branch: cycleBranch, project: repo, archiveRoot });
-      const result = await provider.tryRelease(lease);
+      const result = await provider.release(lease);
       assert.equal(result.outcome, 'released', `cycle ${cycle}: a durable lease releases cleanly`);
     }
   }
@@ -401,7 +401,7 @@ test('a warm slot does not inherit the previous holder\'s reflog — the pool mu
   // The pool is still usable after all of that, which is the property that actually matters.
   const final = await provider.acquire('cpt-99', repo);
   assert.equal(final.path, first.path);
-  const releasedFinal = await provider.tryRelease(final);
+  const releasedFinal = await provider.release(final);
   assert.equal(releasedFinal.outcome, 'released', 'the slot survived every previous holder');
   assert.equal(provider.listLeases().length, 0, 'and the pool is not drained');
 });
@@ -440,7 +440,7 @@ test('an untracked preserved directory never blocks a release — the pool must 
     'precondition: untracked, NOT ignored — invisible to the ignored-files half of the gate',
   );
   assert.equal(
-    (await provider.tryRelease(first)).outcome,
+    (await provider.release(first)).outcome,
     'released',
     'even the first holder must not need force for a directory the release is keeping',
   );
@@ -463,7 +463,7 @@ test('an untracked preserved directory never blocks a release — the pool must 
     sh(lease.path, 'commit', '--quiet', '-m', `cycle ${cycle}`);
     await ensureDurable({ worktree: lease.path, branch, project: repo, archiveRoot });
 
-    const released = await provider.tryRelease(lease);
+    const released = await provider.release(lease);
     assert.equal(
       released.outcome,
       'released',
@@ -575,7 +575,7 @@ test('preserved dependency directories never block a release; an unexpected igno
   writeFileSync(join(first.path, 'dist', 'bundle.js'), 'built\n');
   assert.equal(sh(first.path, 'status', '--porcelain'), '', 'ignored files are invisible to status');
 
-  const released = await provider.tryRelease(first);
+  const released = await provider.release(first);
   assert.equal(released.outcome, 'released');
   assert.ok(existsSync(join(first.path, 'vendor', 'github.com', 'dep.go')), 'and it is preserved');
 
@@ -718,7 +718,7 @@ test('pre_destroy runs before the reset, and its failure never leaks the slot', 
   const lease = await provider.acquire('cpt-01', repo);
   writeFileSync(join(lease.path, 'about-to-die.txt'), 'still-here\n');
 
-  const released = await provider.tryRelease(lease, { force: true });
+  const released = await provider.release(lease, { force: true });
   assert.equal(released.outcome, 'released', 'a failing cleanup command must not leak a pool slot');
   assert.equal(released.warm, true);
   assert.equal(released.hooks?.ok, false);
@@ -935,7 +935,7 @@ test('preserve patterns the release gate cannot match are rejected, not silently
   const lease = await provider.acquire('cpt-01', repo);
   mkdirSync(join(lease.path, 'bazel-out'), { recursive: true });
   writeFileSync(join(lease.path, 'bazel-out', 'artifact'), 'built\n');
-  const releasedFirst = await provider.tryRelease(lease);
+  const releasedFirst = await provider.release(lease);
   assert.equal(releasedFirst.outcome, 'released', 'a preserved directory must never block');
   assert.ok(existsSync(join(lease.path, 'bazel-out', 'artifact')), 'and it survives the reset');
 
@@ -958,7 +958,7 @@ test('preserve patterns the release gate cannot match are rejected, not silently
       return true;
     },
   );
-  const forced = await provider.tryRelease(second, { force: true });
+  const forced = await provider.release(second, { force: true });
   assert.equal(forced.warm, true);
   assert.equal(existsSync(join(second.path, 'foo.cache')), false, 'the reset cleaned it');
 
@@ -966,7 +966,7 @@ test('preserve patterns the release gate cannot match are rejected, not silently
   const third = await provider.acquire('cpt-03', repo);
   assert.equal(third.path, lease.path);
   assert.equal(
-    (await provider.tryRelease(third)).outcome,
+    (await provider.release(third)).outcome,
     'released',
     'a rejected pattern must not leave the slot permanently force-only',
   );
@@ -1242,7 +1242,7 @@ test('a stale lease id must NOT destroy a worktree that has since been re-acquir
   writeFileSync(join(current.path, 'in-progress.txt'), 'cpt-02 is working\n');
 
   // A crash-recovering supervisor replays the lease it still remembers.
-  const outcome = await provider.tryRelease(stale);
+  const outcome = await provider.release(stale);
   assert.equal(outcome.outcome, 'stale-lease');
   assert.equal(outcome.released, false);
   assert.match(outcome.message, /stale/i);
@@ -1280,7 +1280,7 @@ test('releasing an unknown path is a no-op, and a foreign provider lease is refu
   const dir = caseDir('foreign');
   const provider = new ColdWorktreeProvider({ root: join(dir, 'pool'), home: join(dir, 'home') });
 
-  const unknown = await provider.tryRelease(fakeLease({ path: join(dir, 'not-a-lease') }));
+  const unknown = await provider.release(fakeLease({ path: join(dir, 'not-a-lease') }));
   assert.equal(unknown.outcome, 'no-record');
   assert.equal(unknown.released, false);
 
@@ -1342,7 +1342,7 @@ test('release refuses commits no durable ref can reach; forced release is possib
 
   // Forcing is a separate, explicit act — for when the holder process is gone and the work is
   // already durable elsewhere.
-  const forced = await provider.tryRelease(lease, { force: true });
+  const forced = await provider.release(lease, { force: true });
   assert.equal(forced.outcome, 'released');
   assert.equal(forced.released, true);
   assert.equal(existsSync(join(lease.path, 'hill.txt')), false, 'the reset really happened');
@@ -1383,7 +1383,7 @@ test('the gate looks past HEAD: commits on the army branch count even after HEAD
 
   // Once that branch is durable, the same release is allowed.
   await ensureDurable({ worktree: lease.path, branch, project: repo, archiveRoot });
-  const released = await provider.tryRelease(lease);
+  const released = await provider.release(lease);
   assert.equal(released.outcome, 'released');
 });
 
@@ -1408,7 +1408,7 @@ test('a stash taken in the tree blocks release; a stash from elsewhere does not'
   sh(innocent.path, 'commit', '--quiet', '-m', 'done');
   await ensureDurable({ worktree: innocent.path, branch: branchA, project: repo, archiveRoot });
   assert.equal(sh(innocent.path, 'stash', 'list').split('\n').length, 1, 'the human stash is visible');
-  const releasedInnocent = await provider.tryRelease(innocent);
+  const releasedInnocent = await provider.release(innocent);
   assert.equal(
     releasedInnocent.outcome,
     'released',
@@ -1472,7 +1472,7 @@ test('round trip: acquire → branch → commit → durability → release, and 
   assert.equal(sh(repo, 'rev-parse', durability.ref), sha, 'the marker ref lives in the repo');
 
   // Now the same release that was refused a moment ago is allowed — no force needed.
-  const released = await provider.tryRelease(lease);
+  const released = await provider.release(lease);
   assert.equal(released.outcome, 'released');
   assert.equal(existsSync(join(lease.path, 'hill.txt')), false, 'the tree no longer holds the work');
 

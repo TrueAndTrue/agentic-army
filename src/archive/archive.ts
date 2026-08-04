@@ -828,6 +828,32 @@ export class CampaignArchive implements CampaignReader {
   }
 
   /**
+   * Ask, before writing anything, whether this run may mint `agentId` at all.
+   *
+   * THE ORDERING FIX. `recordAgentAttempt` refuses the duplicate, and refusing there is correct —
+   * it is the write that would do the damage. But it is not the FIRST write of a run: by the time
+   * a supervisor reaches its first soldier it has already opened a task and appended several
+   * signals, and those files are append-only. A refused re-run therefore left a task row and four
+   * status signals sitting in a campaign it did no work in, and a reader of that archive could not
+   * tell them from the real run's. Measured on a two-attempt campaign: `tasks.jsonl` 7 → 9 lines,
+   * `signals.jsonl` 9 → 13.
+   *
+   * The append-only guarantee is what forces the shape of the fix. Nothing may be rewritten and
+   * nothing may be deleted, so the only place the extra rows can be prevented is BEFORE the first
+   * one is written — which means the question has to be askable without attempting the write. That
+   * is this method. `runCampaign` and `runChat` ask it the moment the archive is open and refuse
+   * the whole run if the answer is no, so a refused re-run is byte-for-byte invisible in the
+   * archive it was refused from.
+   *
+   * It is a pure read: it asks, it never inserts. `recordAgentAttempt` keeps both of its own
+   * checks, because a caller that never asks must still not be able to overwrite an attempt.
+   */
+  assertAgentIdAvailable(agentId: string): void {
+    this.assertIdUnused(agentId);
+    this.assertNoCaseCollision(agentId);
+  }
+
+  /**
    * Refuse an agent id this campaign has already recorded, before SQLite does.
    *
    * The column is a primary key, so the duplicate was always rejected — as

@@ -70,7 +70,7 @@ import { campaignCommand, parseCampaignArgs, renderCampaignResult } from '../src
 import { FIX_KINDS, unrunnableReason } from '../src/setup/fixes.ts';
 import type { Fix } from '../src/setup/fixes.ts';
 import { PROTECTED_CONFIG_GLOBS } from '../src/setup/init.ts';
-import { createCampaign } from '../src/archive/archive.ts';
+import { AgentIdInUseError, createCampaign } from '../src/archive/archive.ts';
 import { rebuildCampaign } from '../src/archive/rebuild.ts';
 import { runView } from '../src/view/index.ts';
 import type { Report, Verdict } from '../src/contracts/report.ts';
@@ -1493,6 +1493,103 @@ describe('failure paths', () => {
     assertReadableArchive(result);
   });
 
+  /**
+   * The lease went stale under the campaign, and the campaign must not claim it released it.
+   *
+   * `release` reports four outcomes and only `released` means the tree came back. It used to
+   * return `void`, so this file awaited it for its exceptions alone and then announced
+   * `worktree released: <path>` whatever happened — including for the ABA case, where the slot
+   * has been re-leased and that path is another holder's Engineer's tree. Two lies in one line:
+   * this run did not return the tree, and the path names somebody else's work. It went into
+   * `signals.jsonl` too, which is the archive an operator reads AFTER a crash, i.e. precisely
+   * when they are deciding which trees are safe to go poking in.
+   *
+   * The ABA is forced rather than raced, because a race is not a test. Rewriting the slot's
+   * lease record with a different lease id is exactly the state a second holder acquiring the
+   * freed slot leaves behind, and it is what the provider's guard reads.
+   *
+   * NOTHING IS DESTROYED is asserted alongside the wording: the refusal has to be a refusal. A
+   * `not-held` that had reset the tree anyway would satisfy every string assertion here and be
+   * the worse bug.
+   */
+  it('a lease that went stale under the campaign is reported as not-held, not released', async () => {
+    const repo = makeRepo('stale-settle');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('stale-settle', 'ok', ['pass']);
+    const leasesDir = path.join(worktreesRootFor(home), 'leases');
+
+    let stolenFrom: string | null = null;
+    const events: ProgressEvent[] = [];
+    const result = await campaign({
+      objective: 'Add a multiply function',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      onProgress: (event: ProgressEvent) => {
+        events.push(event);
+        if (event.kind !== 'worktree-leased' || stolenFrom !== null) return;
+        for (const name of fs.readdirSync(leasesDir)) {
+          const file = path.join(leasesDir, name);
+          const record = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+            path: string;
+            leaseId: string;
+            leaseHolder: string;
+          };
+          if (path.resolve(record.path) !== path.resolve(event.path)) continue;
+          record.leaseId = 'lease-taken-by-someone-else';
+          record.leaseHolder = 'cpt-99';
+          fs.writeFileSync(file, JSON.stringify(record));
+          stolenFrom = event.path;
+        }
+      },
+    });
+    assert.ok(stolenFrom !== null, 'no lease record matched the leased tree, so no ABA was forced');
+
+    // THE DISPOSITION. Not `released` — this run returned nothing — and not `retained` either,
+    // because it does not hold the tree and telling a human to go and look in it would be the
+    // same defect pointed the other way.
+    assert.equal(
+      result.lease.state,
+      'not-held',
+      `a stale lease was settled as ${JSON.stringify(result.lease.state)}: ${result.lease.reason}`,
+    );
+    assert.match(result.lease.reason, /stale/i, `the reason does not say why:\n${result.lease.reason}`);
+    assert.match(
+      result.lease.reason,
+      /cpt-99/,
+      `the reason does not name who holds the tree now:\n${result.lease.reason}`,
+    );
+
+    // THE NOTE, and its level. `info` would file this under running commentary; a tree that did
+    // not come back is something an operator has to see.
+    const leaseNotes = result.notes.filter((note) => note.code === 'lease');
+    const warned = leaseNotes.find((note) => note.level === 'warn');
+    assert.ok(warned !== undefined, `no warn-level lease note:\n${renderCampaignResult(result)}`);
+    assert.ok(
+      !leaseNotes.some((note) => /worktree released/.test(note.message)),
+      `the campaign still claims it released the tree:\n${JSON.stringify(leaseNotes, null, 2)}`,
+    );
+
+    // THE ARCHIVE. The row an operator reads after a crash.
+    const signals = fs.readFileSync(path.join(result.campaignRoot, 'signals.jsonl'), 'utf8');
+    assert.ok(
+      !/lease released/.test(signals),
+      'signals.jsonl records a release that did not happen',
+    );
+    assert.match(signals, /lease not-held/, 'signals.jsonl does not record what did happen');
+
+    // THE TERMINAL, through the same event the campaign narrates with.
+    const settled = events.filter((event) => event.kind === 'lease-settled');
+    assert.equal(settled.length, 1, 'the lease was settled more than once, or not at all');
+    assert.equal(settled[0]?.state, 'not-held');
+
+    // AND NOTHING WAS DESTROYED. The refusal has to be a refusal.
+    assert.ok(fs.existsSync(stolenFrom), 'the refused release destroyed the tree anyway');
+    assertReadableArchive(result);
+  });
+
   it('worktree acquisition fails: the campaign aborts with a readable archive', async () => {
     const empty = mkTmp('empty-repo');
     git(empty, 'init', '--quiet', '--initial-branch=main'); // no commits: nothing to hand out
@@ -1514,6 +1611,65 @@ describe('failure paths', () => {
     assertReadableArchive(result);
     const signals = fs.readFileSync(path.join(result.campaignRoot, 'signals.jsonl'), 'utf8');
     assert.match(signals, /worktree acquisition failed/);
+  });
+
+  /**
+   * The terminal-status guard, on the one path that still reaches it.
+   *
+   * `settledBeforeThisRun` protects a campaign that somebody already ended from being restamped
+   * by a later run that did no work. Until the agent-id refusal moved ahead of the first append,
+   * a re-run into a DELIVERED campaign was what exercised it — that run now throws before the
+   * archive is written to at all, which is a better outcome and leaves this guard without a
+   * witness. Re-witnessed here on the case the early refusal cannot catch: a campaign that ENDED
+   * without ever recording an agent, so `cpt-01` is free and the run is allowed to attach.
+   *
+   * A repository with no commits produces exactly that — worktree acquisition fails before a
+   * soldier exists — so the second run reaches the cleanup block holding a live handle to a
+   * finished campaign, which is the state the guard is about.
+   */
+  it('a campaign that ended without agents is not restamped by a later run', async () => {
+    const empty = mkTmp('ended-no-agents');
+    git(empty, 'init', '--quiet', '--initial-branch=main'); // no commits: nothing to hand out
+    const home = makeHome({ [empty]: 0 });
+    const bins = makeHarnesses('ended-no-agents', 'ok', ['pass']);
+
+    const first = await campaign({
+      objective: 'Add a multiply function',
+      cwd: empty,
+      home,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+    });
+    assert.equal(first.outcome, 'aborted');
+    assert.equal(
+      fs.readdirSync(path.join(first.campaignRoot, 'agents')).length,
+      0,
+      'an agent was recorded, so the early refusal would catch this and the guard is not on trial',
+    );
+    const campaignJson = path.join(first.campaignRoot, 'campaign.json');
+    const recordBefore = fs.readFileSync(campaignJson, 'utf8');
+    const rowBefore = JSON.parse(recordBefore) as { status: string; ended_at: string | null };
+    assert.equal(rowBefore.status, 'aborted');
+    assert.ok(rowBefore.ended_at !== null, 'nothing to overwrite');
+
+    // Attaches legitimately — no agent id collides — and ends the same way.
+    const second = await campaign({
+      objective: 'Add a multiply function',
+      cwd: empty,
+      home,
+      campaignId: first.campaignId,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+    });
+    assert.equal(second.outcome, 'aborted');
+
+    // The record belongs to the run that ended it. This run's own task and signal rows are its
+    // own to write and are NOT asserted here — only the campaign-level verdict is protected.
+    assert.equal(
+      fs.readFileSync(campaignJson, 'utf8'),
+      recordBefore,
+      'a later run restamped a campaign somebody else had already ended',
+    );
   });
 
   it('a permission denial becomes a signal row — a denial IS a ceiling breach', async () => {
@@ -1693,21 +1849,33 @@ describe('failure paths', () => {
    * `UNIQUE constraint failed: agents.id` — the name of a table they have never seen — because
    * an undiagnosed throw reaches the catch-all that wraps it in "no diagnosis, nothing to paste".
    *
-   * Three properties, and the FIRST is the one that was data loss rather than wording:
+   * WHERE the archive refuses is the property this test is really about, and it changed. The
+   * refusal used to happen at `recordAgentAttempt`, which is the first write that would do damage
+   * but is nowhere near the first write of a run: by then the campaign had opened a task and
+   * appended four signals into an archive it does not own. `tasks.jsonl` and `signals.jsonl` are
+   * APPEND-ONLY, so nothing could take those rows back — measured, `tasks.jsonl` went 7 → 9 lines
+   * and `signals.jsonl` 9 → 13 — and a reader of the first run's campaign could not tell a task
+   * and four status signals from a run that did nothing from the real run's own.
    *
-   * 1. The first run's `campaign.json` is byte-identical afterwards. The second run's cleanup
-   *    block called `setCampaignStatus` unconditionally, so a run that did no work at all —
-   *    it aborts before a single soldier exists — rewrote a finished campaign's `status` from
-   *    `done` to `aborted` and stamped a fresh `ended_at` over it. Asserting only that the
-   *    second run failed proves nothing about what it destroyed on the way out, so the BYTES
-   *    are compared and `status` / `ended_at` are then named individually, because those two
-   *    fields are the record and a diff on them must read as itself.
-   * 2. The sentence the reader reads is about their campaign rather than about SQLite.
-   * 3. The abort note carries a `manual` fix. `AgentIdInUseError` arrives with a full diagnosis,
-   *    so routing it into `noFix` claimed no command resolves a condition that one flag resolves.
-   *    Not `command` either: which id is a value only the reader has.
+   * So the availability of `cpt-01` is now asked one statement after the archive opens and one
+   * statement before it is written to, and the refusal THROWS rather than coming back as an
+   * `aborted` result. It has to: a note is narrated into a campaign, and narrating is the thing
+   * being prevented. That puts it in the same class as the not-a-git-repository refusal — thrown,
+   * with its `fix:` line supplied by the command layer.
+   *
+   * Four properties, and the first two are data rather than wording:
+   *
+   * 1. EVERY append-only file in the first run's campaign is byte-identical afterwards, and each
+   *    one is named individually so a diff reads as itself. This is the property that was broken.
+   * 2. `campaign.json` is byte-identical. The second run's cleanup block called
+   *    `setCampaignStatus` unconditionally, so a run that did no work at all rewrote a finished
+   *    campaign's `status` from `done` to `aborted` and stamped a fresh `ended_at` over it.
+   * 3. The sentence the reader reads is about their campaign rather than about SQLite.
+   * 4. The refusal still carries its fix — through the CLI, since that is where it is rendered
+   *    now. `AgentIdInUseError` arrives with a full diagnosis, so printing it bare would claim
+   *    no answer exists to a condition one flag resolves.
    */
-  it('a re-run into an existing campaign id says so, instead of naming a database table', async () => {
+  it('a re-run into an existing campaign id is refused before it appends a single row', async () => {
     const repo = makeRepo('reuse-id');
     const home = makeHome({ [repo]: 0 });
 
@@ -1724,82 +1892,122 @@ describe('failure paths', () => {
       .map((id) => fs.readFileSync(path.join(first.campaignRoot, 'agents', id, 'agent.json'), 'utf8'));
     assert.ok(agentsBefore.length > 0, 'the first run recorded no agents at all');
 
-    // The first run's record, as bytes and as the two fields that ARE the record. Read before the
-    // second run so the comparison is against what was actually delivered, not against a re-derivation.
-    const campaignJson = path.join(first.campaignRoot, 'campaign.json');
-    const recordBefore = fs.readFileSync(campaignJson, 'utf8');
-    const rowBefore = JSON.parse(recordBefore) as { status: string; ended_at: string | null };
-    assert.equal(rowBefore.status, 'done', `the first run did not finish: ${recordBefore}`);
+    /**
+     * The archive as bytes, before the refused run touches it.
+     *
+     * Every append-only file plus the campaign record, read as text and keyed by name, so the
+     * assertion below can say WHICH file grew rather than "something changed". The line counts
+     * are asserted non-trivial first: comparing two empty files proves nothing, and an archive
+     * whose files this test cannot find would pass silently.
+     */
+    const archiveFiles = ['campaign.json', 'tasks.jsonl', 'signals.jsonl'];
+    const snapshot = (): Record<string, string> =>
+      Object.fromEntries(
+        archiveFiles.map((name) => [name, fs.readFileSync(path.join(first.campaignRoot, name), 'utf8')]),
+      );
+    const before = snapshot();
+    for (const name of ['tasks.jsonl', 'signals.jsonl']) {
+      const lines = (before[name] ?? '').trim().split('\n').filter((line) => line.length > 0);
+      assert.ok(lines.length > 1, `${name} has ${lines.length} lines — nothing to grow`);
+    }
+    const rowBefore = JSON.parse(before['campaign.json'] ?? '{}') as {
+      status: string;
+      ended_at: string | null;
+    };
+    assert.equal(rowBefore.status, 'done', `the first run did not finish: ${before['campaign.json']}`);
     assert.ok(rowBefore.ended_at !== null, 'a finished campaign with no ended_at to overwrite');
 
-    const second = await campaign({
+    // The refusal itself. It rejects — nothing started, so there is no campaign result to return.
+    const thrown = await campaign({
       objective: 'Add a multiply function',
       cwd: repo,
       home,
       campaignId: first.campaignId,
       ...makeHarnesses('reuse-id-2', 'ok', ['pass']),
-    });
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    // 1. THE APPEND-ONLY FILES, asserted FIRST and before anything about the throw.
+    //    Order is deliberate: a refusal that happens too late still refuses, so an assertion on
+    //    the thrown value goes green either way and would mask this one. Comparing the bytes
+    //    first means a regression in WHERE the archive refuses fails as itself — with the rows
+    //    the refused run left behind printed in the diff.
+    assert.deepEqual(
+      snapshot(),
+      before,
+      'a run that did no work appended to another run’s append-only archive',
+    );
 
-    assert.equal(second.outcome, 'aborted');
-    const abort = second.notes.find((note) => note.level === 'error' && note.code === 'aborted');
-    assert.ok(abort !== undefined, `no abort note:\n${renderCampaignResult(second)}`);
+    assert.ok(thrown !== null, 'the re-run was allowed to proceed');
+    assert.ok(
+      thrown instanceof AgentIdInUseError,
+      `refused with the wrong type: ${String(thrown)}`,
+    );
 
-    // 1. THE RECORD. A run that wrote nothing must not have rewritten another run's truth.
-    const rowAfter = JSON.parse(fs.readFileSync(campaignJson, 'utf8')) as {
-      status: string;
-      ended_at: string | null;
-    };
+    // 2. THE RECORD, named field by field, because those two fields ARE the record.
+    const rowAfter = JSON.parse(
+      fs.readFileSync(path.join(first.campaignRoot, 'campaign.json'), 'utf8'),
+    ) as { status: string; ended_at: string | null };
     assert.equal(
       rowAfter.status,
       rowBefore.status,
-      `the aborted second run rewrote the first run's status to ${JSON.stringify(rowAfter.status)}`,
+      `the refused run rewrote the first run's status to ${JSON.stringify(rowAfter.status)}`,
     );
     assert.equal(
       rowAfter.ended_at,
       rowBefore.ended_at,
-      `the aborted second run stamped a fresh ended_at over the first run's`,
+      `the refused run stamped a fresh ended_at over the first run's`,
     );
-    assert.equal(
-      fs.readFileSync(campaignJson, 'utf8'),
-      recordBefore,
-      'campaign.json changed under a run that did no work',
-    );
-    // And the index agrees with the file, so a rebuild cannot resurrect the overwrite.
-    assert.equal(second.status, 'done', 'the result reports a status the archive does not hold');
 
-    // 2. The defect: a raw SQLite string in front of a human.
+    // 3. The defect that was wording: a raw SQLite string in front of a human.
+    const message = thrown.message;
     assert.doesNotMatch(
-      abort.message,
+      message,
       /UNIQUE constraint|agents\.id/,
-      `the database error reached the reader:\n${abort.message}`,
+      `the database error reached the reader:\n${message}`,
     );
-    // What replaced it — the id, why it can only collide, and the way out.
-    assert.match(abort.message, /cpt-01/, `the colliding id is not named:\n${abort.message}`);
+    assert.match(message, /cpt-01/, `the colliding id is not named:\n${message}`);
     assert.match(
-      abort.message,
+      message,
       /minted from 01 on every run/,
-      `the reason a retry cannot help is not given:\n${abort.message}`,
+      `the reason a retry cannot help is not given:\n${message}`,
     );
     assert.match(
-      abort.message,
+      message,
       /no campaign has used yet/,
-      `the reader is not told what to do instead:\n${abort.message}`,
+      `the reader is not told what to do instead:\n${message}`,
     );
 
-    // 3. THE FIX STATE. A diagnosed condition may not be reported as having no answer.
-    assert.equal(
-      abort.fix?.kind,
-      'manual',
-      `a diagnosed collision was reported as ${JSON.stringify(abort.fix)}`,
+    // 4. THE FIX STATE, through the skin that actually prints it. A diagnosed condition may not
+    //    reach the terminal as a bare sentence — which is exactly what it would do if the CLI's
+    //    catch still recognised only `CampaignSetupError`.
+    let err = '';
+    const code = await campaignCommand(['--id', first.campaignId, 'Add a multiply function'], {
+      stdout: { write: () => undefined },
+      stderr: { write: (text: string) => void (err += text) },
+      overrides: {
+        cwd: repo,
+        home,
+        env: {},
+        worktreeProvider: 'cold',
+        ...makeHarnesses('reuse-id-3', 'ok', ['pass']),
+      },
+    });
+    assert.equal(code, 1, `the refused command exited ${String(code)}:\n${err}`);
+    assert.ok(err.includes('\n  fix: '), `the refusal printed no fix line at all:\n${err}`);
+    assert.doesNotMatch(
+      err,
+      /no fix:/,
+      `a condition one flag resolves was reported as having no answer:\n${err}`,
     );
-    const instruction = (abort.fix as Extract<Fix, { kind: 'manual' }>).instruction;
-    assert.match(instruction, /--id/, `the fix does not name the flag to change:\n${instruction}`);
-    assert.ok(
-      instruction.includes(first.campaignId),
-      `the fix does not name the campaign that is in the way:\n${instruction}`,
-    );
+    assert.match(err, /--id/, `the fix does not name the flag to change:\n${err}`);
+    assert.ok(err.includes(first.campaignId), `the fix does not name the campaign in the way:\n${err}`);
 
-    // And the refusal is a refusal: not one attempt from the first run was overwritten, which is
+    // And that second refusal, through the CLI, appended nothing either.
+    assert.deepEqual(snapshot(), before, 'the CLI path appended where the direct call did not');
+
+    // The refusal is a refusal: not one attempt from the first run was overwritten, which is
     // the loss that mattered — `agents/<id>/` is a directory, and a second row under the same id
     // would have taken it over.
     assert.deepEqual(
@@ -1811,7 +2019,6 @@ describe('failure paths', () => {
         ),
       agentsBefore,
     );
-    assert.equal(second.lease.state, 'released', second.lease.reason);
   });
 
   /**

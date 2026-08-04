@@ -304,6 +304,12 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     project,
     title: `chat in ${path.basename(project)}`,
   });
+  // Before the first append, for the reason spelled out at the same call in `runCampaign`: a
+  // session refused for colliding on `col-01` used to open a task and append signals into somebody
+  // else's conversation first, and `tasks.jsonl` and `signals.jsonl` are append-only, so those rows
+  // stayed. `chatCommand` renders the `fix:` line off the thrown type.
+  archive.assertAgentIdAvailable(COMMANDER_AGENT_ID);
+
   const task = archive.createTask({ title: 'the conversation', status: 'in_flight' });
 
   const standingOrders = renderStandingOrders({ project, ceiling, requestedRung, maxAttempts });
