@@ -38,6 +38,35 @@ export type HarnessId = (typeof HARNESS_IDS)[number];
 export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
+/**
+ * A subordinate a worker may field as a native subagent, with the loadout it may field it WITH.
+ *
+ * A native subagent is not a process and has no argv of its own: it runs inside its parent and
+ * inherits its parent's permission settings. So this declaration is the only channel through which
+ * a subordinate's rank can narrow anything, and it is built by `subagentRosterFor` in
+ * `src/command/permissions.ts` from the same `narrowToRank` that builds the parent's own list.
+ * That module is also where the measured table of what the harness does and does not enforce lives;
+ * read it before trusting any field here to be a boundary.
+ */
+export interface SubagentDefinition {
+  /** The `subagent_type` a parent names to field one: `sgt-engineer`. */
+  name: string;
+  /** Authority. Must be strictly junior to the fielding worker's rank. */
+  rank: Rank;
+  /** Branch of service, inherited from the worker that fields it. */
+  role: Role;
+  /** Shown to the fielding model when it chooses whom to send. */
+  description: string;
+  /** The subordinate's system prompt. */
+  prompt: string;
+  /**
+   * Tool NAMES, never rules. There is no position in a subagent declaration for the
+   * `Bash(git:*)` form, so a scoped shell cannot be expressed here — which is one of the reasons
+   * the ranks on this substrate hold no shell at all.
+   */
+  tools: string[];
+}
+
 /** Everything a spawner decides about a soldier before the process exists. */
 export interface SoldierSpec {
   /** Supervisor-minted, stable, human-legible: `cpt-03`. Identity is spawner-owned. */
@@ -94,6 +123,23 @@ export interface SoldierSpec {
   deny: string[];
   /** Extra environment. Credentials are INHERITED, never injected — see the auth note above. */
   env?: Record<string, string>;
+
+  /**
+   * The subordinates this worker may field as native subagents, each with its own narrowed loadout.
+   *
+   * NOT HARNESS-NEUTRAL, and the asymmetry is total rather than a matter of degree. A native
+   * subagent inherits its parent's permission settings, so this is the ONLY channel by which a
+   * subordinate's rank narrows anything — see `SubagentDefinition` in `src/command/permissions.ts`
+   * for what was measured to hold and what was not. `src/harness/claude.ts` emits it as `--agents`.
+   * `codex exec` has no subagent model at all, so there is nothing to translate and nothing to
+   * degrade to: `buildSoldierSpec` refuses to build a codex spec carrying a roster rather than
+   * dropping it, because a dropped roster is a unit that reports a squad it never had.
+   *
+   * Absent or empty means this worker fields nobody, which is not the same as "unset": the claude
+   * adapter pins the nesting cap to zero for a worker with no roster, so an empty roster is an
+   * enforced absence rather than a default.
+   */
+  subagents?: readonly SubagentDefinition[];
 
   /**
    * The orders themselves. ALWAYS present — the caller resolves `orders.md` before spawning.

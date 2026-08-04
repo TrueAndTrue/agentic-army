@@ -149,8 +149,11 @@ import type { OriginalOrders } from './orders.ts';
 import {
   assertGlobalDenyIntact,
   assertNoFlagLikeRules,
+  assertSubagentRosterSafe,
   assertWorktreeRootOutsideProtected,
   permissionsFor,
+  subagentDeny,
+  subagentRosterFor,
 } from './permissions.ts';
 
 // ---------------------------------------------------------------------------------------------
@@ -447,6 +450,16 @@ export interface BuildSpecInput {
   outputSchemaPath?: string;
   /** Resolved army home, so the deny-list carries absolute globs as well as `~`-relative ones. */
   home: string;
+  /**
+   * Issue this worker a roster of subordinates it may field as native subagents.
+   *
+   * OPT-IN, and default-off, which is the conservative direction: a worker with no roster is
+   * pinned to a nesting cap of zero by the claude adapter, so "not asked for" and "not permitted"
+   * are the same state rather than two states one of which is a default nobody chose. An INSPECTOR
+   * is never given one — the review gate is one unit's independent judgement, and a reviewer that
+   * fans out is a reviewer whose verdict is assembled from reports it did not gather.
+   */
+  fanOut?: boolean;
 }
 
 /**
@@ -464,7 +477,41 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
   const { allow, deny } = permissionsFor(input.rank, input.role, input.home);
   assertNoFlagLikeRules(allow, `${input.role} allow-list`);
   assertNoFlagLikeRules(deny, 'global deny-list');
-  assertGlobalDenyIntact(deny, `${input.agentId} (${input.rank}·${input.role})`);
+  const who = `${input.agentId} (${input.rank}·${input.role})`;
+  assertGlobalDenyIntact(deny, who);
+
+  // ---- the lower half of the org chart ---------------------------------------------------
+  //
+  // A roster is opt-in per spawn, and everything about it is decided HERE, in the one function
+  // that builds a spec — the same reason the deny-list is built here rather than remembered at
+  // each call site. A subordinate declared anywhere else would be a subordinate that never met
+  // `assertSubagentRosterSafe`, and a native subagent inherits its parent's settings, so that is
+  // precisely the unit whose rank would mean nothing.
+  const roster = input.fanOut === true ? subagentRosterFor(input.rank, input.role) : [];
+  if (roster.length > 0) {
+    if (input.harness !== 'claude') {
+      // Refuse rather than drop. `codex exec` has no subagent model to translate this to, and a
+      // silently dropped roster is worse than an error: the campaign would brief a unit on a squad
+      // it does not have, and the archive would record a fan-out that never happened.
+      throw new Error(
+        `refusing to spawn ${who}: it was issued a fan-out roster on the ${input.harness} ` +
+          'harness, which has no native subagent model. There is nothing to translate this to ' +
+          'and nothing to degrade it to — a dropped roster is a unit told it commands a squad ' +
+          'that does not exist.',
+      );
+    }
+    assertSubagentRosterSafe(roster, input.rank, allow, who);
+    assertNoFlagLikeRules(
+      roster.flatMap((def) => def.tools),
+      'subagent roster',
+    );
+    // The spawn rule, on the wire. The roster says whom this unit MAY field; these rules say whom
+    // it may not, by name, including the harness's own built-in agent types — measured to be the
+    // only form the permission engine enforces for an agent type.
+    const spawnDeny = subagentDeny(input.rank, input.role);
+    assertNoFlagLikeRules(spawnDeny, 'subagent deny-list');
+    for (const rule of spawnDeny) if (!deny.includes(rule)) deny.push(rule);
+  }
 
   const spec: SoldierSpec = {
     agentId: input.agentId,
@@ -477,6 +524,7 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
     deny,
     orders: input.orders,
   };
+  if (roster.length > 0) spec.subagents = roster;
   if (input.outputSchemaPath !== undefined) spec.outputSchemaPath = input.outputSchemaPath;
   if (input.model !== undefined && input.model !== '') spec.model = input.model;
   if (input.effort !== undefined) spec.effort = input.effort;
@@ -922,6 +970,11 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         orders: engineerOrders,
         outputSchemaPath: REPORT_SCHEMA_PATH,
         home,
+        // The Engineer is the one unit in this campaign that decomposes. It holds the worktree,
+        // the branch and the report, and its subordinates hold none of those — they read, and
+        // they hand back capped answers it acts on. Only offered on the harness that has a
+        // subagent model; `buildSoldierSpec` refuses the combination rather than dropping it.
+        fanOut: engineerTarget.harness === 'claude',
       });
 
       archive.recordAgentAttempt({

@@ -15,9 +15,14 @@ import {
   ROLES,
   SUBSTRATE,
   WRITES_FILES,
+  SPAWNS_UNITS,
   ROLE_WRITES_FILES,
   writesFiles,
   isStrictlyJuniorTo,
+  assertMayField,
+  assertRankFloorContiguous,
+  maxSubagentDepth,
+  subagentRanksUnder,
   formatUnit,
   formatUnitWithGlyph,
   // delivery
@@ -258,23 +263,94 @@ test('PRIVATE is the floor — it can spawn nothing', () => {
   }
 });
 
-test('officers never edit files; CAPTAIN and below do', () => {
+test('exactly ONE rank writes, and it is the only rank that leases a worktree', () => {
   assert.equal(WRITES_FILES.GENERAL, false);
   assert.equal(WRITES_FILES.COLONEL, false);
   assert.equal(WRITES_FILES.CAPTAIN, true);
-  assert.equal(WRITES_FILES.SERGEANT, true);
-  assert.equal(WRITES_FILES.PRIVATE, true);
+  // The two below were `true` for the length of a build and had never been read by anything,
+  // because nothing below CAPTAIN could be fielded. They are `false` deliberately now: a subagent
+  // rank has no worktree of its own, so a writing one writes into its parent's lease beside its
+  // concurrently-running siblings, and the branch that comes out is one the CAPTAIN must own
+  // without having made it. The second reason is a property of the wire format — a subagent's
+  // loadout is declared as tool NAMES, so a scoped `Bash(git:*)` cannot be expressed and the only
+  // shell such a rank could be handed is an unscoped one.
+  assert.equal(WRITES_FILES.SERGEANT, false);
+  assert.equal(WRITES_FILES.PRIVATE, false);
 
-  const officers: Rank[] = RANK_ORDER.filter((r) => !WRITES_FILES[r]);
-  assert.deepEqual(officers, ['GENERAL', 'COLONEL']);
-
-  // The context guard and the safety property are the same property: every writing rank sits
-  // strictly below every non-writing one.
-  for (const writer of RANK_ORDER.filter((r) => WRITES_FILES[r])) {
-    for (const officer of officers) {
-      assert.equal(isStrictlyJuniorTo(writer, officer), true);
-    }
+  // WRITING IS A BAND, NOT A SLOPE, and this is the assertion that says so out loud. Capability
+  // does not decrease monotonically down the order: a CAPTAIN is junior to a COLONEL and holds
+  // strictly more. Officers above are kept incapable of a bad `rm` to protect the strategy they
+  // hold; ranks below are kept incapable of one to protect the attribution of the diff. The
+  // rank that owns the tree is the rank that works in it, and it is exactly one rank wide.
+  assert.deepEqual(
+    RANK_ORDER.filter((r) => WRITES_FILES[r]),
+    ['CAPTAIN'],
+  );
+  assert.deepEqual(
+    RANK_ORDER.filter((r) => !WRITES_FILES[r]),
+    ['GENERAL', 'COLONEL', 'SERGEANT', 'PRIVATE'],
+  );
+  // The band sits strictly below every officer rank. That half of the old claim still holds and
+  // is what the context guard rests on.
+  for (const officer of ['GENERAL', 'COLONEL'] as const) {
+    assert.equal(isStrictlyJuniorTo('CAPTAIN', officer), true);
   }
+  // …and the writing rank is on the durable substrate. A rank that writes must be one whose work
+  // is observable and resumable; the subagent layer is neither, which is the whole reason it does
+  // not write.
+  assert.equal(SUBSTRATE.CAPTAIN, 'process');
+  for (const rank of RANK_ORDER.filter((r) => SUBSTRATE[r] === 'subagent')) {
+    assert.equal(WRITES_FILES[rank], false, `${rank} is a subagent rank and writes`);
+  }
+});
+
+test('the floor is an unbroken run at the bottom — the bound on the fan-out', () => {
+  assert.equal(SPAWNS_UNITS.PRIVATE, false);
+  // SERGEANT is `false` too, which is NARROWER than the design's intent — the squad/one-shot
+  // distinction between the two subagent ranks IS this entry. First fielding of anything below
+  // CAPTAIN, and the recursion is the one failure whose bill is unbounded, so the fan-out is one
+  // level wide until a campaign has been watched using it.
+  assert.equal(SPAWNS_UNITS.SERGEANT, false);
+  assert.deepEqual(
+    RANK_ORDER.filter((r) => !SPAWNS_UNITS[r]),
+    ['SERGEANT', 'PRIVATE'],
+  );
+  // The guard itself, on the real table. It is called on every spawn, so this is the shape of the
+  // table that every loadout in the process depends on.
+  assert.doesNotThrow(() => {
+    assertRankFloorContiguous();
+  });
+
+  // A CAPTAIN fields the two subagent ranks and nothing else — not itself, not upward.
+  assert.deepEqual(subagentRanksUnder('CAPTAIN'), ['SERGEANT', 'PRIVATE']);
+  // Neither subagent rank fields anybody, so both are leaves and the chain is one level deep.
+  assert.deepEqual(subagentRanksUnder('SERGEANT'), []);
+  assert.deepEqual(subagentRanksUnder('PRIVATE'), []);
+
+  // Depth is DERIVED from the table, never a constant. It is 1 because the run of non-spawning
+  // ranks starts at SERGEANT; move that entry and this number moves with it, which is the only
+  // reason it is safe for the harness cap to be computed from the same call.
+  assert.equal(maxSubagentDepth('CAPTAIN'), 1);
+  assert.equal(maxSubagentDepth('SERGEANT'), 0);
+  assert.equal(maxSubagentDepth('PRIVATE'), 0);
+
+  // The spawn rule, enforced rather than documented.
+  assert.throws(() => {
+    assertMayField('CAPTAIN', 'CAPTAIN', 'a CPT·ENGINEER');
+  }, /may field SERGEANT, PRIVATE and nothing else/);
+  assert.throws(() => {
+    assertMayField('CAPTAIN', 'COLONEL', 'a CPT·ENGINEER');
+  }, /may field SERGEANT, PRIVATE and nothing else/);
+  assert.throws(() => {
+    assertMayField('PRIVATE', 'PRIVATE', 'a PVT·ENGINEER');
+  }, /PRIVATE is the floor and spawns nothing/);
+  // The bar this fielding was held to: a SERGEANT fields nothing at all, not even the rank below.
+  assert.throws(() => {
+    assertMayField('SERGEANT', 'PRIVATE', 'a SGT·ENGINEER');
+  }, /SERGEANT is the floor and spawns nothing/);
+  assert.doesNotThrow(() => {
+    assertMayField('CAPTAIN', 'SERGEANT', 'a CPT·ENGINEER');
+  });
 });
 
 test('ROLE_WRITES_FILES says HOLDS AN EDITING TOOL, not "cannot change a byte"', () => {
@@ -304,7 +380,9 @@ test('writesFiles is rank AND role — the intersection, over all 25 pairs', () 
   const writers = RANK_ORDER.flatMap((rank) =>
     ROLES.filter((role) => writesFiles(rank, role)).map((role) => `${rank}·${role}`),
   );
-  assert.deepEqual(writers, ['CAPTAIN·ENGINEER', 'SERGEANT·ENGINEER', 'PRIVATE·ENGINEER']);
+  // ONE pair out of twenty-five puts bytes on disk. Rank AND role, never either alone: an
+  // ENGINEER at any other rank writes nothing, and a CAPTAIN of any other role writes nothing.
+  assert.deepEqual(writers, ['CAPTAIN·ENGINEER']);
   // The officer ranks write nothing whatever role they are handed — including the role whose
   // entire purpose is writing. This is the claim the README makes in its opening paragraph.
   for (const officer of ['GENERAL', 'COLONEL'] as const) {

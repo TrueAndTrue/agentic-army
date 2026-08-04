@@ -67,8 +67,21 @@
  * "enforced" column is trusted there.
  */
 
+import type { SubagentDefinition } from '../contracts/harness.ts';
 import type { Rank, Role } from '../contracts/ranks.ts';
-import { formatUnit, ROLE_WRITES_FILES, WRITES_FILES, writesFiles } from '../contracts/ranks.ts';
+import {
+  assertMayField,
+  assertRankFloorContiguous,
+  formatUnit,
+  maxSubagentDepth,
+  RANK_ABBREV,
+  RANK_ORDER,
+  ROLE_WRITES_FILES,
+  SPAWNS_UNITS,
+  subagentRanksUnder,
+  WRITES_FILES,
+  writesFiles,
+} from '../contracts/ranks.ts';
 import { isInsideOrEqual, worktreesRootFor } from '../config/paths.ts';
 import { invokedAs } from '../setup/checks.ts';
 import { PROTECTED_CONFIG_GLOBS, protectedConfigGlobs } from '../setup/init.ts';
@@ -134,6 +147,12 @@ function bashRules(prefixes: readonly string[]): string[] {
  */
 export const ROLE_ALLOW: Record<Role, readonly string[]> = Object.freeze({
   SCOUT: Object.freeze(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']),
+  // `Task` and `Agent` are the fan-out. BOTH spellings, and that is not belt-and-braces: measured
+  // on claude 2.1.221, `Task` is what the tool roster on `system/init` calls it and `Agent` is what
+  // the model actually emitted when asked to spawn one. Naming one of the two would have produced
+  // a rank that could spawn on paper and not in the field, or the reverse — a floor rank denied
+  // the name nobody uses. A rank that may not spawn loses both in `narrowToRank` and is denied both
+  // by `rankDeny`, so the pair travels together in every direction.
   ENGINEER: Object.freeze([
     'Read',
     'Grep',
@@ -142,6 +161,8 @@ export const ROLE_ALLOW: Record<Role, readonly string[]> = Object.freeze({
     'Write',
     'NotebookEdit',
     'TodoWrite',
+    'Task',
+    'Agent',
     ...bashRules(ENGINEER_BASH_PREFIXES),
   ]),
   // An Inspector reads and runs; it never edits. Mutation testing does mean an
@@ -385,6 +406,16 @@ export const WRITE_CAPABLE_TOOLS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * Every tool that fields another unit. A rank that may not spawn must lose all of them or none.
+ *
+ * Both names, for the reason `ROLE_ALLOW.ENGINEER` gives: the roster and the model disagree about
+ * what the spawn tool is called, so a list holding one of them is a list with a spelling-shaped
+ * hole in it. `COMMANDER_FORBIDDEN_TOOLS` has named both since before anything could spawn, and
+ * this is the same pair — kept separate because that list is a role's ceiling and this is a rank's.
+ */
+export const SPAWN_TOOLS: readonly string[] = Object.freeze(['Task', 'Agent']);
+
+/**
  * The role's loadout with everything this rank may not hold subtracted.
  *
  * Rank narrows; it never widens. A rank that writes gets its role's list unchanged — which is why
@@ -393,8 +424,12 @@ export const WRITE_CAPABLE_TOOLS: readonly string[] = Object.freeze([
  * writes a checklist in a context window, not a byte on disk.
  */
 export function narrowToRank(rank: Rank, allow: readonly string[]): string[] {
-  if (WRITES_FILES[rank]) return [...allow];
-  return allow.filter((rule) => !WRITE_CAPABLE_TOOLS.includes(toolNameOf(rule)));
+  const forbidden = [
+    ...(WRITES_FILES[rank] ? [] : WRITE_CAPABLE_TOOLS),
+    ...(SPAWNS_UNITS[rank] ? [] : SPAWN_TOOLS),
+  ];
+  if (forbidden.length === 0) return [...allow];
+  return allow.filter((rule) => !forbidden.includes(toolNameOf(rule)));
 }
 
 /**
@@ -406,7 +441,10 @@ export function narrowToRank(rank: Rank, allow: readonly string[]): string[] {
  * the same list it was before rank meant anything.
  */
 export function rankDeny(rank: Rank): readonly string[] {
-  return WRITES_FILES[rank] ? [] : WRITE_CAPABLE_TOOLS;
+  return [
+    ...(WRITES_FILES[rank] ? [] : WRITE_CAPABLE_TOOLS),
+    ...(SPAWNS_UNITS[rank] ? [] : SPAWN_TOOLS),
+  ];
 }
 
 /**
@@ -472,6 +510,10 @@ export interface PermissionSet {
  */
 export function permissionsFor(rank: Rank, role: Role, home?: string): PermissionSet {
   const who = `a ${formatUnit(rank, role)}`;
+  // Before anything is subtracted, check that the bottom of the rank order is still a floor. Every
+  // loadout below depends on the recursion terminating somewhere, and the place it terminates is a
+  // table entry that nothing else reads.
+  assertRankFloorContiguous();
   assertDeclaredWritesMatchLoadout(ROLE_ALLOW[role], ROLE_WRITES_FILES[role], `${who} (its role loadout)`);
 
   const allow = narrowToRank(rank, ROLE_ALLOW[role]);
@@ -484,6 +526,247 @@ export function permissionsFor(rank: Rank, role: Role, home?: string): Permissio
   // unchanged: a COL·COMMANDER is denied `Bash` once, by `ROLE_DENY`, exactly as it was.
   for (const tool of rankDeny(rank)) if (!deny.includes(tool)) deny.push(tool);
   return { allow, deny };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrying rank across the spawn boundary
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A subordinate a process-substrate unit may field as a native subagent.
+ *
+ * ## THE PROBLEM THIS SOLVES, WHICH IS NOT THE ONE IT LOOKS LIKE
+ *
+ * A native subagent does not go through `permissionsFor`. It is not a process, it has no argv, and
+ * nobody hands it an `--allowedTools`. It runs INSIDE its parent and INHERITS its parent's
+ * permission settings — so on the day something below CAPTAIN could first be fielded, the rank
+ * narrowing above reached exactly as far as the parent and no further. A CPT·ENGINEER spawning a
+ * SERGEANT would have produced a unit holding Edit, Write, NotebookEdit and a shell, because its
+ * parent holds them, and `WRITES_FILES.SERGEANT` would have had no reader. A rank whose narrowing
+ * can be escaped by spawning is not a rank; it is a label on a unit that has its parent's powers.
+ *
+ * The fix is that the subordinate is DECLARED, with its loadout, at the moment its parent is
+ * spawned — and the loadout is computed by the same `narrowToRank` that computes the parent's, off
+ * the same two tables. There is no second place where a subagent's tools are decided, and no
+ * spelling of "remember to narrow it too".
+ *
+ * ## WHAT THE HARNESS ENFORCES, MEASURED RATHER THAN ASSUMED
+ *
+ * Measured against claude 2.1.221 on 2026-08-04, a live parent with a live subagent, each row run
+ * and read off the stream rather than reasoned about:
+ *
+ * | Property | Result |
+ * |---|---|
+ * | a declared `tools` list is the subagent's ACTUAL loadout | **enforced** — a subordinate declared without `Write` was refused it and reported holding only what it was declared, while its parent held `Write` throughout |
+ * | the parent's deny rules reach the subagent | **enforced** — a subordinate hit the credential deny and got `denied by your permission settings` |
+ * | the parent's scoped shell rules reach the subagent | **enforced** — a subordinate under `Bash(echo:*)` was refused `curl` |
+ * | a subordinate declared without a spawn tool cannot spawn | **enforced** — it reports no such tool, rather than calling one and being refused |
+ * | the spawn DEPTH cap removes the spawn tool at the limit | **enforced** — at the cap, a subordinate declared WITH the spawn tools did not have them |
+ * | naming an agent type on the DENY half blocks it | **enforced** — `denied by permission rule ... from cliArg` |
+ * | naming an agent type on the ALLOW half restricts types | **NOT ENFORCED** — see below |
+ *
+ * That last row is why `BUILTIN_AGENT_TYPES` exists and is a deny. The standing order on this
+ * project is that deny-lists do not work and allow-lists do, and the allow-list was tried FIRST:
+ * a parent whose only spawn rules were `Agent(<our type>)` spawned a built-in `general-purpose`
+ * anyway, successfully. The spawn tool is simply not gated by the allow half. So the enforcing
+ * form here is the deny, against the honest statement of what a deny cannot promise — and the
+ * residual is bounded by two things that ARE enforced: an undeclared built-in still inherits the
+ * parent's own allow and deny rules, so it cannot reach anything the parent could not, and the
+ * depth cap still terminates it. What an escape buys is an unranked unit at the parent's own
+ * ceiling, one level down. Not a wider blast radius — a missing name in the org chart.
+ *
+ * The type itself is `SubagentDefinition` in `src/contracts/harness.ts`; everything that decides
+ * what goes IN one is here.
+ *
+ * A last note on the tool vocabulary, because it is the second reason `WRITES_FILES` denies both
+ * subagent ranks: a declaration carries tool NAMES and has no position for the `Bash(git:*)` form,
+ * so a subordinate cannot be handed a SCOPED shell. The only shell it could be handed is an
+ * unscoped one, and this codebase does not hand out unscoped shells. With both ranks non-writing,
+ * `WRITE_CAPABLE_TOOLS` removes `Bash` before it could ever reach a declaration, and the missing
+ * vocabulary costs nothing.
+ */
+
+/**
+ * Agent types the harness ships with, which exist whether or not this codebase declares them.
+ *
+ * MEASURED, from the `agents` array a live `system/init` reported, and therefore A SNAPSHOT OF ONE
+ * INSTALLATION rather than a closed set — plugins and future releases add to it. It is written down
+ * anyway because the deny is the only form the harness enforces for agent types, and a deny that
+ * names six things is worth more than a deny that names none. What keeps its incompleteness from
+ * mattering is stated above: an unnamed built-in inherits the parent's ceiling and dies at the
+ * depth cap.
+ */
+export const BUILTIN_AGENT_TYPES: readonly string[] = Object.freeze([
+  'claude',
+  'Explore',
+  'general-purpose',
+  'Plan',
+  'statusline-setup',
+]);
+
+/** `SERGEANT` + `ENGINEER` -> `sgt-engineer`. The `subagent_type` a parent names. */
+export function subagentTypeName(rank: Rank, role: Role): string {
+  return `${RANK_ABBREV[rank]}-${role}`.toLowerCase();
+}
+
+/**
+ * The subordinates a unit of this rank and role may field, with each one's narrowed loadout.
+ *
+ * Rank comes from `subagentRanksUnder`, so the roster cannot contain a rank the spawn rule would
+ * reject. Role is INHERITED from the parent: role is branch of service, and a squad fielded to
+ * decompose an engineering objective is engineering. Rank is what changes going down, which is the
+ * whole distinction the two axes exist to draw.
+ */
+export function subagentRosterFor(parentRank: Rank, parentRole: Role): SubagentDefinition[] {
+  return subagentRanksUnder(parentRank).map((rank) => {
+    const tools = toolNamesOf(narrowToRank(rank, ROLE_ALLOW[parentRole]));
+    const writes = writesFiles(rank, parentRole);
+    const spawns = SPAWNS_UNITS[rank];
+    return {
+      name: subagentTypeName(rank, parentRole),
+      rank,
+      role: parentRole,
+      description:
+        `A ${formatUnit(rank, parentRole)} under your command. ` +
+        (spawns
+          ? 'Fan out to it when one objective splits into parts that can be investigated ' +
+            'independently; it may field its own subordinates.'
+          : 'Field it for a single self-contained question. It fields nobody.') +
+        ` It holds ${tools.join(', ')}${writes ? '' : ' and no editor and no shell'}.`,
+      prompt: subordinateBriefing(rank, parentRole, tools, writes, spawns),
+      tools,
+    };
+  });
+}
+
+/**
+ * The unique tool NAMES behind a list of rules, first occurrence order.
+ *
+ * Twenty-eight `Bash(prefix:*)` rules are one tool called `Bash`, and a subagent declaration that
+ * repeated it twenty-eight times would be declaring the same capability over and over while saying
+ * nothing about its scope — which the format cannot carry anyway.
+ */
+export function toolNamesOf(rules: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const rule of rules) {
+    const name = toolNameOf(rule);
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+function subordinateBriefing(
+  rank: Rank,
+  role: Role,
+  tools: readonly string[],
+  writes: boolean,
+  spawns: boolean,
+): string {
+  return [
+    `You are a ${formatUnit(rank, role)}. Your rank is your authority and it is narrower than`,
+    'the unit that fielded you. Do the one thing you were sent to do and report back.',
+    '',
+    `Your tools are: ${tools.join(', ')}.`,
+    writes
+      ? ''
+      : 'You hold no editing tool and no shell, and this is deliberate rather than an oversight: ' +
+        'you share your commander\'s worktree with your siblings, and a change you made there ' +
+        'would arrive on a branch nobody could attribute. Report what should change and where. ' +
+        'Do not ask another unit to make the change on your behalf.',
+    spawns ? '' : 'You field no subordinates. You are the floor.',
+    '',
+    'Return a short, dense answer: what you found, where (file and line), and what you could not',
+    'determine. Your commander is reading many of these — length costs it the context it needs to',
+    'act on yours. Do not restate your orders back.',
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+}
+
+/**
+ * Deny rules that stop a parent fielding anything it was not issued a roster for.
+ *
+ * Two halves, both denies, because the allow half was measured not to gate the spawn tool at all:
+ *
+ *  - every built-in agent type, so the roster is the roster rather than a suggestion alongside a
+ *    shelf of unranked units carrying the parent's own loadout;
+ *  - every ranked type the parent may NOT field. A CAPTAIN's roster names SERGEANT and PRIVATE; the
+ *    types for GENERAL, COLONEL and CAPTAIN itself are denied by name, so the spawn rule is
+ *    enforced where the spawn happens and not only in the roster that omitted them.
+ */
+export function subagentDeny(parentRank: Rank, parentRole: Role): string[] {
+  const allowedNames = new Set(subagentRosterFor(parentRank, parentRole).map((def) => def.name));
+  const forbidden = [
+    ...BUILTIN_AGENT_TYPES,
+    ...RANK_ORDER.filter((rank) => !allowedNames.has(subagentTypeName(rank, parentRole))).map(
+      (rank) => subagentTypeName(rank, parentRole),
+    ),
+  ];
+  const out: string[] = [];
+  for (const type of forbidden) {
+    for (const tool of SPAWN_TOOLS) {
+      const rule = `${tool}(${type})`;
+      if (!out.includes(rule)) out.push(rule);
+    }
+  }
+  return out;
+}
+
+/**
+ * Refuse a roster that would field something the rank table does not permit, or hand a subordinate
+ * a tool its parent does not itself hold.
+ *
+ * The containment check is the one worth explaining. Rank narrows and never widens, and a spawn is
+ * the one place that rule could be broken without touching any table: declare a subordinate with a
+ * tool its parent was never issued, and the child is more capable than the unit that fielded it.
+ * Inheritance makes that a real possibility rather than a theoretical one, because the child's
+ * environment is the parent's — so the check is against the parent's OWN narrowed allow-list, after
+ * its rank has already subtracted from it, not against the role table the parent asked from.
+ */
+export function assertSubagentRosterSafe(
+  roster: readonly SubagentDefinition[],
+  parentRank: Rank,
+  parentAllow: readonly string[],
+  who: string,
+): void {
+  const held = new Set(toolNamesOf(parentAllow));
+  const seen = new Set<string>();
+  for (const def of roster) {
+    assertMayField(parentRank, def.rank, who);
+    if (seen.has(def.name)) {
+      throw new Error(`refusing to spawn ${who}: its roster declares ${def.name} twice`);
+    }
+    seen.add(def.name);
+
+    // The same trap the allow-list has, one level down. A declaration with no tools is not a
+    // subordinate with no tools — it is a subordinate the harness has been told nothing about.
+    assertAllowListNonEmpty(def.tools, `${who}'s subordinate ${def.name}`);
+
+    const gained = def.tools.filter((tool) => !held.has(tool));
+    if (gained.length > 0) {
+      throw new Error(
+        `refusing to spawn ${who}: it would field a ${def.name} holding ${gained.join(', ')}, ` +
+          'which it does not hold itself. Rank narrows going down and never widens, and a spawn ' +
+          'is the one place that can be broken without editing a table — the subordinate runs ' +
+          'inside this unit and inherits its settings, so a tool declared here that the parent ' +
+          'was never issued is authority appearing out of nowhere.',
+      );
+    }
+    assertDeclaredWritesMatchLoadout(
+      def.tools,
+      writesFiles(def.rank, def.role),
+      `${who}'s subordinate ${def.name}`,
+    );
+
+    const spawnHeld = def.tools.filter((tool) => SPAWN_TOOLS.includes(tool));
+    if (spawnHeld.length > 0 && !SPAWNS_UNITS[def.rank]) {
+      throw new Error(
+        `refusing to spawn ${who}: it would field a ${def.name} holding ${spawnHeld.join(', ')}, ` +
+          `and ${def.rank} is the floor. The floor is what bounds the depth — a subordinate that ` +
+          'can field subordinates recurses, and every level of it is billed to one subscription.',
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

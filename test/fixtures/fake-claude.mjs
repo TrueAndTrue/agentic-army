@@ -18,6 +18,7 @@
  *   abort-streaming interrupt answered with terminal_reason:aborted_streaming
  *   abort-unknown   interrupt answered with an unrecognised terminal_reason
  *   work            USES TOOLS on its cwd, under the permission rules it was actually handed
+ *   fanout          FIELDS NATIVE SUBAGENTS off its `--agents` roster, nested and forwarded
  *
  * `--include-partial-messages` is orthogonal to the mode and is read off THIS PROCESS'S argv,
  * like the permission rules: token-level `stream_event` lines are emitted only if the adapter
@@ -58,6 +59,31 @@
  *   realpath'd spelling, because `/tmp` and `/private/tmp` are one directory with two names
  *   and a guard that compares only one of them fails open.
  *
+ *   NATIVE SUBAGENTS, in `fanout` mode, measured against claude 2.1.221 on 2026-08-04 with a live
+ *   parent and a live subordinate. The roster is parsed off `--agents` on THIS PROCESS'S argv and
+ *   every one of these was watched on a real stream before being reproduced here:
+ *
+ *     - a subordinate's declared `tools` list is its ACTUAL loadout, not a hint. One declared
+ *       without `Write` reported holding no such tool while its parent held `Write` throughout,
+ *       so a tool the roster did not name is refused here with NO rule attributed — there is no
+ *       rule, the tool is simply absent.
+ *     - the session's deny rules are INHERITED. A subordinate hit the credential deny and was told
+ *       the path was denied by permission settings, so the global deny holds at depth 2.
+ *     - the session's allow rules are inherited too: a subordinate under `Bash(echo:*)` was
+ *       refused `curl`. A subagent's permission is the INTERSECTION of its declared list and the
+ *       session rules, and that is what `subagentActor` computes.
+ *     - the spawn is gated by the DENY half ONLY. Naming an agent type on the allow half does not
+ *       restrict types — a parent whose only spawn rules were `Agent(<declared type>)` spawned a
+ *       built-in `general-purpose` anyway. This fake does NOT gate the spawn on the allow list,
+ *       deliberately, even though doing so would be harsher: harshness here would hide the hole,
+ *       by letting a test pass on a mechanism that does not exist in the field.
+ *     - `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` is a HARD bound. At the cap the real CLI does not
+ *       refuse the spawn, it removes the spawn tools from the subordinate's loadout, so there is
+ *       nothing to attempt. Read off the environment, never assumed.
+ *
+ *   Forwarded lines carry `parent_tool_use_id` AND a top-level `subagent_type`, which is the shape
+ *   `--forward-subagent-text` actually delivers and what the normalizer reconstructs depth from.
+ *
  *   A control_request with NO turn in flight sends the receipt and no result, matching the real
  *   CLI. That is the one that bit us. Turns occupy time and QUEUE, so "a turn is running" is a
  *   real state rather than a fiction, and two turns produce two results.
@@ -87,8 +113,9 @@
  *     Covered instead by claude-duplex.jsonl, which contains 3.
  *   2 No `thinking` blocks, `system/thinking_tokens` or `rate_limit_event`. Covered by the
  *     recorded fixtures, not here.
- *   3 No subagent forwarding. `work` mode runs tools at depth 0 only; nested
- *     `parent_tool_use_id` chains are covered by claude-subagent.jsonl.
+ *   3 `work` mode runs tools at depth 0 only. `fanout` mode is the one that nests — see the
+ *     MODELLED entry above it. Neither mode reproduces a THREE-level chain from a live recording;
+ *     claude-subagent.jsonl remains the fixture for that.
  *   4 `Bash(prefix:*)` rules are PARSED but never exercised — this fake runs no commands, so a
  *     command allow-list is asserted on argv and nowhere else. The path tools are the half
  *     that governs whether a worker can use its workspace, and they are the half enforced here.
@@ -302,26 +329,26 @@ function decide(tool, target) {
 let denials = [];
 let toolSeq = 0;
 
-function emitToolUse(name, input) {
+function emitToolUse(name, input, parentToolUseId = null) {
   toolSeq += 1;
   const id = `toolu_fake${String(toolSeq).padStart(4, '0')}`;
   say({
     type: 'assistant',
     message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
-    parent_tool_use_id: null,
+    parent_tool_use_id: parentToolUseId,
     session_id: sessionId,
   });
   return id;
 }
 
-function emitToolResult(id, content, isError) {
+function emitToolResult(id, content, isError, parentToolUseId = null) {
   say({
     type: 'user',
     message: {
       role: 'user',
       content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content }],
     },
-    parent_tool_use_id: null,
+    parent_tool_use_id: parentToolUseId,
     session_id: sessionId,
   });
 }
@@ -331,9 +358,9 @@ function emitToolResult(id, content, isError) {
  * must leave the filesystem untouched, or the fake would be proving the opposite of the thing
  * it is here to prove.
  */
-function useTool(name, input, target, perform) {
-  const id = emitToolUse(name, input);
-  const verdict = decide(name, target);
+function useTool(name, input, target, perform, actor = TOP_LEVEL) {
+  const id = emitToolUse(name, input, actor.parentToolUseId);
+  const verdict = actor.decide(name, target);
   if (!verdict.allowed) {
     denials.push({ tool_name: name, tool_use_id: id, tool_input: input });
     emitToolResult(
@@ -342,22 +369,161 @@ function useTool(name, input, target, perform) {
         ? `Claude requested permissions to use ${name}, but you haven't granted it yet.`
         : `Permission to use ${name} has been denied by the rule ${verdict.rule}.`,
       true,
+      actor.parentToolUseId,
     );
     return null;
   }
   try {
     const content = perform();
-    emitToolResult(id, content, false);
+    emitToolResult(id, content, false, actor.parentToolUseId);
     return content;
   } catch (error) {
     // A real filesystem error is NOT a permission denial and must not be filed as one.
-    emitToolResult(id, `Error: ${error?.message ?? String(error)}`, true);
+    emitToolResult(id, `Error: ${error?.message ?? String(error)}`, true, actor.parentToolUseId);
     return null;
   }
 }
 
+/**
+ * Who is making a tool call: the worker process itself, or one of its native subagents.
+ *
+ * `decide` is per-actor because the two are NOT the same function. The process is bound by the
+ * session's allow/deny rules alone. A subagent is bound by those rules AND by the tool-name list
+ * its `--agents` entry declared — measured on claude 2.1.221, that declared list is its ACTUAL
+ * loadout, not a hint: a subordinate declared without `Write` reported holding no such tool while
+ * its parent held `Write` throughout.
+ */
+const TOP_LEVEL = { parentToolUseId: null, decide };
+
 function absoluteIn(cwd, target) {
   return isAbsolute(target) ? resolve(target) : resolve(cwd, target);
+}
+
+// ============================================================================================
+// NATIVE SUBAGENTS — only in `fanout` mode
+// ============================================================================================
+
+/**
+ * The roster this process was handed, read off `--agents`, which is a single JSON argument.
+ *
+ * Read off THIS PROCESS'S OWN ARGV, exactly like the permission rules and for the same reason: a
+ * fake that took its roster from an environment variable would be answering a question the
+ * adapter was never asked, and the argv is the thing under test.
+ */
+function parseRoster() {
+  const at = argv.indexOf('--agents');
+  if (at === -1) return {};
+  try {
+    const parsed = JSON.parse(argv[at + 1] ?? '{}');
+    return parsed !== null && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+const roster = parseRoster();
+
+/**
+ * The nesting cap, off the ENVIRONMENT this process was actually given.
+ *
+ * Measured to be a hard bound rather than a request: at the cap the harness does not refuse the
+ * spawn, it removes the spawn tools from the subordinate's loadout, so a unit at the floor has
+ * nothing to attempt. Modelled that way below — a depth at or beyond the cap has no `Agent`.
+ */
+const spawnDepthCap = Number.parseInt(process.env['CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH'] ?? '', 10);
+const maxSpawnDepth = Number.isFinite(spawnDepthCap) ? spawnDepthCap : 1;
+
+/**
+ * An actor for one native subagent.
+ *
+ * The permission model is the INTERSECTION of three things, and each third was measured
+ * separately rather than assumed:
+ *
+ *   1. the tool-name list its roster entry declared — its actual loadout;
+ *   2. the session's deny rules, which a subagent INHERITS (a subordinate hit the credential deny
+ *      and was told the path was `denied by your permission settings`);
+ *   3. the session's allow rules, which it also inherits (a subordinate under `Bash(echo:*)` was
+ *      refused `curl`).
+ *
+ * A tool the roster entry did not name is refused with no rule attributed, because there is no
+ * rule — the tool is simply not in the loadout. That is the shape the real one produces, and it is
+ * why a subagent's refusal does not always look like a permission denial.
+ */
+function subagentActor(type, parentToolUseId) {
+  const declared = Array.isArray(roster[type]?.tools) ? roster[type].tools : [];
+  return {
+    parentToolUseId,
+    type,
+    decide(tool, target) {
+      if (!declared.includes(tool)) return { allowed: false, rule: null };
+      return decide(tool, target);
+    },
+  };
+}
+
+/** Forwarded subagent prose, as `--forward-subagent-text` delivers it: nested, and typed. */
+function saySubagent(type, parentToolUseId, text) {
+  say({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+    parent_tool_use_id: parentToolUseId,
+    subagent_type: type,
+    session_id: sessionId,
+  });
+}
+
+/**
+ * Field one subagent and run its steps, or be refused.
+ *
+ * THE SPAWN IS GATED BY THE DENY HALF ONLY, and that asymmetry is measured rather than tidied.
+ * A parent whose only spawn rules were `Agent(<a declared type>)` on the ALLOW half spawned a
+ * built-in `general-purpose` anyway, successfully — the spawn tool is simply not gated by the
+ * allow list. Modelling the allow half here would make this fake HARSHER than the real CLI in the
+ * one place where harshness would hide the hole: a test asserting that a built-in type is blocked
+ * would pass on a mechanism that does not exist in the field.
+ */
+function fieldSubagent(type, steps, depth = 1) {
+  const input = { subagent_type: type, description: `field a ${type}`, prompt: steps.join('\n') };
+  const id = emitToolUse('Agent', input);
+
+  if (depth > maxSpawnDepth) {
+    emitToolResult(id, `No Agent tool available at depth ${String(depth)}.`, true);
+    return;
+  }
+  for (const rule of denyRules) {
+    if (ruleMatches(rule, 'Agent', spellings(type)) || ruleMatches(rule, 'Task', spellings(type))) {
+      denials.push({ tool_name: 'Agent', tool_use_id: id, tool_input: input });
+      emitToolResult(id, `Agent type '${type}' has been denied by permission rule '${rule}'.`, true);
+      return;
+    }
+  }
+  if (!Object.hasOwn(roster, type)) {
+    emitToolResult(id, `Agent type '${type}' is not defined.`, true);
+    return;
+  }
+
+  const actor = subagentActor(type, id);
+  saySubagent(type, id, `${type} reporting: ${String(steps.length)} step(s) to run.`);
+  let refused = 0;
+  for (const step of steps) {
+    const parsed = /^(glob|read|write|edit|grep|spawn)\s+(\S+)\s*([\s\S]*)$/i.exec(step.trim());
+    if (parsed === null) continue;
+    const op = parsed[1].toLowerCase();
+    if (op === 'spawn') {
+      // A subagent trying to field a subagent. Its declared loadout decides, exactly as it does
+      // for every other tool — there is no separate spawn path in the real one either.
+      if (!subagentActor(type, id).decide('Agent', parsed[2]).allowed) {
+        saySubagent(type, id, `${type}: I hold no tool that fields a subordinate.`);
+        refused += 1;
+        continue;
+      }
+      fieldSubagent(parsed[2], [], depth + 1);
+      continue;
+    }
+    if (runStep({ op, arg: parsed[2], rest: parsed[3] ?? '' }, actor) === null) refused += 1;
+  }
+  saySubagent(type, id, `${type} done: ${String(refused)} refused.`);
+  emitToolResult(id, `${type} reported back (${String(refused)} refused).`, false);
 }
 
 /**
@@ -390,26 +556,61 @@ function stepsFor(text) {
   ];
 }
 
-function runStep(step) {
+/**
+ * The subordinates a turn fields, and what it tells each to do. Orders name them as:
+ *
+ *   fanout <subagent_type>
+ *     read <path>
+ *     spawn <subagent_type>
+ *
+ * Indented lines belong to the `fanout` above them. Orders naming none field one of every type on
+ * the roster with a single `glob .` each, so a test that only wants nesting to EXIST does not have
+ * to know this syntax — and one that wants a specific refusal can ask for it precisely.
+ */
+function fanoutPlan(text) {
+  const plan = [];
+  for (const raw of text.split('\n')) {
+    const squad = /^\s*fanout\s+(\S+)\s*$/i.exec(raw);
+    if (squad !== null) {
+      plan.push({ type: squad[1], steps: [] });
+      continue;
+    }
+    if (plan.length > 0 && /^\s+\S/.test(raw)) plan[plan.length - 1].steps.push(raw.trim());
+  }
+  if (plan.length > 0) return plan;
+  return Object.keys(roster).map((type) => ({ type, steps: ['glob .'] }));
+}
+
+function runStep(step, actor = TOP_LEVEL) {
   const cwd = process.cwd();
   if (step.op === 'glob') {
     const dir = absoluteIn(cwd, step.arg);
-    return useTool('Glob', { pattern: '**/*', path: dir }, dir, () =>
-      readdirSync(dir).sort().join('\n'),
+    return useTool(
+      'Glob',
+      { pattern: '**/*', path: dir },
+      dir,
+      () => readdirSync(dir).sort().join('\n'),
+      actor,
     );
   }
   if (step.op === 'read') {
     const file = absoluteIn(cwd, step.arg);
-    return useTool('Read', { file_path: file }, file, () => readFileSync(file, 'utf8'));
+    return useTool('Read', { file_path: file }, file, () => readFileSync(file, 'utf8'), actor);
   }
   if (step.op === 'write') {
     const file = absoluteIn(cwd, step.arg);
     const content = `${step.rest}\n`;
-    return useTool('Write', { file_path: file, content }, file, () => {
-      mkdirSync(dirname(file), { recursive: true });
-      writeFileSync(file, content);
-      return `File created successfully at: ${file}`;
-    });
+    return useTool(
+      'Write',
+      { file_path: file, content },
+      file,
+      () => {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, content);
+        return `File created successfully at: ${file}`;
+      },
+      actor,
+    );
   }
   if (step.op === 'edit') {
     const file = absoluteIn(cwd, step.arg);
@@ -424,27 +625,36 @@ function runStep(step) {
         writeFileSync(file, `${before}${step.rest}\n`);
         return `The file ${file} has been updated.`;
       },
+      actor,
     );
   }
   if (step.op === 'grep') {
     const target = absoluteIn(cwd, step.rest === '' ? '.' : step.rest);
-    return useTool('Grep', { pattern: step.arg, path: target }, target, () => {
-      const files = statSync(target).isDirectory()
-        ? readdirSync(target).map((entry) => join(target, entry))
-        : [target];
-      const hits = [];
-      for (const file of files) {
-        let body;
-        try {
-          if (statSync(file).isDirectory()) continue;
-          body = readFileSync(file, 'utf8');
-        } catch {
-          continue;
+    return useTool(
+      'Grep',
+      { pattern: step.arg, path: target },
+      target,
+      () => {
+        const files = statSync(target).isDirectory()
+          ? readdirSync(target).map((entry) => join(target, entry))
+          : [target];
+        const hits = [];
+        for (const file of files) {
+          let body;
+          try {
+            if (statSync(file).isDirectory()) continue;
+            body = readFileSync(file, 'utf8');
+          } catch {
+            continue;
+          }
+          for (const line of body.split('\n')) {
+            if (line.includes(step.arg)) hits.push(`${file}:${line}`);
+          }
         }
-        for (const line of body.split('\n')) if (line.includes(step.arg)) hits.push(`${file}:${line}`);
-      }
-      return hits.length === 0 ? 'No matches found' : hits.join('\n');
-    });
+        return hits.length === 0 ? 'No matches found' : hits.join('\n');
+      },
+      actor,
+    );
   }
   return null;
 }
@@ -767,6 +977,15 @@ rl.on('line', (line) => {
         for (const step of steps) runStep(step);
         streamText(
           `ran ${String(steps.length)} tool(s), ${String(denials.length)} denied`,
+          () => {},
+          false,
+        );
+      }
+      if (mode === 'fanout') {
+        const plan = fanoutPlan(text);
+        for (const squad of plan) fieldSubagent(squad.type, squad.steps);
+        streamText(
+          `fielded ${String(plan.length)} subordinate(s), ${String(denials.length)} denied`,
           () => {},
           false,
         );

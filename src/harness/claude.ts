@@ -33,8 +33,11 @@ import type {
   SoldierEvent,
   SoldierSpec,
   SoldierStatus,
+  SubagentDefinition,
   TokenUsage,
 } from '../contracts/harness.ts';
+import type { Rank } from '../contracts/ranks.ts';
+import { maxSubagentDepth } from '../contracts/ranks.ts';
 import type { JsonlLine } from './jsonl.ts';
 import { createAsyncQueue, createJsonlFramer } from './jsonl.ts';
 
@@ -101,6 +104,32 @@ function assertUuid(field: string, value: string): void {
 }
 
 /**
+ * Serialise a roster into the `--agents` value.
+ *
+ * Keyed by `subagent_type`, in roster order, with only the three fields the CLI reads — `rank` and
+ * `role` are this codebase's bookkeeping and are deliberately NOT sent, because an unknown key in
+ * a value the CLI parses is a bet on its tolerance rather than on its contract.
+ *
+ * A definition holding no tools is refused here rather than serialised. It is the same trap
+ * `assertAllowListNonEmpty` exists for, one level down: an empty list is not "no tools", it is a
+ * declaration that tells the harness nothing about a unit it is about to run.
+ */
+export function buildAgentsJson(defs: readonly SubagentDefinition[]): string {
+  const out: Record<string, { description: string; prompt: string; tools: string[] }> = {};
+  for (const def of defs) {
+    if (def.tools.length === 0) {
+      throw new Error(
+        `SoldierSpec.subagents[${def.name}] declares no tools. An empty list is not "no tools" — ` +
+          'it is a subordinate the harness has been told nothing about, and the loadout it ends ' +
+          'up with is whatever it inherits from the unit that fielded it.',
+      );
+    }
+    out[def.name] = { description: def.description, prompt: def.prompt, tools: [...def.tools] };
+  }
+  return JSON.stringify(out);
+}
+
+/**
  * Build the argv for a duplex soldier. Pure, so the auth regression guards can assert on it
  * without spawning anything.
  */
@@ -140,6 +169,19 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
   if (spec.allow.length > 0) args.push('--allowedTools', ...spec.allow);
   if (spec.deny.length > 0) args.push('--disallowedTools', ...spec.deny);
 
+  // The org chart's lower half. `--agents` takes a JSON OBJECT keyed by `subagent_type`, and it is
+  // the only channel that narrows a native subagent — one runs inside this process and inherits its
+  // permission settings, so without this a subordinate would hold everything its parent holds.
+  //
+  // Emitted AFTER the two variadic flags on purpose. `--allowedTools` and `--disallowedTools`
+  // swallow every following token that does not begin with `-`, and this value is a `{`, so
+  // appending it mid-list would silently turn the whole roster into a tool rule. That is not a
+  // hypothetical: the same variadic behaviour ate a positional prompt during the measurement runs
+  // that produced the table in permissions.ts.
+  if (spec.subagents !== undefined && spec.subagents.length > 0) {
+    args.push('--agents', buildAgentsJson(spec.subagents));
+  }
+
   // The schema-capped return. Unlike codex's `--output-schema`, claude's `--json-schema`
   // takes the schema INLINE, so the contract's path has to be dereferenced here.
   if (spec.outputSchemaPath !== undefined && spec.outputSchemaPath !== '') {
@@ -160,6 +202,26 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
 export const CLAUDE_ENV_FORBIDDEN = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'] as const;
 
 /**
+ * The variable that caps native-subagent nesting below a worker.
+ *
+ * The NAME is claude's; the NUMBER is the rank table's, via `maxSubagentDepth`. Neither half is
+ * written down twice — inserting a rank moves the cap, and the cap is not a constant anyone has to
+ * remember to update.
+ *
+ * Measured on claude 2.1.221 to be a HARD bound rather than a request: at the cap the harness does
+ * not refuse a spawn, it removes the spawn tools from the subordinate's declared loadout entirely,
+ * so a model at the floor has nothing to attempt. That is what makes it the right backstop for the
+ * one thing an agent-type deny-list cannot promise — a type nobody thought to name still cannot
+ * recurse past this number.
+ */
+export const SUBAGENT_DEPTH_ENV_VAR = 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH';
+
+/** The cap for a worker of this rank. Zero when it was issued no roster — see `buildClaudeEnv`. */
+export function subagentDepthEnv(rank: Rank, hasRoster: boolean): Record<string, string> {
+  return { [SUBAGENT_DEPTH_ENV_VAR]: String(hasRoster ? maxSubagentDepth(rank) : 0) };
+}
+
+/**
  * The child's environment.
  *
  * `process.env` is inherited wholesale — that inheritance IS the OAuth login, and stripping
@@ -178,7 +240,21 @@ export function buildClaudeEnv(
       );
     }
   }
-  return { ...base, ...extra };
+  // The nesting cap goes on LAST, over both the inherited environment and the caller's own extras,
+  // and that ordering is the whole point of computing it here instead of at a call site. It is
+  // derived from the rank table, it is the bound on a recursion billed to one subscription, and a
+  // spec that could override it — or an ambient value inherited from whatever shell launched the
+  // campaign — would be a ceiling the process below can raise. Measured: at the cap the harness
+  // does not refuse the spawn, it removes the spawn tool, so there is nothing left to attempt.
+  //
+  // Zero for a worker with no roster, which is the case that matters most: no roster means nobody
+  // authorised this unit to fan out, and omitting the variable would leave it free to field the
+  // harness's own built-in agent types to whatever depth the default allows.
+  return {
+    ...base,
+    ...extra,
+    ...subagentDepthEnv(spec.rank, spec.subagents !== undefined && spec.subagents.length > 0),
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

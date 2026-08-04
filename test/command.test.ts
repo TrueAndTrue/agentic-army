@@ -38,17 +38,32 @@ import {
   assertAllowListNonEmpty,
   assertDeclaredWritesMatchLoadout,
   assertGlobalDenyIntact,
+  assertSubagentRosterSafe,
   assertWorktreeRootOutsideProtected,
+  BUILTIN_AGENT_TYPES,
+  DENIED_COMMAND_RULES,
   missingProtectedGlobs,
   narrowToRank,
   permissionsFor,
   protectedGlobContaining,
   rankDeny,
+  subagentDeny,
+  subagentRosterFor,
   toolNameOf,
   ROLE_ALLOW,
+  SPAWN_TOOLS,
 } from '../src/command/permissions.ts';
-import { ROLES, WRITES_FILES, writesFiles } from '../src/contracts/ranks.ts';
+import {
+  maxSubagentDepth,
+  ROLES,
+  SPAWNS_UNITS,
+  WRITES_FILES,
+  writesFiles,
+} from '../src/contracts/ranks.ts';
 import type { Rank } from '../src/contracts/ranks.ts';
+import { buildClaudeEnv, SUBAGENT_DEPTH_ENV_VAR } from '../src/harness/claude.ts';
+import type { TreeModel } from '../src/view/tree.ts';
+import type { SubagentDefinition } from '../src/contracts/harness.ts';
 import { worktreesRootFor } from '../src/config/paths.ts';
 import {
   ENGINEER_NARRATIVE_KEYS,
@@ -179,7 +194,17 @@ type EngineerMode =
   /** Returns a report whose `branch` carries a fabricated brief for the Inspector. */
   | 'hostile'
   /** Commits, then destroys the tree's `.git`, so cleanup's git calls throw. */
-  | 'nukes-git';
+  | 'nukes-git'
+  /**
+   * Commits, AND fields native subagents off the `--agents` roster it was actually handed.
+   *
+   * The forwarded lines carry `parent_tool_use_id` and a top-level `subagent_type`, which is the
+   * shape `--forward-subagent-text` delivers and the only shape the normalizer can recover depth
+   * from. A subordinate's tool call is checked against ITS OWN declared list, so a mode that
+   * "fielded" a squad holding the parent's loadout would be modelling the exact bug the roster
+   * exists to prevent.
+   */
+  | 'fanout';
 
 interface FakeClaudeOptions {
   mode?: EngineerMode;
@@ -271,6 +296,46 @@ rl.on('line', (line) => {
     // A committed branch, and then a tree whose .git is gone. Cleanup's inspectUnlandedWork
     // shells out to git, and git() throws on a non-zero exit.
     rmSync(join(process.cwd(), '.git'), { recursive: true, force: true });
+  }
+  if (MODE === 'fanout') {
+    // The roster off THIS PROCESS'S OWN argv — never an assumption about what it should be.
+    const ai = argv.indexOf('--agents');
+    let roster = {};
+    try { roster = ai === -1 ? {} : JSON.parse(argv[ai + 1]); } catch { roster = {}; }
+    let seq = 0;
+    for (const type of Object.keys(roster)) {
+      const declared = Array.isArray(roster[type].tools) ? roster[type].tools : [];
+      seq += 1;
+      const id = 'toolu_squad' + seq;
+      say({ type: 'assistant', session_id: sid, parent_tool_use_id: null,
+            message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Agent',
+              input: { subagent_type: type, prompt: 'survey the tree' } }] } });
+      // The subordinate speaks, nested. This is the line the org chart is rebuilt from.
+      say({ type: 'assistant', session_id: sid, parent_tool_use_id: id, subagent_type: type,
+            message: { role: 'assistant', content: [{ type: 'text',
+              text: type + ' surveying; my tools are ' + declared.join(',') }] } });
+      // A tool call at depth 1, allowed only if the roster declared it. Read is declared for
+      // every rank this campaign fields; Write is declared for none of them, and asking for it
+      // is what makes the refusal visible in the archive rather than merely absent.
+      const use = (name, ok) => {
+        seq += 1;
+        const tid = 'toolu_sub' + seq;
+        say({ type: 'assistant', session_id: sid, parent_tool_use_id: id, subagent_type: type,
+              message: { role: 'assistant', content: [{ type: 'tool_use', id: tid, name,
+                input: { file_path: join(process.cwd(), 'ENGINEER.md') } }] } });
+        say({ type: 'user', session_id: sid, parent_tool_use_id: id, subagent_type: type,
+              message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: tid,
+                is_error: !ok,
+                content: ok ? 'ok' : 'I have no ' + name + ' tool.' }] } });
+      };
+      use('Read', declared.includes('Read'));
+      use('Write', declared.includes('Write'));
+      say({ type: 'assistant', session_id: sid, parent_tool_use_id: id, subagent_type: type,
+            message: { role: 'assistant', content: [{ type: 'text', text: type + ' reporting back' }] } });
+      say({ type: 'user', session_id: sid, parent_tool_use_id: null,
+            message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id,
+              is_error: false, content: type + ' reported' }] } });
+    }
   }
   const payload = MODE === 'bad-report' ? '{"totally":"the wrong shape"}' : JSON.stringify(report);
 
@@ -896,7 +961,10 @@ describe('permissions', () => {
     const { allow, deny } = permissionsFor('COLONEL', 'ENGINEER', '/tmp/army-home');
 
     assert.equal(WRITES_FILES.COLONEL, false, 'this test is meaningless if COLONEL writes');
-    assert.deepEqual(allow, ['Read', 'Grep', 'Glob', 'TodoWrite']);
+    // The spawn tools SURVIVE the narrowing, and that is the shape of the whole design rather
+    // than an oversight: rank subtracts what a rank may not hold, and an officer's job is
+    // precisely to field other units. What a COLONEL loses is the ability to do the work itself.
+    assert.deepEqual(allow, ['Read', 'Grep', 'Glob', 'TodoWrite', 'Task', 'Agent']);
     for (const tool of ['Edit', 'Write', 'NotebookEdit']) {
       assert.ok(!allow.includes(tool), `a COL·ENGINEER was handed ${tool}`);
     }
@@ -1207,6 +1275,165 @@ describe('the worktree pool lives outside the region every worker is denied', ()
   });
 });
 
+  // ===========================================================================================
+  // RANK REACHES AN INHERITED-PERMISSION SUBAGENT
+  //
+  // A native subagent never goes through `permissionsFor` — it runs inside its parent and
+  // inherits its settings. These are the guards on the one channel that narrows it. Each has
+  // been watched to fail with its mechanism broken.
+  // ===========================================================================================
+
+  it('a subordinate is narrowed by ITS OWN rank, not by the rank that fielded it', () => {
+    const roster = subagentRosterFor('CAPTAIN', 'ENGINEER');
+    assert.deepEqual(
+      roster.map((def) => def.name),
+      ['sgt-engineer', 'pvt-engineer'],
+    );
+
+    const parentHolds = new Set(ROLE_ALLOW.ENGINEER.map((rule) => toolNameOf(rule)));
+    for (const def of roster) {
+      // Its parent is a CPT·ENGINEER holding Edit, Write, NotebookEdit and 28 Bash rules. None
+      // of it reaches the subordinate, because `WRITES_FILES` denies both subagent ranks.
+      assert.equal(writesFiles(def.rank, def.role), false, `${def.name} declares it writes`);
+      for (const tool of WRITE_CAPABLE_TOOLS) {
+        assert.ok(!def.tools.includes(tool), `${def.name} inherited ${tool} from its parent`);
+      }
+      // Nor can it field anything: both subagent ranks are the floor in this fielding.
+      for (const tool of SPAWN_TOOLS) {
+        assert.ok(!def.tools.includes(tool), `${def.name} kept ${tool} and could recurse`);
+      }
+      // Containment, in the direction that matters: nothing appears from nowhere.
+      for (const tool of def.tools) {
+        assert.ok(parentHolds.has(tool), `${def.name} gained ${tool} its CAPTAIN never held`);
+      }
+      assert.ok(def.tools.length > 0, `${def.name} would be declared with no tools at all`);
+    }
+    // The narrowing is the SAME function that narrows a process, off the same tables.
+    assert.deepEqual(
+      roster[0]?.tools,
+      [...new Set(narrowToRank('SERGEANT', ROLE_ALLOW.ENGINEER).map((r) => toolNameOf(r)))],
+    );
+  });
+
+  it('a roster wider than the unit fielding it REFUSES to be spawned', () => {
+    const parent = permissionsFor('CAPTAIN', 'ENGINEER', '/tmp/army-home');
+    const roster = subagentRosterFor('CAPTAIN', 'ENGINEER');
+
+    assert.doesNotThrow(() => {
+      assertSubagentRosterSafe(roster, 'CAPTAIN', parent.allow, 'a CPT·ENGINEER');
+    });
+
+    // A tool the parent does not hold. Rank narrows and never widens, and a spawn is the one
+    // place that could be broken without editing any table.
+    const widened = roster.map((def) => ({ ...def, tools: [...def.tools, 'WebFetch'] }));
+    assert.throws(
+      () => {
+        assertSubagentRosterSafe(widened, 'CAPTAIN', parent.allow, 'a CPT·ENGINEER');
+      },
+      /would field a sgt-engineer holding WebFetch, which it does not hold itself/,
+    );
+
+    // An editor, on a rank declared not to write.
+    const editing = roster.map((def) => ({ ...def, tools: [...def.tools, 'Edit'] }));
+    assert.throws(
+      () => {
+        assertSubagentRosterSafe(editing, 'CAPTAIN', parent.allow, 'a CPT·ENGINEER');
+      },
+      /declared not to write files and its loadout holds Edit/,
+    );
+
+    // A spawn tool on a floor rank — the fork bomb, refused at the point of declaration.
+    const spawning = roster.map((def) => ({ ...def, tools: [...def.tools, 'Agent'] }));
+    assert.throws(
+      () => {
+        assertSubagentRosterSafe(spawning, 'CAPTAIN', parent.allow, 'a CPT·ENGINEER');
+      },
+      /is the floor/,
+    );
+
+    // A subordinate declared with nothing. An empty list is not "no tools" — it is a unit the
+    // harness was told nothing about, which is the most permissive thing this codebase can emit.
+    const empty = roster.map((def) => ({ ...def, tools: [] }));
+    assert.throws(
+      () => {
+        assertSubagentRosterSafe(empty, 'CAPTAIN', parent.allow, 'a CPT·ENGINEER');
+      },
+      /allow-list is empty/,
+    );
+
+    // And the spawn rule itself: a roster naming the parent's own rank never gets built, but if
+    // one is handed over it is refused where the spawn happens.
+    const ownRank = [{ ...(roster[0] as SubagentDefinition), rank: 'CAPTAIN' as Rank }];
+    assert.throws(
+      () => {
+        assertSubagentRosterSafe(ownRank, 'CAPTAIN', parent.allow, 'a CPT·ENGINEER');
+      },
+      /may field SERGEANT, PRIVATE and nothing else/,
+    );
+  });
+
+  it('the deny half names the built-ins and every rank a CAPTAIN may not field', () => {
+    const deny = subagentDeny('CAPTAIN', 'ENGINEER');
+    // Measured: naming an agent type on the DENY half blocks it; naming it on the ALLOW half does
+    // not restrict types at all. So this list is the enforcing mechanism, not a second opinion.
+    for (const builtin of BUILTIN_AGENT_TYPES) {
+      for (const tool of SPAWN_TOOLS) {
+        assert.ok(deny.includes(`${tool}(${builtin})`), `${tool}(${builtin}) is not denied`);
+      }
+    }
+    for (const rank of ['gen', 'col', 'cpt']) {
+      assert.ok(deny.includes(`Agent(${rank}-engineer)`), `${rank}-engineer is not denied`);
+    }
+    // …and the two it MAY field are not denied, or the roster would be inert.
+    assert.ok(!deny.includes('Agent(sgt-engineer)'));
+    assert.ok(!deny.includes('Agent(pvt-engineer)'));
+  });
+
+  it('a fan-out roster on a harness with no subagents REFUSES, rather than being dropped', () => {
+    // `codex exec` has no subagent model. A silently dropped roster is worse than an error: the
+    // unit would be briefed on a squad it does not have, and the archive would record a fan-out
+    // that never happened.
+    assert.throws(
+      () =>
+        buildSoldierSpec({
+          agentId: 'cpt-01',
+          rank: 'CAPTAIN',
+          role: 'ENGINEER',
+          harness: 'codex',
+          cwd: '/tmp',
+          orders: 'x',
+          home: '/tmp/army-home',
+          fanOut: true,
+        }),
+      /no native subagent model/,
+    );
+    // The same spec on claude carries the roster and the extra denies.
+    const spec = buildSoldierSpec({
+      agentId: 'cpt-01',
+      rank: 'CAPTAIN',
+      role: 'ENGINEER',
+      harness: 'claude',
+      cwd: '/tmp',
+      orders: 'x',
+      home: '/tmp/army-home',
+      fanOut: true,
+    });
+    assert.equal(spec.subagents?.length, 2);
+    assert.ok(spec.deny.includes('Agent(general-purpose)'));
+    // …and a spec that did NOT ask for one carries neither.
+    const plain = buildSoldierSpec({
+      agentId: 'cpt-02',
+      rank: 'CAPTAIN',
+      role: 'INSPECTOR',
+      harness: 'claude',
+      cwd: '/tmp',
+      orders: 'x',
+      home: '/tmp/army-home',
+    });
+    assert.equal(plain.subagents, undefined);
+    assert.ok(!plain.deny.includes('Agent(general-purpose)'));
+  });
+
 // ===============================================================================================
 // 3. Small pure pieces
 // ===============================================================================================
@@ -1404,6 +1631,230 @@ describe('a full campaign — PASS on the first attempt', () => {
     assert.ok(tree.includes(result.campaignId), tree);
     assert.match(tree, /ENGINEER/);
     assert.match(tree, /INSPECTOR/);
+  });
+});
+
+// ===============================================================================================
+// 4b. FAN-OUT — the first campaign that produces real depth
+//
+// Every assertion below, and every one in the rank-reaches-a-subagent block in section 2, was
+// watched to fail with its own mechanism broken and its own assertion in the red — not with the
+// module failing to load and not with a neighbouring guard firing first. Nine breaks, each
+// labelled and each restored.
+// ===============================================================================================
+
+describe('a CPT·ENGINEER fields a squad, and the campaign still delivers', () => {
+  let result: CampaignResult;
+  let home: string;
+  let bins: HarnessBins;
+
+  before(async () => {
+    const repo = makeRepo('fanout');
+    home = makeHome({ [repo]: 0 });
+    bins = makeHarnesses('fanout', 'fanout', ['pass']);
+    result = await campaign({
+      objective: 'Survey the tree and add a multiply function',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+    });
+  });
+
+  it('delivers, and still releases its lease', () => {
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(result.verdict?.verdict, 'pass');
+    // The property fan-out is most likely to break: a worktree is leased by the CAPTAIN and the
+    // subordinates run inside its process, so a squad that outlived the parent, or a parent that
+    // exited without settling, would strand the tree.
+    assert.equal(result.lease.state, 'released', result.lease.reason);
+    assertReadableArchive(result);
+  });
+
+  it('the roster on the wire is the rank table, narrowed — SGT and PVT, and nothing else', () => {
+    const argvs = fs
+      .readFileSync(bins.claudeArgvLog, 'utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as string[]);
+    const argv = argvs[0] as string[];
+
+    const at = argv.indexOf('--agents');
+    assert.notEqual(at, -1, `the Engineer was fielded with no roster: ${argv.join(' ')}`);
+    const roster = JSON.parse(argv[at + 1] as string) as Record<
+      string,
+      { tools: string[]; description: string; prompt: string }
+    >;
+
+    // A CAPTAIN may field the two subagent ranks and nothing else. Not itself, not upward.
+    assert.deepEqual(Object.keys(roster).sort(), ['pvt-engineer', 'sgt-engineer']);
+
+    for (const [name, def] of Object.entries(roster)) {
+      // NOT WIDER THAN ITS RANK PERMITS. `WRITES_FILES` denies both subagent ranks, so neither
+      // may hold an editor, and neither may hold a shell — a subagent loadout is tool NAMES with
+      // no position for `Bash(git:*)`, so the only shell it could carry is an unscoped one.
+      for (const tool of ['Edit', 'Write', 'NotebookEdit', 'Bash', 'BashOutput', 'KillShell']) {
+        assert.ok(!def.tools.includes(tool), `${name} was declared ${tool}`);
+      }
+      // …and it cannot field anything. This is the floor, structurally: the tool is ABSENT, not
+      // present-and-refused, which is why there is nothing for a model to try.
+      for (const tool of ['Task', 'Agent']) {
+        assert.ok(!def.tools.includes(tool), `${name} was declared ${tool} and could spawn`);
+      }
+      assert.ok(def.tools.length > 0, `${name} was declared no tools at all`);
+      // Containment: nothing in a subordinate's list that its parent does not itself hold.
+      const parentHolds = new Set(
+        ROLE_ALLOW.ENGINEER.map((rule) => toolNameOf(rule)),
+      );
+      for (const tool of def.tools) {
+        assert.ok(parentHolds.has(tool), `${name} was handed ${tool}, which its CAPTAIN lacks`);
+      }
+      assert.ok(def.tools.includes('Read'), `${name} cannot read, which is all it is for`);
+    }
+  });
+
+  it('the spawn rule is on the wire: the built-ins and the senior ranks are denied by name', () => {
+    const argv = JSON.parse(
+      (fs.readFileSync(bins.claudeArgvLog, 'utf8').split('\n')[0] ?? '[]'),
+    ) as string[];
+    const deny = new Set(argv);
+
+    // The harness's own agent types. Measured: naming a type on the DENY half blocks it, and
+    // naming it on the ALLOW half does not restrict anything — so this is the enforcing form.
+    for (const builtin of BUILTIN_AGENT_TYPES) {
+      assert.ok(deny.has(`Agent(${builtin})`), `built-in ${builtin} was not denied`);
+      assert.ok(deny.has(`Task(${builtin})`), `built-in ${builtin} was not denied under Task`);
+    }
+    // A CAPTAIN may not field its own rank or above, and the rule is on the command line rather
+    // than only in the roster that omitted them.
+    for (const rank of ['gen', 'col', 'cpt']) {
+      assert.ok(deny.has(`Agent(${rank}-engineer)`), `${rank}-engineer was not denied`);
+    }
+    assert.ok(!deny.has('Agent(sgt-engineer)'), 'the squad it MAY field was denied');
+  });
+
+  it('the depth cap is on the environment, derived from the rank table', () => {
+    // The one bound that does not depend on a name being listed. Measured: at the cap the harness
+    // removes the spawn tools rather than refusing the call, so an agent type nobody thought to
+    // deny still cannot recurse past it.
+    assert.equal(maxSubagentDepth('CAPTAIN'), 1);
+    const env = buildClaudeEnv(
+      {
+        agentId: 'cpt-01',
+        rank: 'CAPTAIN',
+        role: 'ENGINEER',
+        harness: 'claude',
+        cwd: '/tmp',
+        sessionId: '00000000-0000-4000-8000-000000000000',
+        allow: ['Read'],
+        deny: [],
+        orders: 'x',
+        subagents: subagentRosterFor('CAPTAIN', 'ENGINEER'),
+      },
+      {},
+    );
+    assert.equal(env[SUBAGENT_DEPTH_ENV_VAR], '1');
+
+    // …and ZERO for a worker nobody issued a roster to, which is the load-bearing case: an
+    // INSPECTOR must not be able to field the harness's built-ins to whatever depth it defaults to.
+    const noRoster = buildClaudeEnv(
+      {
+        agentId: 'cpt-02',
+        rank: 'CAPTAIN',
+        role: 'INSPECTOR',
+        harness: 'claude',
+        cwd: '/tmp',
+        sessionId: '00000000-0000-4000-8000-000000000000',
+        allow: ['Read'],
+        deny: [],
+        orders: 'x',
+      },
+      {},
+    );
+    assert.equal(noRoster[SUBAGENT_DEPTH_ENV_VAR], '0');
+  });
+
+  it('THE GLOBAL DENY HOLDS AT DEPTH 2 — the subordinates inherit it, because it is one list', () => {
+    const argv = JSON.parse(
+      (fs.readFileSync(bins.claudeArgvLog, 'utf8').split('\n')[0] ?? '[]'),
+    ) as string[];
+
+    // There is exactly ONE deny-list on this command line and the subagents run inside this
+    // process, so what protects the parent protects them. Measured on a live pair: a subordinate
+    // asked to read a credential path was refused with `denied by your permission settings`.
+    assert.deepEqual(missingProtectedGlobs(argv), []);
+    for (const rule of DENIED_COMMAND_RULES) {
+      assert.ok(argv.includes(rule), `the deny-list reaching the squad is missing ${rule}`);
+    }
+    for (const glob of ['~/.ssh', '**/.env']) {
+      assert.ok(
+        argv.some((entry) => entry === `Read(${glob})`),
+        `no read deny for ${glob} reached the squad`,
+      );
+    }
+    // And the roster is on the SAME command line, so there is no ordering in which a subordinate
+    // is declared without the deny-list already applying to the process that declares it.
+    assert.ok(argv.includes('--agents'));
+  });
+
+  it('the archive records the nesting, reconstructed from parent_tool_use_id alone', () => {
+    const engineer = result.attempts[0]?.engineerAgentId as string;
+    const events = fs
+      .readFileSync(
+        path.join(result.campaignRoot, 'agents', engineer, 'stream.jsonl'),
+        'utf8',
+      )
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as { type: string; depth?: number; parentToolUseId?: string | null; subagentType?: string });
+
+    // A SERGEANT has no session of its own on disk. It exists in the archive only because the
+    // parent's stream carried its lines, and depth was recovered from the tool_use that issued
+    // them — never from a field on the wire, which does not exist.
+    const nested = events.filter((e) => (e.depth ?? 0) >= 1);
+    assert.ok(nested.length > 0, 'no event was recorded below depth 0');
+    for (const event of nested) {
+      assert.equal(typeof event.parentToolUseId, 'string', 'a nested event lost its parent');
+    }
+    assert.ok(
+      nested.some((e) => e.subagentType === 'sgt-engineer'),
+      'the SERGEANT is not in the archive',
+    );
+    assert.ok(
+      nested.some((e) => e.subagentType === 'pvt-engineer'),
+      'the PRIVATE is not in the archive',
+    );
+    // The refusal is recorded too, not merely the absence of a success — a squad whose denied
+    // Write left no trace would be indistinguishable from one that never tried.
+    assert.ok(
+      events.some((e) => e.type === 'tool_result' && (e.depth ?? 0) >= 1),
+      'no subagent tool_result was recorded',
+    );
+  });
+
+  it('army view renders the nesting: DEPTH shows 1+1 and the campaign is no longer depth 1-1', async () => {
+    const rendered = await viewTree(result, home);
+    // `1+1` is one recorded spawn depth plus one level seen only in the stream. Before this
+    // existed every campaign rendered `depth 1-1`, because nothing could reach the layer below.
+    assert.match(rendered, /1\+1/, `no nested depth in the render:\n${rendered}`);
+    // An EN-DASH in the range, which is what the renderer emits; the `(2 observed)` suffix only
+    // appears when the stream reached deeper than any recorded row, i.e. exactly when a native
+    // subagent existed.
+    assert.match(
+      rendered,
+      /depth 1\u20131 \(2 observed\)/,
+      `summary did not observe depth 2:\n${rendered}`,
+    );
+
+    const model = JSON.parse(await viewTree(result, home, true)) as TreeModel;
+    assert.equal(model.summary.depthMaxObserved, 2);
+    // The gap is NOT anomalous: a CAPTAIN at depth 1 is normal, and the subagent layer it carries
+    // is reported in the depth cell rather than as a rank that outran its chain.
+    for (const node of model.tasks.flatMap((task) => task.units)) {
+      assert.equal(node.gapAnomalous, false, `${node.agentId} was flagged as an anomalous gap`);
+    }
+    assert.deepEqual(model.summary.anomalies, []);
   });
 });
 

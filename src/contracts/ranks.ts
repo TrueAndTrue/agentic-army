@@ -113,8 +113,83 @@ export const WRITES_FILES: Record<Rank, boolean> = {
   GENERAL: false,
   COLONEL: false,
   CAPTAIN: true,
-  SERGEANT: true,
-  PRIVATE: true,
+  SERGEANT: false,
+  PRIVATE: false,
+};
+
+/**
+ * WHY THE TWO SUBAGENT RANKS DO NOT WRITE — the ruling, and what it was measured against.
+ *
+ * Both entries read `true` for the length of a build, and neither had ever been checked against a
+ * unit that existed: nothing below CAPTAIN was fieldable, so the value was an inherited permissive
+ * default rather than a decision. It is a decision now, and it is `false`, for three reasons that
+ * are properties of the substrate rather than preferences.
+ *
+ * 1. A SUBAGENT RANK HAS NO WORKTREE. CAPTAIN is the lowest rank that leases one; a subagent runs
+ *    inside its parent's process, in its parent's leased tree. So a writing SERGEANT does not write
+ *    in its own workspace — it writes in someone else's, beside its siblings. Measured on claude
+ *    2.1.221: the spawn tool returns `Async agent launched successfully` and the parent does NOT
+ *    block, so a fan-out of four is four writers in one directory, racing each other and the index
+ *    lock. The branch that comes out is one the CAPTAIN has to own without having made it, and the
+ *    review gate reviews that branch. Attribution is the thing the gate is for.
+ *
+ * 2. THE SUBAGENT NARROWING VOCABULARY CANNOT SPELL A SCOPED SHELL. A subagent's loadout is
+ *    declared to the harness as a list of tool NAMES; there is no position in it for the
+ *    `Bash(git:*)` form that keeps a CAPTAIN's shell inside its lane. `WRITE_CAPABLE_TOOLS`
+ *    includes `Bash` precisely because a prefix rule constrains the START of a command line and
+ *    nothing after it — and a subagent cannot even be handed the prefix. Measured: a subagent
+ *    granted `Bash` under a session whose only shell rule was `Bash(echo:*)` ran `whoami`
+ *    successfully, and was refused `curl`. A shell arrived, and its real boundary was neither this
+ *    codebase's rule nor a thing this codebase can state.
+ *
+ * 3. IT IS WHAT THE LAYER IS FOR. The cheap fan-out layer earns its keep by burning context on
+ *    reading and handing back a capped report — many windows spent, one summary ingested. Writing
+ *    stays at the rank that holds the tree, the branch and the report. A SERGEANT that reads
+ *    widely and returns a bounded answer is the whole benefit; a SERGEANT that also edits is the
+ *    benefit plus an unattributable diff.
+ *
+ * The consequence is visible and intended: `writesFiles('SERGEANT', 'ENGINEER')` is `false`, so a
+ * SGT·ENGINEER holds Read/Grep/Glob/TodoWrite and no editor and no shell — the same intersection
+ * that has always given a COLONEL·ENGINEER a read-only loadout, applied at the other end of the
+ * order. Rank narrows; it never widens.
+ */
+
+/**
+ * Whether a rank may field units of its own.
+ *
+ * PRIVATE is the floor, and the floor is the bound. A subagent that can spawn subagents recurses,
+ * and every level of that recursion is billed to one subscription — so the floor cannot be a
+ * sentence in a briefing that a model may reason its way past. `narrowToRank` subtracts the spawn
+ * tools from a rank whose entry here is `false` and `rankDeny` names them, so a PRIVATE reaches
+ * the harness holding no tool that spawns anything. Measured on claude 2.1.221: a subagent whose
+ * declared loadout omits the spawn tool reports that it has no way to spawn one, and the tool is
+ * absent from its list rather than present-and-refused.
+ *
+ * SERGEANT IS ALSO `false`, AND THAT IS A NARROWER TABLE THAN THE ONE THIS PROJECT INTENDS. The
+ * distinction the design draws between the two subagent ranks is exactly this entry — a SERGEANT
+ * leads a squad, a PRIVATE is one shot — so with both `false` the two ranks are currently
+ * indistinguishable in capability, and only their briefings differ. It is deliberate and it is
+ * temporary:
+ *
+ *   - this is the FIRST time anything below CAPTAIN has ever been fielded. The recursion is the
+ *     one failure here whose cost is unbounded and whose bill arrives on somebody's subscription,
+ *     and the conservative direction on a first fielding is the one where the fan-out is one level
+ *     wide and every level of it is visible in the archive before a second is authorised;
+ *   - `maxSubagentDepth('CAPTAIN')` is therefore 1, not 2, and the harness-enforced nesting cap
+ *     that goes onto the worker's environment is that same 1. The bound is not a claim about what
+ *     a model will choose to do.
+ *
+ * Turning a SERGEANT into a real squad is this one entry. Flipping it to `true` moves the derived
+ * cap, the roster, the deny rules and the depth the archive can record, all from here — which is
+ * the point of the value being read rather than restated. Do it when there is a campaign whose
+ * shape actually wants two levels, and watch the first one that uses it.
+ */
+export const SPAWNS_UNITS: Record<Rank, boolean> = {
+  GENERAL: true,
+  COLONEL: true,
+  CAPTAIN: true,
+  SERGEANT: false,
+  PRIVATE: false,
 };
 
 /**
@@ -157,6 +232,117 @@ export function writesFiles(rank: Rank, role: Role): boolean {
  */
 export function isStrictlyJuniorTo(child: Rank, parent: Rank): boolean {
   return RANK_SENIORITY[child] > RANK_SENIORITY[parent];
+}
+
+/**
+ * Every rank a unit of `parent` may field. Strictly junior, seniority order.
+ *
+ * The spawn rule as a LIST rather than as a predicate, because the two answer different questions
+ * and only one of them can be enumerated: `isStrictlyJuniorTo` checks a pairing somebody already
+ * chose, and this decides what the choices are. A roster built from this cannot contain a rank the
+ * predicate would reject, so the two can never disagree about a rank that is actually fielded.
+ */
+export function fieldableRanks(parent: Rank): Rank[] {
+  if (!SPAWNS_UNITS[parent]) return [];
+  return RANK_ORDER.filter((candidate) => isStrictlyJuniorTo(candidate, parent));
+}
+
+/**
+ * The ranks a unit of `parent` may field AS NATIVE SUBAGENTS — strictly junior AND on the subagent
+ * substrate. For a CAPTAIN that is SERGEANT and PRIVATE, and it is derived from the two tables
+ * above rather than typed out, so moving a rank across the substrate line moves the roster with it.
+ */
+export function subagentRanksUnder(parent: Rank): Rank[] {
+  return fieldableRanks(parent).filter((rank) => SUBSTRATE[rank] === 'subagent');
+}
+
+/**
+ * How many levels of native subagent a unit of `parent` may nest, counting the first level as one.
+ *
+ * DERIVED, never a constant. The bound is a fact about the rank table — you may field the subagent
+ * ranks junior to you, each of those may field the ones junior to IT, and the chain stops at the
+ * rank that spawns nothing. Writing `2` here instead would be a number that stops tracking the
+ * table the day a rank is inserted, which is exactly how a cap becomes decorative.
+ */
+export function maxSubagentDepth(parent: Rank): number {
+  const ranks = subagentRanksUnder(parent);
+  if (ranks.length === 0) return 0;
+  let deepest = 0;
+  for (const rank of ranks) {
+    const below = SPAWNS_UNITS[rank] ? maxSubagentDepth(rank) : 0;
+    if (1 + below > deepest) deepest = 1 + below;
+  }
+  return deepest;
+}
+
+/**
+ * Refuse a spawn that the rank table does not permit — the spawn rule, where the spawn happens.
+ *
+ * Two separate refusals, because they are two separate mistakes: a rank that fields ANYTHING when
+ * it is the floor, and a rank that fields its own rank or above. The second is the one the
+ * documentation has always stated and nothing enforced; stating it in a comment leaves it true
+ * only for as long as everyone remembers, and the first unit ever fielded below CAPTAIN is exactly
+ * the moment that stops being good enough.
+ */
+export function assertMayField(parent: Rank, child: Rank, who: string): void {
+  if (!SPAWNS_UNITS[parent]) {
+    throw new Error(
+      `refusing to field a ${child} under ${who}: ${parent} is the floor and spawns nothing. A ` +
+        'rank that can spawn its own subordinates recurses, and every level of that recursion is ' +
+        'billed to one subscription. The floor is what bounds the depth, so it does not get an ' +
+        'exception for one useful case.',
+    );
+  }
+  if (!isStrictlyJuniorTo(child, parent)) {
+    throw new Error(
+      `refusing to field a ${child} under ${who}: a ${parent} may field ${
+        fieldableRanks(parent).join(', ') || 'nothing'
+      } and nothing else. Rank is authority, and authority that can reproduce itself or its own ` +
+        'superiors is not authority — it is a loop.',
+    );
+  }
+}
+
+/**
+ * Refuse a rank table whose floor is not a floor.
+ *
+ * ## The property, and the one it is deliberately NOT
+ *
+ * The obvious guard to write here is "capability never increases going down the order", and it is
+ * WRONG — it would reject this project's central design decision. `WRITES_FILES` is a BAND, not a
+ * slope: GENERAL and COLONEL do not write, CAPTAIN does, SERGEANT and PRIVATE do not. A CAPTAIN is
+ * junior to a COLONEL and holds strictly more, on purpose, because officers are kept incapable of
+ * a bad `rm` while the rank that owns a worktree is the rank that works in it. A monotonicity
+ * check over `WRITES_FILES` was written first and the suite rejected it immediately, which is the
+ * only reason this paragraph exists rather than a quietly weakened table.
+ *
+ * What IS true, and is what the fork-bomb bound rests on, is that the ranks which spawn NOTHING
+ * form an unbroken run at the BOTTOM of the order. `maxSubagentDepth` terminates because the chain
+ * walks downward and eventually reaches a rank that fields nobody; if a non-spawning rank sat in
+ * the middle with a spawning rank beneath it, the floor would be a hole rather than a floor, and
+ * the recursion would resume below it.
+ *
+ * Called from `permissionsFor` on every spawn rather than at module load, deliberately: a throw at
+ * import time takes the whole suite down at the point where a break was planted, and a guard whose
+ * failure reads as "the module would not load" is a guard nobody can read the output of.
+ */
+export function assertRankFloorContiguous(): void {
+  let seenFloor: Rank | null = null;
+  for (const rank of RANK_ORDER) {
+    if (!SPAWNS_UNITS[rank]) {
+      seenFloor ??= rank;
+      continue;
+    }
+    if (seenFloor !== null) {
+      throw new Error(
+        `refusing to build any loadout: SPAWNS_UNITS lets ${rank} field units while ${seenFloor}, ` +
+          'which outranks it, fields none. The ranks that spawn nothing must be an unbroken run ' +
+          'at the bottom of the order — that run is the floor, and the floor is the only thing ' +
+          'that bounds a recursion billed to one subscription. A gap in it is not a floor with an ' +
+          'exception; it is a floor with a hole, and the spawning resumes underneath.',
+      );
+    }
+  }
 }
 
 /**
