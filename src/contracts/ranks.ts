@@ -21,11 +21,23 @@ export type Rank = (typeof RANK_ORDER)[number];
 /**
  * COMMANDER is the branch of service that only ever talks.
  *
- * It exists because `army chat` needs a soldier whose loadout is *nothing* — no Read, no Grep,
- * no Edit, no Bash — and a loadout is chosen by role. Reusing SCOUT would have handed it
+ * It exists because `army chat` needs a soldier whose loadout is ONE INERT TOOL — no Read, no
+ * Grep, no Edit, no Bash — and a loadout is chosen by role. Reusing SCOUT would have handed it
  * Read/Grep/Glob/WebFetch, which is precisely the capability that burns a commanding agent's
  * window one file at a time; reusing ENGINEER would have handed it a shell. Neither is a
  * commanding agent, and the difference is not a matter of prompting.
+ *
+ * ONE INERT TOOL, AND NOT ZERO — the distinction is the reverse of what it looks like.
+ * `ROLE_ALLOW.COMMANDER` in `src/command/permissions.ts` is `['TodoWrite']`, and that entry must
+ * never be taken out in the name of tidying: `buildClaudeArgs` emits `--allowedTools` only when
+ * the list has something in it, so an allow-list holding zero rules drops the flag altogether,
+ * and a claude worker spawned without that flag inherits the harness default — which is every
+ * tool there is. The emptiest allow-list this codebase can spell is therefore the MOST PERMISSIVE
+ * spec it can send, which is why `assertAllowListNonEmpty` refuses that spec at spawn time for
+ * every worker, and why `assertCommanderLoadout` refuses a COMMANDER that has additionally grown
+ * a rule touching the filesystem, a shell or the network. `TodoWrite` writes a checklist into a
+ * context window and never a byte onto disk; it is what keeps the flag on the command line and
+ * every other tool off it.
  *
  * A COMMANDER delegates and reads capped reports. That is its whole tool loadout, and because
  * the loadout is derived from this value rather than asserted in a briefing, it is a property of

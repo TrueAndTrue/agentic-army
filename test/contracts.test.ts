@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -64,7 +64,11 @@ import {
   armyBranch,
 } from '../src/contracts/index.ts';
 
-import type { Rank, Report, Rung, Verdict } from '../src/contracts/index.ts';
+import type { Rank, Report, Role, Rung, Verdict } from '../src/contracts/index.ts';
+
+// The loadout table itself, so the claims a contract file makes about a role's tools are checked
+// against the rules this process actually puts on a command line — not against a retyped list.
+import { ROLE_ALLOW, toolNameOf } from '../src/command/permissions.ts';
 
 // Used only to prove a multi-line string value survived surgery unchanged.
 import { parse as parseTomlForTest } from 'smol-toml';
@@ -1809,6 +1813,212 @@ test('LAYERING: writeProjectCeiling is imported only from src/setup/**', async (
       'Only src/setup/** (which owns `army enlist`, where a human is present) may call it. ' +
       `Offending module(s): ${offenders.join(', ')}. If the orchestrator needs config, import ` +
       'loadConfig — not this.',
+  );
+});
+
+// -----------------------------------------------------------------------------------------
+// ROSTER AND LOADOUT DRIFT — four claims that were wrong, now held by the code they describe
+//
+// Each of these replaced a sentence that had stopped being true. They are here rather than in
+// a reviewer's head because prose about a permission set is exactly the prose that goes stale
+// silently: nothing breaks, the tests stay green, and the next reader believes it.
+//
+// The roles a claim may name are DERIVED (`spawnedRoles`), never listed, so a role that starts
+// or stops being fielded fails the docs that describe the roster instead of quietly outdating
+// them.
+// -----------------------------------------------------------------------------------------
+
+/**
+ * The roles some module actually hands to a spec builder, read out of `src/**` rather than
+ * enumerated here. A listed set would be a second copy of exactly the thing that drifted.
+ *
+ * The pattern anchors on a property at the start of a line, which is what a spec literal looks
+ * like (`        role: 'ENGINEER',`) and what a comment (`// role: 'SENTRY'`) and a comparison
+ * (`role === 'COMMANDER'`) do not.
+ */
+async function spawnedRoles(): Promise<Set<Role>> {
+  const srcRoot = path.resolve(import.meta.dirname, '..', 'src');
+  const entries = await fs.readdir(srcRoot, { recursive: true, withFileTypes: true });
+  const files = entries
+    .filter((e) => e.isFile() && e.name.endsWith('.ts'))
+    .map((e) => path.join(e.parentPath, e.name));
+  assert.ok(files.length > 5, 'the scan must actually find source files, or it proves nothing');
+
+  const found = new Set<Role>();
+  for (const file of files) {
+    const text = await fs.readFile(file, 'utf8');
+    for (const match of text.matchAll(/^[ \t]*role: '([A-Z]+)',/gm)) {
+      const role = match[1] as Role;
+      assert.ok(ROLES.includes(role), `${file} builds a spec for an unknown role ${role}`);
+      found.add(role);
+    }
+  }
+  // A scanner that finds nothing would make every "is it fielded" question answer the same way.
+  assert.ok(found.has('ENGINEER'), 'the scanner must see the Engineer spawn, or it sees nothing');
+  return found;
+}
+
+test('the COMMANDER doc names the tool it holds and says why the list is never emptied', async () => {
+  const text = await readSrc('contracts', 'ranks.ts');
+  const start = text.indexOf('COMMANDER is the branch of service');
+  const end = text.indexOf('export const ROLES');
+  assert.ok(start !== -1 && end > start, 'the COMMANDER doc block must exist to be checked');
+  const block = text.slice(start, end);
+  assert.ok(block.includes('army chat'), 'the slice selected the doc block, not an empty match');
+
+  // The loadout is not a literary question. Whatever ROLE_ALLOW gives a COMMANDER, the contract
+  // file names it — so widening the list forces the sentence describing it to be rewritten.
+  assert.ok(
+    ROLE_ALLOW.COMMANDER.length > 0,
+    'a COMMANDER allow-list with nothing in it drops --allowedTools and inherits every tool',
+  );
+  for (const rule of ROLE_ALLOW.COMMANDER) {
+    assert.ok(
+      block.includes(toolNameOf(rule)),
+      `ROLE_ALLOW.COMMANDER holds ${toolNameOf(rule)} and the contract doc does not mention it. ` +
+        'The doc is where a reader decides what the role IS; a loadout it does not name is a ' +
+        'loadout the next reader will feel free to remove.',
+    );
+  }
+
+  // Wordings that name the dangerous configuration as if it were the safe one.
+  const overclaims: Array<[string, RegExp]> = [
+    ['the loadout is described as absent', /loadout is\s+\*?\s*nothing/i],
+    ['the role is said to carry no tool at all', /holds? no tools|no tools at all|without any tools/i],
+    ['an emptied list is called the strict one', /empty allow-list is (?:the )?(?:safest|most restrictive|strictest)/i],
+  ];
+  for (const [label, pattern] of overclaims) {
+    assert.doesNotMatch(block, pattern, `src/contracts/ranks.ts: ${label}`);
+  }
+
+  // Omitting the false half is not enough — the reason has to be on the page, or the next
+  // simplification pass takes the one tool out and nothing in the prose objects.
+  assert.match(block, /--allowedTools/, 'name the flag that goes missing');
+  assert.match(block, /most permissive/i, 'say what an emptied list actually produces');
+});
+
+test('the --help roster names every role, and marks exactly the ones nothing spawns', async () => {
+  const cli = path.resolve(import.meta.dirname, '..', 'src', 'cli.ts');
+  const res = spawnSync(process.execPath, [cli, '--help'], {
+    encoding: 'utf8',
+    env: { ...process.env, NODE_OPTIONS: '' },
+  });
+  assert.equal(res.status, 0, `--help failed: ${res.stderr}`);
+
+  const at = res.stdout.indexOf('\nROLES');
+  assert.ok(at !== -1, 'the roster block must be in --help to be checked');
+  const block = res.stdout.slice(at);
+  assert.ok(block.includes('ENGINEER'), 'the slice selected the roster, not an empty tail');
+
+  const MARKER = 'NOT YET FIELDED:';
+  const cut = block.indexOf(MARKER);
+  assert.ok(
+    cut !== -1,
+    'the roster must state the status of the roles nothing spawns rather than listing them ' +
+      'beside the ones it does. Deleting them is not the alternative — a sibling settled that ' +
+      'in src/contracts/config.ts and src/command/permissions.ts; the gap gets said out loud.',
+  );
+  const fielded = block.slice(0, cut);
+  const deferred = block.slice(cut + MARKER.length);
+
+  const spawned = await spawnedRoles();
+  for (const role of ROLES) {
+    assert.ok(block.includes(role), `--help omits ${role}; this is the roster a new user reads`);
+    if (spawned.has(role)) {
+      assert.ok(fielded.includes(role), `${role} is spawned by this build and must be listed as such`);
+      assert.ok(!deferred.includes(role), `${role} is spawned by this build and is marked as not fielded`);
+    } else {
+      assert.ok(deferred.includes(role), `nothing spawns a ${role}; --help must say so, not imply otherwise`);
+      assert.ok(!fielded.includes(role), `nothing spawns a ${role}; it must not sit among the fielded roles`);
+    }
+  }
+
+  // The whole help, not the roster: the same overclaim was also sitting in the command list,
+  // four sections above the roster, and a guard scoped to one block would have left it there.
+  assert.doesNotMatch(
+    res.stdout,
+    /holds? no tools|no tools at all|without any tools/i,
+    'the help describes the COMMANDER as carrying nothing, which names the one configuration ' +
+      'this codebase cannot safely emit. See the loadout guard above.',
+  );
+});
+
+test('the worktree contract describes one shared writable lease, not an attenuated Inspector tree', async () => {
+  const doc = await readSrc('contracts', 'worktree.ts');
+  const head = doc.slice(0, doc.indexOf('export const WORKTREE_PROVIDER_IDS'));
+  assert.ok(head.includes('Inspector'), 'the header block must name the Inspector to be checked');
+
+  // The claim, checked against the orchestrator rather than against the sentence beside it.
+  const campaign = await readSrc('command', 'campaign.ts');
+  assert.equal(
+    [...campaign.matchAll(/\.acquire\(/g)].length,
+    1,
+    'a second acquisition would make the one-lease claim in src/contracts/worktree.ts false',
+  );
+  assert.match(campaign, /const worktree = lease\.path;/, 'the shared cwd must be the leased path');
+
+  const specs = [...campaign.matchAll(/buildSoldierSpec\(\{[\s\S]{0,900}?\}\);/g)].map((m) => m[0]);
+  assert.equal(specs.length, 2, 'today exactly two spawns build a spec: the Engineer and the Inspector');
+  assert.ok(specs.some((s) => s.includes("role: 'ENGINEER'")), 'one of them is the Engineer');
+  assert.ok(specs.some((s) => s.includes("role: 'INSPECTOR'")), 'the other is the Inspector');
+  for (const spec of specs) {
+    assert.match(
+      spec,
+      /cwd: worktree,/,
+      'both spawns are handed the same leased path. If one ever gets its own tree, the contract ' +
+        'header stops describing the program and must be rewritten with it.',
+    );
+  }
+
+  // And the half that IS true: the Inspector's harmlessness is its loadout.
+  for (const tool of ['Edit', 'Write', 'NotebookEdit']) {
+    assert.ok(
+      !ROLE_ALLOW.INSPECTOR.some((rule) => toolNameOf(rule) === tool),
+      `an INSPECTOR holding ${tool} would make the review gate's independence a matter of trust`,
+    );
+  }
+  assert.equal(ROLE_WRITES_FILES.INSPECTOR, false);
+
+  const overclaims: Array<[string, RegExp]> = [
+    ['the Inspector is given a tree it cannot write', /Inspector[^.]{0,90}read.only/i],
+    ['the tree itself is called restricted', /read.only[^.]{0,90}(?:worktree|tree|checkout)/i],
+  ];
+  for (const [label, pattern] of overclaims) {
+    assert.doesNotMatch(head, pattern, `src/contracts/worktree.ts: ${label}`);
+  }
+  assert.match(head, /one lease per campaign/i, 'say what the Engineer and Inspector share');
+  assert.match(head, /loadout/i, 'say where the Inspector\'s read-only-ness actually comes from');
+});
+
+test('the archive docs illustrate to_selector with a value that exists', async () => {
+  const spawned = await spawnedRoles();
+
+  // `src/contracts/archive.ts` is a sibling's file and states the caveat inline; these two did
+  // not, which is why they are the ones pinned here.
+  const cited: string[] = [];
+  for (const parts of [['archive', 'schema.ts'], ['archive', 'archive.ts']]) {
+    const text = await readSrc(...parts);
+    for (const match of text.matchAll(/role:([A-Z]+)/g)) {
+      const role = match[1] as string;
+      cited.push(role);
+      assert.ok(
+        spawned.has(role as Role),
+        `src/${parts.join('/')} illustrates to_selector with 'role:${role}', and nothing in this ` +
+          'build spawns one. An example is the only documentation most readers get; an example ' +
+          'that resolves to nobody teaches a shape that has never carried a message.',
+      );
+    }
+  }
+  assert.ok(cited.length > 0, 'the scan must find a selector example, or the loop above proves nothing');
+
+  // The one value that is actually written, in both places, and in the code that writes it.
+  const schema = await readSrc('archive', 'schema.ts');
+  assert.match(schema, /to_selector TEXT,[^\n]*'chain'/, 'the DDL comment leads with the real value');
+  assert.match(await readSrc('archive', 'archive.ts'), /'chain'/, 'so does the field doc');
+  assert.match(
+    await readSrc('command', 'campaign.ts'),
+    /toSelector: 'chain',/,
+    "the docs above say 'chain' is what gets written; this is the line that writes it",
   );
 });
 

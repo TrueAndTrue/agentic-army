@@ -128,7 +128,7 @@ const FROZEN_SIGNALS_BLOCK = `CREATE TABLE signals (
   ts          TEXT    NOT NULL,
   from_agent  TEXT    NOT NULL,
   to_agent    TEXT,                               -- explicit id…
-  to_selector TEXT,                               -- …or 'chain' / 'role:SCOUT' / 'owner:auth-schema'
+  to_selector TEXT,                               -- …or a selector. Only 'chain' is ever written.
   kind        TEXT    NOT NULL,                   -- order|report|query|answer|broadcast|status
   in_reply_to INTEGER REFERENCES signals(seq),
   body        TEXT    NOT NULL,                   -- capped

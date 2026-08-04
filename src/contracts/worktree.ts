@@ -1,12 +1,22 @@
 /**
  * Worktree isolation.
  *
- * Only Engineers need a worktree. The Inspector attaches read-only to the Engineer's worktree —
- * it must, to run the tests there — and Scouts and Sentries, when something spawns one, are
- * read-only against the primary checkout. Nothing in the current slice spawns either of those two
+ * ONE LEASE PER CAMPAIGN, HELD BY TWO WORKERS. `src/command/campaign.ts` calls `acquire` exactly
+ * once and hands the SAME `lease.path` to the Engineer's spawn and to the Inspector's — one
+ * writable tree, one `leaseId`, no second acquisition anywhere in the tree. The Inspector's tree
+ * is not attenuated and could not be: it runs the suite there, and a suite writes — caches,
+ * coverage, build output, the mutations mutation testing needs.
+ *
+ * What keeps the Inspector off the branch is its LOADOUT, not the filesystem. `ROLE_ALLOW` gives
+ * an INSPECTOR no Edit, no Write and no NotebookEdit (`src/command/permissions.ts`), so the
+ * independence of the review gate is a property of the permission set on the command line rather
+ * than of the tree the worker is standing in. Do not go looking for a mount flag that enforces
+ * it; there is not one, and a comment claiming otherwise would send the next reader hunting.
+ *
+ * Scouts and Sentries, when something spawns one, work against the primary checkout and lease
+ * nothing. Nothing in the current slice spawns either of those two
  * (`src/command/permissions.ts` says so where their allow-lists are defined), so that half is the
- * rule the seam is built to, not a description of traffic it carries today. Between them they cut
- * worktree demand ~4x.
+ * rule the seam is built to, not a description of traffic it carries today.
  *
  * ONE PROVIDER IMPLEMENTS THIS TODAY: the pooled git-worktree provider in `src/worktree/cold.ts`.
  * The seam is not vestigial — it is why replacing the original external tool was a swap rather

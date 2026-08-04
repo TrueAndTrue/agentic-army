@@ -212,7 +212,14 @@ export interface AgentOutcome {
 export interface NewSignal {
   fromAgent: string;
   toAgent?: string | null;
-  /** `chain` / `role:SCOUT` / `owner:auth-schema`, resolved and logged by the supervisor. */
+  /**
+   * The symbolic half of addressing, and the honest description of it is short: `'chain'` is the
+   * only value anything in this tree writes (`army campaign` opens with it). It is stored,
+   * indexed and queryable, and that is where it stops — nothing expands a selector into a set of
+   * recipients, so a selector is a LABEL on a row, never an address that reaches anybody.
+   * `role:ENGINEER` and `owner:auth-schema` are the SHAPE the column is built for. See
+   * `src/contracts/archive.ts` for what would trigger building the resolver.
+   */
   toSelector?: string | null;
   kind: SignalKind;
   /** The `seq` of the `query` this answers. */

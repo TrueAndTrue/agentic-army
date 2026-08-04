@@ -86,8 +86,9 @@ SETUP
                     ceiling. Run it from inside the repo.
 
 CAMPAIGNS
-  chat              Talk to a commanding officer that can dispatch work. It
-                    holds no tools; you approve what it sends out.
+  chat              Talk to a commanding officer that can dispatch work. Its
+                    loadout is one inert tool and nothing that opens a file;
+                    you approve what it sends out.
   campaign          Run one objective end to end: Engineer, review gate,
                     delivery up to the project ceiling.
   view              Read-only tree view of a campaign in flight.
@@ -108,8 +109,12 @@ ${firstRun}
   write access to that directory.
 
 RANKS   ☆ GENERAL   ◆ COLONEL   ◇ CAPTAIN   ▪ SERGEANT   · PRIVATE
-ROLES   SCOUT (find out)  ENGINEER (change)  INSPECTOR (verify)  SENTRY (wait)
-        COMMANDER (decide — holds no tools at all)
+ROLES   COMMANDER (decide)   ENGINEER (change)   INSPECTOR (verify)
+        A COMMANDER holds one inert tool and nothing that opens a file, runs a
+        command or reaches the network. That is what the chat session runs on,
+        and it is a permission set rather than a line in a briefing.
+        NOT YET FIELDED: SCOUT (find out), SENTRY (wait). They are declared so
+        the gap is stated rather than hidden; nothing in this build spawns one.
 `;
 }
 
