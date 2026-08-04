@@ -1,0 +1,65 @@
+{
+  "title": "Verdict",
+  "description": "The Inspector's return. Passed to codex as --output-schema <path> and to claude as --json-schema <path>. The Inspector is briefed from the ORIGINAL ORDERS plus the branch, never from the Engineer's account of what it did. Mirrors src/contracts/report.ts — test/contracts.test.ts fails if the two drift. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` at every level and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Both rules are asserted by test/contracts.test.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings", "testsRun", "testCommand"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "description": "pass = the branch satisfies the original orders; fail = it does not.",
+      "enum": ["pass", "fail"]
+    },
+    "summary": {
+      "type": "string",
+      "description": "One line justifying the verdict.",
+      "minLength": 1,
+      "maxLength": 280
+    },
+    "findings": {
+      "type": "array",
+      "description": "At most five. Any blocker means fail.",
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "testsRun": {
+      "type": "boolean",
+      "description": "Did the Inspector actually execute the suite, or only read? pass with testsRun=false is a distinguishable and suspicious state."
+    },
+    "testCommand": {
+      "type": ["string", "null"],
+      "description": "The exact command run, so a human can reproduce the verdict. null when no tests were run.",
+      "minLength": 1,
+      "maxLength": 512
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "message", "file", "line"],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": ["blocker", "major", "minor", "note"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "file": {
+          "type": ["string", "null"],
+          "description": "Repo-relative where possible, so it survives the worktree being returned. null when the finding is not about a file.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "description": "1-based. null when the finding is not about a line.",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,332 @@
+/**
+ * `army campaign` — argument parsing, rendering, exit codes.
+ *
+ * The orchestration is in `campaign.ts`; this file is the CLI skin over it. Keeping them apart is
+ * what lets `test/command.test.ts` drive a whole campaign — including every failure path — by
+ * calling `runCampaign` directly, with no argv, no terminal and no process to inspect.
+ */
+
+import * as path from 'node:path';
+
+import { archiveDurabilityNote } from '../archive/archive.ts';
+import { RUNG_LABEL, RUNGS } from '../contracts/delivery.ts';
+import type { Rung } from '../contracts/delivery.ts';
+import { invokedAs } from '../setup/checks.ts';
+import { renderFix } from '../setup/fixes.ts';
+
+import { CampaignSetupError, runCampaign } from './campaign.ts';
+import type { CampaignNote, CampaignOptions, CampaignResult, WriteStream } from './campaign.ts';
+
+export * from './campaign.ts';
+export * from './orders.ts';
+export * from './permissions.ts';
+
+/**
+ * Every line here that names a command to TYPE goes through `invokedAs()`; the title line does
+ * not, because "army campaign" there is the name of the command, not an instruction to run it.
+ *
+ * See the block above `invokedAs` in `checks.ts`: this text used to hardcode `army campaign "…"`
+ * in its USAGE, and `army` is not on PATH for `npx agentic-army`, `npm run dev --`, or a plain
+ * checkout — which is how the tool is invoked in three of the README's own first examples.
+ */
+export const CAMPAIGN_HELP = `
+army campaign — run one objective end to end
+
+  A CPT·ENGINEER (claude) takes a leased worktree, cuts \`army/<task-id>\` and
+  commits. Then the GENERAL — not the Engineer — spawns a CPT·INSPECTOR (codex),
+  briefed from the ORIGINAL orders and the branch, never from the Engineer's
+  account of what it did. On PASS the work is made durable and the delivery
+  ladder runs, clamped by the project ceiling. On FAIL a fresh Engineer retries
+  in the same worktree with the findings.
+
+USAGE
+  ${invokedAs()} campaign "<objective>" [options]
+
+OPTIONS
+  --rung <0|1|2>       Highest delivery rung to attempt. Clamped by the project
+                       ceiling, never raised by this flag. Default 2.
+  --attempts <n>       Total Engineer attempts including the first. Default 3.
+  --cwd <dir>          Project to fight the campaign in. Default: this directory.
+  --provider <id>      Worktree provider. There is one pooled provider today;
+                       the seam is what lets a devcontainer or a snapshotting
+                       filesystem take over later. Default: the pool.
+  --id <campaign-id>   Override the generated campaign id.
+  --json               Emit the result as JSON on stdout.
+  -h, --help           This.
+
+THE DELIVERY LADDER
+  0  commit         Durable in the army mirror. Your repo is untouched.
+  1  push           Branch on origin. No PR.
+  2  pull request   PR opened, Inspector verdict posted as a review.
+  3  merge          Not implemented in this build; requesting it refuses rather
+                    than quietly shipping rung 2 instead.
+
+  The ceiling lives in ~/.agentic-army/config.toml, keyed by absolute path, and
+  is never read from the repository being worked on. \`${invokedAs()} enlist\` sets it.
+
+WHAT LEAVES THE WORKTREE, AND WHEN
+  Durability is unconditional and happens BEFORE the lease is returned, on the
+  failure paths as well as the happy one — returning a lease resets and cleans
+  the tree, so anything left inside it is destroyed. If the work cannot be made
+  durable the worktree is deliberately RETAINED and the reason is printed.
+`;
+
+class UsageError extends Error {}
+
+export interface CampaignArgs {
+  objective: string;
+  requestedRung?: Rung;
+  maxAttempts?: number;
+  cwd?: string;
+  provider?: 'treehouse' | 'cold';
+  campaignId?: string;
+  json: boolean;
+  help: boolean;
+}
+
+function asRung(raw: string | undefined): Rung {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || !(RUNGS as readonly number[]).includes(value)) {
+    throw new UsageError(`--rung expects one of ${RUNGS.join(', ')}, got ${JSON.stringify(raw ?? '')}`);
+  }
+  return value as Rung;
+}
+
+export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
+  const args: CampaignArgs = { objective: '', json: false, help: false };
+  const positional: string[] = [];
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] as string;
+    const next = (): string | undefined => argv[++i];
+    switch (arg) {
+      case '-h':
+      case '--help':
+        args.help = true;
+        break;
+      case '--json':
+        args.json = true;
+        break;
+      case '--rung':
+        args.requestedRung = asRung(next());
+        break;
+      case '--attempts': {
+        const value = Number(next());
+        if (!Number.isInteger(value) || value < 1) {
+          throw new UsageError('--attempts expects a positive integer');
+        }
+        args.maxAttempts = value;
+        break;
+      }
+      case '--cwd': {
+        const value = next();
+        if (value === undefined) throw new UsageError('--cwd expects a path');
+        args.cwd = path.resolve(value);
+        break;
+      }
+      case '--provider': {
+        const value = next();
+        if (value !== 'treehouse' && value !== 'cold') {
+          throw new UsageError(`--provider expects treehouse or cold, got ${JSON.stringify(value ?? '')}`);
+        }
+        args.provider = value;
+        break;
+      }
+      case '--id': {
+        const value = next();
+        if (value === undefined) throw new UsageError('--id expects a campaign id');
+        args.campaignId = value;
+        break;
+      }
+      default:
+        if (arg.startsWith('-')) throw new UsageError(`unknown option ${arg}`);
+        positional.push(arg);
+        break;
+    }
+  }
+
+  if (!args.help) {
+    // Both of these are the FIRST thing a new user can get wrong, and both used to answer with a
+    // diagnosis and no example. The shape of the thing being asked for is the fix.
+    if (positional.length === 0) {
+      throw new UsageError(
+        `an objective is required, e.g. ${invokedAs()} campaign "add a multiply function to calc.js"`,
+      );
+    }
+    if (positional.length > 1) {
+      throw new UsageError(
+        `expected one objective, got ${String(positional.length)}. Quote it: ` +
+          `${invokedAs()} campaign "…"`,
+      );
+    }
+    args.objective = positional[0] as string;
+  }
+  return args;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------------------------
+
+const LEVEL_MARK: Record<CampaignNote['level'], string> = { info: '·', warn: '⚠', error: '✗' };
+
+/**
+ * @param self  The command prefix to print in front of every suggested next step. Defaults to the
+ *   detected invocation. It is a PARAMETER because a test that asserts on `invokedAs()`'s own
+ *   output cannot fail: on a machine with `army` installed it reads `army`, on one without it
+ *   reads `node …`, and either way the assertion agrees with whatever was produced. Injecting it
+ *   is what lets `test/command.test.ts` render with a known prefix and assert that the *hardcoded*
+ *   `army` is gone — the standing order to ask "can this test fail?".
+ */
+export function renderCampaignResult(result: CampaignResult, self: string = invokedAs()): string {
+  const lines: string[] = [];
+  lines.push('');
+  lines.push(`campaign ${result.campaignId}  —  ${result.outcome}`);
+  lines.push(`  project   ${result.project}`);
+  lines.push(`  task      ${result.taskId}`);
+  lines.push(`  branch    ${result.branch}`);
+  lines.push(
+    `  ceiling   ${result.ceiling} (${RUNG_LABEL[result.ceiling]})   requested ${result.requestedRung} (${RUNG_LABEL[result.requestedRung]})`,
+  );
+  lines.push(
+    result.deliveredRung === null
+      ? '  delivered nothing'
+      : `  delivered rung ${result.deliveredRung} (${RUNG_LABEL[result.deliveredRung]})`,
+  );
+  if (result.delivery !== null) {
+    const durability = result.delivery.durability;
+    lines.push(`  durable   ${durability.target.kind} ${durability.target.url}`);
+  }
+  lines.push(`  worktree  ${result.lease.state} — ${result.lease.reason}`);
+  lines.push('');
+
+  for (const attempt of result.attempts) {
+    // `testsRun` is rendered next to the verdict, and it is not a detail.
+    //
+    // `Verdict` keeps it as a separate field precisely because "`testsRun: false` with
+    // `verdict: 'pass'` is a distinguishable — and suspicious — state that a shared shape would
+    // hide". `report.md` and the rung-2 PR body already carried it; the terminal did not, so a
+    // pass from a reviewer that never ran anything looked exactly like a tested one on the only
+    // screen the user actually reads.
+    const verdict =
+      attempt.verdict === null
+        ? '—'
+        : `${attempt.verdict.verdict.toUpperCase()} ${
+            attempt.verdict.testsRun
+              ? `(tests run${
+                  attempt.verdict.testCommand === undefined
+                    ? ''
+                    : `: ${attempt.verdict.testCommand}`
+                })`
+              : '(NO TESTS RUN — verdict is from reading only)'
+          }`;
+    lines.push(
+      `  attempt ${String(attempt.attempt)}  ◇ ${attempt.engineerAgentId} (${attempt.engineerStatus})` +
+        `  →  ${attempt.inspectorAgentId ?? 'no inspector'} ${verdict}`,
+    );
+    if (attempt.report !== null) lines.push(`             ${attempt.report.summary}`);
+    if (attempt.verdict !== null) lines.push(`             ${attempt.verdict.summary}`);
+  }
+  if (result.attempts.length > 0) lines.push('');
+
+  for (const note of result.notes) {
+    lines.push(`  ${LEVEL_MARK[note.level]} ${note.message}`);
+    // The contract from `src/setup/checks.ts`, honoured here: an outcome that blocks owes the
+    // exact command that resolves it. Indented under its own note so a screen with several of
+    // them still reads as pairs.
+    if (note.fix !== undefined) lines.push(`    ${renderFix(note.fix)}`);
+  }
+  lines.push('');
+  lines.push(`  archive   ${result.campaignRoot}`);
+  lines.push(`            ${self} view ${result.campaignId}`);
+  lines.push('');
+  // =============================================================================================
+  // WHERE THE SQLITE DURABILITY DISCLOSURE BELONGS
+  //
+  // It is a true and useful note, and it was printed on EVERY campaign — including one that
+  // never leased a worktree, never ran a soldier and archived nothing but its own abort. On that
+  // screen it is the longest paragraph and the least relevant thing present, and a paragraph
+  // that is noise four times out of five is a paragraph the reader learns to skip on the fifth.
+  //
+  // The condition is "did this campaign put anything in the index that a power loss could take
+  // away, and that `rebuild` would have work to do about". That is exactly one attempt
+  // having been recorded: an attempt means agent rows, task rows and a `stream.jsonl` a reader
+  // may later cross-check against the index. A campaign with zero attempts wrote its own
+  // campaign row and a handful of signals it has just finished narrating on this very screen.
+  //
+  // It is NOT deleted, and it is not made hard to find: it prints on every campaign that ran a
+  // soldier, and `rebuild` — the command a user reaches for when they suspect the index —
+  // prints it unconditionally.
+  //
+  // It takes `self` for the same reason every other line here does: the note's payload is the
+  // clause naming the command that reconstructs the index, and that command has to be one the
+  // reader can actually type. See `archiveDurabilityNote` for why the constant became a function.
+  // =============================================================================================
+  if (result.attempts.length > 0) {
+    lines.push(`  ${archiveDurabilityNote(self)}`);
+    lines.push('');
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The command
+// ---------------------------------------------------------------------------------------------
+
+export interface CampaignCommandDeps {
+  stdout?: WriteStream;
+  stderr?: WriteStream;
+  /** Everything `runCampaign` accepts except the objective, for tests and for the CLI. */
+  overrides?: Partial<CampaignOptions>;
+}
+
+export async function campaignCommand(
+  argv: readonly string[],
+  deps: CampaignCommandDeps = {},
+): Promise<number> {
+  const stdout = deps.stdout ?? process.stdout;
+  const stderr = deps.stderr ?? process.stderr;
+  // Resolved once, and every command named below is built from it. See `renderCampaignResult`.
+  const self = invokedAs();
+
+  let args: CampaignArgs;
+  try {
+    args = parseCampaignArgs(argv);
+  } catch (error) {
+    stderr.write(`${self} campaign: ${(error as Error).message}\nTry \`${self} campaign --help\`.\n`);
+    return 1;
+  }
+
+  if (args.help) {
+    stdout.write(CAMPAIGN_HELP);
+    return 0;
+  }
+
+  const options: CampaignOptions = {
+    objective: args.objective,
+    ...(args.cwd === undefined ? {} : { cwd: args.cwd }),
+    ...(args.requestedRung === undefined ? {} : { requestedRung: args.requestedRung }),
+    ...(args.maxAttempts === undefined ? {} : { maxAttempts: args.maxAttempts }),
+    ...(args.provider === undefined ? {} : { worktreeProvider: args.provider }),
+    ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
+    ...deps.overrides,
+  };
+
+  let result: CampaignResult;
+  try {
+    result = await runCampaign(options);
+  } catch (error) {
+    stderr.write(`${self} campaign: ${error instanceof Error ? error.message : String(error)}\n`);
+    // The one refusal that happens before there is a campaign to hang a note on. It carries its
+    // own fix rather than leaving this the single path where a bare sentence escapes.
+    if (error instanceof CampaignSetupError) stderr.write(`  ${renderFix(error.fix)}\n`);
+    return 1;
+  }
+
+  if (args.json) {
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    stdout.write(renderCampaignResult(result, self));
+  }
+  return result.exitCode;
+}

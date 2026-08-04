@@ -1,0 +1,95 @@
+{
+  "title": "Report",
+  "description": "The schema-capped return of a working agent. Transport, not truth: full artifacts persist in the war archive and are reached through `artifacts`. Mirrors src/contracts/report.ts — test/contracts.test.ts fails if the two drift. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` at every level and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Both rules are asserted by test/contracts.test.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "findings", "artifacts", "branch", "costUsd"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "description": "done = the orders were carried out; blocked = stopped on something outside this agent's authority; failed = attempted and could not.",
+      "enum": ["done", "blocked", "failed"]
+    },
+    "summary": {
+      "type": "string",
+      "description": "One line. What happened, for a commander who will read nothing else.",
+      "minLength": 1,
+      "maxLength": 280
+    },
+    "findings": {
+      "type": "array",
+      "description": "At most five. More than five is a report.md, not a return value.",
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "Pointers to the big stuff: report.md, diff.patch, stream.jsonl, the branch, the PR.",
+      "maxItems": 20,
+      "items": { "$ref": "#/$defs/artifactRef" }
+    },
+    "branch": {
+      "type": ["string", "null"],
+      "description": "The army/<task-id> branch this agent cut. null if it cut none.",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "costUsd": {
+      "type": ["number", "null"],
+      "description": "Cost of this attempt, as reported by the harness. null if unknown.",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "message", "file", "line"],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": ["blocker", "major", "minor", "note"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "file": {
+          "type": ["string", "null"],
+          "description": "Repo-relative where possible, so it survives the worktree being returned. null when the finding is not about a file.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "description": "1-based. null when the finding is not about a line.",
+          "minimum": 1
+        }
+      }
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref", "note"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["file", "diff", "branch", "pr", "url", "log", "report"]
+        },
+        "ref": {
+          "type": "string",
+          "description": "A path, branch name, PR reference or url, depending on kind.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "note": {
+          "type": ["string", "null"],
+          "description": "One-line gloss. null when there is nothing to add.",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    }
+  }
+}

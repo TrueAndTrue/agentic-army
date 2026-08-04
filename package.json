@@ -1,0 +1,39 @@
+{
+  "name": "agentic-army",
+  "version": "0.1.0",
+  "description": "A war-hierarchy multi-agent orchestrator. The human is the Commander; everything below is an agent with a rank, a role, and a bounded authority.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "army": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "node src/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "smol-toml": "^1.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "agents",
+    "orchestrator",
+    "claude",
+    "codex",
+    "multi-agent"
+  ]
+}

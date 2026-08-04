@@ -1,0 +1,36 @@
+{
+  // Development config: type-check only. We never build during development —
+  // Node 24 strips types natively, so `node src/cli.ts` runs the source directly.
+  // The publish-time build lives in tsconfig.build.json.
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2023",
+    "lib": ["es2023"],
+    "types": ["node"],
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    // These two mechanically enforce the language constraints instead of
+    // relying on reviewer discipline:
+    //   verbatimModuleSyntax  -> every type-only import must say `import type`
+    //   erasableSyntaxOnly    -> no enum / namespace / decorators / parameter
+    //                            properties, i.e. nothing Node's type stripper
+    //                            would choke on.
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+
+    // Source imports carry the real `./x.ts` extension (required by Node's
+    // native type stripping); `rewriteRelativeImportExtensions` turns those
+    // into `./x.js` on emit so dist/ is valid ESM for Node 20.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

@@ -1,0 +1,19 @@
+{
+  // Publish-time build only. Invoked by `npm run build`, which `prepublishOnly`
+  // runs for us. Compiles src/**/*.ts -> dist/**/*.js so that installers only
+  // need Node 20 (no native type stripping required on their machine).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    // Source maps carry their sources inline. `files` never ships src/, so a
+    // map that merely points at ../src/foo.ts would dangle in the published
+    // package and produce useless stack traces on a user's machine.
+    "sourceMap": true,
+    "inlineSources": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["test"]
+}

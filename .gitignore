@@ -1,0 +1,28 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# npm/yarn/pnpm noise
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.tgz
+.npmrc
+
+# local scratch
+.DS_Store
+*.local
+.env
+.env.*
+!.env.example
+
+# the war archive lives in ~/.agentic-army, never in a repo — but if someone
+# points it here during development, do not commit it.
+.agentic-army/
+
+# the design document is kept internal and lives outside this checkout. This
+# entry is the second line of defence: a copy pasted back in during a working
+# session cannot be committed by accident. `test/doctor.test.ts` is the first —
+# it fails if any comment, string, schema description or README line in the
+# tree cites the document, so the code cannot come to depend on it again.
+DESIGN.md
