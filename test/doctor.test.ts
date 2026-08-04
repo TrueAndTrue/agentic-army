@@ -15,6 +15,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as nodePath from 'node:path';
@@ -52,6 +53,7 @@ import {
   inspectLegacyWorktreePool,
   inspectWritableDir,
   installHint,
+  homeDir,
   legacyWorktreePoolDir,
   parseVersion,
   resolveBinarySync,
@@ -65,6 +67,29 @@ import {
 import { parseDoctorArgs, wrap } from '../src/setup/doctor.ts';
 import { PROTECTED_CONFIG_GLOBS, defaultConfigToml, protectedConfigGlobs } from '../src/setup/init.ts';
 import { DEFAULT_CEILING, parseCeiling, parseEnlistArgs, type Rung } from '../src/setup/enlist.ts';
+
+/**
+ * A throwaway directory to hand anything that runs the REAL checks.
+ *
+ * `runChecks` inspects the home it is given, and inspecting means writing: `inspectWritableDir`
+ * proves writability by creating `.army-write-probe-<pid>` and removing it, because
+ * `access(W_OK)` lies on some network shares. Two tests in this file used to call
+ * `runChecks(2000)` and let the home default, which pointed that probe at the developer's own
+ * `~/.agentic-army` on every run of the suite.
+ *
+ * The directory exists before it is handed over, so the probe takes the branch it takes on a
+ * real machine rather than the "not there yet, is the parent writable" branch — the check under
+ * test is the one that writes.
+ */
+const SCRATCH_HOMES: string[] = [];
+function scratchHome(label: string): string {
+  const dir = fs.mkdtempSync(nodePath.join(fs.realpathSync(os.tmpdir()), `army-${label}-`));
+  SCRATCH_HOMES.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of SCRATCH_HOMES) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 // ===========================================================================
 // Version parsing — the thing most likely to silently misbehave
@@ -349,7 +374,7 @@ describe('the treehouse check is gone', () => {
 
   it('doctor reports no check with a treehouse id', async () => {
     const { runChecks } = await import('../src/setup/checks.ts');
-    const report = await runChecks(2000);
+    const report = await runChecks(2000, scratchHome('treehouse'));
     assert.ok(!report.checks.some((c) => c.id === ('treehouse' as never)));
     // And the replacement is present, because removing the check without adding the real
     // precondition would just be deleting coverage.
@@ -516,7 +541,7 @@ describe('the pool left at the old location is not silently orphaned', () => {
 
   it('runChecks reports the check by id', async () => {
     const { runChecks } = await import('../src/setup/checks.ts');
-    const report = await runChecks(2000);
+    const report = await runChecks(2000, scratchHome('stale-pool'));
     assert.ok(report.checks.some((c) => c.id === 'stale-worktree-pool'));
   });
 
@@ -3855,5 +3880,290 @@ describe('no fixture carries the environment of the machine that recorded it', (
       [],
       HOW_TO_SCRUB,
     );
+  });
+});
+
+// ===========================================================================
+// HERMETICITY — this file must not touch the developer's real ~/.agentic-army
+//
+// `test/command.test.ts` and `test/chat.test.ts` each audit ONE entry point: a campaign, and a
+// chat session. Both were green while `npm test` wrote into the real `~/.agentic-army` on every
+// run, because the write was not on either path. It came from here — two tests called
+// `runChecks(2000)`, let the home default to the ambient one, and `inspectWritableDir` proved
+// that directory writable the only way that is honest on a network share: by creating
+// `.army-write-probe-<pid>` in it and removing it again.
+//
+// So the audit had a hole with two sides, and both are closed below.
+//
+//   REACH. It observed one entry point and nothing else in the suite. The audit at the bottom of
+//   this section instruments THIS WHOLE FILE — it runs every test in it under the tripwire and
+//   reports what the process touched — so a call site that reaches for the ambient home is
+//   caught wherever in the file it is written, and by the guard rather than by a person
+//   noticing a directory's mtime moved.
+//
+//   APIS. The patch list carried `writeFileSync`, `appendFileSync` and `mkdirSync` and no way to
+//   remove anything at all. `fs.promises.rm` — the second half of the write probe — went
+//   unobserved, as did rename, copy, truncate and every other mutation. That list now lives in
+//   `test/fixtures/fs-audit.mjs`, covers creation, mutation and removal on both the sync and the
+//   promises APIs, and records the API name beside the path so a hit says what happened to it.
+//
+// The child processes below deliberately run with `NODE_TEST_CONTEXT` cleared. `homeDir()`
+// refuses to resolve the ambient home under the test runner, which is the mechanism that stops
+// this defect being written again — but if that refusal were also active in here, the audit
+// would be proving the tripwire rather than the code, and would stay green if the tripwire were
+// removed tomorrow. Cleared, the ambient home is genuinely reachable in the audited process,
+// so a hit means the code really would have written there.
+// ===========================================================================
+
+/** The tripwire itself, and the module URL every runner below imports it from. */
+const FS_AUDIT_MODULE = pathToFileURL(
+  nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), 'fixtures', 'fs-audit.mjs'),
+).href;
+
+/** Run a generated ESM script in a child, and hand back what it printed. */
+function runAuditChild(
+  source: string,
+  args: string[],
+  env: Record<string, string | undefined>,
+): { status: number | null; stdout: string; stderr: string } {
+  const dir = scratchHome('audit');
+  const runner = nodePath.join(dir, 'runner.mjs');
+  fs.writeFileSync(runner, source, 'utf8');
+  const result = spawnSync(process.execPath, [runner, ...args], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    env: { ...process.env, ...env, ARMY_FS_AUDIT: FS_AUDIT_MODULE, NODE_TEST_CONTEXT: undefined },
+  });
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
+describe('the fs tripwire the hermeticity audits are built on', () => {
+  // A detector nobody has watched fire is not a detector. Every audit below reports the ABSENCE
+  // of hits, and absence is exactly what a broken detector also reports — so the first thing to
+  // establish is that it fires, on a removal as well as on a write, since the removal is the
+  // half the previous patch list could not see.
+  const PROBE = String.raw`
+const audit = await import(process.env.ARMY_FS_AUDIT);
+const [root, outFile] = process.argv.slice(2);
+const fs = await import('node:fs');
+const fsp = await import('node:fs/promises');
+fs.writeFileSync(root + '/sync.txt', 'x');
+fs.renameSync(root + '/sync.txt', root + '/moved.txt');
+fs.rmSync(root + '/moved.txt');
+await fsp.writeFile(root + '/probe.txt', '');
+await fsp.rm(root + '/probe.txt', { force: true });
+// Outside the root: this runner's own source. It must pass straight through unrecorded, or
+// the tripwire is a "did anything happen" detector rather than a "did it happen HERE" one.
+fs.readFileSync(process.argv[1], 'utf8');
+fs.writeFileSync(outFile, JSON.stringify(audit.hitList()));
+`;
+
+  it('records the write, the rename and BOTH deletions, and nothing outside the root', () => {
+    const root = scratchHome('tripwire');
+    const out = nodePath.join(scratchHome('tripwire-out'), 'hits.json');
+    const child = runAuditChild(PROBE, [root, out], {
+      ARMY_AUDIT_ROOTS: JSON.stringify([root]),
+      ARMY_AUDIT_HOME: undefined,
+    });
+    assert.equal(child.status, 0, `the probe never finished: ${child.stderr}`);
+
+    const hits = JSON.parse(fs.readFileSync(out, 'utf8')) as string[];
+    const apis = hits.map((hit) => hit.split(' ')[0]);
+    for (const api of ['writeFileSync', 'renameSync', 'rmSync', 'writeFile', 'rm']) {
+      assert.ok(apis.includes(api), `the tripwire did not record ${api}: ${JSON.stringify(hits)}`);
+    }
+    // `renameSync` names two paths and both are recorded — moving a protected file out is a
+    // delete from the root, and recording only the source would call that a read.
+    assert.equal(hits.filter((hit) => hit.startsWith('renameSync ')).length, 2, JSON.stringify(hits));
+    for (const hit of hits) {
+      assert.ok(hit.includes(root + '/'), `a path outside the audited root was recorded: ${hit}`);
+    }
+  });
+
+  it('refuses to run at all when it has been given nothing to protect', () => {
+    // The one failure mode a green audit cannot distinguish from success: an empty root list
+    // matches nothing, records nothing, and passes. It has to be an error, not a default.
+    const child = runAuditChild(
+      'await import(process.env.ARMY_FS_AUDIT);\n',
+      [],
+      { ARMY_AUDIT_HOME: undefined, ARMY_AUDIT_ROOTS: undefined },
+    );
+    assert.notEqual(child.status, 0, 'an audit with no protected roots started up quite happily');
+    assert.match(child.stderr, /ARMY_AUDIT_HOME/);
+  });
+});
+
+describe('doctor confines itself to the home it was given', () => {
+  const RUNNER = String.raw`
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const [home, outFile] = process.argv.slice(2);
+
+const audit = await import(process.env.ARMY_FS_AUDIT);
+
+const { runChecks } = await import(process.env.ARMY_CHECKS_MODULE);
+let ids = [];
+let home_outcome = null;
+let error = null;
+try {
+  const report = await runChecks(2000, home);
+  ids = report.checks.map((c) => c.id);
+  home_outcome = (report.checks.find((c) => c.id === 'home') ?? {}).outcome ?? null;
+} catch (e) {
+  error = String(e && e.message);
+}
+require('node:fs').writeFileSync(outFile, JSON.stringify({ ids, home_outcome, error, hits: audit.hitList() }, null, 2));
+`;
+
+  it('runs every check against a temporary home and touches nothing under the real one', () => {
+    const home = scratchHome('doctor-run');
+    const out = nodePath.join(scratchHome('doctor-out'), 'audit.json');
+    const child = runAuditChild(RUNNER, [home, out], {
+      ARMY_AUDIT_HOME: os.homedir(),
+      ARMY_CHECKS_MODULE: pathToFileURL(nodePath.resolve('src/setup/checks.ts')).href,
+      AGENTIC_ARMY_HOME: undefined,
+    });
+    assert.equal(child.status, 0, `the audited doctor run exited ${String(child.status)}: ${child.stderr}`);
+
+    const audit = JSON.parse(fs.readFileSync(out, 'utf8')) as {
+      ids: string[];
+      home_outcome: string | null;
+      error: string | null;
+      hits: string[];
+    };
+    assert.equal(audit.error, null, 'the audited doctor run threw');
+    // The checks that touch a directory must actually have run, or the audit is of nothing.
+    for (const id of ['home', 'worktree-pool', 'stale-worktree-pool']) {
+      assert.ok(audit.ids.includes(id), `the ${id} check did not run: ${JSON.stringify(audit.ids)}`);
+    }
+    // And the write probe must have taken its writing branch. An `ok` home is only reachable by
+    // creating the probe file in that directory and removing it again.
+    assert.equal(audit.home_outcome, 'ok', 'the home check never reached the write probe');
+
+    assert.deepEqual(
+      audit.hits,
+      [],
+      'doctor touched the developer\'s real home while inspecting a temporary one. It writes a ' +
+        'probe file to prove writability, so a read here is the least of it:\n  ' +
+        audit.hits.join('\n  '),
+    );
+  });
+});
+
+/**
+ * Set in the child that runs this file under the tripwire, and read to skip the three audits in
+ * this section when it does.
+ *
+ * Without it the last one recurses forever. With it, a `skip` rather than a deletion: the child
+ * runs everything else in the file exactly as the suite does, which is the point — the audit is
+ * of this file's real behaviour, not of a reduced copy of it.
+ */
+const AUDITING_THIS_FILE = process.env['ARMY_HERMETIC_AUDIT_CHILD'] !== undefined;
+
+describe('this whole file, run under the tripwire', { skip: AUDITING_THIS_FILE }, () => {
+  /**
+   * Import the test file. `node:test` schedules and runs it in an ordinary node process exactly
+   * as it does under the runner, so this is the suite's own behaviour rather than a re-enactment
+   * of it. The hits are written on `exit`, once everything has finished.
+   */
+  const RUNNER = String.raw`
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const outFile = process.argv[2];
+
+const audit = await import(process.env.ARMY_FS_AUDIT);
+
+process.on('exit', () => {
+  require('node:fs').writeFileSync(outFile, JSON.stringify({ hits: audit.hitList() }, null, 2));
+});
+
+await import(process.env.ARMY_AUDIT_TEST_FILE);
+`;
+
+  it('touches ZERO paths under the real ~/.agentic-army, ~/.ssh or ~/.aws', () => {
+    const out = nodePath.join(scratchHome('file-audit'), 'audit.json');
+    const child = runAuditChild(RUNNER, [out], {
+      ARMY_AUDIT_HOME: os.homedir(),
+      ARMY_AUDIT_TEST_FILE: pathToFileURL(new URL(import.meta.url).pathname).href,
+      ARMY_HERMETIC_AUDIT_CHILD: '1',
+      // Unset, so the ambient home is genuinely reachable inside the audited process. Setting it
+      // would relocate every default and the audit would pass without proving anything.
+      AGENTIC_ARMY_HOME: undefined,
+    });
+
+    // ===================================================================================
+    // CAN THIS TEST FAIL?
+    //
+    // Four ways it could pass while proving nothing, so all four are asserted rather than
+    // assumed: the child never ran the file, it ran a handful of tests instead of all of them,
+    // its tests were CANCELLED rather than run — a cancelled run still prints `fail 0` — or it
+    // failed outright and the empty hit list is just the shape of a process that stopped early.
+    // ===================================================================================
+    const count = (label: string): number => {
+      const found = new RegExp(`^ℹ ${label} (\\d+)$`, 'm').exec(child.stdout);
+      assert.ok(found !== null, `the child printed no ${label} line:\n${child.stderr}`);
+      return Number(found[1]);
+    };
+    assert.ok(count('tests') > 200, `the child ran only ${String(count('tests'))} tests`);
+    assert.equal(count('fail'), 0, `tests failed inside the audited run:\n${child.stdout.slice(-4000)}`);
+    assert.equal(count('cancelled'), 0, 'tests were cancelled inside the audited run');
+    assert.equal(child.status, 0, `the audited run exited ${String(child.status)}: ${child.stderr}`);
+
+    const audit = JSON.parse(fs.readFileSync(out, 'utf8')) as { hits: string[] };
+    assert.deepEqual(
+      audit.hits,
+      [],
+      'a test in this file touched the developer\'s real ~/.agentic-army. Every check here takes ' +
+        'the directory it inspects as an argument — pass a temporary one. Each line below is the ' +
+        'fs API that did it and the path it was given:\n  ' +
+        audit.hits.join('\n  '),
+    );
+  });
+});
+
+/**
+ * The mechanism, guarded.
+ *
+ * Skipped inside the audit child, and the reason is the point: that child runs with
+ * `NODE_TEST_CONTEXT` cleared precisely so the refusal is DISARMED and the audit observes what
+ * the code would really do. A test of the refusal has nothing to watch there.
+ */
+describe('a test cannot resolve the home from the ambient environment', { skip: AUDITING_THIS_FILE }, () => {
+  it('homeDir() refuses under the test runner, and names the way to opt in', () => {
+    // The precondition. If something upstream had set the override, the refusal below would be
+    // untested and this whole guard would pass for the wrong reason.
+    assert.equal(process.env['AGENTIC_ARMY_HOME'], undefined);
+    assert.ok(process.env['NODE_TEST_CONTEXT'] !== undefined, 'this is not running under the runner');
+    assert.throws(() => homeDir(), /refusing to resolve the home directory/);
+  });
+
+  it('and answers normally the moment a test says which directory it means', () => {
+    const dir = scratchHome('explicit');
+    process.env['AGENTIC_ARMY_HOME'] = dir;
+    try {
+      assert.equal(homeDir(), dir);
+    } finally {
+      delete process.env['AGENTIC_ARMY_HOME'];
+    }
+  });
+
+  it('outside the runner it still defaults, so the real command is untouched', () => {
+    // The cost of a tripwire in shipped code is that it might fire in the field. It cannot:
+    // `NODE_TEST_CONTEXT` is set by the node test runner in the processes it spawns and by
+    // nothing else, and this child has neither it nor the override.
+    const child = runAuditChild(
+      String.raw`
+const { homeDir } = await import(process.env.ARMY_CHECKS_MODULE);
+process.stdout.write(homeDir());
+`,
+      [],
+      {
+        ARMY_CHECKS_MODULE: pathToFileURL(nodePath.resolve('src/setup/checks.ts')).href,
+        ARMY_AUDIT_HOME: os.homedir(),
+        AGENTIC_ARMY_HOME: undefined,
+      },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stdout, nodePath.join(os.homedir(), '.agentic-army'));
   });
 });

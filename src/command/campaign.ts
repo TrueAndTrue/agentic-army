@@ -549,7 +549,12 @@ export interface SoldierRun {
   durationMs: number | null;
   /** The parsed schema-constrained return, or undefined when the run produced none. */
   structured: unknown;
-  /** `permission_denials` from the harness. Each becomes a signal row — a denial is a breach. */
+  /**
+   * `permission_denials` from the harness. Each becomes a signal row — a denial is a breach.
+   *
+   * Allow-list misses only. A deny-rule refusal never appears in this array at all; see
+   * `recordDenials` for what that costs and where the evidence does survive.
+   */
   denials: unknown[];
   /** Adapter-level error messages, for a readable archive when nothing else survived. */
   errors: string[];
@@ -2004,7 +2009,26 @@ async function releaseLease(input: SettleLeaseInput, why: string): Promise<Lease
 // Odds and ends
 // ---------------------------------------------------------------------------------------------
 
-/** A denied action writes a signal row — a permission denial IS a ceiling breach. */
+/**
+ * A reported denial writes a signal row — a permission denial IS a ceiling breach.
+ *
+ * THE ROW COUNT IS A FLOOR, NOT A TOTAL, and what is missing from it is the half a reader
+ * most wants. Measured against claude 2.1.221: a tool call that MISSES THE ALLOW-LIST is
+ * reported in `permission_denials` on the result line and reaches this function. A call that
+ * HITS AN EXPLICIT DENY RULE is not — the refusal comes back only as `is_error` on that call's
+ * `tool_result`, and `permission_denials` stays empty. The global deny-list is what holds the
+ * ceiling against a squad member, so at depth >= 1 the breach this signal exists to raise is
+ * exactly the breach it cannot see.
+ *
+ * That is the harness's behaviour and is not fixable here. What is fixable is the reading:
+ * a signals file with no `permission denied` row means nothing was refused for missing the
+ * allow-list. It does NOT mean nothing was refused, and it does not mean no ceiling was
+ * breached. Anything that treats these rows as a clean bill of health — a reviewer scanning
+ * the log, the `view` command's rendering of it, a future gate that refuses to deliver when a
+ * breach was recorded — is drawing a conclusion the rows cannot carry. The evidence that a
+ * subordinate was refused at depth is the `is_error` tool_result in `stream.jsonl`, which is
+ * archived losslessly and is the only place it survives.
+ */
 function recordDenials(
   archive: CampaignArchive,
   agentId: string,

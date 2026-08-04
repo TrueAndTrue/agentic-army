@@ -74,6 +74,7 @@ import type { Rank, Report, Role, Rung, Verdict } from '../src/contracts/index.t
 // The loadout table itself, so the claims a contract file makes about a role's tools are checked
 // against the rules this process actually puts on a command line — not against a retyped list.
 import { ROLE_ALLOW, toolNameOf } from '../src/command/permissions.ts';
+import { CHAT_HELP } from '../src/command/chat.ts';
 
 // Used only to prove a multi-line string value survived surgery unchanged.
 import { parse as parseTomlForTest } from 'smol-toml';
@@ -1936,7 +1937,51 @@ async function spawnedRoles(): Promise<Set<Role>> {
   return found;
 }
 
-test('the COMMANDER doc names the tool it holds and says why the list is never emptied', async () => {
+/**
+ * Wordings that name the dangerous configuration as if it were the safe one.
+ *
+ * `has NO tools` is in here because it was the last surviving copy of the claim and it was in
+ * `army chat --help` — the text a person reads while deciding whether to trust the thing. The
+ * earlier version of this list only matched `holds no tools`, so a sentence one verb away from
+ * an identical falsehood walked straight through the guard that exists to catch it.
+ */
+const COMMANDER_OVERCLAIMS: ReadonlyArray<[string, RegExp]> = [
+  ['the loadout is described as absent', /loadout is\s+\*?\s*nothing/i],
+  [
+    'the role is said to carry no tool at all',
+    /(?:holds?|has|have|carries|carry|with|given)\s+no tools|no tools at all|without any tools/i,
+  ],
+  ['an emptied list is called the strict one', /empty allow-list is (?:the )?(?:safest|most restrictive|strictest)/i],
+];
+
+/**
+ * The loadout claim, checked against `ROLE_ALLOW` on every surface that makes it.
+ *
+ * Derived, never pinned: whatever the map gives a COMMANDER, each of these texts names it, so
+ * widening the list forces every sentence describing it to be rewritten. And each text must also
+ * carry the REASON the list is never emptied — omitting the false half is not enough, or the
+ * next simplification pass takes the one tool out and nothing in the prose objects.
+ */
+function assertDescribesTheCommanderLoadout(where: string, text: string): void {
+  assert.ok(
+    ROLE_ALLOW.COMMANDER.length > 0,
+    'a COMMANDER allow-list with nothing in it drops --allowedTools and inherits every tool',
+  );
+  for (const rule of ROLE_ALLOW.COMMANDER) {
+    assert.ok(
+      text.includes(toolNameOf(rule)),
+      `ROLE_ALLOW.COMMANDER holds ${toolNameOf(rule)} and ${where} does not mention it. A ` +
+        'loadout the text does not name is a loadout the next reader will feel free to remove.',
+    );
+  }
+  for (const [label, pattern] of COMMANDER_OVERCLAIMS) {
+    assert.doesNotMatch(text, pattern, `${where}: ${label}`);
+  }
+  assert.match(text, /--allowedTools/, `${where}: name the flag that goes missing`);
+  assert.match(text, /most permissive/i, `${where}: say what an emptied list actually produces`);
+}
+
+test('every surface describing the COMMANDER names the tool it holds, and why it is never emptied', async () => {
   const text = await readSrc('contracts', 'ranks.ts');
   const start = text.indexOf('COMMANDER is the branch of service');
   const end = text.indexOf('export const ROLES');
@@ -1944,35 +1989,13 @@ test('the COMMANDER doc names the tool it holds and says why the list is never e
   const block = text.slice(start, end);
   assert.ok(block.includes('army chat'), 'the slice selected the doc block, not an empty match');
 
-  // The loadout is not a literary question. Whatever ROLE_ALLOW gives a COMMANDER, the contract
-  // file names it — so widening the list forces the sentence describing it to be rewritten.
-  assert.ok(
-    ROLE_ALLOW.COMMANDER.length > 0,
-    'a COMMANDER allow-list with nothing in it drops --allowedTools and inherits every tool',
-  );
-  for (const rule of ROLE_ALLOW.COMMANDER) {
-    assert.ok(
-      block.includes(toolNameOf(rule)),
-      `ROLE_ALLOW.COMMANDER holds ${toolNameOf(rule)} and the contract doc does not mention it. ` +
-        'The doc is where a reader decides what the role IS; a loadout it does not name is a ' +
-        'loadout the next reader will feel free to remove.',
-    );
-  }
+  // The contract doc, where a reader decides what the role IS.
+  assertDescribesTheCommanderLoadout('src/contracts/ranks.ts', block);
 
-  // Wordings that name the dangerous configuration as if it were the safe one.
-  const overclaims: Array<[string, RegExp]> = [
-    ['the loadout is described as absent', /loadout is\s+\*?\s*nothing/i],
-    ['the role is said to carry no tool at all', /holds? no tools|no tools at all|without any tools/i],
-    ['an emptied list is called the strict one', /empty allow-list is (?:the )?(?:safest|most restrictive|strictest)/i],
-  ];
-  for (const [label, pattern] of overclaims) {
-    assert.doesNotMatch(block, pattern, `src/contracts/ranks.ts: ${label}`);
-  }
-
-  // Omitting the false half is not enough — the reason has to be on the page, or the next
-  // simplification pass takes the one tool out and nothing in the prose objects.
-  assert.match(block, /--allowedTools/, 'name the flag that goes missing');
-  assert.match(block, /most permissive/i, 'say what an emptied list actually produces');
+  // And the help, where a USER decides what it is. Same derivation, same list, one guard: two
+  // guards over the same property is how the second one ends up weaker than the first.
+  assert.ok(CHAT_HELP.includes('COL·COMMANDER'), 'the help must describe the role to be checked');
+  assertDescribesTheCommanderLoadout('CHAT_HELP in src/command/chat.ts', CHAT_HELP);
 });
 
 test('the --help roster names every role, and marks exactly the ones nothing spawns', async () => {

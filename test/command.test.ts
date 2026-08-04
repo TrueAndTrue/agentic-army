@@ -2284,6 +2284,35 @@ describe('failure paths', () => {
     assert.equal(result.lease.state, 'released');
   });
 
+  it('and the signal log says out loud which denials never reach it', () => {
+    // The test above proves a denial becomes a row. It cannot prove the converse, and the
+    // converse is what a reader assumes: that no row means no breach. It does not. An allow-list
+    // MISS is reported in `permission_denials`; an explicit DENY-RULE hit comes back only as
+    // `is_error` on the tool_result, measured against claude 2.1.221. Since the deny-list is
+    // what holds the ceiling against a squad member, the signal is blind at depth >= 1 to the
+    // one breach it exists for.
+    //
+    // Nothing in this repo can fix that. This pins the ADMISSION, because a limitation that is
+    // known and unwritten is indistinguishable from one nobody found — and the next reader of a
+    // clean log is the person it costs.
+    const source = fs.readFileSync(new URL('../src/command/campaign.ts', import.meta.url), 'utf8');
+    const at = source.indexOf('function recordDenials(');
+    assert.ok(at > 0, 'recordDenials has moved; this guard is pointing at nothing');
+    const doc = source.slice(source.lastIndexOf('/**', at), at);
+    assert.ok(doc.length > 400, 'the docblock on recordDenials was not found');
+
+    for (const [what, pattern] of [
+      ['names the shape the refusal actually arrives in', /is_error/],
+      ['names where it arrives', /tool_result/],
+      ['says the count is not a total', /floor, not a total/i],
+      ['says which depth is blind', /depth >= 1/],
+      ['says an empty log is not proof', /does NOT mean nothing was refused/],
+      ['points at the evidence that does survive', /stream\.jsonl/],
+    ] as const) {
+      assert.match(doc, pattern, `recordDenials no longer ${what}`);
+    }
+  });
+
   it('a HOSTILE branch in the report never reaches the Inspector, on disk or on the wire', async () => {
     // THE BLOCKER, END TO END. `inspectorFactsFrom` used to PREFER `report.branch` over the
     // branch the supervisor cut, so this payload reached `agents/<inspector>/orders.md` AND the
@@ -2676,51 +2705,20 @@ describe('failure paths', () => {
  * the suite would have executed whatever `post_create` was configured there.
  *
  * A grep cannot prove the fix, because the next default that falls back to the real home will be
- * spelled differently. So this AUDITS: a child process patches `node:fs` and `node:fs/promises`
- * BEFORE anything else is imported — which is the only order in which patching a builtin works,
- * an ESM named import snapshots its binding at link time — runs a whole campaign, and reports
- * every path the process touched under a protected root.
+ * spelled differently. So this AUDITS: a child process installs the tripwire in
+ * `test/fixtures/fs-audit.mjs` BEFORE anything else is imported — which is the only order in
+ * which patching a builtin works, an ESM named import snapshots its binding at link time — runs
+ * a whole campaign, and reports every path the process touched under a protected root.
  *
- * SCOPE, stated because a guard that overstates itself is worse than none: this covers the
- * campaign process itself. Subprocesses (git, the fake harnesses) have their own file tables and
- * are not instrumented here; what they are given is `env: {}` and an explicit `cwd`.
+ * The tripwire, the protected roots and the honest account of what it cannot see all live in
+ * that fixture. This file supplies only the thing to run underneath it.
  */
 const AUDIT_RUNNER = String.raw`
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const [homeDir, repo, armyHome, claudeBin, codexBin, outFile] = process.argv.slice(2);
+const [repo, armyHome, claudeBin, codexBin, outFile] = process.argv.slice(2);
 
-const protectedRoots = [
-  homeDir + '/.agentic-army',
-  homeDir + '/.ssh',
-  homeDir + '/.aws',
-  homeDir + '/.config/gh',
-];
-const hits = new Set();
-const record = (value) => {
-  if (typeof value !== 'string') {
-    if (value instanceof URL) value = value.pathname;
-    else if (Buffer.isBuffer(value)) value = value.toString('utf8');
-    else return;
-  }
-  for (const root of protectedRoots) if (value === root || value.startsWith(root + '/')) hits.add(value);
-};
-
-// Patch the CJS exports object. Every ESM consumer of a builtin resolves through it, PROVIDED the
-// patch lands before the consumer is linked — hence the dynamic import at the bottom.
-for (const [mod, names] of [
-  [require('node:fs'), ['readFileSync','readFile','existsSync','statSync','stat','lstatSync','openSync','open','readdirSync','readdir','realpathSync','realpath','accessSync','access','writeFileSync','appendFileSync','mkdirSync','createReadStream']],
-  [require('node:fs/promises'), ['readFile','stat','lstat','open','readdir','realpath','access','writeFile','appendFile','mkdir']],
-]) {
-  for (const name of names) {
-    const original = mod[name];
-    if (typeof original !== 'function') continue;
-    mod[name] = function patched(first, ...rest) {
-      record(first);
-      return original.call(this, first, ...rest);
-    };
-  }
-}
+const audit = await import(process.env.ARMY_FS_AUDIT);
 
 const { runCampaign } = await import(process.env.ARMY_CAMPAIGN_MODULE);
 let outcome = 'threw';
@@ -2739,7 +2737,7 @@ try {
 } catch (error) {
   outcome = 'threw: ' + (error && error.message);
 }
-require('node:fs').writeFileSync(outFile, JSON.stringify({ outcome, hits: [...hits] }, null, 2));
+require('node:fs').writeFileSync(outFile, JSON.stringify({ outcome, hits: audit.hitList() }, null, 2));
 `;
 
 describe('the suite is hermetic (never reads the real ~/.agentic-army)', () => {
@@ -2752,16 +2750,17 @@ describe('the suite is hermetic (never reads the real ~/.agentic-army)', () => {
     const repo = makeRepo('audit-repo');
     const armyHome = makeHome({ [repo]: 0 });
     const bins = makeHarnesses('audit', 'ok', ['pass']);
-    const realHome = os.homedir();
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(
         process.execPath,
-        [runner, realHome, repo, armyHome, bins.claudeBin, bins.codexBin, out],
+        [runner, repo, armyHome, bins.claudeBin, bins.codexBin, out],
         {
           stdio: ['ignore', 'pipe', 'pipe'],
           env: {
             ...GIT_ENV,
+            ARMY_AUDIT_HOME: os.homedir(),
+            ARMY_FS_AUDIT: pathToFileURL(path.resolve('test/fixtures/fs-audit.mjs')).href,
             ARMY_CAMPAIGN_MODULE: pathToFileURL(
               path.resolve('src/command/campaign.ts'),
             ).href,
@@ -2781,8 +2780,9 @@ describe('the suite is hermetic (never reads the real ~/.agentic-army)', () => {
     assert.deepEqual(
       audit.hits,
       [],
-      'a campaign read the developer\'s real home. The worktree pool reads <home>/config.toml ' +
-        'for post_create hooks, and a hook is arbitrary command execution:\n  ' +
+      'a campaign touched the developer\'s real home. The worktree pool reads <home>/config.toml ' +
+        'for post_create hooks, and a hook is arbitrary command execution. Each line below is ' +
+        'the fs API that did it and the path it was given:\n  ' +
         audit.hits.join('\n  '),
     );
   });

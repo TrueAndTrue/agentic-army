@@ -34,6 +34,7 @@ import * as path from 'node:path';
 
 import { installWarningFilter } from '../archive/db.ts';
 import {
+  HOME_ENV_VAR,
   armyHome,
   normalizePathForCompare as normalizePath,
   realpathOrResolve,
@@ -1273,8 +1274,32 @@ export async function probe(
  * two modules disagreeing about where the config lives is a silent security
  * failure — `army enlist` writes a ceiling the campaign runner never reads —
  * so the copy is gone rather than pinned.
+ *
+ * UNDER THE TEST RUNNER IT REFUSES rather than defaulting, and that is the whole mechanism
+ * behind the hermeticity of this module. `inspectWritableDir` proves writability by writing a
+ * real probe file and deleting it — deliberately, because `access(W_OK)` lies on some network
+ * shares — so any code path that reaches it with an ambiently-resolved home MUTATES the
+ * developer's own archive directory. Two tests did exactly that for months by calling
+ * `runChecks(2000)` and letting the home default: they were invisible because nothing was
+ * asserted about the home, and a probe file that is deleted a millisecond later leaves nothing
+ * to notice.
+ *
+ * A defaulted parameter cannot hold that line: the next caller forgets it the same way these
+ * two did, and forgetting is silent. Refusing is not. Nothing outside a test process is
+ * affected — `NODE_TEST_CONTEXT` is set by the node test runner in the processes it spawns and
+ * by nothing else — and a test that genuinely wants the real home can still say so by setting
+ * the override to it, which is an opt-in a reviewer can see.
  */
 export function homeDir(): string {
+  const override = process.env[HOME_ENV_VAR];
+  if ((override === undefined || override.trim() === '') && process.env['NODE_TEST_CONTEXT'] !== undefined) {
+    throw new Error(
+      `refusing to resolve the home directory from the ambient environment inside a test: ` +
+        `${HOME_ENV_VAR} is unset, so this would resolve the developer's own archive, and the ` +
+        `writability probe writes into whatever it is handed. Pass an explicit directory (` +
+        `runChecks takes one), or set ${HOME_ENV_VAR} to a temporary directory for this test.`,
+    );
+  }
   return armyHome(process.env);
 }
 
@@ -1512,8 +1537,17 @@ export type DoctorReport = {
  * Run every check concurrently. They are all independent subprocess spawns;
  * serialising them would make `army doctor` feel broken (~8 × process startup).
  * Result order is fixed regardless of completion order.
+ *
+ * `home` is threaded through every directory check rather than each one reaching for
+ * `homeDir()` on its own, so the whole report is about ONE directory and a caller can say which.
+ * The default is the ambient home, which is what the real command wants and what a test cannot
+ * have: `homeDir()` refuses under the test runner, so omitting this argument there is a loud
+ * failure rather than a write into the developer's archive.
  */
-export async function runChecks(timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<DoctorReport> {
+export async function runChecks(
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  home: string = homeDir(),
+): Promise<DoctorReport> {
   const started = Date.now();
   const platform = process.platform;
 
@@ -1537,13 +1571,13 @@ export async function runChecks(timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise
     return classifyGh(version, auth, platform);
   };
 
-  const homeCheck = async (): Promise<CheckResult> => classifyHome(await inspectHome());
+  const homeCheck = async (): Promise<CheckResult> => classifyHome(await inspectHome(home));
 
   const worktreePoolCheck = async (): Promise<CheckResult> =>
-    classifyWorktreePool(await inspectWritableDir(worktreePoolDir()));
+    classifyWorktreePool(await inspectWritableDir(worktreePoolDir(home)));
 
   const staleWorktreePoolCheck = async (): Promise<CheckResult> =>
-    classifyStaleWorktreePool(await inspectLegacyWorktreePool());
+    classifyStaleWorktreePool(await inspectLegacyWorktreePool(legacyWorktreePoolDir(home)));
 
   const sqliteCheck = async (): Promise<CheckResult> => {
     const r = await canImportSqlite();
@@ -1568,7 +1602,7 @@ export async function runChecks(timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise
     outcome: worstOutcome(checks),
     counts: countOutcomes(checks),
     checks,
-    homeDir: homeDir(),
+    homeDir: home,
     invokedAs: invocation(),
     elapsedMs: Date.now() - started,
   };

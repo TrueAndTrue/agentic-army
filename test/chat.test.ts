@@ -2008,49 +2008,21 @@ describe('army chat — the command', () => {
  * session including a dispatch.
  *
  * A grep cannot prove this, because the next default that falls back to the real home will be
- * spelled differently. So a child process patches `node:fs` and `node:fs/promises` BEFORE
- * anything else is imported — the only order in which patching a builtin works, since an ESM
- * named import snapshots its binding at link time — runs the session, and reports every path it
- * touched under a protected root.
+ * spelled differently. So a child process installs the tripwire in `test/fixtures/fs-audit.mjs`
+ * BEFORE anything else is imported — the only order in which patching a builtin works, since an
+ * ESM named import snapshots its binding at link time — runs the session, and reports every path
+ * it touched under a protected root.
  *
- * SCOPE: this covers the chat process itself. Subprocesses (git, the fake harnesses) have their
- * own file tables and are not instrumented; what they are given is `env: {}` and an explicit cwd.
+ * The tripwire, the protected roots and what it cannot see are all stated in that fixture. This
+ * file supplies only the session to run underneath it. The list used to be inline here and inline
+ * again in `test/command.test.ts`, and the two had already drifted.
  */
 const AUDIT_RUNNER = String.raw`
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const [homeDir, repo, armyHome, commanderBin, claudeBin, codexBin, outFile] = process.argv.slice(2);
+const [repo, armyHome, commanderBin, claudeBin, codexBin, outFile] = process.argv.slice(2);
 
-const protectedRoots = [
-  homeDir + '/.agentic-army',
-  homeDir + '/.agentic-army-trees',
-  homeDir + '/.ssh',
-  homeDir + '/.aws',
-  homeDir + '/.config/gh',
-];
-const hits = new Set();
-const record = (value) => {
-  if (typeof value !== 'string') {
-    if (value instanceof URL) value = value.pathname;
-    else if (Buffer.isBuffer(value)) value = value.toString('utf8');
-    else return;
-  }
-  for (const root of protectedRoots) if (value === root || value.startsWith(root + '/')) hits.add(value);
-};
-
-for (const [mod, names] of [
-  [require('node:fs'), ['readFileSync','readFile','existsSync','statSync','stat','lstatSync','openSync','open','readdirSync','readdir','realpathSync','realpath','accessSync','access','writeFileSync','appendFileSync','mkdirSync','createReadStream']],
-  [require('node:fs/promises'), ['readFile','stat','lstat','open','readdir','realpath','access','writeFile','appendFile','mkdir']],
-]) {
-  for (const name of names) {
-    const original = mod[name];
-    if (typeof original !== 'function') continue;
-    mod[name] = function patched(first, ...rest) {
-      record(first);
-      return original.call(this, first, ...rest);
-    };
-  }
-}
+const audit = await import(process.env.ARMY_FS_AUDIT);
 
 const { runChat } = await import(process.env.ARMY_CHAT_MODULE);
 const { createScriptedIo } = await import(process.env.ARMY_CHAT_IO_MODULE);
@@ -2074,7 +2046,7 @@ try {
 } catch (error) {
   outcome = 'threw: ' + (error && error.message);
 }
-require('node:fs').writeFileSync(outFile, JSON.stringify({ outcome, dispatched, hits: [...hits] }, null, 2));
+require('node:fs').writeFileSync(outFile, JSON.stringify({ outcome, dispatched, hits: audit.hitList() }, null, 2));
 `;
 
 describe('the suite is hermetic (a chat never reads the real ~/.agentic-army)', () => {
@@ -2089,16 +2061,16 @@ describe('the suite is hermetic (a chat never reads the real ~/.agentic-army)', 
       `on it.\n\n${dispatchBlock('add a multiply function to calc.js')}`,
       'passed.',
     ]);
-    const realHome = os.homedir();
-
     await new Promise<void>((resolve, reject) => {
       const child = spawn(
         process.execPath,
-        [runner, realHome, rig.repo, rig.home, rig.commanderBin, rig.claudeBin, rig.codexBin, out],
+        [runner, rig.repo, rig.home, rig.commanderBin, rig.claudeBin, rig.codexBin, out],
         {
           stdio: ['ignore', 'pipe', 'pipe'],
           env: {
             ...GIT_ENV,
+            ARMY_AUDIT_HOME: os.homedir(),
+            ARMY_FS_AUDIT: pathToFileURL(path.resolve('test/fixtures/fs-audit.mjs')).href,
             ARMY_CHAT_MODULE: pathToFileURL(path.resolve('src/chat/run.ts')).href,
             ARMY_CHAT_IO_MODULE: pathToFileURL(path.resolve('src/chat/io.ts')).href,
           },
@@ -2122,7 +2094,9 @@ describe('the suite is hermetic (a chat never reads the real ~/.agentic-army)', 
     assert.deepEqual(
       audit.hits,
       [],
-      'a chat session read the developer\'s real home:\n  ' + audit.hits.join('\n  '),
+      'a chat session touched the developer\'s real home. Each line is the fs API that did it ' +
+        'and the path it was given:\n  ' +
+        audit.hits.join('\n  '),
     );
   });
 });

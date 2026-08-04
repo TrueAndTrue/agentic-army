@@ -31,8 +31,11 @@ import { renderFix } from '../setup/fixes.ts';
 export const CHAT_HELP = `
 army chat — a live session with a commanding officer
 
-  A COL·COMMANDER (claude) holds one persistent duplex session. It has NO tools:
-  no Read, no Grep, no Edit, no Bash, no network. That is a permission set, not a
+  A COL·COMMANDER (claude) holds one persistent duplex session. Its whole loadout
+  is TodoWrite — no Read, no Grep, no Edit, no Bash, no network — and one inert
+  tool rather than none, because an emptied allow-list is the most permissive
+  spec this can emit: it drops --allowedTools and inherits every tool there is.
+  What the commander holds is a permission set, not a
   request — it is what keeps the window that holds your objective from being
   spent one source file at a time.
 
