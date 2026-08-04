@@ -87,10 +87,15 @@ export const SUBSTRATE: Record<Rank, Substrate> = {
  * Officers never edit files.
  *
  * This is simultaneously the context guard and the safety property: the ranks holding strategy
- * are structurally incapable of a bad `rm`. Enforced downstream by the permission allow-list
- *; this map is the single source of truth that generator consults.
+ * are structurally incapable of a bad `rm`.
  *
- * CAPTAIN is the lowest rank with a worktree and the highest rank that writes.
+ * `permissionsFor` in `src/command/permissions.ts` reads this map on every spawn and subtracts
+ * the write-capable tools — Edit, Write, NotebookEdit and the shell — from the loadout of any
+ * rank whose entry is `false`, whatever its role asked for, and names them on the deny half as
+ * well. Flip an entry here and the tools a worker of that rank receives change; there is no
+ * second copy to keep in step and no generator to re-run.
+ *
+ * CAPTAIN is the highest rank that writes.
  */
 export const WRITES_FILES: Record<Rank, boolean> = {
   GENERAL: false,
@@ -100,7 +105,15 @@ export const WRITES_FILES: Record<Rank, boolean> = {
   PRIVATE: true,
 };
 
-/** Roles that write files at all. Intersected with `WRITES_FILES` by rank. */
+/**
+ * Roles that write files at all — meaning HOLD Edit/Write/NotebookEdit, not "cannot cause a byte
+ * to change". An INSPECTOR runs `npm test` in a writable tree and is `false` here regardless,
+ * because the review gate's independence comes from it never holding an editing tool.
+ *
+ * Intersected with `WRITES_FILES` by rank in `writesFiles` below. Checked against the loadout it
+ * describes on every spawn: `permissionsFor` refuses a role whose `ROLE_ALLOW` entry disagrees
+ * with this map, in either direction, so the two cannot drift apart in silence.
+ */
 export const ROLE_WRITES_FILES: Record<Role, boolean> = {
   SCOUT: false,
   ENGINEER: true,
@@ -109,14 +122,17 @@ export const ROLE_WRITES_FILES: Record<Role, boolean> = {
   COMMANDER: false,
 };
 
-/** Only Engineers need a worktree. Inspectors attach read-only to the Engineer's. */
-export const ROLE_NEEDS_WORKTREE: Record<Role, boolean> = {
-  SCOUT: false,
-  ENGINEER: true,
-  INSPECTOR: false,
-  SENTRY: false,
-  COMMANDER: false,
-};
+/**
+ * Whether a unit of this rank and role holds a tool that puts bytes on disk — the intersection
+ * rule, in one place.
+ *
+ * Rank narrows; it never widens. A role asks for a loadout and its rank subtracts from it, so a
+ * COLONEL·ENGINEER writes nothing even though every ENGINEER asks to, and no rank can hand an
+ * INSPECTOR an Edit tool the role never asked for.
+ */
+export function writesFiles(rank: Rank, role: Role): boolean {
+  return WRITES_FILES[rank] && ROLE_WRITES_FILES[role];
+}
 
 /**
  * True iff `child` is strictly junior to `parent` — the spawn rule.

@@ -1600,7 +1600,7 @@ interface WorkRun {
  * so no other test in this file inherits a tool-using harness.
  */
 async function runEngineer(cwd: string, home: string): Promise<WorkRun> {
-  const permissions = permissionsFor('ENGINEER', home);
+  const permissions = permissionsFor('CAPTAIN', 'ENGINEER', home);
   const spec: SoldierSpec = {
     agentId: 'cpt-01',
     rank: 'CAPTAIN',

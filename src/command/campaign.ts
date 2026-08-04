@@ -459,7 +459,9 @@ export interface BuildSpecInput {
  * hurry.
  */
 export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
-  const { allow, deny } = permissionsFor(input.role, input.home);
+  // Rank AND role. The rank has been on this input since the first spec was built; until it was
+  // passed here it decided a label and a substrate and nothing about what the worker could do.
+  const { allow, deny } = permissionsFor(input.rank, input.role, input.home);
   assertNoFlagLikeRules(allow, `${input.role} allow-list`);
   assertNoFlagLikeRules(deny, 'global deny-list');
   assertGlobalDenyIntact(deny, `${input.agentId} (${input.rank}·${input.role})`);

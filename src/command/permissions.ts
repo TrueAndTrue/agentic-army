@@ -6,6 +6,9 @@
  * ALLOW  ENGINEER   Read Grep Glob, Edit Write, Bash(git*|test|build|lint)
  *        INSPECTOR  Read Grep Glob, Bash(test|lint)
  *
+ * NARROW (by rank, subtracted from whatever the role asked for)
+ *        GENERAL COLONEL   no Edit Write NotebookEdit, no Bash at all
+ *
  * DENY   (global, every role, no override)
  *        git push --force*   npm publish   gh pr merge
  *        writes outside the leased worktree
@@ -64,7 +67,8 @@
  * "enforced" column is trusted there.
  */
 
-import type { Role } from '../contracts/ranks.ts';
+import type { Rank, Role } from '../contracts/ranks.ts';
+import { formatUnit, ROLE_WRITES_FILES, WRITES_FILES, writesFiles } from '../contracts/ranks.ts';
 import { isInsideOrEqual, worktreesRootFor } from '../config/paths.ts';
 import { invokedAs } from '../setup/checks.ts';
 import { PROTECTED_CONFIG_GLOBS, protectedConfigGlobs } from '../setup/init.ts';
@@ -330,14 +334,114 @@ export function assertCommanderLoadout(allow: readonly string[], who: string): v
         'paying for itself. The loadout is the guard; a sentence in the briefing is not.',
     );
   }
-  if (allow.length === 0) {
-    throw new Error(
-      `refusing to spawn ${who}: its allow-list is empty. An empty list is not "no tools" — the ` +
-        'claude adapter omits `--allowedTools` entirely when there is nothing to put after it, ' +
-        'and a worker spawned without that flag receives the default loadout, which is every ' +
-        'tool. The most restrictive spelling of this list is one harmless tool, never none.',
-    );
-  }
+  assertAllowListNonEmpty(allow, who);
+}
+
+/**
+ * Refuse an empty allow-list, for ANY worker.
+ *
+ * An empty list is not "no tools". `buildClaudeArgs` omits `--allowedTools` when there is nothing
+ * to put after it, and a claude worker spawned without that flag receives the DEFAULT loadout,
+ * which is every tool — so the emptiest list this codebase can produce is also the most
+ * permissive spec it can produce. That trap predates rank narrowing; narrowing makes it reachable
+ * by a second route, because subtracting the write-capable tools from a role whose whole loadout
+ * is write-capable leaves nothing (a SENTRY holds two `Bash` rules and nothing else). Hence the
+ * check moved out of the commander's guard and onto every path.
+ */
+export function assertAllowListNonEmpty(allow: readonly string[], who: string): void {
+  if (allow.length > 0) return;
+  throw new Error(
+    `refusing to spawn ${who}: its allow-list is empty. An empty list is not "no tools" — the ` +
+      'claude adapter omits `--allowedTools` entirely when there is nothing to put after it, ' +
+      'and a worker spawned without that flag receives the default loadout, which is every ' +
+      'tool. The most restrictive spelling of this list is one harmless tool, never none.',
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rank narrows authority
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Tool names a rank that does not write may never hold, whatever its role asks for.
+ *
+ * The first three are the obvious ones. `Bash` is here for the unobvious reason, and it is the
+ * whole reason this list is not just `WRITE_TOOLS`: a `Bash(prefix:*)` rule constrains the START
+ * of a command line and nothing after it, so `Bash(npm test:*)` permits `npm test; rm -rf .` and
+ * `Bash(prettier:*)` permits `prettier --write`. There is no spelling of a bash prefix rule that
+ * is provably read-only. A rank whose stated property is that it is structurally incapable of a
+ * bad `rm` therefore holds no shell at all — the alternative is a list of prefixes someone has
+ * decided look harmless, which is a deny-list wearing an allow-list's clothes.
+ *
+ * `BashOutput` and `KillShell` are here because they are the handles on a shell that is already
+ * running; they are inert without `Bash`, and removing them costs a rank that holds no `Bash`
+ * exactly nothing.
+ */
+export const WRITE_CAPABLE_TOOLS: readonly string[] = Object.freeze([
+  ...WRITE_TOOLS,
+  'Bash',
+  'BashOutput',
+  'KillShell',
+]);
+
+/**
+ * The role's loadout with everything this rank may not hold subtracted.
+ *
+ * Rank narrows; it never widens. A rank that writes gets its role's list unchanged — which is why
+ * every unit this project actually fields today (`CPT·ENGINEER`, `CPT·INSPECTOR`) is byte-for-byte
+ * unaffected by this function, and why `COL·COMMANDER` is too: its one tool is `TodoWrite`, which
+ * writes a checklist in a context window, not a byte on disk.
+ */
+export function narrowToRank(rank: Rank, allow: readonly string[]): string[] {
+  if (WRITES_FILES[rank]) return [...allow];
+  return allow.filter((rule) => !WRITE_CAPABLE_TOOLS.includes(toolNameOf(rule)));
+}
+
+/**
+ * The deny half of the same narrowing — the second, independent mechanism.
+ *
+ * `narrowToRank` omits the tools; this names them. The two fail for different reasons: an
+ * omission is undone by a widened `ROLE_ALLOW`, a harness default, or a hand-edited spec, and the
+ * deny still holds. Nothing is added for a rank that writes, so a `CPT·ENGINEER`'s deny-list is
+ * the same list it was before rank meant anything.
+ */
+export function rankDeny(rank: Rank): readonly string[] {
+  return WRITES_FILES[rank] ? [] : WRITE_CAPABLE_TOOLS;
+}
+
+/**
+ * Refuse a loadout that contradicts what its rank and role declare about writing.
+ *
+ * Called twice on every spawn, on two different lists, because the two calls catch two different
+ * mistakes:
+ *
+ *  - on `ROLE_ALLOW[role]` against `ROLE_WRITES_FILES[role]`, which makes the role map load-bearing
+ *    rather than decorative: adding `Edit` to the INSPECTOR loadout, or clearing the ENGINEER's
+ *    flag, stops every spawn instead of quietly restating the review gate;
+ *  - on the NARROWED list against `writesFiles(rank, role)`, which is the post-condition of the
+ *    narrowing itself: delete the filter in `narrowToRank` and no COLONEL·ENGINEER can be built.
+ *
+ * It checks `WRITE_TOOLS` only, not `WRITE_CAPABLE_TOOLS`, because holding a shell is not the same
+ * claim: a CPT·INSPECTOR declares `false` here and keeps its `Bash(npm test:*)`, which is the
+ * point of the distinction the INSPECTOR loadout comment makes.
+ */
+export function assertDeclaredWritesMatchLoadout(
+  allow: readonly string[],
+  declared: boolean,
+  who: string,
+): void {
+  const held = allow.filter((rule) => WRITE_TOOLS.includes(toolNameOf(rule)));
+  if (held.length > 0 === declared) return;
+  throw new Error(
+    declared
+      ? `refusing to spawn ${who}: it is declared to write files and its loadout holds no ` +
+        `${WRITE_TOOLS.join('/')} tool. A worker told to edit and handed nothing to edit with ` +
+        'fails at the far end of an expensive run, and the failure looks like a bad model.'
+      : `refusing to spawn ${who}: it is declared not to write files and its loadout holds ` +
+        `${held.join(', ')}. Rank is authority: it narrows a role's loadout and never widens ` +
+        'one, so a write tool surviving here means the narrowing was bypassed rather than that ' +
+        'the declaration was wrong. Change the declaration deliberately, or leave the tool off.',
+  );
 }
 
 export interface PermissionSet {
@@ -345,11 +449,41 @@ export interface PermissionSet {
   deny: string[];
 }
 
-/** The allow/deny pair for one worker. The only supported way to build one. */
-export function permissionsFor(role: Role, home?: string): PermissionSet {
-  const allow = [...ROLE_ALLOW[role]];
-  if (role === 'COMMANDER') assertCommanderLoadout(allow, `a ${role}`);
-  return { allow, deny: [...globalDeny(home), ...ROLE_DENY[role]] };
+/**
+ * The allow/deny pair for one worker. The only supported way to build one.
+ *
+ * ## The intersection rule
+ *
+ * A ROLE asks for a loadout. A RANK subtracts from it. Nothing anywhere adds.
+ *
+ * ```
+ * allow = ROLE_ALLOW[role]  minus  (WRITES_FILES[rank] ? nothing : WRITE_CAPABLE_TOOLS)
+ * deny  = globalDeny(home)  plus   ROLE_DENY[role]  plus  rankDeny(rank)
+ * ```
+ *
+ * so a worker holds a write tool iff `writesFiles(rank, role)` — rank AND role, never either
+ * alone. The rank half is the new one: a COLONEL·ENGINEER is constructible and receives Read,
+ * Grep, Glob and TodoWrite, with no Edit, no Write, no NotebookEdit and no shell, because the
+ * ranks holding strategy are the ranks that must be incapable of a bad `rm`.
+ *
+ * `rank` is a required positional argument and deliberately has no default. A rank that a call
+ * site may omit is a mechanism that the next call site will omit, and this whole function exists
+ * because a map declared as the single source of truth had no reader for the length of a build.
+ */
+export function permissionsFor(rank: Rank, role: Role, home?: string): PermissionSet {
+  const who = `a ${formatUnit(rank, role)}`;
+  assertDeclaredWritesMatchLoadout(ROLE_ALLOW[role], ROLE_WRITES_FILES[role], `${who} (its role loadout)`);
+
+  const allow = narrowToRank(rank, ROLE_ALLOW[role]);
+  if (role === 'COMMANDER') assertCommanderLoadout(allow, who);
+  assertDeclaredWritesMatchLoadout(allow, writesFiles(rank, role), who);
+  assertAllowListNonEmpty(allow, who);
+
+  const deny = [...globalDeny(home), ...ROLE_DENY[role]];
+  // Appended only when absent, so the wire format of every worker that was already correct is
+  // unchanged: a COL·COMMANDER is denied `Bash` once, by `ROLE_DENY`, exactly as it was.
+  for (const tool of rankDeny(rank)) if (!deny.includes(tool)) deny.push(tool);
+  return { allow, deny };
 }
 
 // ---------------------------------------------------------------------------------------------

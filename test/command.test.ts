@@ -34,13 +34,21 @@ import { pathToFileURL } from 'node:url';
 
 import {
   GLOBAL_DENY,
+  WRITE_CAPABLE_TOOLS,
+  assertAllowListNonEmpty,
+  assertDeclaredWritesMatchLoadout,
   assertGlobalDenyIntact,
   assertWorktreeRootOutsideProtected,
   missingProtectedGlobs,
+  narrowToRank,
   permissionsFor,
   protectedGlobContaining,
+  rankDeny,
+  toolNameOf,
   ROLE_ALLOW,
 } from '../src/command/permissions.ts';
+import { ROLES, WRITES_FILES, writesFiles } from '../src/contracts/ranks.ts';
+import type { Rank } from '../src/contracts/ranks.ts';
 import { worktreesRootFor } from '../src/config/paths.ts';
 import {
   ENGINEER_NARRATIVE_KEYS,
@@ -873,6 +881,141 @@ describe('permissions', () => {
     assert.ok(ROLE_ALLOW.INSPECTOR.some((rule) => /Bash\((npm test|node --test)/.test(rule)));
   });
 
+  // ===========================================================================================
+  // RANK NARROWS AUTHORITY
+  //
+  // `WRITES_FILES` spent this build declaring itself the single source of truth that the
+  // generator consults, with no generator and no consumer. These tests are the consumer's
+  // guard: each one has been watched to fail with the mechanism broken, because a test that has
+  // only ever been green is indistinguishable from the comment it replaced.
+  // ===========================================================================================
+
+  it('a COLONEL-ranked ENGINEER receives no write tool and no shell, whatever the role asked for', () => {
+    // Constructible, and never spawned today — which is the point. The property is being closed
+    // before something fields one, not after.
+    const { allow, deny } = permissionsFor('COLONEL', 'ENGINEER', '/tmp/army-home');
+
+    assert.equal(WRITES_FILES.COLONEL, false, 'this test is meaningless if COLONEL writes');
+    assert.deepEqual(allow, ['Read', 'Grep', 'Glob', 'TodoWrite']);
+    for (const tool of ['Edit', 'Write', 'NotebookEdit']) {
+      assert.ok(!allow.includes(tool), `a COL·ENGINEER was handed ${tool}`);
+    }
+    // Not one bash rule survives. A `Bash(prefix:*)` rule bounds the start of a command line and
+    // nothing after it, so `Bash(npm test:*)` is a licence to run `npm test; rm -rf .` — there is
+    // no read-only spelling of a shell rule to keep.
+    assert.equal(
+      allow.filter((rule) => toolNameOf(rule) === 'Bash').length,
+      0,
+      `a COL·ENGINEER kept a shell: ${allow.filter((r) => toolNameOf(r) === 'Bash').join(' ')}`,
+    );
+    // …and the second, independent mechanism: the deny half names them too.
+    for (const tool of WRITE_CAPABLE_TOOLS) {
+      assert.ok(deny.includes(tool), `the COL·ENGINEER deny-list is missing ${tool}`);
+    }
+    // The floor is still the floor.
+    assert.deepEqual(missingProtectedGlobs(deny), []);
+  });
+
+  it('NOTHING FIELDED CHANGES: a CPT·ENGINEER and a CPT·INSPECTOR are byte-identical to before', () => {
+    const engineer = permissionsFor('CAPTAIN', 'ENGINEER', '/tmp/army-home');
+    // The exact list the role asks for, in order, with nothing subtracted and nothing added.
+    assert.deepEqual(engineer.allow, [...ROLE_ALLOW.ENGINEER]);
+    assert.deepEqual(rankDeny('CAPTAIN'), [], 'a writing rank subtracts nothing and adds nothing');
+    // Nothing was appended to the deny half either: every entry a Captain is denied is still a
+    // rule with an argument, never a bare tool name, which is the shape rank narrowing adds.
+    for (const tool of WRITE_CAPABLE_TOOLS) {
+      assert.ok(!engineer.deny.includes(tool), `rank narrowing leaked ${tool} onto a CPT deny-list`);
+    }
+    for (const tool of ['Edit', 'Write', 'NotebookEdit']) assert.ok(engineer.allow.includes(tool));
+    assert.ok(engineer.allow.some((rule) => rule.startsWith('Bash(git')));
+
+    const inspector = permissionsFor('CAPTAIN', 'INSPECTOR', '/tmp/army-home');
+    assert.deepEqual(inspector.allow, [...ROLE_ALLOW.INSPECTOR]);
+    // The narrowing must not "fix" the Inspector into an editor, and must not take its shell.
+    for (const tool of ['Edit', 'Write', 'NotebookEdit']) {
+      assert.ok(!inspector.allow.includes(tool), `the narrowing handed an INSPECTOR ${tool}`);
+    }
+    assert.ok(
+      inspector.allow.some((rule) => /^Bash\((npm test|node --test)/.test(rule)),
+      'an INSPECTOR needs its suite: a writable tree is a worktree question, not a tool question',
+    );
+    // Rank is not the reason an Inspector cannot edit — its ROLE is. Both Captains here.
+    assert.equal(WRITES_FILES.CAPTAIN, true);
+    assert.equal(writesFiles('CAPTAIN', 'INSPECTOR'), false);
+  });
+
+  it('narrowToRank subtracts and never adds, for every rank and every role', () => {
+    for (const rank of Object.keys(WRITES_FILES) as Rank[]) {
+      for (const role of ROLES) {
+        const narrowed = narrowToRank(rank, ROLE_ALLOW[role]);
+        for (const rule of narrowed) {
+          assert.ok(ROLE_ALLOW[role].includes(rule), `${rank}·${role} gained ${rule} from nowhere`);
+        }
+        if (WRITES_FILES[rank]) {
+          assert.deepEqual(narrowed, [...ROLE_ALLOW[role]], `${rank}·${role} was narrowed anyway`);
+        } else {
+          for (const rule of narrowed) {
+            assert.ok(
+              !WRITE_CAPABLE_TOOLS.includes(toolNameOf(rule)),
+              `${rank}·${role} kept ${rule}`,
+            );
+          }
+        }
+      }
+    }
+  });
+
+  it('the effective loadout holds a write tool iff writesFiles(rank, role) — all 25 pairs', () => {
+    for (const rank of Object.keys(WRITES_FILES) as Rank[]) {
+      for (const role of ROLES) {
+        let allow: string[];
+        try {
+          allow = permissionsFor(rank, role, '/tmp/army-home').allow;
+        } catch (error) {
+          // The only legal refusal here: a role whose whole loadout was write-capable, narrowed
+          // to nothing. An empty allow-list omits `--allowedTools`, which grants EVERY tool, so
+          // refusing is the safe answer and silently shipping the empty list is not.
+          assert.match((error as Error).message, /allow-list is empty/, `${rank}·${role}`);
+          assert.deepEqual(narrowToRank(rank, ROLE_ALLOW[role]), [], `${rank}·${role}`);
+          continue;
+        }
+        const holdsWriteTool = allow.some((rule) =>
+          ['Edit', 'Write', 'NotebookEdit'].includes(toolNameOf(rule)),
+        );
+        assert.equal(holdsWriteTool, writesFiles(rank, role), `${rank}·${role}`);
+      }
+    }
+  });
+
+  it('a rank that narrows a role away REFUSES rather than shipping the empty list', () => {
+    // A SENTRY holds two Bash rules and nothing else, so an officer-ranked one has no loadout
+    // left. `--allowedTools` with nothing after it is omitted, and a claude worker without that
+    // flag gets the default loadout — every tool. The empty list is the most permissive spec
+    // this codebase can produce, so the narrowing must not be able to produce one quietly.
+    assert.deepEqual(narrowToRank('COLONEL', ROLE_ALLOW.SENTRY), []);
+    assert.throws(() => permissionsFor('COLONEL', 'SENTRY', '/tmp/army-home'), /allow-list is empty/);
+    assert.throws(() => assertAllowListNonEmpty([], 'a COL·SENTRY'), /allow-list is empty/);
+    assert.doesNotThrow(() => assertAllowListNonEmpty(['TodoWrite'], 'a COL·SENTRY'));
+  });
+
+  it('a loadout that contradicts its declaration REFUSES to become a permission set', () => {
+    // The role map is load-bearing in BOTH directions: an editing tool added to a role declared
+    // not to write, and a role declared to write whose tools were taken away.
+    assert.throws(
+      () => assertDeclaredWritesMatchLoadout(['Read', 'Edit'], false, 'a CPT·INSPECTOR'),
+      /holds Edit/,
+    );
+    assert.throws(
+      () => assertDeclaredWritesMatchLoadout(['Read', 'Grep'], true, 'a CPT·ENGINEER'),
+      /declared to write files and its loadout holds no/,
+    );
+    assert.doesNotThrow(() => assertDeclaredWritesMatchLoadout(['Read', 'Edit'], true, 'x'));
+    assert.doesNotThrow(() => assertDeclaredWritesMatchLoadout(['Read'], false, 'x'));
+    // A shell is not a write tool for this check, which is exactly why an INSPECTOR keeps its
+    // `Bash(npm test:*)` while declaring `false`.
+    assert.doesNotThrow(() => assertDeclaredWritesMatchLoadout(['Bash(npm test:*)'], false, 'x'));
+  });
+
   it('the global deny-list carries every PROTECTED_CONFIG_GLOBS entry', () => {
     assert.deepEqual(missingProtectedGlobs(GLOBAL_DENY), []);
     for (const glob of PROTECTED_CONFIG_GLOBS) {
@@ -895,7 +1038,7 @@ describe('permissions', () => {
   });
 
   it('resolves ~ and $AGENTIC_ARMY_HOME to absolute globs as well', () => {
-    const { deny } = permissionsFor('ENGINEER', '/tmp/army-home');
+    const { deny } = permissionsFor('CAPTAIN', 'ENGINEER', '/tmp/army-home');
     assert.ok(deny.some((rule) => rule.includes('(/tmp/army-home/**)')));
     assert.ok(deny.some((rule) => rule.includes('(/tmp/army-home/config.toml)')));
     // …and still carries the unexpanded forms, because which one a harness understands is not

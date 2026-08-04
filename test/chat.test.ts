@@ -33,12 +33,14 @@ import {
   COMMANDER_FORBIDDEN_TOOLS,
   ROLE_ALLOW,
   ROLE_DENY,
+  WRITE_CAPABLE_TOOLS,
   assertCommanderLoadout,
+  narrowToRank,
   permissionsFor,
   toolNameOf,
 } from '../src/command/permissions.ts';
 import { PROTECTED_CONFIG_GLOBS } from '../src/setup/init.ts';
-import { ROLES } from '../src/contracts/ranks.ts';
+import { ROLES, WRITES_FILES } from '../src/contracts/ranks.ts';
 import { buildSoldierSpec } from '../src/command/campaign.ts';
 import { parseChatArgs, CHAT_HELP, chatCommand } from '../src/command/chat.ts';
 import { createScriptedIo } from '../src/chat/io.ts';
@@ -602,7 +604,7 @@ describe('the commander\'s context is guarded by its permission set, not by its 
   });
 
   it('the deny half names every one of them, and still carries the protected-config block', () => {
-    const { allow, deny } = permissionsFor('COMMANDER', '/tmp/army-home-for-this-test');
+    const { allow, deny } = permissionsFor('COLONEL', 'COMMANDER', '/tmp/army-home-for-this-test');
     assert.deepEqual(allow, [...ROLE_ALLOW.COMMANDER]);
     for (const tool of COMMANDER_FORBIDDEN_TOOLS) {
       assert.ok(deny.includes(tool), `the COMMANDER deny-list is missing ${tool}`);
@@ -613,6 +615,27 @@ describe('the commander\'s context is guarded by its permission set, not by its 
       assert.ok(deny.some((rule) => rule.includes(`(${glob})`)), `deny-list lost ${glob}`);
     }
     assert.deepEqual(ROLE_DENY.ENGINEER, [], 'the role-specific deny is for COMMANDER only');
+  });
+
+  it('the commander is an OFFICER, and rank narrowing leaves its one-tool loadout alone', () => {
+    // `COMMANDER_AGENT_ID` is `col-01` — the human is the GENERAL, so the commander is a COLONEL,
+    // and COLONEL is a rank that does not write. It is therefore the one officer-ranked unit this
+    // project actually fields, and the rank narrowing must be a no-op on it: `TodoWrite` writes a
+    // checklist into a context window, not a byte onto disk.
+    assert.equal(WRITES_FILES.COLONEL, false);
+    assert.deepEqual(narrowToRank('COLONEL', ROLE_ALLOW.COMMANDER), ['TodoWrite']);
+
+    const { allow, deny } = permissionsFor('COLONEL', 'COMMANDER', '/tmp/army-home-for-this-test');
+    assert.deepEqual(allow, ['TodoWrite']);
+    // And the deny half is byte-identical: every tool rank would add is already there by role, so
+    // nothing is appended and nothing is duplicated. A duplicate would reach `--disallowedTools`.
+    for (const tool of WRITE_CAPABLE_TOOLS) {
+      assert.equal(
+        deny.filter((rule) => rule === tool).length,
+        1,
+        `${tool} appears ${deny.filter((rule) => rule === tool).length} times on the wire`,
+      );
+    }
   });
 
   it('a widened COMMANDER allow-list REFUSES to become a permission set', () => {

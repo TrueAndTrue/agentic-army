@@ -15,6 +15,8 @@ import {
   ROLES,
   SUBSTRATE,
   WRITES_FILES,
+  ROLE_WRITES_FILES,
+  writesFiles,
   isStrictlyJuniorTo,
   formatUnit,
   formatUnitWithGlyph,
@@ -253,6 +255,41 @@ test('officers never edit files; CAPTAIN and below do', () => {
     for (const officer of officers) {
       assert.equal(isStrictlyJuniorTo(writer, officer), true);
     }
+  }
+});
+
+test('ROLE_WRITES_FILES says HOLDS AN EDITING TOOL, not "cannot change a byte"', () => {
+  assert.equal(ROLE_WRITES_FILES.ENGINEER, true);
+  assert.equal(ROLE_WRITES_FILES.SCOUT, false);
+  assert.equal(ROLE_WRITES_FILES.SENTRY, false);
+  assert.equal(ROLE_WRITES_FILES.COMMANDER, false);
+  // The one that reads like a bug and is not. An INSPECTOR runs the suite and mutation-tests in a
+  // WRITABLE tree — bytes change. It is `false` here because it holds no Edit/Write tool, and that
+  // is what keeps the review gate independent of the branch it is reviewing. Handing an Inspector
+  // an editing tool so this flag could read `true` would be the actual defect.
+  assert.equal(ROLE_WRITES_FILES.INSPECTOR, false);
+  for (const role of ROLES) assert.equal(typeof ROLE_WRITES_FILES[role], 'boolean');
+});
+
+test('writesFiles is rank AND role — the intersection, over all 25 pairs', () => {
+  for (const rank of RANK_ORDER) {
+    for (const role of ROLES) {
+      assert.equal(
+        writesFiles(rank, role),
+        WRITES_FILES[rank] && ROLE_WRITES_FILES[role],
+        `${rank}·${role}`,
+      );
+    }
+  }
+  // Rank narrows and never widens: the only pairs that write are an ENGINEER at a writing rank.
+  const writers = RANK_ORDER.flatMap((rank) =>
+    ROLES.filter((role) => writesFiles(rank, role)).map((role) => `${rank}·${role}`),
+  );
+  assert.deepEqual(writers, ['CAPTAIN·ENGINEER', 'SERGEANT·ENGINEER', 'PRIVATE·ENGINEER']);
+  // The officer ranks write nothing whatever role they are handed — including the role whose
+  // entire purpose is writing. This is the claim the README makes in its opening paragraph.
+  for (const officer of ['GENERAL', 'COLONEL'] as const) {
+    for (const role of ROLES) assert.equal(writesFiles(officer, role), false, `${officer}·${role}`);
   }
 });
 
