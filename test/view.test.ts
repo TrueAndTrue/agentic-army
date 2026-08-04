@@ -635,6 +635,45 @@ test('unanswered queries are computed from the log, not stored', () => {
   assert.equal(model({ signals }).summary.openQueries, 1);
 });
 
+/**
+ * The blind spot is admitted where the rows are READ, not only where they are written.
+ *
+ * `src/command/campaign.ts` already carries this, on `recordDenials`, and `test/command.test.ts`
+ * pins it there. That is the writing end. This is the reading end, and it is the end that
+ * matters: nobody forms a belief about a campaign by looking at the function that appended a
+ * row. They look at `army view`, see a summary with no warning in it, and conclude the ceiling
+ * held. An empty denial log does not support that conclusion, so the file that builds the
+ * summary has to say so.
+ *
+ * Pinned by claim rather than by wording — each pattern is one thing a reader must not be able
+ * to lose, and a rewrite that drops any of them is a rewrite that quietly restores the
+ * misreading.
+ */
+test('the view says what an empty denial log does and does not prove', () => {
+  const source = fs.readFileSync(new URL('../src/view/tree.ts', import.meta.url), 'utf8');
+  const at = source.indexOf('function countOpenQueries(');
+  assert.ok(at > 0, 'countOpenQueries has moved; this guard is pointing at nothing');
+
+  // The signal-reading section of the view, not the whole file: a sentence somewhere else must
+  // not satisfy a claim that has to sit beside the code doing the reading.
+  const head = source.lastIndexOf('// ------', at);
+  assert.ok(head > 0 && at - head < 4000, 'the section header above countOpenQueries was not found');
+  const section = source.slice(head, at);
+
+  for (const [what, pattern] of [
+    ['names the shape the refusal actually arrives in', /is_error/],
+    ['names where it arrives', /tool_result/],
+    ['names the array the row does come from', /permission_denials/],
+    ['says which depth is blind', /depth >= 1/],
+    ['says what an absent row DOES prove', /missing its allow-list/],
+    ['says what it does not prove', /does NOT prove that nothing was refused/],
+    ['refuses the clean-bill-of-health reading', /clean bill of health/i],
+    ['points at the evidence that does survive', /stream\.jsonl/],
+  ] as const) {
+    assert.match(section, pattern, `the signal-reading section of src/view/tree.ts no longer ${what}`);
+  }
+});
+
 // ---------------------------------------------------------------------------------------------
 // The JSONL tail — a torn final line is waited on, never parsed as garbage
 // ---------------------------------------------------------------------------------------------

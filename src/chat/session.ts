@@ -5,7 +5,7 @@
  * ☆ YOU (a terminal)
  *  │  types
  *  ▼
- * ◆ COL·COMMANDER   claude, duplex, no tools, one persistent session
+ * ◆ COL·COMMANDER   claude, duplex, TodoWrite only, one persistent session
  *  │  asks for an objective
  *  ▼
  * (a human keystroke)

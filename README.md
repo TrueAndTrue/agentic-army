@@ -265,8 +265,11 @@ you › I want calc.js to also export a multiply function. Propose the objective
   the diff. The claim that it multiplies correctly rests on review, not execution.
 ```
 
-**The commander has no tools.** Its allow-list is one inert entry; Read, Grep, Glob, Edit, Write,
-Bash and network are all denied to it by the same permission layer that governs every worker.
+**The commander's entire loadout is `TodoWrite`.** Read, Grep, Glob, Edit, Write, Bash and
+network are all denied to it by the same permission layer that governs every worker. One inert
+tool rather than an empty list, deliberately: an empty allow-list makes the harness omit
+`--allowedTools` altogether, and the worker then inherits every tool there is — so "no tools" is
+the most permissive thing this program can start, not the least.
 That is why it says *"I haven't read calc.js"* — not modesty, and not an instruction it was given
 that it might ignore. Asked directly to read a file, it answers that the function is not there to
 call. This is the point of the rank: the window holding your objective cannot be spent one source

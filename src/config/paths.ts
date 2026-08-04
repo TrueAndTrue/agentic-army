@@ -24,22 +24,59 @@ import { GLOBAL_CONFIG_DIR_NAME, GLOBAL_CONFIG_FILE_NAME } from '../contracts/co
 /** Escape hatch for tests and unusual setups. Read by `src/setup/checks.ts` too. */
 export const HOME_ENV_VAR = 'AGENTIC_ARMY_HOME';
 
+/**
+ * Set by the node test runner in every process it spawns, and by nothing else.
+ *
+ * It is read here as a fact about the PROCESS rather than about the `env` argument, and that
+ * distinction is the whole strength of the refusal below: a caller that hands `armyHome` a
+ * curated dictionary — `{}`, or a hook overlay, or a fixture's env — is still inside a test
+ * process, and its `os.homedir()` fallback still lands on the developer's real archive.
+ * Keying the tripwire off the argument would let exactly those callers through.
+ */
+const TEST_RUNNER_ENV_VAR = 'NODE_TEST_CONTEXT';
+
 export type Env = Record<string, string | undefined>;
 
 /**
  * The army's home directory — `~/.agentic-army`, or `$AGENTIC_ARMY_HOME`.
  *
- * DELIBERATE DUPLICATE of `homeDir()` in `src/setup/checks.ts`, which must stay
- * byte-for-byte equivalent: same env var, same "blank means unset" rule, same `path.resolve`
- * of the override, same default. Two modules disagreeing about where the config lives is a
- * bug where `army enlist` writes a ceiling that the campaign runner never reads — i.e. a
- * silent security failure, not a cosmetic one. `test/contracts.test.ts` asserts the two agree.
- * The eventual fix is for setup to import this; it cannot yet, because config must not depend
- * on the CLI layer.
+ * The ONE resolver. `homeDir()` in `src/setup/checks.ts` used to be a second implementation
+ * kept "byte-for-byte equivalent" by a test; two modules disagreeing about where the config
+ * lives is a bug where `army enlist` writes a ceiling that the campaign runner never reads —
+ * a silent security failure, not a cosmetic one — so the copy delegates here instead.
+ *
+ * ## Under the test runner it REFUSES rather than defaulting
+ *
+ * With no override set, the fallback is `os.homedir()`, so every caller that omits one resolves
+ * the DEVELOPER'S OWN archive: `~/.agentic-army`, the directory holding real campaign records
+ * and the real ceiling. Code reached from here creates it, writes probe files into it, leases
+ * worktrees beside it. Two doctor tests did precisely that for months and nobody saw it, because
+ * nothing was asserted about the home and a probe file deleted a millisecond later leaves nothing
+ * to notice; the defect had to be found by comparing the directory's mtime across a test run.
+ *
+ * The refusal was first put on `homeDir()` alone, which closed the doctor write path and left
+ * this function — the resolver `src/cli.ts`, `src/view/**`, `src/config/load.ts` and the campaign
+ * runner all use — defaulting exactly as before. So the property held on one path and nowhere
+ * else. It lives here now, once, and `homeDir()` inherits it by calling this.
+ *
+ * A defaulted parameter cannot hold that line: the next caller forgets it the way those two did,
+ * and forgetting is silent. Refusing is not. Nothing outside a test process is affected, and a
+ * test that genuinely means the real home can still say so by setting the override to it — an
+ * opt-in a reviewer can see in the diff.
  */
 export function armyHome(env: Env = process.env): string {
   const override = env[HOME_ENV_VAR];
   if (override !== undefined && override.trim() !== '') return path.resolve(override);
+  if (process.env[TEST_RUNNER_ENV_VAR] !== undefined) {
+    throw new Error(
+      `refusing to resolve the home directory from the ambient environment inside a test: ` +
+        `${HOME_ENV_VAR} is unset, so this would resolve the developer's own archive — the real ` +
+        `~/${GLOBAL_CONFIG_DIR_NAME} — and code downstream of here creates directories and writes ` +
+        `probe files into whatever it is handed. Pass an explicit home (runChecks, runCampaign, ` +
+        `loadConfig and the chat session all take one), or set ${HOME_ENV_VAR} to a temporary ` +
+        `directory for this test.`,
+    );
+  }
   return path.join(os.homedir(), GLOBAL_CONFIG_DIR_NAME);
 }
 

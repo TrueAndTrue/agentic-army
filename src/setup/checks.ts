@@ -34,7 +34,6 @@ import * as path from 'node:path';
 
 import { installWarningFilter } from '../archive/db.ts';
 import {
-  HOME_ENV_VAR,
   armyHome,
   normalizePathForCompare as normalizePath,
   realpathOrResolve,
@@ -1275,31 +1274,21 @@ export async function probe(
  * failure — `army enlist` writes a ceiling the campaign runner never reads —
  * so the copy is gone rather than pinned.
  *
- * UNDER THE TEST RUNNER IT REFUSES rather than defaulting, and that is the whole mechanism
- * behind the hermeticity of this module. `inspectWritableDir` proves writability by writing a
+ * UNDER THE TEST RUNNER IT REFUSES rather than defaulting, and that refusal is NOT implemented
+ * here. It lives in `armyHome`, because this module is not the only door: `src/cli.ts`,
+ * `src/view/**`, `src/config/load.ts` and the campaign runner reach the same ambient home
+ * through `armyHome` directly, and a refusal written only here held the property on the doctor's
+ * write path and on no other. A second copy would also be free to drift — this repo has already
+ * watched two inline copies of one audit diverge until the same defect failed in one file and
+ * was invisible in the other — so there is exactly one, and this function inherits it by calling.
+ *
+ * Why the doctor is where it was noticed: `inspectWritableDir` proves writability by writing a
  * real probe file and deleting it — deliberately, because `access(W_OK)` lies on some network
  * shares — so any code path that reaches it with an ambiently-resolved home MUTATES the
  * developer's own archive directory. Two tests did exactly that for months by calling
- * `runChecks(2000)` and letting the home default: they were invisible because nothing was
- * asserted about the home, and a probe file that is deleted a millisecond later leaves nothing
- * to notice.
- *
- * A defaulted parameter cannot hold that line: the next caller forgets it the same way these
- * two did, and forgetting is silent. Refusing is not. Nothing outside a test process is
- * affected — `NODE_TEST_CONTEXT` is set by the node test runner in the processes it spawns and
- * by nothing else — and a test that genuinely wants the real home can still say so by setting
- * the override to it, which is an opt-in a reviewer can see.
+ * `runChecks(2000)` and letting the home default.
  */
 export function homeDir(): string {
-  const override = process.env[HOME_ENV_VAR];
-  if ((override === undefined || override.trim() === '') && process.env['NODE_TEST_CONTEXT'] !== undefined) {
-    throw new Error(
-      `refusing to resolve the home directory from the ambient environment inside a test: ` +
-        `${HOME_ENV_VAR} is unset, so this would resolve the developer's own archive, and the ` +
-        `writability probe writes into whatever it is handed. Pass an explicit directory (` +
-        `runChecks takes one), or set ${HOME_ENV_VAR} to a temporary directory for this test.`,
-    );
-  }
   return armyHome(process.env);
 }
 

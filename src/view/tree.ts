@@ -774,6 +774,36 @@ export function buildTree(snapshot: CampaignSnapshot, options: BuildTreeOptions)
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// Reading the signal log — and the one thing it cannot tell an operator
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * WHAT AN ABSENT `permission denied` ROW PROVES, WHICH IS LESS THAN IT LOOKS.
+ *
+ * `src/command/campaign.ts` writes one signal row per entry the harness reports in
+ * `permission_denials`, and a denial is a ceiling breach. This module is the other end: the
+ * rows arrive here, get counted and rendered, and a person decides from that whether the
+ * campaign behaved. So the limit belongs here too — the row is written in one file and read in
+ * this one, and the reader is the one who can be misled by it.
+ *
+ * Measured against claude 2.1.221: a tool call that MISSES THE ALLOW-LIST is reported in
+ * `permission_denials` and becomes a row. A call that HITS AN EXPLICIT DENY RULE is not — the
+ * refusal comes back only as `is_error` on that call's `tool_result`, and `permission_denials`
+ * stays empty. The global deny-list is what holds the ceiling against a squad member, so at
+ * depth >= 1 the breach the row exists to raise is exactly the breach it cannot see.
+ *
+ * Precisely, then. A view with no `permission denied` row proves that nothing was refused for
+ * missing its allow-list. It does NOT prove that nothing was refused, and it does NOT prove that
+ * no ceiling was breached. Anyone reading this summary as a clean bill of health — and a summary
+ * with no warning in it is the easiest thing in the program to read that way — is drawing a
+ * conclusion these rows cannot carry.
+ *
+ * Where the evidence does survive: `stream.jsonl`, which is teed losslessly per agent and holds
+ * the `is_error` tool_result. That file, not this summary, is what answers "was anything refused
+ * at depth", and a reviewer who needs that answer has to open it.
+ */
+
 /**
  * A query is answered iff an `answer` row exists with `in_reply_to = seq`. There is
  * no state column, so this is a computation and not a lookup — the same rule the archive applies

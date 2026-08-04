@@ -75,6 +75,7 @@ import type { Rank, Report, Role, Rung, Verdict } from '../src/contracts/index.t
 // against the rules this process actually puts on a command line — not against a retyped list.
 import { ROLE_ALLOW, toolNameOf } from '../src/command/permissions.ts';
 import { CHAT_HELP } from '../src/command/chat.ts';
+import { SLASH_HELP } from '../src/chat/run.ts';
 
 // Used only to prove a multi-line string value survived surgery unchanged.
 import { parse as parseTomlForTest } from 'smol-toml';
@@ -915,11 +916,63 @@ test('army branches are namespaced', () => {
 
 test('armyHome honours AGENTIC_ARMY_HOME', () => {
   assert.equal(armyHome({ AGENTIC_ARMY_HOME: '/tmp/army-x' }), path.resolve('/tmp/army-x'));
-  assert.equal(armyHome({ AGENTIC_ARMY_HOME: '   ' }), path.join(os.homedir(), '.agentic-army'));
-  assert.equal(armyHome({}), path.join(os.homedir(), '.agentic-army'));
-  // Defaults to the live environment when none is passed.
-  assert.equal(armyHome(), armyHome(process.env));
   assert.equal(configPath('/tmp/army-x'), path.join('/tmp/army-x', 'config.toml'));
+});
+
+/**
+ * The refusal, and the reason this test cannot simply assert the default.
+ *
+ * It used to: `armyHome({})` was pinned to `~/.agentic-army`. That assertion was harmless in
+ * itself and lethal as an example — it is the exact call every other test copied, and each copy
+ * pointed real code at the developer's own archive, where the doctor's writability probe then
+ * created and deleted files. The refusal was put on `homeDir()` in `src/setup/checks.ts` first
+ * and closed one path; `armyHome` is the resolver `src/cli.ts`, `src/view/**`, `src/config/load.ts`
+ * and the campaign runner reach, and it kept defaulting, so the property held on one door and
+ * nowhere else.
+ *
+ * The refusal keys off the PROCESS, not off the argument, which is why `armyHome({})` refuses
+ * too: a caller handing over a curated dictionary is still inside a test process, and the
+ * `os.homedir()` fallback still lands on the real archive.
+ */
+test('armyHome refuses to resolve the ambient home inside a test, whatever env it is handed', () => {
+  // The precondition. With an override set upstream nothing below is a refusal and this guard
+  // would pass for the wrong reason.
+  assert.equal(process.env['AGENTIC_ARMY_HOME'], undefined);
+  assert.ok(process.env['NODE_TEST_CONTEXT'] !== undefined, 'this is not running under the runner');
+
+  const refusal = /refusing to resolve the home directory/;
+  assert.throws(() => armyHome(), refusal, 'the live environment');
+  assert.throws(() => armyHome({}), refusal, 'an env with nothing in it');
+  assert.throws(() => armyHome({ AGENTIC_ARMY_HOME: '   ' }), refusal, 'blank still means unset');
+  assert.throws(() => armyHome({ HOME: '/tmp/somewhere' }), refusal, 'steering HOME is not an opt-in');
+});
+
+/**
+ * And outside the runner it still defaults, so the shipped command is untouched.
+ *
+ * A tripwire in production code costs nothing only if it cannot fire in the field. This is the
+ * assertion that the default — the whole `~/.agentic-army` convention — still exists at all,
+ * moved into a child because it cannot be observed from in here any more. `NODE_TEST_CONTEXT`
+ * is set by the node test runner in the processes it spawns and by nothing else.
+ */
+test('outside the test runner armyHome still defaults to ~/.agentic-army', () => {
+  const env: Record<string, string | undefined> = { ...process.env };
+  delete env['NODE_TEST_CONTEXT'];
+  delete env['AGENTIC_ARMY_HOME'];
+
+  const module = new URL('../src/config/paths.ts', import.meta.url).href;
+  const observed = execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `const { armyHome } = await import(${JSON.stringify(module)});
+process.stdout.write(armyHome());`,
+    ],
+    { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  // Resolution only — nothing here creates or touches that directory.
+  assert.equal(observed, path.join(os.homedir(), '.agentic-army'));
 });
 
 test('archiveRoot defaults to the config file’s own directory', () => {
@@ -1944,15 +1997,42 @@ async function spawnedRoles(): Promise<Set<Role>> {
  * `army chat --help` — the text a person reads while deciding whether to trust the thing. The
  * earlier version of this list only matched `holds no tools`, so a sentence one verb away from
  * an identical falsehood walked straight through the guard that exists to catch it.
+ *
+ * The verb list is GONE for the same reason it was too narrow the first time. It matched
+ * `holds no tools` and then `has no tools`, and the next copy found was `claude, duplex, no
+ * tools, one persistent session` — a diagram label with no verb in front of it at all, which
+ * would have walked through a list of verbs however long. The phrase itself is the falsehood,
+ * so the phrase is what is matched, wherever it appears and whatever precedes it.
+ *
+ * That does mean the exact string cannot be used even to quote and deny it. `src/harness/
+ * claude.ts` and `src/command/permissions.ts` both write `an empty list is not "no tools"`,
+ * which is true and useful — and neither is a surface this list is pointed at. If one ever
+ * becomes one, the sentence gets rephrased rather than the pattern loosened: a guard that
+ * understands quotation marks is a guard with a hole shaped like quotation marks.
  */
 const COMMANDER_OVERCLAIMS: ReadonlyArray<[string, RegExp]> = [
   ['the loadout is described as absent', /loadout is\s+\*?\s*nothing/i],
-  [
-    'the role is said to carry no tool at all',
-    /(?:holds?|has|have|carries|carry|with|given)\s+no tools|no tools at all|without any tools/i,
-  ],
+  ['the role is said to carry no tool at all', /\bno tools\b|without any tools/i],
+  // The SINGULAR, found by this guard the first time it was run over `src/chat/**`: a header
+  // block asserting `**The commander never holds a tool.**` four sections above the banner that
+  // had just been corrected. Same falsehood, one plural away, and the plural pattern above sails
+  // straight past it.
+  ['the role is said never to hold even one tool', /never\s+(?:holds?|has|carries|carry)\s+(?:a|any|one)\s+tool\b/i],
   ['an emptied list is called the strict one', /empty allow-list is (?:the )?(?:safest|most restrictive|strictest)/i],
 ];
+
+/**
+ * The negative half on its own, for surfaces that must not lie about the loadout but have no
+ * room to explain it — a banner line, a diagram label, a `--help` screen written for something
+ * else. Shares the list with the full check below rather than restating it: this repo has
+ * already watched two inline copies of one audit drift until the same defect failed in one file
+ * and was invisible in the other.
+ */
+function assertNoCommanderOverclaim(where: string, text: string): void {
+  for (const [label, pattern] of COMMANDER_OVERCLAIMS) {
+    assert.doesNotMatch(text, pattern, `${where}: ${label}`);
+  }
+}
 
 /**
  * The loadout claim, checked against `ROLE_ALLOW` on every surface that makes it.
@@ -1974,9 +2054,7 @@ function assertDescribesTheCommanderLoadout(where: string, text: string): void {
         'loadout the text does not name is a loadout the next reader will feel free to remove.',
     );
   }
-  for (const [label, pattern] of COMMANDER_OVERCLAIMS) {
-    assert.doesNotMatch(text, pattern, `${where}: ${label}`);
-  }
+  assertNoCommanderOverclaim(where, text);
   assert.match(text, /--allowedTools/, `${where}: name the flag that goes missing`);
   assert.match(text, /most permissive/i, `${where}: say what an emptied list actually produces`);
 }
@@ -1996,6 +2074,38 @@ test('every surface describing the COMMANDER names the tool it holds, and why it
   // guards over the same property is how the second one ends up weaker than the first.
   assert.ok(CHAT_HELP.includes('COL·COMMANDER'), 'the help must describe the role to be checked');
   assertDescribesTheCommanderLoadout('CHAT_HELP in src/command/chat.ts', CHAT_HELP);
+
+  // `/help` inside a live session. Not a summary of the help above — it is the only description
+  // of the loadout reachable without leaving the session, so it carries the reason in full.
+  assert.ok(SLASH_HELP.includes('/exit'), 'the slash help must be the slash help');
+  assertDescribesTheCommanderLoadout('SLASH_HELP in src/chat/run.ts', SLASH_HELP);
+});
+
+/**
+ * The same list, swept across the whole of `src/chat/**`.
+ *
+ * Pointing the guard at named exports caught the two texts somebody thought to name and left a
+ * third — a diagram label in a module header — untouched, because nothing imports a comment.
+ * A directory sweep has no such blind spot: every banner, prompt, comment and string in the
+ * commanding session is checked, and a new file joins the guard by existing.
+ */
+test('nothing in the chat session describes the COMMANDER as carrying nothing', async () => {
+  const dir = path.resolve(import.meta.dirname, '..', 'src', 'chat');
+  const names = (await fs.readdir(dir, { recursive: true, withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.ts'))
+    .map((entry) => path.join(entry.parentPath, entry.name));
+  assert.ok(names.length >= 3, `the sweep found ${String(names.length)} files under src/chat; it must find the module`);
+
+  let checked = 0;
+  for (const file of names) {
+    const text = await fs.readFile(file, 'utf8');
+    assertNoCommanderOverclaim(path.relative(path.resolve(import.meta.dirname, '..'), file), text);
+    if (text.includes('COL·COMMANDER')) checked += 1;
+  }
+  // The sweep is worthless if it read three files that never mention the role. Two do today —
+  // the banner in `run.ts` and the diagram in `session.ts` — and both are texts that carried the
+  // false claim until this guard was widened to reach them.
+  assert.ok(checked >= 2, 'the sweep must actually be reading the files that describe the role');
 });
 
 test('the --help roster names every role, and marks exactly the ones nothing spawns', async () => {
@@ -2036,12 +2146,9 @@ test('the --help roster names every role, and marks exactly the ones nothing spa
 
   // The whole help, not the roster: the same overclaim was also sitting in the command list,
   // four sections above the roster, and a guard scoped to one block would have left it there.
-  assert.doesNotMatch(
-    res.stdout,
-    /holds? no tools|no tools at all|without any tools/i,
-    'the help describes the COMMANDER as carrying nothing, which names the one configuration ' +
-      'this codebase cannot safely emit. See the loadout guard above.',
-  );
+  // The list comes from `COMMANDER_OVERCLAIMS`; it used to be an inline copy of three of its
+  // patterns, which is how a list gets widened in one place and not the other.
+  assertNoCommanderOverclaim('the rendered `army --help`', res.stdout);
 });
 
 test('the worktree contract describes one shared writable lease, not an attenuated Inspector tree', async () => {

@@ -44,7 +44,7 @@
  *    delivers it is a human typing. So the objective is printed in full, on one line, and the
  *    dispatch runs if and only if the next line read from the terminal says yes.
  *
- * 2. **The commander never holds a tool.** The spec goes through `buildSoldierSpec`, the same
+ * 2. **The commander's loadout is one inert tool.** The spec goes through `buildSoldierSpec`, the same
  *    choke point every campaign worker goes through, so the protected-config deny is asserted on
  *    it and `assertCommanderLoadout` refuses a widened allow-list.
  *
@@ -207,7 +207,7 @@ export function isApproval(line: string): boolean {
 export function chatBanner(self: string, project: string, ceiling: Rung, rung: Rung): string {
   return [
     '',
-    '◆ COL·COMMANDER — a live session. It holds the objective; it holds no tools.',
+    '◆ COL·COMMANDER — a live session. It holds the objective, and one inert tool: TodoWrite.',
     `  project   ${project}`,
     `  ceiling   ${String(ceiling)} (${RUNG_LABEL[ceiling]})   dispatches ask for at most ${String(rung)} (${RUNG_LABEL[rung]})`,
     '  Ctrl-C stops the answer. Again to leave. /exit leaves too.',
@@ -828,6 +828,9 @@ export const SLASH_HELP = `
   Ctrl-C         stop the answer in flight; again to leave
   Ctrl-D         leave
 
-  The commander holds no tools. To change a file it proposes an objective, you approve it,
-  and an Engineer is raised in a leased worktree and reviewed by an independent Inspector.
+  The commander's whole loadout is one inert tool, TodoWrite. It is one rather than none
+  because an emptied allow-list makes the launcher omit --allowedTools altogether, and the
+  process then inherits claude's own default loadout — the most permissive configuration
+  this program can start. To change a file it proposes an objective, you approve it, and an
+  Engineer is raised in a leased worktree and reviewed by an independent Inspector.
 `;

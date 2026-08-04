@@ -986,10 +986,8 @@ test('preserve patterns the release gate cannot match are rejected, not silently
  * Add a new input to either and this goes red without anyone remembering to update a list.
  */
 test('the config-relocating strip list cannot fall behind what resolves the config', async () => {
-  const pathsSource = readFileSync(
-    new URL('../src/config/paths.ts', import.meta.url),
-    'utf8',
-  );
+  const pathsModule = new URL('../src/config/paths.ts', import.meta.url);
+  const pathsSource = readFileSync(pathsModule, 'utf8');
 
   // Resolve `env['X']`, `process.env['X']`, `env[X]` and `env.X`. An identifier is looked up as
   // a `const X = '…'` in the same file; anything that CANNOT be resolved fails the test rather
@@ -1015,12 +1013,59 @@ test('the config-relocating strip list cannot fall behind what resolves the conf
   }
 
   assert.ok(derived.has('AGENTIC_ARMY_HOME'), 'sanity: the known override must be derived, not assumed');
+
+  // Being READ by `src/config/paths.ts` is not the same as being able to RELOCATE the config,
+  // and the difference arrived the day `armyHome` started reading `NODE_TEST_CONTEXT` — the
+  // tripwire that makes it refuse inside the test runner instead of resolving the developer's
+  // own archive. That variable can make the resolver throw; it cannot make it answer somewhere
+  // else, and stripping it from a hook overlay would protect nothing.
+  //
+  // So which is which is OBSERVED rather than declared. Naming the exception in a list here is
+  // precisely the tautology this test was rewritten to escape: the list would be updated by
+  // whoever added the read, which is whoever would have got it wrong. Each derived name is set
+  // to a sentinel PATH in a child, and `armyHome`'s own answer decides. Answer moves to the
+  // sentinel -> it relocates the config -> it must be stripped.
+  let relocating = 0;
   for (const name of derived) {
-    assert.ok(
-      CONFIG_RELOCATING_ENV_VARS.includes(name),
-      `src/config/paths.ts reads ${name}, so it can relocate the config and MUST be stripped`,
+    const sentinel = join(ROOT, `sentinel-${name}`);
+    const childEnv: Record<string, string | undefined> = { ...process.env };
+    // Cleared so the observation is of the resolver rather than of the tripwire, and so a
+    // stray override in the developer's shell cannot answer for the variable under test.
+    delete childEnv['NODE_TEST_CONTEXT'];
+    delete childEnv['AGENTIC_ARMY_HOME'];
+    childEnv[name] = sentinel;
+
+    const observed = execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `const { armyHome } = await import(${JSON.stringify(pathsModule.href)});
+try { process.stdout.write(armyHome()); } catch { process.stdout.write('<refused>'); }`,
+      ],
+      { encoding: 'utf8', env: childEnv, stdio: ['ignore', 'pipe', 'ignore'] },
     );
+
+    if (observed.includes(sentinel)) {
+      relocating += 1;
+      assert.ok(
+        CONFIG_RELOCATING_ENV_VARS.includes(name),
+        `src/config/paths.ts reads ${name} and setting it moved the resolved home to ${observed}, ` +
+          'so it relocates the config and MUST be stripped',
+      );
+    } else {
+      assert.notEqual(
+        observed,
+        '',
+        `the child observing ${name} printed nothing; the observation, not the variable, is broken`,
+      );
+    }
   }
+  assert.ok(
+    relocating > 0,
+    'no derived variable was observed to move the resolved home — the observation is broken, ' +
+      'and a broken observation exempts every variable it looks at',
+  );
 
   // `os.homedir()` is native, so its inputs are observed rather than parsed. This is what makes
   // `HOME` provably a config-relocating variable on this platform rather than a guess.
