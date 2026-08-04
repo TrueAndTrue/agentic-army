@@ -3,10 +3,10 @@
 A war-hierarchy multi-agent orchestrator. You are the **Commander**; everything below you is
 an agent with a rank (its authority), a role (its branch of service), and a bounded blast
 radius. Officers hold strategy and are structurally incapable of editing a file; Captains and
-below do the work, each in its own isolated worktree; and every change is reviewed by an
-Inspector that was briefed by the *parent*, from the original orders, never by the agent under
-review. The design goal is that nothing enters a commanding agent's context except a
-hard-schema report — guarded by mechanism rather than by discipline.
+below do the work in a leased worktree rather than in your checkout; and every change is
+reviewed by an Inspector that was briefed by the *parent*, from the original orders, never by
+the agent under review. The design goal is that nothing enters a commanding agent's context
+except a hard-schema report — guarded by mechanism rather than by discipline.
 
 > **Status: the loop runs; the package is not published.** `army doctor`, `army init`,
 > `army enlist`, `army chat`, `army campaign`, `army view` and `army rebuild` are all
@@ -190,6 +190,17 @@ One objective, end to end. A CPT·ENGINEER (claude) takes a leased worktree, cut
 (codex), briefed from the *original orders and the branch*, never from the Engineer's account of
 what it did. On PASS the work is made durable and the delivery ladder runs, clamped by the
 project ceiling. On FAIL a fresh Engineer retries in the same worktree with the findings.
+
+**One tree per campaign, and the Inspector shares it.** A campaign leases exactly one worktree
+and runs the Engineer and then the Inspector in it, so the Inspector reads and tests the branch
+in place. Its independence is *not* a fact about the tree, and it is worth being exact about
+where it does come from: the **brief** (the original orders plus the branch, assembled by the
+GENERAL — the Engineer's `report.md` is never handed to it) and the **loadout** (an INSPECTOR is
+granted Read, Grep, Glob, TodoWrite and a fixed set of `Bash` prefixes, and no `Edit`, `Write` or
+`NotebookEdit` at any rank). A second, disposable tree per Inspector is a reasonable thing to
+want — it would stop a mutation-test edit from being visible to a retrying Engineer — but it is
+not what runs, and the trigger to build it is the first campaign that fields an Engineer and an
+Inspector *concurrently*, which today's strictly sequential attempt loop never does.
 
 ```sh
 army campaign "add a multiply function to calc.js"

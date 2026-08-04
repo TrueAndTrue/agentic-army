@@ -5,8 +5,12 @@
  *
  * ```
  * ~/.agentic-army/campaigns/2026-08-02-take-hill-4/
- *   campaign.db            # agents, tasks, signals, events, timings, cost
+ *   campaign.db            # the INDEX: agents, tasks, signals, events, timings, cost
+ *   campaign.json          # truth: the CampaignRow
+ *   tasks.jsonl            # truth: append-only TaskRow snapshots, last line per id wins
+ *   signals.jsonl          # truth: append-only mirror of the signals table
  *   agents/cpt-03/
+ *     agent.json           # truth: the AgentRow
  *     orders.md            # cat-able
  *     report.json          # the schema-capped return
  *     report.md            # full findings
@@ -14,9 +18,18 @@
  *     diff.patch
  * ```
  *
- * **SQLite is the index; files are truth.** A `rebuild-from-files` command must exist from day
- * one or that seam rots. Every row type below must therefore be reconstructible from the files
- * on disk alone — if a column cannot be, it does not belong here.
+ * **SQLite is the index; files are truth.** `army rebuild` (`src/archive/rebuild.ts`) throws
+ * `campaign.db` away and puts it back from `campaign.json`, `tasks.jsonl`, `signals.jsonl`,
+ * `agents/<id>/agent.json` and `agents/<id>/stream.jsonl`, without ever reading the existing
+ * database. Every row type below must therefore be reconstructible from the files on disk alone
+ * — if a column cannot be, it does not belong here.
+ *
+ * THE FOUR TRUTH FILES ARE LISTED ABOVE ON PURPOSE. This block used to show only `campaign.db`
+ * and the per-agent artifacts, which made the rebuild claim in the paragraph below unreadable:
+ * it named files the layout it sits under did not contain. `test/contracts.test.ts` now fails if
+ * any file `rebuild.ts` reads is missing from this comment, so the two cannot drift again.
+ * Their names live in `src/archive/paths.ts` (`CAMPAIGN_JSON_FILENAME` and friends) rather than
+ * here, because this module is row shapes and that one is paths.
  *
  * Field names are snake_case because these are row shapes, mapped 1:1 onto SQL columns.
  * `node:sqlite` is functional but flagged experimental; keep it behind a thin interface so
@@ -29,7 +42,19 @@ import type { Rung } from './delivery.ts';
 
 /** `~/.agentic-army/campaigns/<campaign-id>/` */
 export const CAMPAIGNS_DIRNAME = 'campaigns';
-/** `~/.agentic-army/mirrors/<project>.git` — the rung-0 durability target. */
+/**
+ * `~/.agentic-army/mirrors/<basename>-<sha1-8>.git` — the rung-0 durability target.
+ *
+ * The 8-char digest of the project's ABSOLUTE path is part of the name, not decoration, and the
+ * spelling is `mirrorPathFor` in `src/delivery/durability.ts`. Two checkouts sharing a basename
+ * — `~/work/api` and `~/oss/api` — would otherwise share one bare repo, and `army/<task-id>`
+ * from one would collide with the identical branch name from the other.
+ *
+ * This comment used to name a bare basename with no digest, describing exactly the collision the
+ * code goes out of its way not to have. The old spelling is not written out here even as a
+ * counter-example: `test/contracts.test.ts` greps for it, and a disowned quote and a live claim
+ * look identical to `grep`.
+ */
 export const MIRRORS_DIRNAME = 'mirrors';
 /** Per-campaign SQLite index. */
 export const CAMPAIGN_DB_FILENAME = 'campaign.db';
@@ -120,7 +145,15 @@ export interface AgentRow {
   harness: HarnessId;
   model: string | null;
   effort: string | null;
-  /** The `--session-id` this agent was spawned with; `--resume` key after a crash. */
+  /**
+   * The session id this agent was spawned with. Supervisor-minted, so identity never has to be
+   * parsed out of the child's output — that part is true of every harness and is the reason the
+   * column exists.
+   *
+   * IT IS NOT A RESUME KEY TODAY. The claude adapter passes it as `--session-id`; the codex
+   * adapter has no analogue and records it for identity only, and nothing in this tree emits
+   * `--resume` or `codex exec resume`. See the resume note in `src/contracts/harness.ts`.
+   */
   session_id: string;
   /** 1-based attempt number for `task_id`. */
   attempt: number;
@@ -154,10 +187,19 @@ export interface AgentRow {
  * `seq` is a total order and is never reused. `body` is capped; anything large goes to a file
  * and `artifact` points at it.
  *
- * Addressing: `to_agent` is an explicit id an agent is entitled to name (its own chain, plus
- * units a common ancestor attached to it); `to_selector` is `'chain'` / `'role:SCOUT'` /
- * `'owner:auth-schema'`, resolved and logged by the supervisor — because a depth-4 Private has
- * never seen the org chart and cannot know an id it was never told.
+ * Addressing: `to_agent` is an explicit agent id, and that half runs — `army campaign` and
+ * `army chat` both write real ids on real rows.
+ *
+ * `to_selector` is the symbolic half, and it is NOT RESOLVED YET. The column is written (the
+ * campaign opens with `to_selector = 'chain'`), stored, indexed and queryable, and that is all:
+ * nothing expands a selector into a set of recipients, so `'role:SCOUT'` and
+ * `'owner:auth-schema'` are the shape the column is built for, not traffic it carries. Treat a
+ * selector as a LABEL on a row today, not as an address that reaches anybody.
+ *
+ * WHAT WOULD TRIGGER BUILDING IT: the first agent that must address a unit whose id it was never
+ * told — a depth-4 Private answering a broadcast, or any fan-out wider than the one chain a
+ * campaign currently runs. Until a second concurrent unit exists to address, a resolver has
+ * nothing to resolve, which is why the column ships ahead of it rather than the other way round.
  *
  * Orders still flow strictly downward. The bus is requests and audit, not command — and it is
  * addressing and audit, NOT wake.
@@ -167,9 +209,9 @@ export interface SignalRow {
   seq: number;
   ts: string;
   from_agent: string;
-  /** Explicit agent id… */
+  /** Explicit agent id. The half that is delivered. */
   to_agent: string | null;
-  /** …or `chain` / `role:SCOUT` / `owner:auth-schema`. */
+  /** The symbolic half — `chain` today, `role:…` / `owner:…` when a resolver exists. See above. */
   to_selector: string | null;
   kind: SignalKind;
   /** REFERENCES signals(seq). An `answer` row's link back to its `query`. */

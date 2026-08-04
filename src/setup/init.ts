@@ -156,12 +156,15 @@ default_ceiling = 0
 # ---------------------------------------------------------------------------
 # [worktree] — the pool every agent works in
 # ---------------------------------------------------------------------------
-# Every Engineer and every Inspector gets its own leased worktree:
-# an Inspector's most valuable move is mutation testing — revert a fix, watch
-# the test go red, restore it — and that needs to WRITE, so it cannot share the
-# Engineer's tree. Trees are pooled and reused rather than created per task,
-# because a warm reset preserves node_modules and turns a 1–3 minute dependency
-# install into an incremental one.
+# A campaign leases ONE tree and runs its Engineer and then its Inspector in it.
+# The Inspector needs a WRITABLE tree — its most valuable move is mutation
+# testing: revert a fix, watch the test go red, restore it — and a leased tree
+# is writable, so sharing works. It is not granted an editing tool either way;
+# that is its loadout, not the tree. (A second disposable tree per Inspector
+# would isolate those mutations from a retrying Engineer, and is not built.)
+# Trees are pooled and reused rather than created per task, because a warm reset
+# preserves node_modules and turns a 1–3 minute dependency install into an
+# incremental one.
 #
 # Pooling is built in. There is no external binary to install: \`npm i -g
 # agentic-army\` is the whole install story.
@@ -241,12 +244,26 @@ default_ceiling = 0
 # ---------------------------------------------------------------------------
 # [[dispatch.rules]] — which harness runs which job
 # ---------------------------------------------------------------------------
-# Static vendor split by role:
+# HOW MATCHING WORKS TODAY, in one sentence: the role picks the vendor, and the
+# first rule below whose \`use\` names that vendor supplies the model and effort.
 #
-#   ENGINEER   -> claude
-#   SCOUT      -> claude
-#   INSPECTOR  -> codex
-#   SENTRY     -> codex
+#   INSPECTOR            -> codex
+#   every other role     -> claude
+#
+# So the two rules below are, in practice, "the claude settings" and "the codex
+# settings", and editing \`model\` or \`effort\` in them genuinely changes what
+# gets spawned. Only SCOUT and SENTRY are absent from that list, and only
+# because nothing spawns one — see [projects]'s neighbours in the docs.
+#
+# \`when\` IS NOT MATCHED AGAINST ANYTHING. It is accepted, it is required (a
+# rule without one is ignored, with a warning), and it is read by humans and by
+# the audit trail — but no dispatcher compares it to a task. It is the slot a
+# real predicate will occupy. Write it as a truthful label for the rule, not as
+# a condition you expect to be evaluated. Same for \`why\`, which is prose by
+# design.
+#
+# \`use\` is an array and ONLY THE FIRST ENTRY IS READ. Extra entries are
+# parsed, validated and then ignored.
 #
 # Zero quota machinery, both subscription pools used without coordination, and
 # cross-vendor review independence is structural rather than a rule somebody has
@@ -254,9 +271,10 @@ default_ceiling = 0
 # training and therefore its blind spots. A GPT Inspector does not.
 #
 # The accepted weakness is real: when Claude quota is exhausted every Engineer
-# stops while Codex sits at 85%. That is the trigger to build quota resolution —
-# at which point \`use\` becomes a multi-entry candidate array and nothing else
-# about this file changes. That is why the arrays below are arrays.
+# stops while Codex sits at 85%. THAT IS THE TRIGGER to build quota resolution,
+# and it is what makes \`use\` an array and \`when\` a string ahead of either
+# being consulted: on that day the second entry starts being read and a matcher
+# starts reading \`when\`, and this file does not change shape.
 #
 # When that day comes, one rule carries over verbatim: never downgrade reasoning
 # class to conserve quota. Report that the strongest-class choice cannot proceed
@@ -271,6 +289,11 @@ why = "Engineers build on Claude."
 when = "An Engineer has claimed done and its branch needs review."
 use = [ { harness = "codex", model = "gpt-5.5", effort = "high" } ]
 why = "Reviewer must not share the builder's blind spots."
+
+# There is also an optional \`dispatch.default\` array of targets. It parses and
+# it validates; NOTHING READS IT YET. A role that matches no rule falls back to
+# a built-in target, not to this. It is accepted rather than rejected so that a
+# config already carrying one keeps loading.
 
 
 # ---------------------------------------------------------------------------

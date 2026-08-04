@@ -54,11 +54,15 @@ import type { Env } from './paths.ts';
 export const CONFIG_VERSION = 1;
 
 /**
- * The static vendor split by role — Engineers and Scouts on claude, Inspectors and Sentries on
- * codex — used when the config is absent or has no usable rules. Unlike a ceiling, a dispatch
- * default has no blast radius — the worst case is a job running on the wrong vendor — so falling
- * back to a working default here is safe, whereas falling back to a working default for a
- * ceiling would be the whole vulnerability.
+ * The static vendor split — Inspectors on codex, every other role on claude — used when the
+ * config is absent or has no usable rules. Unlike a ceiling, a dispatch default has no blast
+ * radius — the worst case is a job running on the wrong vendor — so falling back to a working
+ * default here is safe, whereas falling back to a working default for a ceiling would be the
+ * whole vulnerability.
+ *
+ * The split is enacted by `dispatchFor` in `src/command/campaign.ts` and is a function of the
+ * ROLE alone; what these rules supply is the `model` and `effort` for whichever harness the role
+ * chose. The `when` strings below are labels — see `DispatchRule.when`, which nothing matches on.
  *
  * Kept byte-compatible with the `[[dispatch.rules]]` block that `army init` writes.
  */
@@ -194,6 +198,27 @@ function parseDispatchTarget(raw: unknown, where: string, warnings: string[]): D
   return target;
 }
 
+/**
+ * `[dispatch]` -> `DispatchConfig`.
+ *
+ * TOLERANCE IS THE POINT HERE, and it is worth saying which fields this function accepts without
+ * anything downstream reading them, because "accepted" and "in effect" are different claims and
+ * only one of them is true of each:
+ *
+ *   IN EFFECT   `use[0].harness` (selects which rule a role reads), `use[0].model`,
+ *               `use[0].effort` — these reach the spawned process.
+ *   ACCEPTED,   `when`  — required, validated non-empty, never matched against a task;
+ *   NOT READ    `why`   — prose, by design;
+ *               `use[1..]` — parsed and validated, then ignored;
+ *               `default` — parsed and validated, then ignored (`dispatchFor` has its own
+ *                           hardcoded fallback). See `DispatchConfig.default`.
+ *
+ * None of the four is rejected and none produces a warning on its own, deliberately: a config
+ * somebody has already hand-edited must keep loading, and an upgrade that turned a working file
+ * into a warning storm — or a load failure — would be a worse bug than the documentation one it
+ * fixed. What each field is worth is stated on the type and in the `army init` template, which is
+ * where a reader is standing when they edit it.
+ */
 function parseDispatch(raw: unknown, warnings: string[]): DispatchConfig {
   if (raw === undefined) return DEFAULT_DISPATCH;
   if (!isTable(raw)) {
@@ -245,6 +270,9 @@ function parseDispatch(raw: unknown, warnings: string[]): DispatchConfig {
 
   const config: DispatchConfig = { rules };
 
+  // Parsed and validated so that a typo in a `dispatch.default` is still reported, and so that a
+  // config carrying one keeps loading. NOTHING READS THE RESULT — `dispatchFor` falls back to its
+  // own `{ harness }` computed from the role. See `DispatchConfig.default`.
   const rawDefault = raw['default'];
   if (Array.isArray(rawDefault)) {
     const targets = rawDefault

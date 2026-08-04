@@ -6,7 +6,10 @@
  *
  * - **Durability is UNCONDITIONAL and uncapped.** Work leaves the ephemeral worktree for a real
  *   git ref before the lease is released — the origin remote if the project has one, otherwise
- *   a bare mirror at `~/.agentic-army/mirrors/<project>.git`. No ceiling suppresses this: the
+ *   a bare mirror at `~/.agentic-army/mirrors/<basename>-<sha1-8>.git`, where the digest is of
+ *   the project's ABSOLUTE path (`mirrorPathFor`, `src/delivery/durability.ts`). The digest is
+ *   load-bearing, not noise: without it `~/work/api` and `~/oss/api` share one bare repo and
+ *   their identical `army/<task-id>` branches collide. No ceiling suppresses this: the
  *   pool never drains and no overnight run is ever lost. A ceiling of 0 does not mean "do not
  *   persist", it means "your repo stays untouched".
  * - **Delivery IS capped.** The rungs are prefixes, not alternatives, so a ceiling is a clamp

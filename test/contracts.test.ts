@@ -52,6 +52,9 @@ import {
   // archive
   TASK_STATUSES,
   SIGNAL_KINDS,
+  CAMPAIGN_DB_FILENAME,
+  MIRRORS_DIRNAME,
+  STREAM_JSONL_FILENAME,
   // harness
   SOLDIER_EVENT_TYPES,
   HARNESS_IDS,
@@ -78,6 +81,18 @@ import {
   upsertProjectEntry,
   writeProjectCeiling,
 } from '../src/config/load.ts';
+
+// The truth-file names live with the paths, not with the row shapes. Imported rather than
+// retyped so that renaming one breaks the layout guard instead of silently weakening it.
+import {
+  AGENT_JSON_FILENAME,
+  CAMPAIGN_JSON_FILENAME,
+  SIGNALS_JSONL_FILENAME,
+  TASKS_JSONL_FILENAME,
+} from '../src/archive/paths.ts';
+
+// The real mirror path builder — the guard below compares the docs to what this produces.
+import { mirrorPathFor } from '../src/delivery/durability.ts';
 
 // The ONE read-only import left from the setup module. It is not a pinning test: this is the
 // config FORMAT the setup unit writes to disk, and being able to parse it is a real integration
@@ -1554,6 +1569,209 @@ test('PROJECTS_SECTION says only what is true about raising a ceiling', () => {
 
   // The one claim that IS absolute stays absolute: the repo has no say.
   assert.match(PROJECTS_SECTION, /never inside the\s*#?\s*repository it governs/i);
+});
+
+// -----------------------------------------------------------------------------------------
+// DOC/CODE DRIFT — claims a comment makes, pinned to the code that has to keep them true
+//
+// Every assertion below started life as a sentence in a doc comment that had stopped
+// describing the program. A comment nobody can fail is a comment that drifts, so each of these
+// reads the REAL artifact — the layout block, the mirror path the delivery code builds, the
+// schema description that ships in the npm tarball, the dispatcher's own body — rather than
+// trusting the prose next to it.
+// -----------------------------------------------------------------------------------------
+
+/** A source file under `src/`, read as text so a comment can be asserted on. */
+async function readSrc(...parts: string[]): Promise<string> {
+  return fs.readFile(path.resolve(import.meta.dirname, '..', 'src', ...parts), 'utf8');
+}
+
+test('the archive layout block names every file `army rebuild` reconstructs from', async () => {
+  const text = await readSrc('contracts', 'archive.ts');
+
+  // The fenced block at the head of the module, not the whole file: a filename mentioned in
+  // some other paragraph must not satisfy a claim the LAYOUT makes.
+  const block = /```\n([\s\S]*?)```/.exec(text)?.[1];
+  assert.ok(block !== undefined, 'the layout block must exist to be checked');
+  assert.ok(block.includes('campaigns/'), 'the scanner found the right block, not an empty match');
+
+  // Sourced from the path module rather than retyped, so renaming a constant ripples here.
+  const truth = [
+    CAMPAIGN_JSON_FILENAME,
+    TASKS_JSONL_FILENAME,
+    SIGNALS_JSONL_FILENAME,
+    AGENT_JSON_FILENAME,
+    STREAM_JSONL_FILENAME,
+  ];
+  for (const file of truth) {
+    assert.ok(
+      block.includes(file),
+      `the layout block omits ${file}. The module claims two lines below it that campaign.db ` +
+        'is rebuilt from the files on disk; a layout that does not contain those files makes ' +
+        'that claim unreadable. Add it, or stop making the claim.',
+    );
+  }
+  // And the index itself, so the "SQLite is the index" contrast has both halves.
+  assert.ok(block.includes(CAMPAIGN_DB_FILENAME), 'the index belongs in the layout too');
+});
+
+test('the mirror path in the contracts is the one durability actually builds', async () => {
+  // The property the digest exists for: two checkouts sharing a basename must not collide.
+  const a = mirrorPathFor('/Users/x/work/api', '/archive');
+  const b = mirrorPathFor('/Users/x/oss/api', '/archive');
+  assert.notEqual(a, b, 'same basename, different absolute path — these must not share a mirror');
+  for (const p of [a, b]) {
+    assert.equal(path.basename(path.dirname(p)), MIRRORS_DIRNAME);
+    assert.match(
+      path.basename(p),
+      /^api-[0-9a-f]{8}\.git$/,
+      'the shipped name is <basename>-<sha1-8>.git — the docs below are pinned to this shape',
+    );
+  }
+
+  // Both contracts used to document `mirrors/<project>.git`, which is precisely the colliding
+  // name the code refuses to produce. Neither may say it again.
+  for (const [where, text] of [
+    ['contracts/archive.ts', await readSrc('contracts', 'archive.ts')],
+    ['contracts/delivery.ts', await readSrc('contracts', 'delivery.ts')],
+  ] as const) {
+    assert.ok(
+      !text.includes('mirrors/<project>.git'),
+      `${where} documents mirrors/<project>.git, a path mirrorPathFor never produces`,
+    );
+    assert.match(
+      text,
+      /<basename>-<sha1-8>\.git/,
+      `${where} must document the digest — it is load-bearing, not cosmetic`,
+    );
+  }
+});
+
+test('the schema descriptions ship in the package, so they must not misdescribe the flags', () => {
+  // These strings enter a model's context on every structured return and are published in the
+  // npm tarball, so a wrong one is not an internal note.
+  for (const [name, schema] of [
+    ['report.v1.json', reportSchema],
+    ['verdict.v1.json', verdictSchema],
+  ] as const) {
+    const description = String(schema.description);
+    assert.ok(
+      !/--json-schema\s*<path>/.test(description),
+      `${name} says claude takes --json-schema <path>. It does not: claude rejects a path with ` +
+        '"--json-schema is not valid JSON", and src/harness/claude.ts inlines the file contents.',
+    );
+    assert.ok(description.includes('--output-schema'), `${name}: codex's flag is named`);
+  }
+
+  // The verdict schema is the one that carried the false claim; it must now name the asymmetry.
+  const verdictDescription = String(verdictSchema.description);
+  assert.match(verdictDescription, /inline/i);
+  assert.match(verdictDescription, /--output-schema <path>/);
+});
+
+test('the claude adapter really does inline the schema file, which is what the docs now say', async () => {
+  const claude = await fs.readFile(
+    path.resolve(import.meta.dirname, '..', 'src', 'harness', 'claude.ts'),
+    'utf8',
+  );
+  // The doc claim above is only worth pinning if the adapter is the thing it describes.
+  assert.match(
+    claude,
+    /args\.push\('--json-schema',\s*read\(spec\.outputSchemaPath\)\)/,
+    'claude.ts must pass the file CONTENTS. If this moved, the schema descriptions and ' +
+      'SoldierSpec.outputSchemaPath both describe something that no longer happens.',
+  );
+});
+
+test('dispatch: `when` and `dispatch.default` are documented as accepted-but-unread, and are', async () => {
+  const campaign = await fs.readFile(
+    path.resolve(import.meta.dirname, '..', 'src', 'command', 'campaign.ts'),
+    'utf8',
+  );
+  const body = /function dispatchFor\([\s\S]*?\n}\n/.exec(campaign)?.[0];
+  assert.ok(body !== undefined, 'dispatchFor must be findable, or this guard proves nothing');
+  assert.ok(body.includes('rule.use[0]'), 'the scanner is looking at the real dispatcher');
+
+  // THE CODE HALF. If either of these starts being read, this test fails — which is the point:
+  // wiring one up is welcome, and it must come with the doc change, not without it.
+  assert.ok(
+    !/\.when\b/.test(body),
+    'dispatchFor now reads `when`. Good — then update DispatchRule.when in ' +
+      'src/contracts/config.ts, the [[dispatch.rules]] block in src/setup/init.ts and the ' +
+      'note in parseDispatch, all of which currently tell the user nothing matches on it.',
+  );
+  assert.ok(
+    !/\bdispatch\.default\b|\bconfig\.dispatch\.default\b/.test(body),
+    'dispatchFor now reads dispatch.default. Then DispatchConfig.default must stop saying ' +
+      'NOT BUILT YET, and the init template must stop saying nothing reads it.',
+  );
+
+  // THE DOC HALF, so the two cannot be true separately.
+  const contract = await readSrc('contracts', 'config.ts');
+  assert.match(contract, /NOT A PREDICATE, AND NOTHING MATCHES ON IT/);
+  assert.match(contract, /\*\*ONLY `use\[0\]` IS READ\.\*\*/);
+  assert.match(contract, /NOT BUILT YET — accepted, validated, and read by nothing/);
+  assert.ok(
+    !contract.includes('an unmatched task is an error, not a guess'),
+    'that sentence was false in both halves: absence is not an error, and the fallback is a guess',
+  );
+});
+
+test('the config template promises the vendor split the dispatcher performs', () => {
+  const toml = defaultConfigToml();
+  // SENTRY -> codex was written here and has never been true: nothing spawns a SENTRY, and were
+  // one fielded it would take the non-INSPECTOR branch to claude.
+  assert.ok(
+    !/^#\s*SENTRY\s*->\s*codex\s*$/m.test(toml),
+    'the template routes SENTRY to codex. Only INSPECTOR routes to codex.',
+  );
+  assert.match(toml, /INSPECTOR\s+->\s+codex/, 'the split that does happen is stated');
+  assert.match(toml, /every other role\s+->\s+claude/i);
+  assert.match(toml, /IS NOT MATCHED AGAINST ANYTHING/, '`when` is labelled honestly in place');
+  assert.match(toml, /ONLY THE FIRST ENTRY IS READ/, '`use` is labelled honestly in place');
+  assert.match(toml, /NOTHING READS IT YET/, '`dispatch.default` is labelled honestly in place');
+});
+
+test('TOLERANCE: a config carrying the old `when` and `dispatch.default` still loads', () => {
+  // The upgrade above changed documentation, not the accepted grammar. A file somebody edited
+  // months ago — free-text `when`, a `dispatch.default`, and an extra `use` candidate nothing
+  // reads — must still load, with the same live targets and no new warnings.
+  const toml = [
+    'version = 1',
+    '',
+    '[dispatch]',
+    'default = [ { harness = "claude", model = "claude-sonnet-5" } ]',
+    '',
+    '[[dispatch.rules]]',
+    'when = "the moon is waxing and the task smells like refactoring"',
+    'use = [ { harness = "claude", model = "claude-sonnet-5", effort = "xhigh" } ]',
+    'why = "Engineers build on Claude."',
+    '',
+    '[[dispatch.rules]]',
+    'when = "An Engineer has claimed done and its branch needs review."',
+    'use = [',
+    '  { harness = "codex", model = "gpt-5.5", effort = "high" },',
+    '  { harness = "claude", model = "claude-sonnet-5", effort = "high" },',
+    ']',
+    'why = "Reviewer must not share the builder\'s blind spots."',
+  ].join('\n');
+
+  const { config, warnings } = parseConfig(toml, '/tmp/h/config.toml');
+  assert.deepEqual(warnings, [], 'an already-valid config must not start warning');
+
+  // `when` is carried verbatim, whatever it says — nothing validates it as a predicate.
+  assert.equal(config.dispatch.rules[0]?.when, 'the moon is waxing and the task smells like refactoring');
+  // The live fields are unaffected by the nonsense label above it.
+  assert.deepEqual(config.dispatch.rules[0]?.use[0], {
+    harness: 'claude',
+    model: 'claude-sonnet-5',
+    effort: 'xhigh',
+  });
+  // Extra candidates survive parsing and are simply never consulted.
+  assert.equal(config.dispatch.rules[1]?.use.length, 2);
+  assert.equal(config.dispatch.rules[1]?.use[0]?.harness, 'codex');
+  // And the default is accepted rather than rejected, exactly as before.
+  assert.deepEqual(config.dispatch.default, [{ harness: 'claude', model: 'claude-sonnet-5' }]);
 });
 
 // -----------------------------------------------------------------------------------------

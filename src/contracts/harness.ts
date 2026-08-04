@@ -10,6 +10,13 @@
  * | claude  | `-p --input-format stream-json`     | `-p`         | `--json-schema`   | `--resume`    |
  * | codex   | `app-server` (stdio)                | `exec --json`| `--output-schema` | `exec resume` |
  *
+ * THE RESUME COLUMN IS VENDOR CAPABILITY, NOT SHIPPED BEHAVIOUR. Nothing in this tree emits
+ * `--resume` or `codex exec resume`; a crashed soldier is re-attempted as a fresh agent, not
+ * resumed. The column stays because it is what the seam has to be able to express, and because
+ * the two spellings differ enough that discovering it late would be a rewrite — but no caller
+ * should read it as "resume works today". What it takes to make it true is written on
+ * `SoldierSpec.sessionId`.
+ *
  * AUTH: workers inherit the interactive OAuth login. Forward `CLAUDE_CONFIG_DIR`; never
  * set `ANTHROPIC_API_KEY` and NEVER pass `--bare` — it skips the keychain and silently breaks
  * subscription auth.
@@ -49,8 +56,22 @@ export interface SoldierSpec {
    */
   cwd: string;
   /**
-   * Supervisor-minted UUID passed as `--session-id`, so identity never has to be parsed out of
-   * the child's output — and `--resume <sessionId>` works after a crash.
+   * Supervisor-minted UUID. Its ONE live job is identity: the spawner knows what it spawned
+   * without parsing an id out of the child's output, and it is written to `AgentRow.session_id`.
+   * A UUID rather than a free string because claude validates the flag's format.
+   *
+   * NOT HARNESS-NEUTRAL, despite reading like it. `src/harness/claude.ts` passes it as
+   * `--session-id` and claude echoes it back on `system/init`. `src/harness/codex.ts` has no
+   * analogue — the thread id is CODEX-minted and arrives on the first line as
+   * `thread.started.thread_id` — so for a codex soldier this value is carried and recorded but
+   * never reaches the process, and the `sessionId` on its `ready` event is the codex thread id,
+   * not this.
+   *
+   * NOT A RESUME KEY EITHER, today: nothing emits `--resume` or `codex exec resume`. Making
+   * resume real needs the codex thread id persisted alongside this (the adapter already exposes
+   * it) and a supervisor that reattaches instead of re-attempting; the trigger is a campaign long
+   * enough that losing a crashed agent's context costs more than re-running it, which a
+   * single-task campaign is not.
    */
   sessionId: string;
   /**
