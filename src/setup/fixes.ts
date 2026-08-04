@@ -46,6 +46,7 @@
  */
 
 import { invokedAs } from './checks.ts';
+import { quoteArg } from './shell.ts';
 
 // ---------------------------------------------------------------------------
 // The type
@@ -112,22 +113,19 @@ export function unrunnableReason(command: string): string | null {
 // Quoting
 // ---------------------------------------------------------------------------
 
-const BARE_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
-
 /**
- * Quote a value for the shell the reader is standing in.
+ * `quoteArg` lives in `./shell.ts` now and is re-exported, not reimplemented.
  *
- * Left bare when it needs no quoting, because the overwhelmingly common case is a tidy absolute
- * path and `git -C /home/me/repo commit …` is what a person would type. POSIX gets single quotes
- * when it does need them: `"` interpolates `$`, backticks and `\`, so a path containing any of
- * those inside double quotes is a command that runs something other than what it reads as.
+ * It moved because `src/setup/checks.ts` needed it and could not have it: `checks.ts` had its own
+ * double-quoting `quoteIfNeeded`, which is wrong on `$`, backticks and `\`, and it could not
+ * import the correct one from here because this module imports `invokedAs` from `checks.ts` — a
+ * cycle. A leaf that imports nothing breaks the tie; see the header of `./shell.ts` for why that
+ * leaf is a new one rather than `src/config/paths.ts`.
+ *
+ * Re-exported rather than moved-and-updated-everywhere so the callers outside this directory keep
+ * the import they already have. It is one binding with two names to reach it, not two copies.
  */
-export function quoteArg(value: string, platform: NodeJS.Platform = process.platform): string {
-  if (value === '') return platform === 'win32' ? '""' : "''";
-  if (BARE_SAFE.test(value)) return value;
-  if (platform === 'win32') return `"${value.replaceAll('"', '""')}"`;
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
+export { quoteArg } from './shell.ts';
 
 // ---------------------------------------------------------------------------
 // The shared conditions

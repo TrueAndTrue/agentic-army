@@ -86,6 +86,8 @@ SETUP
                     ceiling. Run it from inside the repo.
 
 CAMPAIGNS
+  chat              Talk to a commanding officer that can dispatch work. It
+                    holds no tools; you approve what it sends out.
   campaign          Run one objective end to end: Engineer, review gate,
                     delivery up to the project ceiling.
   view              Read-only tree view of a campaign in flight.
@@ -107,6 +109,7 @@ ${firstRun}
 
 RANKS   ☆ GENERAL   ◆ COLONEL   ◇ CAPTAIN   ▪ SERGEANT   · PRIVATE
 ROLES   SCOUT (find out)  ENGINEER (change)  INSPECTOR (verify)  SENTRY (wait)
+        COMMANDER (decide — holds no tools at all)
 `;
 }
 
@@ -297,7 +300,7 @@ function wantsHelp(argv: readonly string[]): boolean {
 }
 
 /** Commands that carry their own `--help` text, so it cannot drift from their own options. */
-const SELF_DOCUMENTING = new Set(['campaign', 'view']);
+const SELF_DOCUMENTING = new Set(['chat', 'campaign', 'view']);
 
 /**
  * Every command this file routes, in the order the help lists them.
@@ -306,7 +309,7 @@ const SELF_DOCUMENTING = new Set(['campaign', 'view']);
  * command` can never advertise a stale set.
  */
 function knownCommands(): string[] {
-  const order = ['doctor', 'init', 'enlist', 'campaign', 'view', 'rebuild'];
+  const order = ['doctor', 'init', 'enlist', 'chat', 'campaign', 'view', 'rebuild'];
   const all = new Set([...Object.keys(COMMAND_HELP), ...SELF_DOCUMENTING]);
   return [...order.filter((c) => all.has(c)), ...[...all].filter((c) => !order.includes(c))];
 }
@@ -361,6 +364,10 @@ export async function run(argv: readonly string[]): Promise<number> {
     // The three campaign commands are imported on demand. `army doctor` is the thing you run
     // when the machine is broken, and it should not have to load the archive, the harness
     // adapters and the delivery ladder to tell you `claude` is missing.
+    case 'chat': {
+      const { chatCommand } = await import('./command/chat.ts');
+      return chatCommand(rest);
+    }
     case 'campaign': {
       const { campaignCommand } = await import('./command/index.ts');
       return campaignCommand(rest);

@@ -151,6 +151,23 @@ export const ROLE_ALLOW: Record<Role, readonly string[]> = Object.freeze({
     ...bashRules(INSPECTOR_BASH_PREFIXES),
   ]),
   SENTRY: Object.freeze(['Bash(gh pr view:*)', 'Bash(gh run list:*)']),
+  // ==========================================================================================
+  // THE COMMANDER'S LOADOUT IS THE POINT OF THE COMMANDER.
+  //
+  // A commanding agent that can read a file will read a file, and the whole hierarchy exists
+  // because that is the failure: one `Read` of a 2000-line module and the window holding the
+  // strategy is gone. Telling it not to is a request. Not giving it the tool is a mechanism.
+  //
+  // `TodoWrite` is here and it is not decoration. `buildClaudeArgs` only emits `--allowedTools`
+  // when the list is NON-EMPTY, so a literally empty allow-list omits the flag — and a claude
+  // worker with no `--allowedTools` gets the DEFAULT loadout, which is everything. An empty
+  // allow-list would therefore be the most permissive spec this codebase can produce. One inert
+  // tool keeps the flag on the command line and every other tool off it.
+  //
+  // `assertCommanderLoadout` below refuses to spawn a COMMANDER whose list has grown a tool
+  // that touches the filesystem, a shell, or the network, so this cannot be widened quietly.
+  // ==========================================================================================
+  COMMANDER: Object.freeze(['TodoWrite']),
 }) as Record<Role, readonly string[]>;
 
 // ---------------------------------------------------------------------------------------------
@@ -234,6 +251,95 @@ export function globalDeny(home?: string): string[] {
   return [...GLOBAL_DENY, ...resolved];
 }
 
+// ---------------------------------------------------------------------------------------------
+// The commander's context guard
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Tool names a COMMANDER may never hold, whatever the allow-list says.
+ *
+ * The classification is "can this put bytes into the holder's context window, or bytes onto this
+ * machine" — not "is this dangerous". `Read` is not dangerous. `Read` is the thing that ends a
+ * commanding agent's usefulness, one file at a time, which is why it is on the same list as
+ * `Bash`.
+ *
+ * Names, not rules: a rule is `Bash(git:*)` and a name is `Bash`, so the check below strips the
+ * parenthesised argument before comparing. Matching on the whole rule string would let
+ * `Bash(cat:*)` through a list that names `Bash`.
+ */
+export const COMMANDER_FORBIDDEN_TOOLS: readonly string[] = Object.freeze([
+  'Read',
+  'Grep',
+  'Glob',
+  'Edit',
+  'Write',
+  'NotebookEdit',
+  'Bash',
+  'BashOutput',
+  'KillShell',
+  'WebFetch',
+  'WebSearch',
+  'Task',
+  'Agent',
+]);
+
+/** `Bash(git:*)` -> `Bash`. A rule's tool NAME, which is what a loadout is really made of. */
+export function toolNameOf(rule: string): string {
+  const open = rule.indexOf('(');
+  return (open === -1 ? rule : rule.slice(0, open)).trim();
+}
+
+/**
+ * Extra denies that apply to one role only.
+ *
+ * The global deny-list is deliberately the same for everyone — it is the floor. This is the
+ * ceiling for a role whose whole definition is an absence, and it exists because two mechanisms
+ * that fail independently are worth more here than one: `--allowedTools` omits every tool not
+ * named, and `--disallowedTools` names them anyway. If a future flag change, a harness default,
+ * or a hand-edited spec ever restores the default loadout, the deny half still holds.
+ */
+export const ROLE_DENY: Record<Role, readonly string[]> = Object.freeze({
+  SCOUT: Object.freeze([]),
+  ENGINEER: Object.freeze([]),
+  INSPECTOR: Object.freeze([]),
+  SENTRY: Object.freeze([]),
+  COMMANDER: Object.freeze(COMMANDER_FORBIDDEN_TOOLS.map((tool) => tool)),
+}) as Record<Role, readonly string[]>;
+
+/**
+ * Refuse to spawn a COMMANDER that can read a file, run a command, or reach the network.
+ *
+ * Called from `permissionsFor`, so there is no route to a permission set that skips it, and it
+ * throws rather than filtering. Filtering would mean a widened `ROLE_ALLOW.COMMANDER` silently
+ * became a narrow one at spawn time, and the next reader would find a list whose contents are
+ * not what the process actually runs with. A refusal is visible; a quiet correction is not.
+ *
+ * Scope, stated because a guard that overstates itself is worse than none: this checks the rules
+ * this process is about to put on the command line. It is not a claim about what the harness
+ * enforces — see the harness table at the top of this file for that, and note that a COMMANDER
+ * runs on claude, which is the harness where per-tool rules ARE enforced.
+ */
+export function assertCommanderLoadout(allow: readonly string[], who: string): void {
+  const forbidden = new Set(COMMANDER_FORBIDDEN_TOOLS);
+  const offending = allow.filter((rule) => forbidden.has(toolNameOf(rule)));
+  if (offending.length > 0) {
+    throw new Error(
+      `refusing to spawn ${who}: its allow-list holds ${offending.join(', ')}. A commanding ` +
+        'agent that can read files or run commands does not delegate — it does the work itself, ' +
+        'fills the window that was holding the strategy, and the hierarchy underneath it stops ' +
+        'paying for itself. The loadout is the guard; a sentence in the briefing is not.',
+    );
+  }
+  if (allow.length === 0) {
+    throw new Error(
+      `refusing to spawn ${who}: its allow-list is empty. An empty list is not "no tools" — the ` +
+        'claude adapter omits `--allowedTools` entirely when there is nothing to put after it, ' +
+        'and a worker spawned without that flag receives the default loadout, which is every ' +
+        'tool. The most restrictive spelling of this list is one harmless tool, never none.',
+    );
+  }
+}
+
 export interface PermissionSet {
   allow: string[];
   deny: string[];
@@ -241,7 +347,9 @@ export interface PermissionSet {
 
 /** The allow/deny pair for one worker. The only supported way to build one. */
 export function permissionsFor(role: Role, home?: string): PermissionSet {
-  return { allow: [...ROLE_ALLOW[role]], deny: globalDeny(home) };
+  const allow = [...ROLE_ALLOW[role]];
+  if (role === 'COMMANDER') assertCommanderLoadout(allow, `a ${role}`);
+  return { allow, deny: [...globalDeny(home), ...ROLE_DENY[role]] };
 }
 
 // ---------------------------------------------------------------------------------------------

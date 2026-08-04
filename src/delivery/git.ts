@@ -302,9 +302,13 @@ const GH_FLAG_TAKES_VALUE: Record<string, boolean> = {
   '-L': true,
   '--state': true,
   '-s': true,
+  '--match-head-commit': true,
   '--draft': false,
   '-d': false,
   '--comment': false,
+  '--squash': false,
+  '--merge': false,
+  '--rebase': false,
   '--version': false,
 };
 
@@ -316,13 +320,108 @@ const GH_ALLOWED_COMMANDS: Record<string, readonly string[]> = {
   'pr review': ['--comment', '--body', '-b', '--repo', '-R'],
 };
 
-export function assertGhAllowed(args: readonly string[]): void {
+// ---------------------------------------------------------------------------------------------
+// the merge authority — `gh pr merge`, and the only door it has
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `gh pr merge` is DELIBERATELY ABSENT from `GH_ALLOWED_COMMANDS` above, which is the table every
+ * unauthorised call is checked against. It is reachable only by handing `assertGhAllowed` a
+ * `MergeAuthority`, and the only place one is minted is `grantMergeAuthority` below.
+ *
+ * Why a second table rather than a row in the first one: the first table is what a worker's
+ * argv meets. Nothing a worker can say — no flag order, no `--repo` before the subcommand, no
+ * `gh api` URL — reaches this one, because reaching it needs an OBJECT, not a string, and the
+ * object is minted in the supervisor process from evidence a worker never holds. The permission
+ * layer's `Bash(gh pr merge:*)` deny is untouched and stays the outer wall; this is the inner
+ * one.
+ *
+ * WHAT IS NOT HERE, AND WHY:
+ *
+ *  - `--admin` — merges past branch protection, required checks and required reviews. The entire
+ *    value of rung 3 is that it merges work a review gate cleared; a flag that skips the gate
+ *    turns it into the opposite. A host that refuses is answering, not malfunctioning.
+ *  - `--auto` — queues the merge to happen later, when checks pass, with nobody watching. That
+ *    is a merge that outlives the evidence it was authorised by.
+ *  - `--delete-branch` — `git push --delete` is refused a few dozen lines above; reaching the
+ *    same destruction through gh would make that refusal decorative.
+ *  - `--body` / `--subject` — a merge commit message is not needed to land a reviewed branch,
+ *    and every string this module does not send is a string that cannot carry an injection.
+ */
+const GH_MERGE_COMMAND = 'pr merge';
+
+/** Exactly one of these must be present: gh refuses to guess a merge method, and so do we. */
+const GH_MERGE_METHODS = ['--squash', '--merge', '--rebase'] as const;
+export type MergeMethod = 'squash' | 'merge' | 'rebase';
+
+const GH_MERGE_FLAGS: readonly string[] = [...GH_MERGE_METHODS, '--match-head-commit', '--repo', '-R'];
+
+/**
+ * Permission to merge ONE pull request AT ONE COMMIT, held as a value rather than as a boolean.
+ *
+ * A boolean parameter (`{ allowMerge: true }`) would have been three characters cheaper and
+ * strictly worse: every call site could spell it, and it would say nothing about WHICH merge was
+ * authorised. This carries its own evidence, and `assertGhAllowed` checks the argv against it —
+ * so an authority that leaks into the wrong call still cannot merge a different pull request, or
+ * the same one at a commit that arrived after the Inspector read it.
+ */
+export interface MergeAuthority {
+  /** The project's ceiling from the global config. Only 3 authorises anything. */
+  readonly ceiling: number;
+  /** The Inspector verdict on this exact work. Only `pass` authorises anything. */
+  readonly verdict: string;
+  /** The pull request the merge is for, as it will appear in the argv. */
+  readonly prRef: string;
+  /** The commit the verdict was rendered against, and the only one that may land. */
+  readonly headCommit: string;
+}
+
+export interface MergeAuthorityInput {
+  ceiling: number;
+  verdict: string;
+  prRef: string;
+  headCommit: string;
+}
+
+/**
+ * Mint a merge authority, or `null`. NEVER throws — a caller that treats "no authority" as an
+ * exception to be caught tends to grow a `catch` that continues, and the whole point is that the
+ * absence of permission is an ordinary, expected, reportable state.
+ *
+ * Fail-closed at every field. `ceiling` is checked here as well as by the ladder because this is
+ * the last place before the argv where the number can be looked at, and "the ceiling is the
+ * authority" is worth stating twice in a merge path.
+ */
+export function grantMergeAuthority(input: MergeAuthorityInput): MergeAuthority | null {
+  if (input.ceiling !== 3) return null;
+  if (input.verdict !== 'pass') return null;
+  if (typeof input.prRef !== 'string' || input.prRef.trim() === '') return null;
+  if (!/^[0-9a-f]{40}$/i.test(input.headCommit)) return null;
+  return {
+    ceiling: input.ceiling,
+    verdict: input.verdict,
+    prRef: input.prRef,
+    headCommit: input.headCommit,
+  };
+}
+
+/** The one argv this module will ever send for a merge. Pure, so it is testable offline. */
+export function prMergeArgs(
+  prRef: string,
+  headCommit: string,
+  method: MergeMethod = 'squash',
+): string[] {
+  return ['pr', 'merge', prRef, `--${method}`, '--match-head-commit', headCommit];
+}
+
+export function assertGhAllowed(args: readonly string[], authority?: MergeAuthority): void {
   const printable = `gh ${args.join(' ')}`;
   const deny = (rule: string): never => {
     throw new DeniedCommandError(printable, rule);
   };
 
   const flags: string[] = [];
+  const values = new Map<string, string>();
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
@@ -336,13 +435,16 @@ export function assertGhAllowed(args: readonly string[]): void {
       deny(
         `\`${name}\` is not on the gh flag allow-list. Unknown flags are refused because a flag ` +
           'that is silently ignored here is a flag gh will happily act on — `-X PUT` being the ' +
-          'example that mattered.',
+          'example that mattered, and `--admin` being the one that matters at rung 3.',
       );
     }
     flags.push(name);
     // A value never counts as a positional, which is what made `gh pr --repo O/R merge N` look
     // like `pr merge` to cobra while looking like `pr O/R merge` to a naive scanner.
-    if (takesValue === true && !arg.includes('=')) i += 1;
+    if (takesValue === true) {
+      const inline = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : args[++i];
+      values.set(name, inline ?? '');
+    }
   }
 
   if (positional.length === 0) {
@@ -352,14 +454,20 @@ export function assertGhAllowed(args: readonly string[]): void {
 
   const two = positional.slice(0, 2).join(' ');
   const one = positional[0]!;
+
+  if (two === GH_MERGE_COMMAND) {
+    assertMergeAllowed(deny, positional, flags, values, authority);
+    return;
+  }
+
   const command = GH_ALLOWED_COMMANDS[two] !== undefined ? two : one;
   const allowedFlags = GH_ALLOWED_COMMANDS[command];
   if (allowedFlags === undefined) {
     deny(
       `\`gh ${command}\` is not on the allow-list. This module needs exactly ` +
         `${Object.keys(GH_ALLOWED_COMMANDS).map((c) => `\`gh ${c}\``).join(', ')} — and nothing ` +
-        'else, notably not `gh pr merge` (rung 3, denied globally) and not `gh api`, which can ' +
-        'reach the merge endpoint by URL without ever naming it.',
+        'else, notably not `gh api`, which can reach the merge endpoint by URL without ever ' +
+        'naming it. `gh pr merge` has one door and it is not this table.',
     );
   }
   for (const flag of flags) {
@@ -372,6 +480,84 @@ export function assertGhAllowed(args: readonly string[]): void {
       'a pull-request review must be `--comment`. An approval (or a request for changes) is a ' +
         'state change that branch protection and auto-merge act on — a step toward rung 3 that ' +
         'nobody asked for. The army posts the Inspector verdict; it does not vote.',
+    );
+  }
+}
+
+/**
+ * `gh pr merge`, checked against the authority that permits it.
+ *
+ * Every branch here refuses; the function returns only by falling off the end, which is the
+ * shape a merge guard should have. The argv must be exactly `pr merge <ref>` — no extra
+ * positionals, because a second one is either a typo or a second pull request — carrying one
+ * merge method and a `--match-head-commit` that pins the merge to the commit the verdict was
+ * rendered against.
+ */
+function assertMergeAllowed(
+  deny: (rule: string) => never,
+  positional: readonly string[],
+  flags: readonly string[],
+  values: ReadonlyMap<string, string>,
+  authority: MergeAuthority | undefined,
+): void {
+  if (authority === undefined) {
+    deny(
+      '`gh pr merge` is denied to every worker at every rank, and to every call site in this ' +
+        'process that does not hold a `MergeAuthority`. A merge is an action of the supervisor ' +
+        'the human launched, at the ceiling the human set, after an Inspector PASS — never ' +
+        'something an agent talks its way into.',
+    );
+    return; // unreachable — `deny` throws. It is here so the refusal narrows the type too.
+  }
+  if (authority.ceiling !== 3) {
+    deny(
+      `the merge authority carries ceiling ${String(authority.ceiling)}, and only a project ` +
+        'ceiling of 3 authorises a merge. The ceiling is the authority; a request is not.',
+    );
+  }
+  if (authority.verdict !== 'pass') {
+    deny(
+      `the merge authority carries an Inspector verdict of \`${authority.verdict}\`. Only a ` +
+        'PASS merges. Fail closed: a missing or failing verdict is not a slow yes.',
+    );
+  }
+  if (positional.length !== 3) {
+    deny(
+      'a merge argv must be exactly `pr merge <pull-request>`. Extra positionals are refused ' +
+        'rather than interpreted.',
+    );
+  }
+  if (positional[2] !== authority.prRef) {
+    deny(
+      `this authority is for \`${authority.prRef}\`, not \`${positional[2] ?? ''}\`. An ` +
+        'authority is minted for one pull request and merges no other.',
+    );
+  }
+  for (const flag of flags) {
+    if (!GH_MERGE_FLAGS.includes(flag)) {
+      deny(
+        `\`${flag}\` is not permitted for \`gh pr merge\`. The permitted set is ` +
+          `${GH_MERGE_FLAGS.join(', ')} — notably not \`--admin\` (merges past branch ` +
+          'protection, required checks and required reviews), not `--auto` (a merge that ' +
+          'outlives the evidence for it) and not `--delete-branch`.',
+      );
+    }
+  }
+  const methods = flags.filter((flag) => (GH_MERGE_METHODS as readonly string[]).includes(flag));
+  if (methods.length !== 1) {
+    deny(
+      `a merge must name exactly one method (${GH_MERGE_METHODS.join(', ')}); this argv names ` +
+        `${String(methods.length)}. Letting gh pick, or letting two flags race, is a merge ` +
+        'strategy chosen by accident.',
+    );
+  }
+  const pinned = values.get('--match-head-commit');
+  if (pinned !== authority.headCommit) {
+    deny(
+      '`--match-head-commit` must pin the merge to the commit the Inspector passed ' +
+        `(${authority.headCommit.slice(0, 12)}…). Without it, a commit pushed to the branch ` +
+        'between the verdict and the merge lands unreviewed — the merge would be of work ' +
+        'nothing ever inspected.',
     );
   }
 }
@@ -594,9 +780,17 @@ export async function probeGh(opts: GhProbeOptions = {}): Promise<GhStatus> {
   return { available: true, authenticated: true, reason: null };
 }
 
+export interface GhOptions extends GhProbeOptions {
+  /**
+   * Present on exactly one call in this package: the supervisor's merge. Absent everywhere else,
+   * which is why every other call site is structurally incapable of merging.
+   */
+  authority?: MergeAuthority;
+}
+
 /** Run gh and throw on a non-zero exit. Returns trimmed stdout. */
-export async function gh(args: readonly string[], opts: GhProbeOptions = {}): Promise<string> {
-  assertGhAllowed(args);
+export async function gh(args: readonly string[], opts: GhOptions = {}): Promise<string> {
+  assertGhAllowed(args, opts.authority);
   const result = await run(opts.binary ?? 'gh', args, opts);
   if (result.code !== 0) throw new CommandError(describe(result), result);
   return result.stdout.trim();

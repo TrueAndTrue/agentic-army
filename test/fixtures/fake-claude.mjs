@@ -17,38 +17,114 @@
  *   silent          accepts the turn, emits NOTHING, exits 0      (silent-death test)
  *   abort-streaming interrupt answered with terminal_reason:aborted_streaming
  *   abort-unknown   interrupt answered with an unrecognised terminal_reason
+ *   work            USES TOOLS on its cwd, under the permission rules it was actually handed
+ *
+ * `--include-partial-messages` is orthogonal to the mode and is read off THIS PROCESS'S argv,
+ * like the permission rules: token-level `stream_event` lines are emitted only if the adapter
+ * actually asked for them.
  *
  * ==========================================================================================
- * KNOWN DIVERGENCES FROM THE REAL CLI — a fake must never be more forgiving than the real thing.
+ * WHAT THIS FAKE MODELS, AND WHAT IT DOES NOT — a fake must never be more forgiving than the
+ * real thing.
  *
  * A fake that is MORE FORGIVING than the real thing hides the bugs it exists to catch. Not
- * hypothetical: this file used to answer EVERY `control_request` with a `result`, which
- * silently cleared the adapter's interrupt flag and let a real leak pass 135 green tests.
+ * hypothetical, twice over:
+ *
+ *   - this file used to answer EVERY `control_request` with a `result`, which silently cleared
+ *     the adapter's interrupt flag and let a real leak pass 135 green tests;
+ *   - this file used to ignore `--allowedTools` / `--disallowedTools` entirely and never
+ *     populate `permission_denials`. A worker was provisioned a worktree it was completely
+ *     denied — Read, Grep, Glob, Write and Edit all refused, not one file created — and 621
+ *     tests were green. The permission tests asserted the deny globs were EMITTED. Nothing
+ *     asserted a worker could still WORK with them applied.
+ *
  * Each remaining gap is listed so the next person knows what this fake does NOT prove.
  * Close one, or add to the list — never leave one undocumented.
  *
- *   FIXED  a control_request with NO turn in flight now sends the receipt and no result,
- *          matching the real CLI. This is the one that bit us.
- *   FIXED  turns occupy time, so `turnInFlight` is a real state rather than a fiction.
+ * ---- MODELLED -----------------------------------------------------------------------------
  *
- *   OPEN 1 `system/init` is emitted once; the real CLI re-emits it at the start of every turn.
- *          Covered instead by claude-duplex.jsonl, which contains 3.
- *   OPEN 2 No `thinking` blocks, `system/thinking_tokens` or `rate_limit_event`. Covered by
- *          the recorded fixtures, not here.
- *   OPEN 3 No tool_use/tool_result cycle and no subagent forwarding. Covered by
- *          claude-subagent.jsonl.
- *   OPEN 4 `permission_denials` is never populated; covered by a normalizer unit test.
- *   OPEN 5 `still_queued` is always []; `interrupt_cancel_queued_v1` semantics are not
- *          modelled AT ALL, so queued-message cancellation is untested everywhere.
- *   OPEN 6 Costs are exact multiples of 0.25 and usage is constant — realistic in SHAPE
- *          (cumulative) but not in value.
- *   OPEN 7 Never emits `error_max_turns` / `budget_exhausted`; those exist only as pure
- *          `claudeResultStatus` unit tests.
+ *   PERMISSIONS. `--allowedTools` / `--disallowedTools` are parsed off THIS PROCESS'S OWN argv
+ *   and enforced on Read, Grep, Glob, Write and Edit in `work` mode. Deny beats allow; a
+ *   non-empty allow-list is exhaustive, so a tool named by neither list is refused, which is
+ *   what `--permission-mode dontAsk` does. A refusal emits the real three-part shape — an
+ *   assistant `tool_use`, a `tool_result` with `is_error: true`, and an entry in
+ *   `permission_denials` on the result line — and, crucially, does NOT touch the filesystem.
+ *   So a worker denied its own workspace produces no files, exactly as it did in the field.
+ *
+ *   PATH SCOPING. `Tool(<glob>)` patterns are matched against the resolved target: `**` spans
+ *   separators, `*` and `?` do not, `~` expands to the home directory and
+ *   `$AGENTIC_ARMY_HOME` to the environment the adapter forwarded. A bare `Tool` with no
+ *   parentheses matches any input. Targets are matched in BOTH their resolved and their
+ *   realpath'd spelling, because `/tmp` and `/private/tmp` are one directory with two names
+ *   and a guard that compares only one of them fails open.
+ *
+ *   A control_request with NO turn in flight sends the receipt and no result, matching the real
+ *   CLI. That is the one that bit us. Turns occupy time and QUEUE, so "a turn is running" is a
+ *   real state rather than a fiction, and two turns produce two results.
+ *
+ *   STDIN CLOSING IS NOT AN ABORT. Measured: a turn written and then followed immediately by
+ *   `stdin.end()` still produces its assistant message and its result before the real CLI exits
+ *   0. See the `rl.on('close')` handler for what this file used to do instead, and what that
+ *   cost.
+ *
+ *   PARTIAL MESSAGES, recorded from claude 2.1.221 on 2026-08-03 and reproduced exactly,
+ *   INCLUDING THE TRAP. `--include-partial-messages` is purely ADDITIVE upstream: the same turn
+ *   run with and without it produces byte-identical `assistant` / `user` / `result` lines, and
+ *   the flag only interleaves extra `stream_event` lines. So the aggregate `assistant` message
+ *   STILL CARRIES THE WHOLE TEXT after the deltas have already delivered it, and a fake that
+ *   emitted only the deltas would hide every double-render bug there is. It is emitted here,
+ *   in the measured position — after the last delta of the block and BEFORE that block's
+ *   `content_block_stop`.
+ *
+ *   INTERRUPTED MID-STREAM. Measured: the aggregate that lands after a mid-stream abort is
+ *   byte-identical to the deltas delivered so far — truncated, not re-generated — there is no
+ *   `content_block_stop`, a `[Request interrupted by user]` user line follows, and the result
+ *   reports `aborted_streaming`. All four are reproduced.
+ *
+ * ---- NOT MODELLED -------------------------------------------------------------------------
+ *
+ *   1 `system/init` is emitted once; the real CLI re-emits it at the start of every turn.
+ *     Covered instead by claude-duplex.jsonl, which contains 3.
+ *   2 No `thinking` blocks, `system/thinking_tokens` or `rate_limit_event`. Covered by the
+ *     recorded fixtures, not here.
+ *   3 No subagent forwarding. `work` mode runs tools at depth 0 only; nested
+ *     `parent_tool_use_id` chains are covered by claude-subagent.jsonl.
+ *   4 `Bash(prefix:*)` rules are PARSED but never exercised — this fake runs no commands, so a
+ *     command allow-list is asserted on argv and nowhere else. The path tools are the half
+ *     that governs whether a worker can use its workspace, and they are the half enforced here.
+ *   5 The matcher is deliberately CRUDER and slightly HARSHER than the real one: `**` matches
+ *     dotfiles, and a rule whose `$AGENTIC_ARMY_HOME` is unset matches nothing rather than
+ *     guessing. Harsher in a fake costs a false alarm; kinder costs a shipped lockout. Do not
+ *     "fix" this by making it more permissive.
+ *   6 Only tools in `work` mode go through the check. Every other mode calls no tools at all,
+ *     so its permission argv is inert — a test that wants the boundary exercised must ask for
+ *     `work`.
+ *   7 `still_queued` is always [], so `interrupt_cancel_queued_v1` is untested everywhere. Turns
+ *     DO queue now and each reports its own result, but an interrupt cancels the lot and reports
+ *     one abort rather than naming the survivors.
+ *   8 Costs are exact multiples of 0.25 and usage is constant — realistic in SHAPE
+ *     (cumulative) but not in value.
+ *   9 Never emits `error_max_turns` / `budget_exhausted`; those exist only as pure
+ *     `claudeResultStatus` unit tests.
+ *  10 No `thinking_delta` partials, because there are no `thinking` blocks to partial (gap 2).
+ *     `content_block_delta` carrying `delta.thinking` is covered by claude-partial.jsonl.
+ *  11 The `[Request interrupted by user]` user line is emitted only on the partial-message
+ *     abort path, which is the one measured fresh. The non-partial abort path still omits it;
+ *     claude-abort-streaming.jsonl is what covers it there.
  * ==========================================================================================
  */
 
+import {
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { writeFileSync } from 'node:fs';
 
 const mode = process.env['FAKE_CLAUDE_MODE'] ?? 'ok';
 const argv = process.argv.slice(2);
@@ -73,6 +149,307 @@ if (process.env['FAKE_PROBE_FILE']) {
     }),
   );
 }
+
+// ============================================================================================
+// THE PERMISSION MODEL
+//
+// Read off argv, not off an environment variable a test could set to something the adapter
+// never actually passed. The whole point is that what constrains this process is what reached
+// execve — if `buildClaudeArgs` stops emitting a rule, the rule stops being enforced here too,
+// and the test that depended on it goes red.
+// ============================================================================================
+
+/**
+ * The values of a variadic flag: everything up to the next `--flag`.
+ *
+ * Safe because no rule may begin with `-` — both `buildClaudeArgs` and `assertNoFlagLikeRules`
+ * refuse one, precisely because a rule that looks like a flag becomes a real flag here.
+ */
+function flagList(name) {
+  const at = argv.indexOf(name);
+  if (at === -1) return [];
+  const out = [];
+  for (let i = at + 1; i < argv.length; i += 1) {
+    const token = argv[i] ?? '';
+    if (token.startsWith('--')) break;
+    out.push(token);
+  }
+  return out;
+}
+
+const allowRules = flagList('--allowedTools');
+const denyRules = flagList('--disallowedTools');
+
+/**
+ * Token-level streaming, read off argv for the same reason the permission rules are: if
+ * `buildClaudeArgs` stops emitting the flag, this process stops emitting partials, and the test
+ * that depended on them goes red instead of passing on a fiction.
+ */
+const partialMessages = argv.includes('--include-partial-messages');
+
+const RULE_RE = /^([A-Za-z_][A-Za-z0-9_]*)(?:\(([\s\S]*)\))?$/;
+
+/**
+ * Canonical spelling of a path that may not exist yet: realpath the deepest existing ancestor
+ * and re-append the tail. `/tmp` IS `/private/tmp` on macOS, so a lease under one spelling and
+ * a deny root under the other are the same directory — and a matcher that compares strings
+ * calls them unrelated, which is a guard that fails open in the permissive direction.
+ */
+function canonical(target) {
+  let current = resolve(target);
+  const tail = [];
+  for (;;) {
+    try {
+      const real = realpathSync.native(current);
+      return tail.length === 0 ? real : join(real, ...tail.reverse());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return resolve(target);
+      tail.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** Every spelling a rule might legitimately be written against. */
+function spellings(target) {
+  const abs = isAbsolute(target) ? resolve(target) : resolve(process.cwd(), target);
+  const real = canonical(abs);
+  return real === abs ? [abs] : [abs, real];
+}
+
+/**
+ * `~` and `$AGENTIC_ARMY_HOME` expanded, or `null` when the variable is not in this process's
+ * environment. Null means "matches nothing": guessing at an unset home would invent a boundary
+ * the real CLI does not have.
+ */
+function expandPattern(pattern) {
+  let out = pattern;
+  if (out === '~' || out.startsWith('~/')) out = homedir() + out.slice(1);
+  if (out.includes('$AGENTIC_ARMY_HOME')) {
+    const home = process.env['AGENTIC_ARMY_HOME'];
+    if (home === undefined || home === '') return null;
+    out = out.split('$AGENTIC_ARMY_HOME').join(home);
+  }
+  return out;
+}
+
+/** `**` spans separators; `*` and `?` stop at one. Everything else is a literal. */
+function globToSource(pattern) {
+  let out = '';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        out += '.*';
+        i += 1;
+      } else {
+        out += '[^/]*';
+      }
+      continue;
+    }
+    if (c === '?') {
+      out += '[^/]';
+      continue;
+    }
+    out += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return out;
+}
+
+function patternMatches(pattern, candidates) {
+  const expanded = expandPattern(pattern);
+  if (expanded === null) return false;
+  // A pattern with no leading `/` names a shape anywhere in the tree — `**&#47;.env` is a
+  // filename rule, not a region rule, and the real CLI treats it as one.
+  const anchored = expanded.startsWith('/') || /^[A-Za-z]:[\\/]/.test(expanded);
+  const re = new RegExp(`^${anchored ? '' : '(?:.*/)?'}${globToSource(expanded)}$`);
+  return candidates.some((candidate) => re.test(candidate));
+}
+
+function ruleMatches(rule, tool, candidates) {
+  const parsed = RULE_RE.exec(rule.trim());
+  if (parsed === null) return false;
+  if (parsed[1] !== tool) return false;
+  // A bare `Read` with no parentheses is the tool itself, on any input.
+  if (parsed[2] === undefined) return true;
+  return patternMatches(parsed[2], candidates);
+}
+
+/**
+ * Deny beats allow. A non-empty allow-list is EXHAUSTIVE — anything it does not name is
+ * refused, because `--permission-mode dontAsk` has nowhere to ask. An empty allow-list means
+ * no allow-list was passed at all, which is unconstrained; that is what keeps every existing
+ * lifecycle test, none of which passes permission argv, behaving as it did.
+ */
+function decide(tool, target) {
+  const candidates = spellings(target);
+  for (const rule of denyRules) {
+    if (ruleMatches(rule, tool, candidates)) return { allowed: false, rule };
+  }
+  if (allowRules.length === 0) return { allowed: true, rule: null };
+  for (const rule of allowRules) {
+    if (ruleMatches(rule, tool, candidates)) return { allowed: true, rule };
+  }
+  return { allowed: false, rule: null };
+}
+
+// ============================================================================================
+// TOOL USE — only in `work` mode
+// ============================================================================================
+
+/** Denials accrued this turn. Drained onto the result line, as the real CLI does. */
+let denials = [];
+let toolSeq = 0;
+
+function emitToolUse(name, input) {
+  toolSeq += 1;
+  const id = `toolu_fake${String(toolSeq).padStart(4, '0')}`;
+  say({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+  });
+  return id;
+}
+
+function emitToolResult(id, content, isError) {
+  say({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content }],
+    },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+  });
+}
+
+/**
+ * One tool call, permission-checked. `perform` runs ONLY if the call is allowed — a denied tool
+ * must leave the filesystem untouched, or the fake would be proving the opposite of the thing
+ * it is here to prove.
+ */
+function useTool(name, input, target, perform) {
+  const id = emitToolUse(name, input);
+  const verdict = decide(name, target);
+  if (!verdict.allowed) {
+    denials.push({ tool_name: name, tool_use_id: id, tool_input: input });
+    emitToolResult(
+      id,
+      verdict.rule === null
+        ? `Claude requested permissions to use ${name}, but you haven't granted it yet.`
+        : `Permission to use ${name} has been denied by the rule ${verdict.rule}.`,
+      true,
+    );
+    return null;
+  }
+  try {
+    const content = perform();
+    emitToolResult(id, content, false);
+    return content;
+  } catch (error) {
+    // A real filesystem error is NOT a permission denial and must not be filed as one.
+    emitToolResult(id, `Error: ${error?.message ?? String(error)}`, true);
+    return null;
+  }
+}
+
+function absoluteIn(cwd, target) {
+  return isAbsolute(target) ? resolve(target) : resolve(cwd, target);
+}
+
+/**
+ * The steps a turn performs. Orders may name them explicitly, one per line:
+ *
+ *   glob <dir>            read <path>            grep <needle> <path>
+ *   write <path> <text>   edit <path> <text>
+ *
+ * Orders that name none get the default routine below — a worker that looks around its
+ * workspace, writes a file, reads it back, greps it and edits it. Prose orders therefore still
+ * exercise all five path tools, so a test does not have to know this syntax to be hostile.
+ */
+function stepsFor(text) {
+  const steps = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    const parsed = /^(glob|read|write|edit|grep)\s+(\S+)\s*([\s\S]*)$/i.exec(line);
+    if (parsed === null) continue;
+    steps.push({ op: parsed[1].toLowerCase(), arg: parsed[2], rest: parsed[3] ?? '' });
+  }
+  if (steps.length > 0) return steps;
+
+  const file = process.env['FAKE_CLAUDE_WORK_FILE'] ?? 'engineer-work.txt';
+  return [
+    { op: 'glob', arg: '.', rest: '' },
+    { op: 'write', arg: file, rest: 'engineer was here' },
+    { op: 'read', arg: file, rest: '' },
+    { op: 'grep', arg: 'engineer', rest: file },
+    { op: 'edit', arg: file, rest: 'and edited it' },
+  ];
+}
+
+function runStep(step) {
+  const cwd = process.cwd();
+  if (step.op === 'glob') {
+    const dir = absoluteIn(cwd, step.arg);
+    return useTool('Glob', { pattern: '**/*', path: dir }, dir, () =>
+      readdirSync(dir).sort().join('\n'),
+    );
+  }
+  if (step.op === 'read') {
+    const file = absoluteIn(cwd, step.arg);
+    return useTool('Read', { file_path: file }, file, () => readFileSync(file, 'utf8'));
+  }
+  if (step.op === 'write') {
+    const file = absoluteIn(cwd, step.arg);
+    const content = `${step.rest}\n`;
+    return useTool('Write', { file_path: file, content }, file, () => {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, content);
+      return `File created successfully at: ${file}`;
+    });
+  }
+  if (step.op === 'edit') {
+    const file = absoluteIn(cwd, step.arg);
+    // The real Edit reads the file itself, under its OWN permission — an Edit that is allowed
+    // does not additionally need Read. Modelled that way on purpose.
+    return useTool(
+      'Edit',
+      { file_path: file, old_string: '', new_string: step.rest },
+      file,
+      () => {
+        const before = readFileSync(file, 'utf8');
+        writeFileSync(file, `${before}${step.rest}\n`);
+        return `The file ${file} has been updated.`;
+      },
+    );
+  }
+  if (step.op === 'grep') {
+    const target = absoluteIn(cwd, step.rest === '' ? '.' : step.rest);
+    return useTool('Grep', { pattern: step.arg, path: target }, target, () => {
+      const files = statSync(target).isDirectory()
+        ? readdirSync(target).map((entry) => join(target, entry))
+        : [target];
+      const hits = [];
+      for (const file of files) {
+        let body;
+        try {
+          if (statSync(file).isDirectory()) continue;
+          body = readFileSync(file, 'utf8');
+        } catch {
+          continue;
+        }
+        for (const line of body.split('\n')) if (line.includes(step.arg)) hits.push(`${file}:${line}`);
+      }
+      return hits.length === 0 ? 'No matches found' : hits.join('\n');
+    });
+  }
+  return null;
+}
+
+// ============================================================================================
 
 say({
   type: 'system',
@@ -104,10 +481,165 @@ if (mode === 'partial') {
 if (mode === 'deaf') process.on('SIGTERM', () => {});
 
 let turn = 0;
-/** Whether a turn is running — the state the real CLI has and this fake used to pretend away. */
-let turnInFlight = false;
-let turnTimer;
+
+/**
+ * Turns accepted and not yet reported, oldest first — the state the real CLI has and this fake
+ * used to pretend away twice over.
+ *
+ * It was a single `turnInFlight` boolean plus a single `turnTimer`, and a second turn pushed
+ * before the first one's timer fired OVERWROTE that timer. The first turn's `finish` then ran,
+ * cleared the shared flag, and the second turn's `finish` returned early — so two turns produced
+ * ONE result, and the test named "a duplex round trip: ready, two turns, clean close" never once
+ * saw two turns close. The real CLI reports one result per turn, which is why
+ * `interrupt_cancel_queued_v1` and `still_queued` exist at all.
+ */
+const turns = [];
+const turnInFlight = () => turns.length > 0;
+
+// ============================================================================================
+// PARTIAL MESSAGES
+// ============================================================================================
+
+/** Modes whose turn occupies real time, and therefore stream their text over real time. */
+const SLOW_MODES = new Set(['slow', 'abort-streaming', 'abort-unknown']);
+/** Gap between deltas in a slow turn — wide enough for an interrupt to land between two of them. */
+const DELTA_GAP_MS = SLOW_MODES.has(mode) ? 120 : 0;
+
+let uuidSeq = 0;
+
+function sayStreamEvent(event) {
+  uuidSeq += 1;
+  say({
+    type: 'stream_event',
+    event,
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    uuid: `fake-partial-${String(uuidSeq).padStart(4, '0')}`,
+  });
+}
+
+/**
+ * `stamped` reproduces which lines carried a `timestamp` before partial messages existed — the
+ * turn echo did, the `work` summary did not. Kept exactly, so that with the flag off this file's
+ * output is byte-for-byte what it was: the adapter stamps an unstamped line on receipt, and a
+ * wall-clock `ts` is not the same value as a fixed one.
+ */
+function sayAssistantText(text, stamped = true) {
+  say({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    ...(stamped ? { timestamp: '2026-08-02T00:00:00.000Z' } : {}),
+  });
+}
+
+/**
+ * The chunking. Four pieces, so a test can tell "arrived in pieces" from "arrived in one lump"
+ * and still assert that the pieces rejoin into EXACTLY the aggregate — which is the property the
+ * adapter's suppression rule rests on, measured true on every real turn including an aborted one.
+ */
+function chunksOf(text) {
+  if (text.length === 0) return [''];
+  const size = Math.max(1, Math.ceil(text.length / 4));
+  const out = [];
+  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
+  return out;
+}
+
+/** The block currently being streamed, or null. Non-null is what makes an abort mid-STREAM. */
+let streaming = null;
+
+/**
+ * Deliver one assistant text block. Without the flag that is a single `assistant` line, exactly
+ * as before. With it, the measured sequence — and the aggregate is still emitted, because the
+ * real CLI still emits it and a fake that dropped it would prove the opposite of the point.
+ */
+function streamText(text, onComplete, stamped = true) {
+  if (!partialMessages) {
+    sayAssistantText(text, stamped);
+    onComplete();
+    return;
+  }
+  sayStreamEvent({
+    type: 'message_start',
+    message: {
+      id: `msg_fake${String(turn)}`,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      stop_reason: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  });
+  sayStreamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+
+  // `flush` delivers the rest at once. Used when stdin closes mid-stream: that is not an abort,
+  // so the block is completed rather than cut, and the aggregate still equals the deltas.
+  streaming = { delivered: '', timer: undefined, flush: null };
+  const chunks = chunksOf(text);
+  let gap = DELTA_GAP_MS;
+  let i = 0;
+  const step = () => {
+    if (i < chunks.length) {
+      streaming.delivered += chunks[i];
+      sayStreamEvent({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: chunks[i] },
+      });
+      i += 1;
+      if (gap === 0) return step();
+      streaming.timer = setTimeout(step, gap);
+      return;
+    }
+    // MEASURED ORDER: the aggregate lands after the last delta and BEFORE content_block_stop.
+    sayAssistantText(streaming.delivered, stamped);
+    sayStreamEvent({ type: 'content_block_stop', index: 0 });
+    sayStreamEvent({
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: chunks.length },
+    });
+    sayStreamEvent({ type: 'message_stop' });
+    streaming = null;
+    onComplete();
+  };
+  streaming.flush = () => {
+    gap = 0;
+    clearTimeout(streaming.timer);
+    step();
+  };
+  step();
+}
+
+/**
+ * Cut a stream short, the way the real CLI does. The aggregate that follows an abort carries
+ * what was ALREADY DELIVERED and nothing more — no `content_block_stop`, no `message_stop` —
+ * then the `[Request interrupted by user]` echo. Measured, not guessed.
+ */
+function abortStreaming() {
+  if (streaming === null) return;
+  clearTimeout(streaming.timer);
+  const delivered = streaming.delivered;
+  streaming = null;
+  sayAssistantText(delivered);
+  say({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+  });
+}
+
 const rl = createInterface({ input: process.stdin });
+
+/** Everything denied since the last result line, in the real CLI's shape, then cleared. */
+function drainDenials() {
+  const out = denials;
+  denials = [];
+  return out;
+}
 
 rl.on('line', (line) => {
   if (line.trim() === '') return;
@@ -143,10 +675,13 @@ rl.on('line', (line) => {
     //
     // A fake more forgiving than reality hides exactly the bug it exists to catch.
     // ---------------------------------------------------------------------------------------
-    if (!turnInFlight) return;
+    if (!turnInFlight()) return;
 
-    clearTimeout(turnTimer);
-    turnInFlight = false;
+    // Mid-STREAM rather than mid-tool: the half that reports `aborted_streaming`.
+    abortStreaming();
+    // ONE result per interrupt, however many turns it cancelled — the rest are what the receipt's
+    // `still_queued` is for, and that is gap 7, not modelled.
+    for (const t of [...turns]) t.cancel();
     say({
       type: 'result',
       subtype: 'error_during_execution',
@@ -162,6 +697,7 @@ rl.on('line', (line) => {
       session_id: sessionId,
       duration_ms: 11,
       total_cost_usd: 0.5,
+      permission_denials: drainDenials(),
     });
     return;
   }
@@ -173,22 +709,31 @@ rl.on('line', (line) => {
       process.exit(0);
     }
     turn += 1;
+    const myTurn = turn;
     const text = msg.message?.content?.[0]?.text ?? '';
-    say({
-      type: 'assistant',
-      message: { role: 'assistant', content: [{ type: 'text', text: `echo:${text}` }] },
-      parent_tool_use_id: null,
-      session_id: sessionId,
-      timestamp: '2026-08-02T00:00:00.000Z',
-    });
 
     // A turn OCCUPIES TIME, as it does in reality. Without this there is no window in which an
     // interrupt can land mid-turn, so `slow` is what the abort tests drive; `ok` finishes promptly
-    // but still asynchronously, so `turnInFlight` is a real state rather than a fiction.
-    turnInFlight = true;
-    const finish = () => {
-      if (!turnInFlight) return;
-      turnInFlight = false;
+    // but still asynchronously, so an in-flight turn is a real state rather than a fiction.
+    //
+    // Enqueued BEFORE the reply is delivered, not after: with partial messages the delivery
+    // itself spans time, and an interrupt that lands between two deltas has a turn to abort.
+    let timer;
+    let settled = false;
+    const entry = {
+      /** Stop tracking this turn without reporting it — the interrupt path owns the result. */
+      cancel: () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const at = turns.indexOf(entry);
+        if (at !== -1) turns.splice(at, 1);
+      },
+      finish: () => {},
+    };
+    entry.finish = () => {
+      if (settled) return;
+      entry.cancel();
       say({
         type: 'result',
         subtype: 'success',
@@ -196,21 +741,72 @@ rl.on('line', (line) => {
         terminal_reason: 'completed',
         session_id: sessionId,
         duration_ms: 5,
-        // Cumulative, exactly like the real CLI.
-        total_cost_usd: turn * 0.25,
+        // Cumulative, exactly like the real CLI: turn 1 reports 0.25, turn 2 reports 0.50.
+        total_cost_usd: myTurn * 0.25,
         usage: {
           input_tokens: 1,
           output_tokens: 2,
           cache_read_input_tokens: 3,
           cache_creation_input_tokens: 4,
         },
+        // Always present, even when empty — the recorded fixtures carry `permission_denials: []`
+        // on every result line, and a consumer that only ever sees the key when it is populated
+        // is a consumer whose empty case was never exercised.
+        permission_denials: drainDenials(),
       });
     };
-    turnTimer = setTimeout(finish, mode === 'slow' || mode === 'abort-streaming' || mode === 'abort-unknown' ? 5000 : 5);
+
+    turns.push(entry);
+
+    // Deliver the reply, THEN start the clock on the result. Without partial messages that is one
+    // `assistant` line and the timer is armed in the same tick, exactly as it always was — but it
+    // is now THIS turn's timer, not a single shared one a later turn can stamp on.
+    streamText(`echo:${text}`, () => {
+      if (mode === 'work') {
+        const steps = stepsFor(text);
+        for (const step of steps) runStep(step);
+        streamText(
+          `ran ${String(steps.length)} tool(s), ${String(denials.length)} denied`,
+          () => {},
+          false,
+        );
+      }
+      timer = setTimeout(entry.finish, SLOW_MODES.has(mode) ? 5000 : 5);
+    });
   }
 });
 
+/**
+ * STDIN CLOSED.
+ *
+ * MEASURED against claude 2.1.221 on 2026-08-03: a turn written and then followed IMMEDIATELY by
+ * `stdin.end()` still produces its `assistant` message and its `result`, and only then exits 0.
+ * The real CLI finishes the turn it is running.
+ *
+ * This handler used to be `process.exit(0)`, which does neither half of that:
+ *
+ *   1. It discarded a turn that was still in flight, so the adapter saw a worker that was given
+ *      work and produced no `result` — `silentlyDied()`, i.e. `exitCode: 0, status: 'error'`.
+ *   2. `process.stdout` on a PIPE is ASYNCHRONOUS, and `process.exit` does not drain it. Lines
+ *      already written — `system/init` included — were thrown away unwritten.
+ *
+ * Together those put an UNSTATED DEADLINE on every test that sends and then closes: the turn had
+ * to have completed before `close()`, or the run failed for reasons that had nothing to do with
+ * the adapter. Measured at 28ms typical and 36ms under an eight-way CPU load against a 250ms
+ * budget, so it did not fire here — but a budget nobody wrote down is a budget nobody maintains,
+ * and this signature is indistinguishable from a real silent death.
+ *
+ * So: settle the turn, then let node exit of its own accord once no handles remain. Falling off
+ * the end of the event loop flushes stdout; `process.exit` truncates it.
+ */
 rl.on('close', () => {
-  if (mode === 'deaf') setInterval(() => {}, 1000);
-  else process.exit(0);
+  if (mode === 'deaf') {
+    setInterval(() => {}, 1000);
+    return;
+  }
+  // A block still streaming is delivered in FULL rather than cut: stdin closing is not an abort,
+  // and the aggregate must still equal what the deltas carried.
+  if (streaming !== null) streaming.flush();
+  for (const t of [...turns]) t.finish();
+  process.exitCode = 0;
 });

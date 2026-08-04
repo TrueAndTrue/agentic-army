@@ -48,11 +48,20 @@
  *   about how many processes actually ran. It also survives an Engineer that crashed, which
  *   resuming a dead process does not.
  *
- * - The default requested rung is **2**, not the project ceiling. Rung 3 refuses by design
- *   (`RungNotImplementedError`), so defaulting to a ceiling of 3 would make every campaign on a
- *   fully-trusted project fail at the last step. Defaulting to 2 and clamping is the honest
- *   reading of the v1 scope's "rungs 0–2"; `--rung 3` still refuses, loudly, because that
- *   request is explicit.
+ * - The default requested rung is **2**, not the project ceiling. A merge is not something a
+ *   campaign should back into because the project happens to permit one: rung 3 is asked for, by
+ *   name, on the command line. Defaulting to 2 and clamping keeps the ceiling a cap rather than a
+ *   target, and a project at ceiling 3 that never passes `--rung 3` opens pull requests exactly
+ *   as it did before.
+ *
+ * ## Rung 3, and what this file owes it
+ *
+ * `runLadder` will not merge for a caller that cannot produce the evidence: `RunLadderInput.merge`
+ * carries the Engineer's final status and whether the retry budget was exhausted, and a rung-3
+ * plan without it refuses outright (`RungNotImplementedError`). This file is that caller, and the
+ * two fields come from `mergeEvidence` — read off this campaign's own state, never asserted as
+ * literals. A gate whose input is a constant is a gate that cannot fire, and one that cannot fire
+ * is indistinguishable from one that was deleted.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -82,7 +91,13 @@ import {
 import type { Lease } from '../contracts/worktree.ts';
 import { armyBranch } from '../contracts/worktree.ts';
 
-import { CampaignArchive, campaignIdFor, createCampaign, listCampaignIds } from '../archive/archive.ts';
+import {
+  AgentIdInUseError,
+  CampaignArchive,
+  campaignIdFor,
+  createCampaign,
+  listCampaignIds,
+} from '../archive/archive.ts';
 import type { ArchiveConfig } from '../archive/archive.ts';
 import { loadConfig } from '../config/load.ts';
 import { armyHome, configPath, worktreesRootFor } from '../config/paths.ts';
@@ -95,7 +110,13 @@ import {
 } from '../delivery/durability.ts';
 import { runGit } from '../delivery/git.ts';
 import type { GhStatus } from '../delivery/git.ts';
-import type { DeliveryConfig, DeliveryNote, DeliveryNoteCode, LadderResult } from '../delivery/ladder.ts';
+import type {
+  DeliveryConfig,
+  DeliveryNote,
+  DeliveryNoteCode,
+  LadderResult,
+  MergeRequest,
+} from '../delivery/ladder.ts';
 import { RungNotImplementedError, projectCeiling, runLadder } from '../delivery/ladder.ts';
 import { createClaudeAdapter } from '../harness/claude.ts';
 import { createCodexAdapter, isCodexSoldier } from '../harness/codex.ts';
@@ -116,6 +137,7 @@ import {
 import { PoolExhaustedError, UnlandedWorkError } from '../worktree/cold.ts';
 import { selectWorktreeProvider } from '../worktree/index.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
+import type { ProgressEvent, ProgressListener } from '../view/progress.ts';
 
 import {
   briefInspectorFromAttempt,
@@ -218,10 +240,25 @@ export interface CampaignResult {
   ceiling: Rung;
   /** The rung actually reached, or null if nothing was delivered. */
   deliveredRung: Rung | null;
+  /**
+   * True when the campaign stopped because it had no Engineer attempts left.
+   *
+   * NOT "the last attempt was attempt `maxAttempts`" — a PASS on the final attempt spent the
+   * whole budget and finished, which is a different thing from running out of it. This is the
+   * value rung 3's retry gate reads (see `mergeEvidence`), reported rather than kept private so
+   * the gate's input is something a test can hold still and look at.
+   */
+  retriesExhausted: boolean;
   delivery: LadderResult | null;
   lease: LeaseDisposition;
   notes: CampaignNote[];
-  /** 0 only when the Inspector passed and delivery ran without an error-level note. */
+  /**
+   * 0 only when the Inspector passed AND delivery ran without an error-level note.
+   *
+   * The second clause is not decoration. A rung-3 merge that landed and then failed is
+   * `delivered` — the work is on the base branch — and still an error, because something after
+   * the merge did not happen and nobody knows what. That campaign exits non-zero.
+   */
   exitCode: number;
 }
 
@@ -270,6 +307,16 @@ export interface CampaignOptions {
   /** Injected so rung-2 behaviour is testable with no network and no GitHub account. */
   ghProbe?: () => Promise<GhStatus>;
   /**
+   * The `gh` binary the delivery ladder spawns. Defaults to `gh` on PATH.
+   *
+   * `ghProbe` alone cannot reach rung 3: it answers the availability question and nothing else,
+   * so every command AFTER the probe — create, review, view, merge — still went to the real
+   * binary. This is the seam that lets the whole merge path run against a stand-in executable and
+   * a bare repository on this disk, with no network and no GitHub account, which is the only way
+   * the gates get exercised rather than described.
+   */
+  ghBinary?: string;
+  /**
    * Swap the archive's SQLite driver. `ArchiveConfig` exposes this so `bun:sqlite` and
    * `better-sqlite3` stay drop-ins; forwarding it here means a campaign is not the one place that
    * hard-codes `node:sqlite`. It is also how the cleanup-path tests force an archive write to
@@ -281,6 +328,19 @@ export interface CampaignOptions {
   now?: () => string;
   /** Per-soldier wall-clock ceiling. */
   timeoutMs?: number;
+  /**
+   * Narration, as it happens.
+   *
+   * A campaign takes minutes and used to print nothing until it was over, so the only feedback a
+   * blocked human got was a cursor. The lifecycle was never missing — `signals.jsonl` had it all
+   * along — it was simply never offered to the one caller with a person waiting on it.
+   *
+   * OPTIONAL, and silent when absent: `src/chat` drives the same `runCampaign` through
+   * `runDispatch` and renders its own frame around it, so a campaign that nobody passed a
+   * listener to must behave exactly as it did before. Every emission is guarded, because a
+   * listener writing to a closed pipe must not be able to end a campaign that is holding a lease.
+   */
+  onProgress?: ProgressListener;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -348,7 +408,19 @@ export interface BuildSpecInput {
   cwd: string;
   orders: string;
   ordersPath?: string;
-  outputSchemaPath: string;
+  /**
+   * The capped-return schema, when this worker has one.
+   *
+   * Optional because a COMMANDER does not. Every worker that goes away and comes back returns a
+   * `Report` or a `Verdict`, and the schema is what makes that return a bounded transport rather
+   * than a transcript. A commander never goes away — it is a conversation, and its replies are
+   * read by a human on a terminal, so constraining them to a JSON object would put the schema in
+   * the one position where it buys nothing and costs the whole reason the session is live.
+   *
+   * The bound that matters for a commander is on what comes back INTO it, and that is enforced
+   * on the subordinates' side, where the schema already is.
+   */
+  outputSchemaPath?: string;
   /** Resolved army home, so the deny-list carries absolute globs as well as `~`-relative ones. */
   home: string;
 }
@@ -375,11 +447,11 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
     harness: input.harness,
     cwd: input.cwd,
     sessionId: randomUUID(),
-    outputSchemaPath: input.outputSchemaPath,
     allow,
     deny,
     orders: input.orders,
   };
+  if (input.outputSchemaPath !== undefined) spec.outputSchemaPath = input.outputSchemaPath;
   if (input.model !== undefined && input.model !== '') spec.model = input.model;
   if (input.effort !== undefined) spec.effort = input.effort;
   if (input.ordersPath !== undefined) spec.ordersPath = input.ordersPath;
@@ -530,6 +602,15 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const home = options.home ?? armyHome(env);
   const notes: CampaignNote[] = [];
+  /**
+   * Flipped once `campaign-opened` has been narrated.
+   *
+   * Notes raised BEFORE that — the delivery-ceiling note is the only one — are held back from the
+   * live stream rather than printed out of order in front of the line that says which campaign
+   * this is. They are not lost: every note, at every level, is on the result and in the final
+   * report. What the stream owes is the lifecycle, in order.
+   */
+  let opened = false;
   const note = (
     level: CampaignNote['level'],
     code: CampaignNoteCode,
@@ -537,6 +618,26 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     fix?: Fix,
   ): void => {
     notes.push({ level, code, message, ...(fix === undefined ? {} : { fix }) });
+    // `info` notes are the running commentary the final report exists to collect; streaming them
+    // too would bury the eight lifecycle lines a waiting reader is actually looking for.
+    if (opened && level !== 'info') progress({ kind: 'note', level, message });
+  };
+
+  /**
+   * Narrate one moment, and never let the narration be why a campaign ends.
+   *
+   * A listener is a terminal writer. `process.stdout.write` throws EPIPE when the reader has gone
+   * — `army campaign … | head` is enough — and an exception here would unwind through the attempt
+   * loop into the `finally`, which is the one path that settles a lease. A progress line is worth
+   * less than a worktree, so it is worth exactly nothing when it fails.
+   */
+  const progress = (event: ProgressEvent): void => {
+    if (options.onProgress === undefined) return;
+    try {
+      options.onProgress(event);
+    } catch {
+      /* narration is never load-bearing */
+    }
   };
 
   const loaded = await loadConfig({ home, env });
@@ -578,6 +679,34 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     title: options.objective,
   });
 
+  /**
+   * Whether THIS run is the one entitled to write this campaign's terminal status.
+   *
+   * `createCampaign` is idempotent on purpose — re-attaching to a campaign after a crash must not
+   * be destructive — so `--id` pointed at a campaign that has already been fought hands this run a
+   * live handle to somebody else's finished record. The cleanup block below always ran
+   * `setCampaignStatus`, unconditionally, which meant a second run that did NO WORK AT ALL (it
+   * collides on `cpt-01` and aborts before a soldier exists) rewrote the first run's
+   * `campaign.json` from `done` to `aborted` with a fresh `ended_at`. The files are truth and the
+   * index is a rebuildable view of them; a run that wrote nothing must not be able to overwrite
+   * what another run delivered.
+   *
+   * The test is the status the campaign had when this run ATTACHED, not whether the row was
+   * freshly inserted, and that distinction is the whole point:
+   *
+   *   `active`  — either the row this call just inserted, or a campaign interrupted mid-flight.
+   *               Both are ours to settle: closing out a crashed attempt and releasing its lease
+   *               is exactly the re-attachment idempotence exists for, and it still works.
+   *   anything  — `done` / `aborted` / `failed`. Somebody already ended this campaign and wrote
+   *   else       the record. Nothing this run does may edit it.
+   *
+   * Note what is NOT skipped when this is false: the lease is still settled, the disposition is
+   * still recorded as a signal, the task this run created is still closed, and the archive is
+   * still closed. This run's own rows are its own to write. Only the campaign-level verdict —
+   * the one row that belongs to the run that actually fought it — is left alone.
+   */
+  const settledBeforeThisRun = archive.getCampaign().status !== 'active';
+
   const task = archive.createTask({ title: options.objective, status: 'in_flight' });
   const branch = armyBranch(task.id);
   const orders: OriginalOrders = { objective: options.objective, project, taskId: task.id };
@@ -588,6 +717,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     kind: 'broadcast',
     body: cap(`campaign opened: ${options.objective}`),
   });
+  opened = true;
+  progress({ kind: 'campaign-opened', campaignId, title: options.objective });
   for (const warning of loaded.warnings) {
     archive.appendSignal({
       fromAgent: GENERAL_AGENT_ID,
@@ -609,6 +740,21 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   let outcome: CampaignOutcome = 'aborted';
   let finalReport: Report | null = null;
   let finalVerdict: Verdict | null = null;
+  /**
+   * Whether this campaign ran out of Engineer attempts. Rung 3's second gate reads it.
+   *
+   * STATE, not an inference made at the delivery site. Today the exhausted branch below sets this
+   * and immediately stops the campaign, so delivery only ever sees `false` — which is exactly why
+   * writing `false` at the call site would be wrong. That would encode the current control flow as
+   * a fact, and the next edit that lets an exhausted campaign reach delivery would merge it
+   * without anything going red. Recorded where the budget is actually spent, the gate keeps
+   * working through that edit instead of quietly dying in it.
+   *
+   * Note also what this is NOT: `attempt >= maxAttempts`. A PASS on the final attempt used the
+   * whole budget and did not run out of it — the campaign finished. Exhausted means the campaign
+   * stopped because there was nothing left to try.
+   */
+  let retriesExhausted = false;
   let delivery: LadderResult | null = null;
   let baseCommit: string | null = null;
   /** The status this campaign intends to record, then what the archive says it recorded. */
@@ -692,6 +838,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       leaseId: lease.leaseId,
       reason: 'campaign in flight',
     };
+    progress({ kind: 'worktree-leased', provider: selection.selected, path: lease.path });
     const worktree = lease.path;
     baseCommit = (await runGit(['rev-parse', 'HEAD'], { cwd: worktree })).stdout.trim() || null;
 
@@ -747,6 +894,23 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         body: cap(options.objective),
         artifact: `agents/${engineerId}/orders.md`,
       });
+      // At DISPATCH time, not at the end: the hint is only worth printing while there is still
+      // something to watch. It is emitted once — repeating it before every unit would turn the
+      // one line that tells the reader what to do next into part of the noise.
+      //
+      // BEFORE the dispatch line, not after, and that ordering is load-bearing. The sink starts
+      // its elapsed ticker on `unit-dispatched` and stops it on the next event of any kind, so a
+      // hint emitted afterwards would silently cancel the ticker for the Engineer — the single
+      // longest wait in the campaign, and the exact minutes this whole change exists to fill.
+      if (attempt === 1) progress({ kind: 'watch-hint', campaignId });
+      progress({
+        kind: 'unit-dispatched',
+        agentId: engineerId,
+        rank: 'CAPTAIN',
+        role: 'ENGINEER',
+        harness: engineerSpec.harness,
+        attempt,
+      });
 
       const engineerRun = await runSoldier(
         adapterFor(options, engineerSpec.harness),
@@ -797,6 +961,17 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         kind: 'report',
         body: cap(report?.summary ?? `no valid report (${engineerRun.status})`),
         artifact: report === null ? null : `agents/${engineerId}/report.json`,
+      });
+      progress({
+        kind: 'unit-returned',
+        agentId: engineerId,
+        rank: 'CAPTAIN',
+        role: 'ENGINEER',
+        status: engineerRun.status,
+        // Model-controlled prose. `renderProgressEvent` sanitises and clips it; this hands over
+        // the raw field rather than a pre-formatted line so the renderer stays the only place
+        // that decides what a terminal is allowed to receive.
+        summary: report?.summary ?? null,
       });
 
       if (report === null || engineerRun.status !== 'ok' || report.status !== 'done') {
@@ -910,6 +1085,14 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         body: cap(`review ${branch} against the original orders`),
         artifact: `agents/${inspectorId}/orders.md`,
       });
+      progress({
+        kind: 'unit-dispatched',
+        agentId: inspectorId,
+        rank: 'CAPTAIN',
+        role: 'INSPECTOR',
+        harness: inspectorSpec.harness,
+        attempt,
+      });
 
       const inspectorRun = await runSoldier(
         adapterFor(options, inspectorSpec.harness),
@@ -960,6 +1143,20 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         status: verdict === null ? 'failed' : 'done',
         branch,
       });
+      if (verdict !== null) {
+        progress({
+          kind: 'verdict',
+          agentId: inspectorId,
+          rank: 'CAPTAIN',
+          role: 'INSPECTOR',
+          verdict: verdict.verdict,
+          testsRun: verdict.testsRun,
+          summary: verdict.summary,
+        });
+      }
+      // A reviewer that returned nothing is narrated by the error note below, not by a `verdict`
+      // event: the review gate fails CLOSED, and printing a verdict line for a verdict that does
+      // not exist is the one shape of this stream that could mislead.
 
       if (verdict === null) {
         // A reviewer that produced nothing usable is NOT a pass. The Inspector runs on a
@@ -995,6 +1192,9 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       note('warn', 'inspector', `${inspectorId} FAILED ${branch}: ${cap(verdict.summary, 120)}`);
       previousVerdict = verdict;
       if (attempt >= maxAttempts) {
+        // Recorded BEFORE the note and the break, so the flag is true from the instant the fact
+        // is true rather than from the instant something happens to read it.
+        retriesExhausted = true;
         note(
           'error',
           'retry',
@@ -1027,7 +1227,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           branch,
           worktree,
           verdict: finalVerdict,
+          // Rung 3's evidence. Supplied on EVERY delivery, not only when rung 3 was requested:
+          // the ladder reads it if and only if the clamped plan is rung 3, so gating it here
+          // would put the decision of whether the gate runs in two places instead of one.
+          merge: mergeEvidence(finalReport, retriesExhausted),
           ...(options.ghProbe === undefined ? {} : { ghProbe: options.ghProbe }),
+          ...(options.ghBinary === undefined ? {} : { ghBinary: options.ghBinary }),
         });
         for (const deliveryNote of delivery.notes) {
           note(
@@ -1041,6 +1246,11 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           );
         }
         recordNoteSignals(GENERAL_AGENT_ID, delivery.notes as readonly DeliveryNote[]);
+        progress({
+          kind: 'delivered',
+          rung: delivery.delivered,
+          url: delivery.pr?.url ?? delivery.durability.target.url ?? null,
+        });
         archive.updateTask(task.id, {
           status: 'done',
           deliveredRung: delivery.delivered,
@@ -1067,17 +1277,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   } catch (error) {
     if (!(error instanceof CampaignAborted)) {
       const message = error instanceof Error ? error.message : String(error);
-      note(
-        'error',
-        'aborted',
-        `campaign aborted: ${message}`,
-        error instanceof CampaignSetupError
-          ? error.fix
-          : noFix(
-              'the campaign hit a failure it does not have a diagnosis for, so nothing here is a ' +
-                `command worth pasting. What it managed to write is in ${archive.root}.`,
-            ),
-      );
+      note('error', 'aborted', `campaign aborted: ${message}`, diagnoseAbort(error, archive.root));
       archive.appendSignal({
         fromAgent: GENERAL_AGENT_ID,
         kind: 'status',
@@ -1155,6 +1355,14 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         artifact: leaseDisposition.path,
       }),
     );
+    // The last lifecycle line, and the one a reader most needs on a campaign that ended badly:
+    // whether the tree was returned or is being held with their work still in it.
+    progress({
+      kind: 'lease-settled',
+      state: leaseDisposition.state,
+      path: leaseDisposition.path,
+      reason: leaseDisposition.reason,
+    });
     guard('closing the task', () => {
       if (outcome !== 'delivered' && archive.getTask(task.id)?.status === 'in_flight') {
         archive.updateTask(task.id, {
@@ -1164,9 +1372,15 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       }
     });
     intendedStatus = outcome === 'delivered' ? 'done' : outcome === 'aborted' ? 'aborted' : 'failed';
-    guard('closing the campaign', () => archive.setCampaignStatus(intendedStatus));
-    // Read it back so the result reports what the archive actually says — but never let that
-    // read be the reason a campaign has no result at all.
+    // Only for a campaign this run is entitled to close. See `settledBeforeThisRun`: a campaign
+    // that had already ended before this run attached keeps the verdict of the run that earned it.
+    if (!settledBeforeThisRun) {
+      guard('closing the campaign', () => archive.setCampaignStatus(intendedStatus));
+    }
+    // Read it back so the result reports what the archive actually says — which for a campaign
+    // this run left alone is the OTHER run's status, and that is the honest answer: `status` is
+    // the campaign's, `outcome` is this run's. Never let that read be the reason a campaign has
+    // no result at all.
     guard('reading back the campaign status', () => {
       intendedStatus = archive.getCampaign().status;
     });
@@ -1177,7 +1391,14 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   const finalStatus = intendedStatus;
   const deliveredRung = delivery?.delivered ?? null;
 
-  const exitCode = outcome === 'delivered' ? 0 : 1;
+  // `outcome === 'delivered'` alone was enough while the only error-level DELIVERY note came from
+  // `runLadder` throwing, which also set `outcome = 'delivery-failed'`. Rung 3 broke that pairing:
+  // `merge-uncertain` is delivered — the pull request really is merged — AND an error, because
+  // the command that merged it failed afterwards and a human has to go and look. Exiting 0 there
+  // would tell a script everything is fine while the note on screen says it is not, which is the
+  // safe-sounding half of "I could not do X so I did Y".
+  const deliveryFailedLoudly = notes.some((n) => n.level === 'error' && n.code === 'delivery');
+  const exitCode = outcome === 'delivered' && !deliveryFailedLoudly ? 0 : 1;
   return {
     campaignId,
     campaignRoot,
@@ -1192,6 +1413,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     requestedRung,
     ceiling,
     deliveredRung,
+    retriesExhausted,
     delivery,
     lease: leaseDisposition,
     notes,
@@ -1250,6 +1472,57 @@ function retainedTreeFix(worktree: string): Fix {
     `nothing was destroyed — the work is still in ${worktree}. Inspect it with ` +
       `\`git -C ${q} status\` and \`git -C ${q} log --oneline\`, then commit or discard it. ` +
       'The pool will not hand that slot out again while the lease is held.',
+  );
+}
+
+/**
+ * `--id` pointed at a campaign that already has an agent under the id this run is minting.
+ *
+ * Keyed on `AgentIdInUseError`, which `src/archive/archive.ts` exports for precisely this — the
+ * layer that owes the reader a `fix:` line has to be able to RECOGNISE the condition, and
+ * recognising it by matching the words in the message would make every rewording of them a silent
+ * regression. Shared by `campaign` and by `chat` because it is one condition with one answer; the
+ * only thing that differs is which subcommand the reader types again.
+ *
+ * `manual`, and both of the other two kinds are wrong here for a stated reason:
+ *
+ *   not `none`     — `none` is a positive claim that NOTHING removes the condition. Something
+ *                    does: run again under a campaign id no campaign has used. Saying "no fix" to
+ *                    a reader who is one flag away from succeeding is the dishonest half of a
+ *                    diagnosis that already knows the answer.
+ *   not `command`  — the one missing value is WHICH id, and that is the reader's to choose; a
+ *                    line we could paste would have to invent it. A `command` also promises that
+ *                    running it verbatim clears the condition, and the only such line here starts
+ *                    a whole fresh campaign — minutes of model time — which is not something to
+ *                    hand someone as a paste-and-run.
+ */
+export function agentIdInUseFix(error: AgentIdInUseError, subcommand: 'campaign' | 'chat'): Fix {
+  return doThis(
+    `re-run \`${invokedAs()} ${subcommand}\` under a campaign id nothing has used yet — pass a ` +
+      `different \`--id\`, or drop \`--id\` and one is minted for you. Campaign ${error.campaignId} ` +
+      `already holds ${error.agentId} from an attempt that started ${error.startedAt}; it keeps ` +
+      `its own record, and \`${invokedAs()} view ${quoteArg(error.campaignId)}\` reads it back.`,
+  );
+}
+
+/**
+ * What to do about a campaign that ended in the outer catch, whatever threw.
+ *
+ * The `none` branch is the honest answer for a genuinely undiagnosed throw and stays. What it may
+ * NOT do is absorb errors that arrive carrying a diagnosis — it used to swallow every non-setup
+ * error, and `AgentIdInUseError` walked straight into it: a condition with a known cause, a known
+ * reason no retry helps, and a known way out, printed under "nothing here is a command worth
+ * pasting". `none` is a positive claim, so a `none` that is not true is a worse lie than silence.
+ *
+ * Ordered by specificity, and every branch keys on a TYPE. New diagnosable throws are added here;
+ * the `none` at the end shrinks as they are.
+ */
+function diagnoseAbort(error: unknown, campaignRoot: string): Fix {
+  if (error instanceof CampaignSetupError) return error.fix;
+  if (error instanceof AgentIdInUseError) return agentIdInUseFix(error, 'campaign');
+  return noFix(
+    'the campaign hit a failure it does not have a diagnosis for, so nothing here is a ' +
+      `command worth pasting. What it managed to write is in ${campaignRoot}.`,
   );
 }
 
@@ -1328,6 +1601,28 @@ function diagnoseSoldierFailure(failure: SoldierFailure): Fix {
   );
 }
 
+/**
+ * The evidence rung 3 requires from this call site, read off the campaign's own state.
+ *
+ * Exported so a test can hold the derivation still and check it, rather than only observing the
+ * merge that happens to come out the other end. Both arguments are values the campaign tracked as
+ * it ran; NEITHER field is a literal, and the reason is worth stating once in the place it
+ * applies. `runLadder` refuses a merge when the Engineer is not `done` or the retry budget is
+ * spent. If this function answered `'done'` and `false` unconditionally, both refusals would be
+ * unreachable from here — the checks would still be in `ladder.ts`, still read as protection, and
+ * protect nothing, which is strictly worse than not having them, because a dead gate is a gate
+ * everyone stops thinking about.
+ *
+ * A missing report is the interesting case. It cannot happen on today's delivery path — a
+ * campaign only reaches delivery through a `done` report and a PASS — but "cannot happen" is a
+ * claim about control flow, and this function's job is to be right without one. No report means
+ * no Engineer status, and an absent status is not a `done` status: it is reported as `failed`,
+ * which refuses. Evidence that is missing is never read as good news.
+ */
+export function mergeEvidence(report: Report | null, retriesExhausted: boolean): MergeRequest {
+  return { engineerStatus: report?.status ?? 'failed', retriesExhausted };
+}
+
 interface DeliveryContext {
   project: string;
   objective: string;
@@ -1371,10 +1666,55 @@ function fixForDeliveryNote(code: DeliveryNoteCode, ctx: DeliveryContext): Fix |
         'the pull request is open but carries no Inspector review — post the verdict from ' +
           '`report.md` on it by hand, or re-run once `gh` can write reviews.',
       );
+    // ---- rung 3 ------------------------------------------------------------------------
+    //
+    // Keyed on the code, like everything above it, so the ladder's prose stays free to change.
+    // That means ONE fix has to serve every reason behind `merge-refused` — there are eight of
+    // them and they share no command — so it points at the note it sits directly under, which
+    // names the gate and is rendered on the line above. What it must not do is offer a re-run:
+    // every refusal reason is a fact about this campaign's work, and running the same campaign
+    // again changes none of them.
+    case 'merge-refused':
+      return doThis(
+        'nothing merged, and nothing is broken. A gate in this process said no and the note ' +
+          'above names which one — the pull request is open with the Inspector verdict on it, ' +
+          'exactly as rung 2 leaves it. Read the reason, decide whether you agree, and merge it ' +
+          'yourself if you do. Re-running the campaign will reach the same gate.',
+      );
+    case 'merge-blocked':
+      return doThis(
+        `the remote refused the merge and the note above quotes it verbatim. That is the host's ` +
+          'answer — branch protection, a required check still running or failed, a required ' +
+          'review, or a conflict with the base branch. Resolve it on the pull request itself; ' +
+          'nothing here can, and nothing here will force it.',
+      );
+    case 'merge-uncertain':
+      return doThis(
+        'the pull request is MERGED and the command that merged it failed afterwards, so this ' +
+          'campaign cannot say what else did or did not happen. Look before you act: check the ' +
+          'base branch has the commit named in the note above, and check whether the branch was ' +
+          'deleted. Do NOT re-run this campaign against that pull request — a second merge is ' +
+          'the one outcome worth avoiding here.',
+      );
+    // `merge-planned` announces an intention, `merged` and `merge-noop` an accomplished one.
+    // None is a problem, and a fix line under a success trains the reader to skim past the ones
+    // that are.
+    case 'merge-planned':
+    case 'merged':
+    case 'merge-noop':
     case 'durability-mirror':
     case 'pr-opened':
     case 'review-posted':
       return undefined;
+    default: {
+      // `DeliveryNoteCode` is the contract between this file and `ladder.ts`, and a contract that
+      // only one side is obliged to satisfy is a wish. A new code added there stops compiling
+      // here until it has been given a fix — or explicitly listed above as one that needs none —
+      // which is the whole reason this table keys on the code and not on the message.
+      const unhandled: never = code;
+      void unhandled;
+      return undefined;
+    }
   }
 }
 

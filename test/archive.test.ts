@@ -32,6 +32,7 @@ import type {
 import type { SoldierEvent } from '../src/contracts/harness.ts';
 
 import {
+  AgentIdInUseError,
   CampaignArchive,
   createCampaign,
   listCampaignIds,
@@ -1171,6 +1172,67 @@ test(
     );
 
     assert.deepEqual(listCampaignIds(archiveRoot), ['2026-08-02-take-hill-4']);
+  }),
+);
+
+test(
+  're-recording an agent id is refused with the reason, not with a SQLite constraint',
+  withCampaign(({ archive }) => {
+    // Run one. Agent ids are minted from 01 by the supervisor, so this is what every run starts
+    // with, and a run pointed at an existing campaign starts with it again.
+    archive.recordAgentAttempt({
+      id: 'cpt-01',
+      rank: 'CAPTAIN',
+      role: 'ENGINEER',
+      harness: 'claude',
+      sessionId: 's-1',
+      startedAt: '2026-08-02T09:00:00.000Z',
+    });
+
+    let thrown: unknown;
+    try {
+      archive.recordAgentAttempt({
+        id: 'cpt-01',
+        rank: 'CAPTAIN',
+        role: 'ENGINEER',
+        harness: 'claude',
+        sessionId: 's-2',
+      });
+      assert.fail('a duplicate agent id was accepted');
+    } catch (error) {
+      thrown = error;
+    }
+
+    // TYPED, so the layer that owes the reader a `fix:` line can recognise the condition without
+    // matching on prose that is free to be reworded.
+    assert.ok(
+      thrown instanceof AgentIdInUseError,
+      `not the typed refusal: ${String(thrown)}`,
+    );
+    assert.equal(thrown.agentId, 'cpt-01');
+    assert.equal(thrown.campaignId, '2026-08-02-take-hill-4');
+    assert.equal(thrown.startedAt, '2026-08-02T09:00:00.000Z');
+
+    const message = thrown.message;
+    // What the reader used to get, and what no reader can act on: the name of a table and a
+    // constraint. The whole defect is that this string reached a terminal.
+    assert.doesNotMatch(
+      message,
+      /UNIQUE constraint|agents\.id/,
+      `the database error reached the reader:\n${message}`,
+    );
+    // What they need instead: the id, why it can only ever collide, and the way out.
+    assert.match(message, /cpt-01/, 'the colliding id is not named');
+    assert.match(message, /minted from 01 on every run/, 'the reason it can never succeed is not given');
+    assert.match(message, /no campaign has used yet/, 'the way out is not stated');
+    assert.match(message, /Nothing was written/, 'the reader is not told the archive is intact');
+
+    // And it means it: the refusal is a refusal, not a partial write.
+    assert.deepEqual(
+      archive.listAgents().map((agent) => agent.id),
+      ['cpt-01'],
+    );
+    assert.equal(archive.getAgent('cpt-01')?.session_id, 's-1', 'the first attempt was overwritten');
   }),
 );
 

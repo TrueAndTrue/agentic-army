@@ -161,6 +161,43 @@ export interface NewAgentAttempt {
   attempt?: number;
 }
 
+/**
+ * This campaign already has an agent under that id, so the attempt cannot be recorded.
+ *
+ * TYPED, and exported, for the same reason `campaign.ts` keys its diagnoses on typed errors and
+ * typed note codes rather than on prose: the layer that owes the reader a `fix:` line has to be
+ * able to RECOGNISE this condition, and recognising it by matching the words below would make
+ * every rewording of them a silent regression. The message says what happened and what to do
+ * because it is what the reader sees today; the class is what lets the answer improve.
+ *
+ * It names no command. `src/setup/**` sits above `src/archive/**` — the same layering that made
+ * `archiveDurabilityNote` take the invocation as a parameter — so this file cannot resolve how
+ * the reader invoked the tool, and a command it cannot spell correctly is a command it must not
+ * spell at all.
+ */
+export class AgentIdInUseError extends Error {
+  readonly agentId: string;
+  readonly campaignId: string;
+  /** When the attempt already holding the id started — the evidence that this is a re-run. */
+  readonly startedAt: string;
+
+  constructor(agentId: string, campaignId: string, startedAt: string) {
+    super(
+      `agent ${JSON.stringify(agentId)} is already recorded in campaign ` +
+        `${JSON.stringify(campaignId)}, from an attempt that started ${startedAt}. Agent ids are ` +
+        'minted from 01 on every run, so a run pointed at a campaign that already has agents ' +
+        'collides on its first soldier and no retry of it can end differently. Nothing was ' +
+        'written and the recorded attempt is untouched. Run this against a campaign id no ' +
+        'campaign has used yet — omitting `--id` picks an unused one — and leave this campaign ' +
+        'to be read.',
+    );
+    this.name = 'AgentIdInUseError';
+    this.agentId = agentId;
+    this.campaignId = campaignId;
+    this.startedAt = startedAt;
+  }
+}
+
 export interface AgentOutcome {
   status?: AgentStatus;
   endedAt?: string;
@@ -690,6 +727,7 @@ export class CampaignArchive implements CampaignReader {
   recordAgentAttempt(input: NewAgentAttempt): AgentRow {
     this.assertWritable('recordAgentAttempt');
     assertSafeSegment(input.id, 'agent id');
+    this.assertIdUnused(input.id);
     this.assertNoCaseCollision(input.id);
     const startedAt = input.startedAt ?? this.now();
     const dirRel = agentDirRelative(input.id);
@@ -787,6 +825,28 @@ export class CampaignArchive implements CampaignReader {
       if (result.changes === 0) throw new Error(`no such agent ${agentId}`);
       return this.persistAgent(agentId);
     });
+  }
+
+  /**
+   * Refuse an agent id this campaign has already recorded, before SQLite does.
+   *
+   * The column is a primary key, so the duplicate was always rejected — as
+   * `UNIQUE constraint failed: agents.id`, a sentence about a table the reader has never seen and
+   * cannot act on. It reached them verbatim, because the layer above wraps an undiagnosed throw
+   * in "no diagnosis, nothing to paste". The condition is not undiagnosable: agent ids are minted
+   * from 01 on every run, so a run pointed at a campaign that already has agents collides on its
+   * FIRST soldier, every time, with no sequence of retries that ends differently.
+   *
+   * Refused HERE and not one layer up in `createCampaign`, which stays idempotent on purpose:
+   * re-opening a campaign to append signals, settle a lease or close out an attempt after a crash
+   * is legitimate and must keep working. Only minting a duplicate agent id is the impossible
+   * thing, so only that is refused — and refusing it with the reason and the way out is the
+   * difference between a database error and something the reader can do.
+   */
+  private assertIdUnused(agentId: string): void {
+    const existing = this.getAgent(agentId);
+    if (existing === undefined) return;
+    throw new AgentIdInUseError(agentId, this.campaignId, existing.started_at);
   }
 
   /**

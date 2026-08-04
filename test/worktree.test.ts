@@ -29,10 +29,18 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { Lease } from '../src/contracts/worktree.ts';
+import type { SoldierEvent, SoldierSpec } from '../src/contracts/index.ts';
 import { armyBranch } from '../src/contracts/worktree.ts';
+import { createClaudeAdapter } from '../src/harness/index.ts';
+import {
+  assertWorktreeRootOutsideProtected,
+  permissionsFor,
+} from '../src/command/permissions.ts';
+import { worktreesRootFor } from '../src/config/paths.ts';
 import {
   CONFIG_RELOCATING_ENV_VARS,
   ColdWorktreeProvider,
@@ -1555,3 +1563,187 @@ test('the pooled provider can be demanded explicitly, and is available wherever 
   assert.equal(selection.note.level, 'info');
   assert.equal(await selection.provider.isAvailable(), true);
 });
+
+// ---------------------------------------------------------------------------------------------
+// CAN A WORKER ACTUALLY USE THE TREE IT WAS LEASED?
+//
+// This is the question 621 green tests never asked. The permission tests asserted that the deny
+// globs were EMITTED. Nothing asserted that a worker could still WORK with them applied — and on
+// a real machine an Engineer was leased a tree under `~/.agentic-army`, where Read, Grep, Glob,
+// Write and Edit are all denied, and could not create a single file. The suite stayed green
+// because `test/fixtures/fake-claude.mjs` never read its own `--allowedTools` argv.
+//
+// So these two tests run the whole chain for real: the real pool-root derivation, a real git
+// worktree, the real `permissionsFor()` argv, the real claude adapter, and a fake that refuses
+// what the argv tells it to refuse. The first proves a worker can work; the second points the
+// pool back inside the protected tree and proves the same run fails. Neither is worth anything
+// without the other: the positive alone can pass because the fake is toothless, and the negative
+// alone can pass because the fake is broken.
+// ---------------------------------------------------------------------------------------------
+
+const FAKE_CLAUDE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-claude.mjs');
+
+/** The file the fake's default work routine writes into its cwd. */
+const WORK_FILE = 'engineer-work.txt';
+
+interface WorkRun {
+  events: SoldierEvent[];
+  /** One entry per `permission_denials` row the harness reported, tool name only. */
+  deniedTools: string[];
+  /** Tools whose `tool_result` came back clean. */
+  usedTools: string[];
+}
+
+/**
+ * Spawn an ENGINEER against the fake in its tool-using mode, in `cwd`, under `deny`/`allow`, and
+ * report what it managed to do. `FAKE_CLAUDE_MODE` is set around the spawn rather than globally
+ * so no other test in this file inherits a tool-using harness.
+ */
+async function runEngineer(cwd: string, home: string): Promise<WorkRun> {
+  const permissions = permissionsFor('ENGINEER', home);
+  const spec: SoldierSpec = {
+    agentId: 'cpt-01',
+    rank: 'CAPTAIN',
+    role: 'ENGINEER',
+    harness: 'claude',
+    cwd,
+    sessionId: '9f2b7c1a-0d44-4e6b-8f10-2c5d7a3e9b64',
+    allow: permissions.allow,
+    deny: permissions.deny,
+    orders: 'take hill 4',
+  };
+
+  const saved = process.env['FAKE_CLAUDE_MODE'];
+  process.env['FAKE_CLAUDE_MODE'] = 'work';
+  const events: SoldierEvent[] = [];
+  try {
+    const adapter = createClaudeAdapter({ bin: FAKE_CLAUDE, closeGraceMs: 2000, killGraceMs: 500 });
+    const soldier = await adapter.spawn(spec);
+    // Wait for the turn's own `result`, not for a stopwatch. A fixed sleep here is a flake on a
+    // loaded machine and, worse, a fixed sleep that is TOO SHORT reads as "the worker produced
+    // nothing" — which is the exact symptom this pair of tests exists to distinguish from a
+    // permission lockout.
+    let turnDone: () => void = () => {};
+    const finished = new Promise<void>((r) => (turnDone = r));
+    const pump = (async () => {
+      for await (const event of soldier.stream()) {
+        events.push(event);
+        if (event.type === 'result') turnDone();
+      }
+    })();
+    await soldier.send(spec.orders);
+    await Promise.race([finished, new Promise((r) => setTimeout(r, 10_000))]);
+    await soldier.close();
+    await pump;
+  } finally {
+    if (saved === undefined) delete process.env['FAKE_CLAUDE_MODE'];
+    else process.env['FAKE_CLAUDE_MODE'] = saved;
+  }
+
+  const deniedTools = events
+    .filter((e) => e.type === 'unknown' && e.harnessType === 'permission_denial')
+    .map((e) => ((e as { raw?: unknown }).raw as { tool_name?: string }).tool_name ?? '?');
+
+  const byId = new Map<string, string>();
+  for (const e of events) if (e.type === 'tool_use') byId.set(e.toolUseId, e.name);
+  const usedTools = events
+    .filter((e): e is Extract<SoldierEvent, { type: 'tool_result' }> => e.type === 'tool_result')
+    .filter((e) => !e.isError)
+    .map((e) => byId.get(e.toolUseId) ?? '?');
+
+  return { events, deniedTools, usedTools };
+}
+
+const PATH_TOOLS = ['Glob', 'Write', 'Read', 'Grep', 'Edit'];
+
+test(
+  'an ENGINEER leased a tree from the derived pool root can actually read and write it',
+  { skip: process.platform === 'win32' ? 'POSIX shebang fake' : false },
+  async () => {
+    const dir = caseDir('engineer-can-work');
+    const repo = repoWithCommit(join(dir, 'repo'));
+    const home = join(dir, '.agentic-army');
+    mkdirSync(home, { recursive: true });
+
+    // The REAL derivation, not a path this test picked. If `worktreesRootFor` is ever changed
+    // back to something under the home, this test is the one that notices.
+    const poolRoot = worktreesRootFor(home);
+    assertWorktreeRootOutsideProtected(poolRoot, home);
+
+    const provider = new ColdWorktreeProvider({ root: poolRoot, home });
+    const lease = await provider.acquire('cpt-01', repo);
+
+    const run = await runEngineer(lease.path, home);
+
+    // THE PROPERTY, in the only form that cannot be faked: bytes on disk, in the leased tree.
+    const written = join(lease.path, WORK_FILE);
+    assert.ok(existsSync(written), `the Engineer created nothing in ${lease.path}`);
+    assert.match(readFileSync(written, 'utf8'), /engineer was here/);
+    assert.match(readFileSync(written, 'utf8'), /and edited it/, 'Edit ran too, not just Write');
+
+    // And git agrees the file landed inside the worktree rather than somewhere adjacent.
+    assert.match(sh(lease.path, 'status', '--porcelain'), new RegExp(`\\?\\? ${WORK_FILE}`));
+
+    assert.deepEqual(run.deniedTools, [], 'a worker in its own tree must be denied nothing');
+    assert.deepEqual(
+      run.usedTools,
+      PATH_TOOLS,
+      'every path tool an Engineer holds must work inside its lease',
+    );
+    assert.ok(
+      run.events.some((e) => e.type === 'result' && e.status === 'ok'),
+      'the turn itself must complete',
+    );
+
+    await provider.release(lease, { force: true });
+  },
+);
+
+test(
+  'the SAME run fails when the pool is pointed back inside the protected tree',
+  { skip: process.platform === 'win32' ? 'POSIX shebang fake' : false },
+  async () => {
+    const dir = caseDir('engineer-locked-out');
+    const repo = repoWithCommit(join(dir, 'repo'));
+    const home = join(dir, '.agentic-army');
+    mkdirSync(home, { recursive: true });
+
+    // The shipped bug, spelled out: the pool defaulted to `<archiveRoot>/worktrees` and
+    // `archiveRoot` defaults to the army home. Every worker denies that whole region.
+    const poolRoot = join(home, 'worktrees');
+    assert.throws(
+      () => assertWorktreeRootOutsideProtected(poolRoot, home),
+      /denied Read, Grep, Glob, Write and Edit/,
+      'the guard that now prevents this must still refuse it',
+    );
+
+    // The guard is deliberately bypassed here — this test is what the world looked like before
+    // it existed, and its whole job is to show that the lockout is now VISIBLE to the suite.
+    const provider = new ColdWorktreeProvider({ root: poolRoot, home });
+    const lease = await provider.acquire('cpt-01', repo);
+    assert.ok(lease.path.startsWith(home), 'sanity: the lease really is inside the protected tree');
+
+    const run = await runEngineer(lease.path, home);
+
+    // TOTAL LOCKOUT. Not a degraded run — every path tool the Engineer holds is refused, and the
+    // filesystem is untouched. This is exactly what the user saw, and what 621 tests missed.
+    assert.deepEqual(run.deniedTools, PATH_TOOLS, 'every path tool must be denied, not just some');
+    assert.deepEqual(run.usedTools, [], 'nothing may succeed inside a region every rule denies');
+    assert.equal(
+      existsSync(join(lease.path, WORK_FILE)),
+      false,
+      'a denied tool must not touch the filesystem — a denial that still writes proves nothing',
+    );
+
+    // The denial rows carry the real CLI's shape, so the archive and the escalation ladder get
+    // something they can route rather than a boolean.
+    const denial = run.events.find(
+      (e) => e.type === 'unknown' && e.harnessType === 'permission_denial',
+    );
+    const raw = (denial as { raw?: Record<string, unknown> } | undefined)?.raw ?? {};
+    assert.deepEqual(Object.keys(raw).sort(), ['tool_input', 'tool_name', 'tool_use_id']);
+    assert.match(String(raw['tool_use_id']), /^toolu_/);
+
+    await provider.release(lease, { force: true });
+  },
+);

@@ -18,7 +18,20 @@ export const RANK_ORDER = [
 
 export type Rank = (typeof RANK_ORDER)[number];
 
-export const ROLES = ['SCOUT', 'ENGINEER', 'INSPECTOR', 'SENTRY'] as const;
+/**
+ * COMMANDER is the branch of service that only ever talks.
+ *
+ * It exists because `army chat` needs a soldier whose loadout is *nothing* — no Read, no Grep,
+ * no Edit, no Bash — and a loadout is chosen by role. Reusing SCOUT would have handed it
+ * Read/Grep/Glob/WebFetch, which is precisely the capability that burns a commanding agent's
+ * window one file at a time; reusing ENGINEER would have handed it a shell. Neither is a
+ * commanding agent, and the difference is not a matter of prompting.
+ *
+ * A COMMANDER delegates and reads capped reports. That is its whole tool loadout, and because
+ * the loadout is derived from this value rather than asserted in a briefing, it is a property of
+ * the process rather than a request made of the model.
+ */
+export const ROLES = ['SCOUT', 'ENGINEER', 'INSPECTOR', 'SENTRY', 'COMMANDER'] as const;
 
 export type Role = (typeof ROLES)[number];
 
@@ -93,6 +106,7 @@ export const ROLE_WRITES_FILES: Record<Role, boolean> = {
   ENGINEER: true,
   INSPECTOR: false,
   SENTRY: false,
+  COMMANDER: false,
 };
 
 /** Only Engineers need a worktree. Inspectors attach read-only to the Engineer's. */
@@ -101,6 +115,7 @@ export const ROLE_NEEDS_WORKTREE: Record<Role, boolean> = {
   ENGINEER: true,
   INSPECTOR: false,
   SENTRY: false,
+  COMMANDER: false,
 };
 
 /**

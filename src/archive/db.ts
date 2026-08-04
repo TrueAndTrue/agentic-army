@@ -152,8 +152,19 @@ let warningFilterInstalled = false;
  * Node installs its own `warning` listener at bootstrap; adding a second one would not stop it
  * printing, so the existing listeners are captured, detached, and re-invoked by ours for every
  * warning that is not the SQLite one. Any future warning still prints exactly as it would have.
+ *
+ * EXPORTED, and this is the only copy. It used to be module-private, so the two other places that
+ * load `node:sqlite` — `canImportSqlite` in `src/setup/checks.ts` and `openReadOnlyDb` in
+ * `src/view/live.ts` — could not reach it. The first mirrored the mechanism by hand; the second
+ * did not mirror it at all, so `army view --source db` printed the warning while `army doctor`
+ * was on screen promising that it never reaches your terminal. Every route that reaches
+ * `node:sqlite` now calls THIS function first. Adding a fourth means calling it too.
+ *
+ * Idempotent, and safe to call from any of them in any order: the flag makes the second call a
+ * no-op, and if a future copy ever did install a second filter it would capture this one as one
+ * of its `previous` listeners and re-emit through it, so nothing is dropped twice or lost.
  */
-function installWarningFilter(): void {
+export function installWarningFilter(): void {
   if (warningFilterInstalled) return;
   warningFilterInstalled = true;
   const previous = process.listeners('warning');

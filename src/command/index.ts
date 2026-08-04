@@ -13,6 +13,9 @@ import { RUNG_LABEL, RUNGS } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import { invokedAs } from '../setup/checks.ts';
 import { renderFix } from '../setup/fixes.ts';
+import { detectCharset } from '../view/index.ts';
+import { createProgressSink } from '../view/progress.ts';
+import type { ProgressSink } from '../view/progress.ts';
 
 import { CampaignSetupError, runCampaign } from './campaign.ts';
 import type { CampaignNote, CampaignOptions, CampaignResult, WriteStream } from './campaign.ts';
@@ -43,8 +46,9 @@ USAGE
   ${invokedAs()} campaign "<objective>" [options]
 
 OPTIONS
-  --rung <0|1|2>       Highest delivery rung to attempt. Clamped by the project
-                       ceiling, never raised by this flag. Default 2.
+  --rung <0|1|2|3>     Highest delivery rung to attempt. Clamped by the project
+                       ceiling, never raised by this flag. Default 2 — a merge is
+                       asked for by name, never arrived at by default.
   --attempts <n>       Total Engineer attempts including the first. Default 3.
   --cwd <dir>          Project to fight the campaign in. Default: this directory.
   --provider <id>      Worktree provider. There is one pooled provider today;
@@ -58,8 +62,10 @@ THE DELIVERY LADDER
   0  commit         Durable in the army mirror. Your repo is untouched.
   1  push           Branch on origin. No PR.
   2  pull request   PR opened, Inspector verdict posted as a review.
-  3  merge          Not implemented in this build; requesting it refuses rather
-                    than quietly shipping rung 2 instead.
+  3  merge          The PR merged, and only after an Inspector PASS that reached
+                    it, with the Engineer done and the retry budget intact.
+                    Anything else — a FAIL, a missing verdict, a host that says
+                    no — stops at rung 2 and says which. Needs a ceiling of 3.
 
   The ceiling lives in ~/.agentic-army/config.toml, keyed by absolute path, and
   is never read from the repository being worked on. \`${invokedAs()} enlist\` sets it.
@@ -84,8 +90,21 @@ export interface CampaignArgs {
   help: boolean;
 }
 
+/**
+ * `--rung` → a `Rung`, or a usage error. Never a guess.
+ *
+ * The digits-only screen is deliberate and is NOT what `Number()` does on its own. `Number()`
+ * reads `" 3"`, `"3 "`, `"+3"`, `"3e0"`, `"3.0"` and `"0x3"` as 3, and — the one that actually
+ * bit — reads `""` as **0**, so `--rung ""` silently selected a rung instead of complaining. Now
+ * that rung 3 is a rung that merges, "what the user typed" and "what the flag selected" have to
+ * be the same string. Anything else refuses, and refusing is the safe direction here: the
+ * campaign does not start at all, which is lower than rung 0.
+ *
+ * This is a floor, not a ceiling. Whatever survives is still clamped by the project's ceiling in
+ * the global config, which is the only thing that can authorise a rung.
+ */
 function asRung(raw: string | undefined): Rung {
-  const value = Number(raw);
+  const value = raw !== undefined && /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isInteger(value) || !(RUNGS as readonly number[]).includes(value)) {
     throw new UsageError(`--rung expects one of ${RUNGS.join(', ')}, got ${JSON.stringify(raw ?? '')}`);
   }
@@ -278,6 +297,37 @@ export interface CampaignCommandDeps {
   stderr?: WriteStream;
   /** Everything `runCampaign` accepts except the objective, for tests and for the CLI. */
   overrides?: Partial<CampaignOptions>;
+  /** The environment the charset is detected from. Defaults to the real one. */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * Where the live narration goes, and whether it may touch the cursor.
+ *
+ * TWO SEPARATE QUESTIONS, and conflating them is how a progress renderer corrupts a pipe:
+ *
+ * - **Which stream.** `--json` puts a machine-readable document on stdout, so narration goes to
+ *   stderr instead. A reader piping the JSON into `jq` still gets the lifecycle on their terminal,
+ *   and the document stays parseable — which "print progress to stdout unless quiet" would not.
+ * - **Whether it animates.** Cursor control and spinner frames go out only when the chosen stream
+ *   is a real terminal. Redirected to a file, the SAME lines are written, plain: silence is not an
+ *   improvement on a log, but escape bytes in one are a corruption.
+ */
+function progressSinkFor(
+  args: CampaignArgs,
+  stdout: WriteStream,
+  stderr: WriteStream,
+  self: string,
+  env: Record<string, string | undefined>,
+): ProgressSink {
+  const stream = args.json ? stderr : stdout;
+  const isTTY = stream.isTTY === true;
+  return createProgressSink({
+    stream,
+    self,
+    live: isTTY,
+    charset: detectCharset(env, isTTY, process.platform),
+  });
 }
 
 export async function campaignCommand(
@@ -302,13 +352,17 @@ export async function campaignCommand(
     return 0;
   }
 
+  const sink = progressSinkFor(args, stdout, stderr, self, deps.env ?? process.env);
+
   const options: CampaignOptions = {
     objective: args.objective,
+    onProgress: sink.emit,
     ...(args.cwd === undefined ? {} : { cwd: args.cwd }),
     ...(args.requestedRung === undefined ? {} : { requestedRung: args.requestedRung }),
     ...(args.maxAttempts === undefined ? {} : { maxAttempts: args.maxAttempts }),
     ...(args.provider === undefined ? {} : { worktreeProvider: args.provider }),
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
+    // Spread LAST, so a caller that wants its own listener — or none — wins over the default.
     ...deps.overrides,
   };
 
@@ -316,12 +370,16 @@ export async function campaignCommand(
   try {
     result = await runCampaign(options);
   } catch (error) {
+    // Before the report, and before the error line: the ticker owns the cursor's line, and an
+    // error printed over a half-drawn spinner frame is an error the reader cannot read.
+    sink.close();
     stderr.write(`${self} campaign: ${error instanceof Error ? error.message : String(error)}\n`);
     // The one refusal that happens before there is a campaign to hang a note on. It carries its
     // own fix rather than leaving this the single path where a bare sentence escapes.
     if (error instanceof CampaignSetupError) stderr.write(`  ${renderFix(error.fix)}\n`);
     return 1;
   }
+  sink.close();
 
   if (args.json) {
     stdout.write(`${JSON.stringify(result, null, 2)}\n`);

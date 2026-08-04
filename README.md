@@ -9,8 +9,9 @@ review. The design goal is that nothing enters a commanding agent's context exce
 hard-schema report — guarded by mechanism rather than by discipline.
 
 > **Status: the loop runs; the package is not published.** `army doctor`, `army init`,
-> `army enlist`, `army campaign`, `army view` and `army rebuild` are all implemented, and every
-> transcript below is real output from running them. What is missing is distribution:
+> `army enlist`, `army chat`, `army campaign`, `army view` and `army rebuild` are all
+> implemented, and every transcript below is real output from running them. What is missing is
+> distribution:
 > `agentic-army` is not on the npm registry, so `npx agentic-army …` and `npm install -g
 > agentic-army` both 404 today — run it from a checkout, see [Getting it](#getting-it).
 >
@@ -124,11 +125,24 @@ ceiling caps is *delivery*:
 | 0 | commit — durable in the army mirror, your repo untouched. **Default.** |
 | 1 | push — branch on origin, no PR |
 | 2 | pull request — opened, Inspector verdict posted as a review |
-| 3 | merge — after an Inspector PASS. **Not implemented in this build.** |
+| 3 | merge — after an Inspector PASS, by the supervisor, if the host allows it |
 
-Rung 3 is a rung the ceiling can hold and the ladder cannot climb: `src/delivery/ladder.ts`
-plans it and then refuses to execute it, rather than quietly delivering rung 2 and reporting
-success. `army campaign --rung` accepts `0|1|2` only.
+**Everything about rung 3 is fail-closed.** The merge is performed by the supervisor process you
+launched — never by a worker, which is denied `gh pr merge` at every rank — and only when all of
+these hold at once: the project ceiling is 3, the Inspector returned PASS, that verdict reached
+the pull request as a review, the Engineer finished, and the retry budget was not exhausted.
+Anything else delivers rung 2 and names the condition that failed. The merge is pinned to the
+exact commit the Inspector read, so a commit pushed to the branch after the verdict cannot ride
+in on it. Nothing overrides the remote: no admin override, no auto-merge, no force. If branch
+protection, a required check, a required review or a conflict makes the host refuse, the refusal
+is reported as the host worded it and the campaign stops there. Re-running is safe — an existing
+pull request is adopted rather than opened a second time, and one that is already merged is a
+no-op rather than an error.
+
+`army campaign --rung 3` still refuses, and says why. The campaign command does not yet hand the
+ladder the two facts rung 3 needs from it — whether the Engineer finished, and whether the retry
+budget ran out — and a rung whose evidence is missing refuses rather than shipping rung 2 under a
+rung-3 heading. `src/delivery/ladder.ts` is where that gate lives.
 
 ```sh
 army enlist                 # ceiling 0
@@ -208,6 +222,58 @@ that never existed. **The ceiling clamped the request** rather than honouring `-
 said so. And **durability happened before the lease was returned**, so the commit survived the
 worktree being reset and handed to the next campaign; it is readable out of the mirror
 afterwards with plain `git`.
+
+## `army chat`
+
+A campaign is one objective, decided up front. `chat` is the other shape: a live session with a
+**COL·COMMANDER** that can raise work mid-conversation.
+
+```sh
+army chat
+army chat --rung 2          # highest rung any dispatch may attempt, still clamped by the ceiling
+```
+
+```
+you › I want calc.js to also export a multiply function. Propose the objective.
+
+◆ I haven't read `calc.js` — I don't know whether it uses CommonJS or ESM, so I'm keeping
+  the objective about behaviour, not style, so it can't drift into a rewrite.
+
+  ```army-dispatch
+  {"objective": "Add a multiply function to calc.js that returns the product of its two
+   numeric arguments, and export it alongside the existing exports using the same
+   module/export style already in that file; leave existing functions unchanged."}
+  ```
+
+  ◇ dispatch this? [y/N] y
+  ◇ cpt-01 ENGINEER (ok)  →  cpt-02 PASS (NO TESTS RUN)
+  delivered · branch army/t-e12c2e318b38 · rung 0 (commit) · worktree released
+
+◆ Delivered, first attempt, verdict pass. One caveat worth your attention: `testsRun: false`.
+  There's no package.json, so nothing verified the behaviour beyond the Inspector reading
+  the diff. The claim that it multiplies correctly rests on review, not execution.
+```
+
+**The commander has no tools.** Its allow-list is one inert entry; Read, Grep, Glob, Edit, Write,
+Bash and network are all denied to it by the same permission layer that governs every worker.
+That is why it says *"I haven't read calc.js"* — not modesty, and not an instruction it was given
+that it might ignore. Asked directly to read a file, it answers that the function is not there to
+call. This is the point of the rank: the window holding your objective cannot be spent one source
+file at a time, because spending it that way is not an available action.
+
+**Nothing is dispatched without a keystroke.** The commander proposes; you approve. Everything it
+raises goes through the gate `army campaign` uses — the same code, so the same independent
+Inspector briefed from the objective and the branch, the same durability, the same ceiling clamp.
+`--rung` sets a maximum for the session and is itself clamped; it can lower, never raise.
+
+**Ctrl-C stops the turn, not the session.** The interrupt is a control message on stdin rather
+than a signal, so an answer in flight aborts in milliseconds and the same session takes your next
+line. During a dispatch it refuses instead, and says why: only the campaign's own cleanup can
+settle a lease, and abandoning one mid-flight is how a worktree leaks. A second Ctrl-C, or
+Ctrl-D, exits.
+
+The conversation is archived like any campaign — `army view` renders it, and the query/answer
+pairs are linked in `signals.jsonl`, so a crash costs you nothing.
 
 ## `army view`
 
@@ -333,18 +399,26 @@ directory.
 removed from `PATH` and `ANTHROPIC_API_KEY` set, to see all three degradations and exit 0);
 `init`, twice, for the idempotence claim; `enlist`, and `enlist --ceiling 2` and `--ceiling 3`
 non-interactively to see the refusal and the exact config line it prints instead; `campaign`,
-end to end, Engineer through Inspector to durability; `view`, `view --list`, `view --source db`,
+end to end, Engineer through Inspector to durability; `chat`, against real claude and codex —
+one objective proposed, approved at the prompt, dispatched through the gate to a rung-0
+delivery, plus the refusal when the commander was asked to read a file, and a live interrupt
+mid-answer; `view`, `view --list`, `view --source db`,
 `view --follow`; `rebuild`. The `army` spelling in the first column of
 [First run](#first-run) was checked too, against a built `dist/` on `PATH`, because the claim
 that suggestions match your invocation is only interesting if it holds in more than one form.
 
 **Implemented but NOT exercised here, so take the description and not a demonstration:**
 
-- **Delivery rungs 1, 2 and 3.** Only rung 0 was run. Push, pull request and merge need a real
-  remote and a `gh` login against one, which a throwaway repo does not have. Rung 3 is
-  documented above as unimplemented on the strength of `src/delivery/ladder.ts` refusing it —
-  the rung-3 campaign run above was clamped to 0 by the ceiling first, so the refusal itself is
-  a code claim, not something observed.
+- **Delivery rungs 1, 2 and 3 through `army campaign`.** Only rung 0 was run that way. Push,
+  pull request and merge need a real remote and a `gh` login against one, which a throwaway repo
+  does not have.
+- **Rung 3 against a real host.** The merge rung is exercised in `test/delivery.test.ts` against
+  local infrastructure only: real repositories, a real bare repo standing in for `origin`, a real
+  durability push, the real allow-list on every argv, and a stand-in `gh` executable on disk that
+  performs the merge by moving the bare repo's `main`. So "it merged" is a fact about a
+  repository on this machine, and the gates, the argv, the idempotence and the reporting are all
+  demonstrated. What is NOT demonstrated: that the real `gh` accepts these flags, and that
+  GitHub's branch protection refuses the way the stand-in does. Those two remain code claims.
 - **The retry path.** The Inspector passed on attempt 1, so no second Engineer was fielded.
 - **Raising a ceiling from a real TTY.** Only the non-interactive refusal was observed.
 - **Windows.** Untested, and never claimed otherwise. Paths are built with `node:path` and the

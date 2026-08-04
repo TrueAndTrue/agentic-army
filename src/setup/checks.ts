@@ -32,6 +32,7 @@ import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { installWarningFilter } from '../archive/db.ts';
 import {
   armyHome,
   normalizePathForCompare as normalizePath,
@@ -39,6 +40,8 @@ import {
   samePath,
   worktreesRootFor,
 } from '../config/paths.ts';
+
+import { quoteArg } from './shell.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -262,11 +265,6 @@ export type InvocationContext = {
 export const BIN_NAME = 'army';
 export const PACKAGE_NAME = 'agentic-army';
 
-/** Shell-safe rendering of a path that may contain spaces. */
-function quoteIfNeeded(value: string): string {
-  return /[\s"']/.test(value) ? `"${value}"` : value;
-}
-
 /** Index of the `node_modules/<PACKAGE_NAME>` segment pair, or -1. */
 function packageSegment(scriptPath: string): { parts: string[]; index: number } {
   const parts = scriptPath.split(/[\\/]/);
@@ -457,7 +455,7 @@ export function detectInvocation(ctx: InvocationContext = {}): Invocation {
     !shadowed && relative !== '' && !relative.startsWith('..') && !p.isAbsolute(relative);
   return {
     form: 'node-script',
-    command: `node ${quoteIfNeeded(useRelative ? relative : scriptPath)}`,
+    command: `node ${quoteArg(useRelative ? relative : scriptPath, platform)}`,
     reason: shadowed
       ? `a different ${BIN_NAME} owns that name on PATH (${String(onPath)}), so the full path is ` +
         'the only unambiguous way to name this install'
@@ -766,18 +764,26 @@ export type HomeState = DirState;
  * The second case moves the offender aside rather than deleting it. Doctor is diagnostic; it
  * must never hand out a command that destroys a file the user may care about, and `.bak` is
  * recoverable where `rm` is not.
+ *
+ * Every interpolation goes through `quoteArg`, and this line is the reason that matters most in
+ * this file. It is the one fix doctor prints that is a WRITE, it is aimed at a directory the user
+ * chose the name of, and it is offered to be pasted. Hand-written `"…"` around it — which is what
+ * this used to do — leaves `$`, a backtick and `\` live inside the quotes, so a home at
+ * `$HOME/army stuff` created a DIFFERENT directory than the one on screen, and a backtick made it
+ * run a command. `.bak` was the safety argument for `mv`; it is not a safety argument for `mv`
+ * pointed somewhere else.
  */
 function mkdirFix(state: DirState, platform: Platform = process.platform): string {
   const win = platform === 'win32';
+  const q = (value: string): string => quoteArg(value, platform);
+  const dir = q(state.dir);
   const blocker = state.blockedBy ?? null;
   if (blocker !== null) {
     return win
-      ? `move "${blocker}" "${blocker}.bak" && mkdir "${state.dir}"`
-      : `mv "${blocker}" "${blocker}.bak" && mkdir -p "${state.dir}"`;
+      ? `move ${q(blocker)} ${q(`${blocker}.bak`)} && mkdir ${dir}`
+      : `mv ${q(blocker)} ${q(`${blocker}.bak`)} && mkdir -p ${dir}`;
   }
-  return win
-    ? `mkdir "${state.dir}"`
-    : `mkdir -p "${state.dir}" && chmod u+rwx "${state.dir}"`;
+  return win ? `mkdir ${dir}` : `mkdir -p ${dir} && chmod u+rwx ${dir}`;
 }
 
 export function classifyHome(state: DirState): CheckResult {
@@ -884,8 +890,11 @@ export function classifyStaleWorktreePool(state: LegacyPoolState): CheckResult {
     return { ...base, outcome: 'ok', found: `${state.dir} (absent — trees live in the sibling)` };
   }
 
-  const removals = state.trees.map((tree) => `git worktree remove ${quoteIfNeeded(tree)}`);
-  const fix = [...removals, `rm -rf ${quoteIfNeeded(state.dir)}`].join(' && ');
+  // `quoteArg`, not a hand-written pair of double quotes: this chain ends in `rm -rf`, and a
+  // pool directory whose name contains a backtick or a `$` would otherwise expand between the
+  // line the user reads and the line the shell runs.
+  const removals = state.trees.map((tree) => `git worktree remove ${quoteArg(tree)}`);
+  const fix = [...removals, `rm -rf ${quoteArg(state.dir)}`].join(' && ');
 
   if (state.trees.length === 0) {
     return {
@@ -1460,50 +1469,22 @@ export async function inspectLegacyWorktreePool(
 // node:sqlite — importable, and silent about it
 // ---------------------------------------------------------------------------
 
-let sqliteWarningFilterInstalled = false;
-
-/**
- * Swallow `ExperimentalWarning: SQLite is an experimental feature…` and NOTHING else.
- *
- * MIRRORED, deliberately and not by accident, from `installWarningFilter` in
- * `src/archive/db.ts`. That module solved this exact problem carefully and this one bypassed it,
- * which is why `army init` opened with a warning that reads like a crash. The mechanism is
- * copied rather than imported for one reason only: the archive's copy is module-private. If it
- * is ever exported, delete this and import it — there should be one of these, not two.
- *
- * The mechanism, and why each part is load-bearing:
- *
- *   - Node installs its OWN `warning` listener at bootstrap, and that listener is what prints.
- *     Adding a second listener does not stop it, so the existing ones are captured, detached,
- *     and re-invoked by ours for every warning that is not the SQLite one.
- *   - Which means this is NOT a global mute. A `DeprecationWarning`, or an `ExperimentalWarning`
- *     about anything other than SQLite, still reaches stderr formatted exactly as Node would
- *     have formatted it. `test/doctor.test.ts` proves that in a child process rather than
- *     asserting it here in a comment.
- *
- * Two independent copies compose safely: whichever installs second captures the first as one of
- * its "previous" listeners and re-emits through it. So loading the archive and running doctor in
- * the same process filters once, not twice, and drops nothing.
- */
-function installSqliteWarningFilter(): void {
-  if (sqliteWarningFilterInstalled) return;
-  sqliteWarningFilterInstalled = true;
-  const previous = process.listeners('warning');
-  process.removeAllListeners('warning');
-  process.on('warning', (warning: Error) => {
-    if (warning.name === 'ExperimentalWarning' && /\bSQLite\b/i.test(warning.message)) return;
-    for (const listener of previous) listener.call(process, warning);
-  });
-}
-
 /**
  * Can this Node open the archive index at all?
  *
  * The filter goes in BEFORE the import, because the warning fires on load — which is also why
  * this is a lazy dynamic `import` and not a hoisted one.
+ *
+ * `installWarningFilter` used to be a hand-mirrored copy of the archive's, kept here because the
+ * archive's was module-private and its own comment said to delete this one the day it was
+ * exported. That day is today: it is imported now, so there is one filter and it is impossible
+ * for this route and the archive's to disagree about what gets swallowed.
+ *
+ * The import direction is the safe one — `src/setup/**` sits above `src/archive/**`, and `db.ts`
+ * imports nothing but `node:module`, so nothing is pulled in by reaching for it.
  */
 export async function canImportSqlite(): Promise<{ ok: boolean; error: string | null }> {
-  installSqliteWarningFilter();
+  installWarningFilter();
   try {
     await import('node:sqlite');
     return { ok: true, error: null };

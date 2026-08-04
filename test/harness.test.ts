@@ -89,9 +89,16 @@ function loadFixture(name: string): JsonlLine[] {
   return parseJsonl(readFileSync(join(FIXTURES, `${name}.jsonl`), 'utf8'));
 }
 
-function normalizeClaudeFixture(name: string): SoldierEvent[] {
-  const n = createClaudeNormalizer();
+function normalizeClaudeFixture(name: string, partialText = false): SoldierEvent[] {
+  const n = createClaudeNormalizer(partialText ? { partialText } : undefined);
   return loadFixture(name).flatMap((l) => n.next(l, FIXED_TS));
+}
+
+/** Every text-bearing event, in order — what a consumer that renders text actually renders. */
+function renderedText(events: readonly SoldierEvent[]): string {
+  return events
+    .map((e) => (e.type === 'assistant_text' || e.type === 'subagent_text' ? e.text : ''))
+    .join('');
 }
 
 function normalizeCodexFixture(name: string): SoldierEvent[] {
@@ -112,6 +119,49 @@ async function collect(stream: AsyncIterable<SoldierEvent>): Promise<SoldierEven
   const out: SoldierEvent[] = [];
   for await (const e of stream) out.push(e);
   return out;
+}
+
+/**
+ * How long `collectResults` will wait before giving up. NOT a timing assumption: the passing path
+ * never reaches it, because it settles on the event itself. It is a HANG-BREAKER — a soldier that
+ * under-reports must fail on an assertion that names what was missing, not park the runner
+ * forever. Mutation-tested: making the fake drop one of two turns hangs a bare `await` and the
+ * whole file with it, which is how this ceiling came to be here.
+ */
+const RESULT_CEILING_MS = 15_000;
+
+/**
+ * `collect`, plus a promise that settles once `n` `result` events have landed.
+ *
+ * A lifecycle test that sleeps before closing is asserting an UNSTATED DEADLINE — "the fake will
+ * be finished within 250ms" — and a deadline nobody wrote down is a deadline nobody maintains.
+ * Waiting for the event the test is actually about removes the guess: it cannot pass by luck on a
+ * fast machine, and it cannot fail by bad luck on a loaded one. It settles on stream end too, so
+ * a soldier that dies without reporting fails on its assertion rather than hanging.
+ */
+function collectResults(
+  stream: AsyncIterable<SoldierEvent>,
+  n: number,
+): { all: Promise<SoldierEvent[]>; results: Promise<void> } {
+  const out: SoldierEvent[] = [];
+  let seen = 0;
+  let done: () => void = () => {};
+  const results = new Promise<void>((r) => (done = r));
+  const ceiling = setTimeout(() => done(), RESULT_CEILING_MS);
+  ceiling.unref?.();
+  const all = (async (): Promise<SoldierEvent[]> => {
+    for await (const e of stream) {
+      out.push(e);
+      if (e.type === 'result' && (seen += 1) >= n) {
+        clearTimeout(ceiling);
+        done();
+      }
+    }
+    clearTimeout(ceiling);
+    done();
+    return out;
+  })();
+  return { all, results };
 }
 
 /** The value of a `-c key=value` override, or undefined. Robust to override ordering. */
@@ -414,6 +464,37 @@ describe('claude argv', () => {
 
   test('nothing prompts', () => {
     assert.equal(args[args.indexOf('--permission-mode') + 1], 'dontAsk');
+  });
+
+  test('--include-partial-messages is OPT-IN, and off by default', () => {
+    // Off by default because the lines it produces are duplicates of the aggregate `assistant`
+    // message. Measured against claude 2.1.221: a 2217-char reply arrives as 32 deltas and those
+    // lines are 54% of the turn's stdout. A campaign soldier has nobody at a prompt, so for it
+    // that is pure cost — and asking for lines we then discard would break the archive's rule
+    // that no line is dropped.
+    assert.equal(args.includes('--include-partial-messages'), false);
+    assert.equal(buildClaudeArgs(spec(), {}).includes('--include-partial-messages'), false);
+    assert.equal(
+      buildClaudeArgs(spec(), { partialMessages: false }).includes('--include-partial-messages'),
+      false,
+    );
+    assert.ok(
+      buildClaudeArgs(spec(), { partialMessages: true }).includes('--include-partial-messages'),
+    );
+  });
+
+  test('the partial flag is a bare flag, and lands clear of the variadic ones', () => {
+    // `--allowedTools` swallows everything up to the next `--flag`, so a flag emitted INSIDE that
+    // run would be read as a tool name by the CLI and by the fake alike.
+    const a = buildClaudeArgs(spec({ allow: ['Read', 'Grep'], deny: ['Bash(git push*)'] }), {
+      partialMessages: true,
+    });
+    const at = a.indexOf('--include-partial-messages');
+    assert.ok(at > -1);
+    assert.ok(at < a.indexOf('--allowedTools'), 'must precede --allowedTools');
+    assert.ok(at < a.indexOf('--disallowedTools'), 'must precede --disallowedTools');
+    // It takes no value: whatever follows is another flag, never a bare word.
+    assert.equal((a[at + 1] ?? '--end').startsWith('--'), true);
   });
 
   test('never introduces a PTY or tmux dependency — the Windows story', () => {
@@ -730,6 +811,261 @@ describe('claude normalizer / fixture claude-subagent.jsonl (subagents on the or
       assert.equal(e.depth, 0);
       assert.equal(e.parentToolUseId, null);
     }
+  });
+});
+
+// =============================================================================================
+// 3b. partial messages — token-level streaming, pinned against recorded real streams
+//
+// claude-partial.jsonl and claude-partial-abort.jsonl were captured from claude 2.1.221 on
+// 2026-08-03 by running the real duplex invocation with --include-partial-messages. Between them
+// they carry text_delta, thinking_delta, signature_delta and input_json_delta, a tool round trip,
+// two messages in one turn, and a turn aborted MID-STREAM by a real control_request.
+// =============================================================================================
+
+describe('claude normalizer / --include-partial-messages, default OFF', () => {
+  // THE "CONSUMERS MUST NOT CARE" GUARD. `army campaign`'s narration, `army view`, the archive
+  // writer and the org-chart tracking all read this stream. Adding a finer granularity must not
+  // change what any of them sees, and this is what says so.
+  const off = normalizeClaudeFixture('claude-partial');
+
+  test('every partial line becomes `unknown` — never text, never dropped', () => {
+    const lines = loadFixture('claude-partial');
+    const partialLines = lines.filter(
+      (l) => l.ok && (l.value as { type?: string }).type === 'stream_event',
+    ).length;
+    assert.equal(partialLines, 26, 'the fixture must actually contain partials');
+
+    const partials = off.filter(
+      (e) => e.type === 'unknown' && (e.harnessType ?? '').startsWith('stream_event/'),
+    );
+    assert.equal(partials.length, partialLines, 'one event per partial line, no more, no fewer');
+    assert.deepEqual(
+      [...new Set(partials.map((e) => (e.type === 'unknown' ? e.harnessType : '')))].sort(),
+      [
+        'stream_event/content_block_delta',
+        'stream_event/content_block_start',
+        'stream_event/content_block_stop',
+        'stream_event/message_delta',
+        'stream_event/message_start',
+        'stream_event/message_stop',
+      ],
+    );
+  });
+
+  test('the text a consumer renders is the aggregate message, exactly as before', () => {
+    const texts = off.filter((e) => e.type === 'assistant_text').map((e) => e.text);
+    // Two thinking blocks' worth of nothing plus the one real reply: the SAME three
+    // assistant_text events a run without the flag produces, because the flag is additive.
+    assert.equal(texts.length, 2);
+    assert.match(texts.join(''), /^Yes — 1729 is the smallest such number/);
+  });
+
+  test('the tool round trip is untouched by the partials interleaved through it', () => {
+    const uses = off.filter((e) => e.type === 'tool_use');
+    assert.equal(uses.length, 1);
+    assert.equal(uses[0]?.type === 'tool_use' ? uses[0].name : null, 'Bash');
+    // input_json_delta fragments are NOT individually parseable; the aggregate is authoritative.
+    const input = uses[0]?.type === 'tool_use' ? uses[0].input : null;
+    assert.equal(typeof (input as { command?: unknown }).command, 'string');
+    assert.equal(off.filter((e) => e.type === 'tool_result').length, 1);
+  });
+});
+
+describe('claude normalizer / --include-partial-messages, opted IN', () => {
+  const on = normalizeClaudeFixture('claude-partial', true);
+  const off = normalizeClaudeFixture('claude-partial');
+
+  test('text now arrives in pieces — the whole point', () => {
+    const said = (events: readonly SoldierEvent[]): string[] =>
+      events.flatMap((e) => (e.type === 'assistant_text' && e.text !== '' ? [e.text] : []));
+    // Without the flag the reply is ONE lump, delivered after the whole wait. With it, three.
+    assert.deepEqual(said(off).length, 1);
+    assert.equal(said(on).length, 3);
+    assert.equal(said(on)[0], 'Y');
+    assert.equal(said(on).join(''), said(off).join(''));
+  });
+
+  test('BLOCKER: the same text is never rendered twice', () => {
+    // The aggregate `assistant` message still arrives — verified against the real CLI, which is
+    // why the fixture has it. A consumer that concatenates text must see the reply ONCE.
+    assert.equal(renderedText(on), renderedText(off));
+    const reply = renderedText(on);
+    assert.match(reply, /^Yes — 1729 is the smallest such number/);
+    assert.equal(reply.indexOf('1729'), reply.lastIndexOf('1729'), 'the reply appears once');
+  });
+
+  test('the suppressed LINE still reaches the stream — only the TEXT is deduplicated', () => {
+    // `stream.jsonl` is replay truth. Losing the aggregate line would lose its usage block, its
+    // message id and its `raw` altogether.
+    const marker = on.filter(
+      (e) => e.type === 'unknown' && e.harnessType === 'assistant/text_streamed',
+    );
+    assert.equal(marker.length, 1);
+    assert.equal((marker[0]?.raw as { type?: string }).type, 'assistant');
+  });
+
+  test('NO LINE IS DROPPED, in either mode', () => {
+    // The archive's one hard rule. Asserted per line rather than in total, so a line that
+    // silently produced zero events cannot hide behind one that produced two.
+    for (const partial of [false, true]) {
+      for (const name of ['claude-partial', 'claude-partial-abort']) {
+        const n = createClaudeNormalizer(partial ? { partialText: true } : undefined);
+        for (const line of loadFixture(name)) {
+          assert.ok(
+            n.next(line, FIXED_TS).length >= 1,
+            `${name} (partial=${String(partial)}) dropped ${line.text.slice(0, 60)}`,
+          );
+        }
+      }
+    }
+  });
+
+  test('everything that is not text stays `unknown`, including tool-input fragments', () => {
+    // `input_json_delta` carries fragments of a tool call's arguments. They are not text and must
+    // never be rendered as any; and `thinking_delta` on the -p path is redacted to an empty
+    // string plus a token estimate, so it must not become a run of contentless text events.
+    const kinds = on
+      .filter((e) => e.type === 'unknown')
+      .map((e) => (e.type === 'unknown' ? e.harnessType : ''));
+    assert.equal(kinds.filter((k) => k === 'stream_event/content_block_delta').length, 11);
+    // The one empty text event is the aggregate's own redacted `thinking` block, and it is
+    // present in BOTH modes. The eleven partials added none of their own — which is the point:
+    // turning the flag on must not put a run of contentless rows in the archive, and must not
+    // register an empty buffer that then suppresses that very block.
+    const blanks = (events: readonly SoldierEvent[]): number =>
+      events.filter((e) => e.type === 'assistant_text' && e.text === '').length;
+    assert.equal(blanks(on), blanks(off));
+    assert.equal(blanks(on), 1);
+  });
+
+  test('the tool round trip and the result survive identically', () => {
+    for (const type of ['tool_use', 'tool_result', 'result', 'ready'] as const) {
+      assert.deepEqual(
+        on.filter((e) => e.type === type).map((e) => JSON.stringify(e.raw)),
+        off.filter((e) => e.type === type).map((e) => JSON.stringify(e.raw)),
+        type,
+      );
+    }
+  });
+
+  test('suppression is EXACT MATCH: an aggregate that differs is emitted, not lost', () => {
+    // The two mistakes are not symmetric. Suppressing wrongly LOSES text the soldier produced;
+    // failing to suppress shows a duplicate. So a future CLI that post-processes what it streamed
+    // must fall out on the safe side.
+    const n = createClaudeNormalizer({ partialText: true });
+    const feed = (value: unknown): SoldierEvent[] => n.next({ ok: true, index: 0, text: '', value });
+    feed({ type: 'stream_event', event: { type: 'message_start' }, parent_tool_use_id: null });
+    feed({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hell' } },
+      parent_tool_use_id: null,
+    });
+    const out = feed({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'hello there' }] },
+    });
+    assert.equal(out[0]?.type, 'assistant_text', 'a mismatched aggregate must still be emitted');
+    assert.equal(out[0]?.type === 'assistant_text' ? out[0].text : null, 'hello there');
+  });
+
+  test('a message boundary clears the buffers, so one turn cannot suppress the next', () => {
+    const n = createClaudeNormalizer({ partialText: true });
+    const feed = (value: unknown): SoldierEvent[] => n.next({ ok: true, index: 0, text: '', value });
+    feed({ type: 'stream_event', event: { type: 'message_start' }, parent_tool_use_id: null });
+    feed({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'same' } },
+      parent_tool_use_id: null,
+    });
+    // A NEW message that happens to say the same words, with no deltas of its own — a turn cut
+    // short leaves exactly this state behind.
+    feed({ type: 'stream_event', event: { type: 'message_start' }, parent_tool_use_id: null });
+    const out = feed({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'same' }] },
+    });
+    assert.equal(out[0]?.type, 'assistant_text');
+  });
+
+  test('two identical blocks in one message are not both eaten by one run of deltas', () => {
+    const n = createClaudeNormalizer({ partialText: true });
+    const feed = (value: unknown): SoldierEvent[] => n.next({ ok: true, index: 0, text: '', value });
+    feed({ type: 'stream_event', event: { type: 'message_start' }, parent_tool_use_id: null });
+    feed({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      parent_tool_use_id: null,
+    });
+    const out = feed({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'ok' },
+          { type: 'text', text: 'ok' },
+        ],
+      },
+    });
+    assert.deepEqual(out.map((e) => e.type), ['assistant_text']);
+  });
+
+  test('a forwarded subagent delta becomes subagent_text, not assistant_text', () => {
+    // Text at depth >= 1 belongs to a nested agent. Lifting it to the top level would put a
+    // subagent's words in the Commander's mouth on the org chart.
+    const n = createClaudeNormalizer({ partialText: true });
+    const feed = (value: unknown): SoldierEvent[] => n.next({ ok: true, index: 0, text: '', value });
+    const out = feed({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'sub' } },
+      parent_tool_use_id: 'toolu_parent',
+      subagent_type: 'scout',
+    });
+    assert.equal(out[0]?.type, 'subagent_text');
+    assert.equal(out[0]?.type === 'subagent_text' ? out[0].subagentType : null, 'scout');
+    assert.equal(out[0]?.depth, 1);
+  });
+});
+
+describe('claude normalizer / fixture claude-partial-abort.jsonl (interrupted MID-STREAM)', () => {
+  const on = normalizeClaudeFixture('claude-partial-abort', true);
+  const off = normalizeClaudeFixture('claude-partial-abort');
+
+  test('a real mid-stream abort is still classified as an abort, not an error', () => {
+    // The recorded result carries `subtype: error_during_execution, is_error: true,
+    // terminal_reason: aborted_streaming` — the exact shape that used to be filed as a failure
+    // and retried, re-running work a human deliberately stopped.
+    const raw = on.find((e) => e.type === 'result')?.raw as Record<string, unknown>;
+    assert.equal(raw['terminal_reason'], 'aborted_streaming');
+    assert.equal(raw['is_error'], true);
+    for (const events of [on, off]) {
+      assert.equal(events.find((e) => e.type === 'result')?.status, 'interrupted');
+    }
+  });
+
+  test('the record is coherent: what was streamed is what the aggregate holds', () => {
+    // Measured on the real abort — the aggregate is TRUNCATED to what was already delivered, not
+    // re-generated. So the transcript reads the same whether it was replayed from the deltas or
+    // from the aggregate, and neither shows a word the soldier did not produce.
+    assert.equal(renderedText(on), renderedText(off));
+    assert.ok(renderedText(on).startsWith('The sea does not begin anywhere in particular'));
+    assert.ok(renderedText(on).endsWith('the sea is simply the'), 'cut off mid-sentence');
+  });
+
+  test('the partial text survives the abort as three events, not one', () => {
+    assert.equal(on.filter((e) => e.type === 'assistant_text').length, 3);
+    assert.equal(off.filter((e) => e.type === 'assistant_text').length, 1);
+  });
+
+  test('there is no content_block_stop — the block was cut, and that is recorded', () => {
+    const kinds = on
+      .filter((e) => e.type === 'unknown')
+      .map((e) => (e.type === 'unknown' ? e.harnessType : ''));
+    assert.equal(kinds.includes('stream_event/content_block_stop'), false);
+    assert.ok(kinds.includes('stream_event/message_start'));
   });
 });
 
@@ -1069,17 +1405,30 @@ describe('claude adapter lifecycle', { skip: WINDOWS ? 'POSIX shebang fakes' : f
   const adapter = createClaudeAdapter({ bin: FAKE_CLAUDE, closeGraceMs: 1500, killGraceMs: 500 });
 
   test('a duplex round trip: ready, two turns, clean close', async () => {
+    // This test was reported flaky (`close.status: 'error'` about 1 run in 3). It is not a race:
+    // the adapter reports `error` here only via `silentlyDied()` — turns sent, no result seen —
+    // and the fake reaches that state only when it is prevented from reporting. Two things could
+    // prevent it, and both were in the FIXTURE, not the product: a half-written `fake-claude.mjs`
+    // caught mid-save (a valid prefix of it runs, emits `system/init`, and exits 0 having never
+    // installed its stdin handler), and the fixture's own `process.exit(0)` on stdin close, which
+    // discarded a turn that was still in flight. The second is fixed; the first is why nothing
+    // here waits on a clock any more.
     const soldier = await adapter.spawn(spec());
-    const events = collect(soldier.stream());
+    const { all: events, results } = collectResults(soldier.stream(), 2);
     await soldier.send('first');
     await soldier.send('second');
-    await new Promise((r) => setTimeout(r, 250));
+    await results; // both turns have REPORTED — no sleep, so no unstated deadline
     const close = await soldier.close();
     const all = await events;
 
     assert.equal(close.exitCode, 0);
     assert.equal(close.status, 'ok');
     assert.ok((close.durationMs ?? 0) >= 0);
+
+    // TWO turns, two results. This used to see one: the fake kept a single shared turn timer and
+    // the second `send` overwrote the first's, so a test named "two turns" closed one.
+    const costs = all.flatMap((e) => (e.type === 'result' ? [e.costUsd] : []));
+    assert.deepEqual(costs, [0.25, 0.5], 'one result per turn, cumulative');
     // Cumulative, so the ledger takes the LAST value, not the sum of 0.25 + 0.50.
     assert.equal(close.costUsd, 0.5);
 
@@ -1087,6 +1436,31 @@ describe('claude adapter lifecycle', { skip: WINDOWS ? 'POSIX shebang fakes' : f
     assert.deepEqual(texts, ['echo:first', 'echo:second']);
     assert.equal(all.filter((e) => e.type === 'ready').length, 1);
     assert.equal(all.at(-1)?.type, 'result');
+  });
+
+  test('closing stdin mid-turn does not lose the turn — the real CLI finishes it', async () => {
+    // MEASURED against claude 2.1.221: a turn written and then followed IMMEDIATELY by
+    // `stdin.end()` still produces its assistant message and its result before exiting 0.
+    //
+    // The fixture used to `process.exit(0)` the moment readline closed, throwing away a turn it
+    // had accepted — which the adapter then reports, correctly, as a worker that did no work:
+    // `exitCode: 0, status: 'error'`. That is the reported flake's exact signature, and it made
+    // every send-then-close test carry a hidden timing budget. Measured at 28ms typical / 36ms
+    // under an 8-way CPU load against the 250ms that test used to sleep — 7x margin, so it was
+    // not firing, but the budget was real and nothing named it.
+    const soldier = await adapter.spawn(spec());
+    const events = collect(soldier.stream());
+    await soldier.send('work please');
+    const close = await soldier.close(); // NO sleep: close races the turn on purpose
+    const all = await events;
+
+    assert.equal(close.status, 'ok', 'a turn accepted is a turn reported');
+    assert.equal(close.exitCode, 0);
+    assert.equal(all.filter((e) => e.type === 'result').length, 1);
+    assert.deepEqual(
+      all.filter((e) => e.type === 'assistant_text').map((e) => e.text),
+      ['echo:work please'],
+    );
   });
 
   test('close() is idempotent', async () => {
@@ -1387,6 +1761,337 @@ describe('claude adapter lifecycle', { skip: WINDOWS ? 'POSIX shebang fakes' : f
   });
 });
 
+// =============================================================================================
+// 4a2. token-level streaming, end to end through a real process
+//
+// The normalizer tests above run over recorded lines. These run the fake CLI, so the argv builder,
+// `spawn`, the framer, the normalizer and the interrupt path are all on the wire together.
+// =============================================================================================
+
+describe('claude adapter / token-level streaming', { skip: WINDOWS ? 'POSIX shebang fakes' : false }, () => {
+  const plain = createClaudeAdapter({ bin: FAKE_CLAUDE, closeGraceMs: 1500, killGraceMs: 500 });
+  const partial = createClaudeAdapter({
+    bin: FAKE_CLAUDE,
+    closeGraceMs: 1500,
+    killGraceMs: 500,
+    partialMessages: true,
+  });
+
+  async function turn(adapter: HarnessAdapter, text: string): Promise<SoldierEvent[]> {
+    const soldier = await adapter.spawn(spec());
+    const events = collect(soldier.stream());
+    await soldier.send(text);
+    await new Promise((r) => setTimeout(r, 250));
+    await soldier.close();
+    return events;
+  }
+
+  test('PROCESS-LEVEL: the flag reaches the child only when asked for', async () => {
+    // Asserting on `buildClaudeArgs` alone proves the pure function; this looks at execve.
+    const off = await probeViaAdapter(plain, spec());
+    assert.equal(off.argv.includes('--include-partial-messages'), false);
+    const on = await probeViaAdapter(partial, spec());
+    assert.ok(on.argv.includes('--include-partial-messages'));
+  });
+
+  test('ARMY_CLAUDE_PARTIAL=1 turns it on out of band, like ARMY_CLAUDE_BIN', async () => {
+    const saved = process.env['ARMY_CLAUDE_PARTIAL'];
+    process.env['ARMY_CLAUDE_PARTIAL'] = '1';
+    try {
+      const a = createClaudeAdapter({ bin: FAKE_CLAUDE, closeGraceMs: 1500, killGraceMs: 500 });
+      const probe = await probeViaAdapter(a, spec());
+      assert.ok(probe.argv.includes('--include-partial-messages'));
+    } finally {
+      if (saved === undefined) delete process.env['ARMY_CLAUDE_PARTIAL'];
+      else process.env['ARMY_CLAUDE_PARTIAL'] = saved;
+    }
+    // ...and it is read at construction, so an adapter built without it stays without it.
+    assert.equal(
+      (await probeViaAdapter(plain, spec())).argv.includes('--include-partial-messages'),
+      false,
+    );
+  });
+
+  test('a reply arrives in pieces instead of one lump, and says itself once', async () => {
+    const lumpy = await turn(plain, 'hello');
+    const streamed = await turn(partial, 'hello');
+
+    const said = (events: SoldierEvent[]): string[] =>
+      events.flatMap((e) => (e.type === 'assistant_text' ? [e.text] : []));
+
+    assert.deepEqual(said(lumpy), ['echo:hello'], 'today: one event, after the whole wait');
+    assert.ok(said(streamed).length > 1, 'streamed text must arrive in more than one piece');
+    // THE NO-DOUBLE-EMIT RULE, through a real process. The fake still emits the aggregate
+    // `assistant` line after the deltas — because the real CLI does — so a consumer that
+    // concatenates would show the reply twice if the rule were not enforced in the normalizer.
+    assert.equal(said(streamed).join(''), 'echo:hello');
+  });
+
+  test('the aggregate line is still archived — only its text is deduplicated', async () => {
+    const streamed = await turn(partial, 'hello');
+    const marker = streamed.filter(
+      (e) => e.type === 'unknown' && e.harnessType === 'assistant/text_streamed',
+    );
+    assert.equal(marker.length, 1);
+    assert.equal((marker[0]?.raw as { type?: string }).type, 'assistant');
+  });
+
+  test('CONSUMERS MUST NOT CARE: the default stream is unchanged, event for event', async () => {
+    // `army campaign`'s narration, `army view`, the archive writer and the org-chart tracking all
+    // read this stream. With the flag off they must see exactly what they saw before — and the
+    // fake reads the flag off its own argv, so this fails the moment the flag stops being opt-in.
+    const before = await turn(plain, 'hello');
+    assert.deepEqual(countTypes(before), { ready: 1, assistant_text: 1, result: 1 });
+    assert.equal(
+      before.some((e) => e.type === 'unknown' && (e.harnessType ?? '').startsWith('stream_event')),
+      false,
+    );
+  });
+
+  test('a turn interrupted MID-STREAM keeps the partial text and is filed as an abort', async () => {
+    // `slow` streams its deltas across real time, so the interrupt lands BETWEEN two of them —
+    // the state that reports `aborted_streaming` rather than `aborted_tools`, and the half that
+    // was once misfiled as an error and retried.
+    const saved = process.env['FAKE_CLAUDE_MODE'];
+    process.env['FAKE_CLAUDE_MODE'] = 'abort-streaming';
+    try {
+      const soldier = await partial.spawn(spec());
+      const events = collect(soldier.stream());
+      await soldier.send('a long answer');
+      await new Promise((r) => setTimeout(r, 200)); // mid-stream: some deltas, not all
+      await soldier.interrupt();
+      await new Promise((r) => setTimeout(r, 200));
+      const close = await soldier.close();
+      const all = await events;
+
+      const result = all.find((e) => e.type === 'result');
+      assert.equal(result?.status, 'interrupted', 'aborted_streaming is an abort, not an error');
+      assert.equal((result?.raw as Record<string, unknown>)['terminal_reason'], 'aborted_streaming');
+      assert.equal(close.status, 'interrupted');
+
+      // A COHERENT RECORD. What survives is a prefix of the reply, said exactly once — not
+      // nothing, and not the same words twice.
+      const text = all
+        .flatMap((e) => (e.type === 'assistant_text' ? [e.text] : []))
+        .join('');
+      assert.ok(text.length > 0, 'the words already produced are not thrown away');
+      assert.ok('echo:a long answer'.startsWith(text), `a prefix of the reply, got ${text}`);
+      assert.ok(text.length < 'echo:a long answer'.length, 'it really was cut short');
+      assert.ok(all.some((e) => e.type === 'unknown' && e.harnessType === 'user/text'));
+    } finally {
+      if (saved === undefined) delete process.env['FAKE_CLAUDE_MODE'];
+      else process.env['FAKE_CLAUDE_MODE'] = saved;
+    }
+  });
+
+  test('BLOCKER: an abort mid-stream must not misfile the NEXT clean turn', async () => {
+    // The leaked-flag inverse, now with a delta stream in the middle of it. This project shipped
+    // the bug and then its inverse; a new event granularity must not reintroduce either.
+    const soldier = await partial.spawn(spec());
+    const events = collect(soldier.stream());
+    await soldier.send('first');
+    await new Promise((r) => setTimeout(r, 150)); // turn 1 completes; nothing is in flight
+    await soldier.interrupt(); // no-op: receipt only, no result
+    await new Promise((r) => setTimeout(r, 60));
+    await soldier.send('second');
+    await new Promise((r) => setTimeout(r, 150));
+    const close = await soldier.close();
+    const all = await events;
+
+    assert.deepEqual(
+      all.filter((e) => e.type === 'result').map((e) => e.status),
+      ['ok', 'ok'],
+      'neither turn was interrupted',
+    );
+    assert.equal(close.status, 'ok');
+    assert.equal(
+      all.flatMap((e) => (e.type === 'assistant_text' ? [e.text] : [])).join(''),
+      'echo:firstecho:second',
+    );
+  });
+});
+
+// =============================================================================================
+// 4b. THE FAKE'S OWN TEETH
+//
+// A fake that is kinder than the real thing is not a test double, it is a second implementation
+// that always agrees with you. This one used to ignore `--allowedTools` / `--disallowedTools`
+// completely and never populate `permission_denials`, and a worker that was denied its own
+// worktree — every path tool refused, not one file created — passed 621 green tests.
+//
+// So these tests are about the DOUBLE, not the adapter: they check that the permission argv the
+// adapter really emits actually constrains the process it is emitted to. `test/worktree.test.ts`
+// spends that hostility on the end-to-end lockout; this section pins the matcher semantics the
+// lockout test depends on, because a matcher that denies EVERYTHING would pass that test too.
+// =============================================================================================
+
+interface FakeWorkRun {
+  events: SoldierEvent[];
+  /** Tool names from `permission_denials`, in order. */
+  denied: string[];
+  /** Tool names whose `tool_result` came back clean. */
+  used: string[];
+  /** Tool names whose `tool_result` was an error but NOT a permission denial. */
+  failed: string[];
+}
+
+describe('the fake claude CLI enforces the permission argv it is handed', { skip: WINDOWS ? 'POSIX shebang fakes' : false }, () => {
+  const adapter = createClaudeAdapter({ bin: FAKE_CLAUDE, closeGraceMs: 2000, killGraceMs: 500 });
+
+  function workDir(label: string): string {
+    return nodeFs.mkdtempSync(join(realpathSync.native(tmpdir()), `army-work-${label}-`));
+  }
+
+  async function work(
+    cwd: string,
+    allow: string[],
+    deny: string[],
+    orders: string,
+  ): Promise<FakeWorkRun> {
+    const saved = process.env['FAKE_CLAUDE_MODE'];
+    process.env['FAKE_CLAUDE_MODE'] = 'work';
+    const events: SoldierEvent[] = [];
+    try {
+      const soldier = await adapter.spawn(spec({ cwd, allow, deny, orders }));
+      let done: () => void = () => {};
+      const finished = new Promise<void>((r) => (done = r));
+      const pump = (async () => {
+        for await (const event of soldier.stream()) {
+          events.push(event);
+          if (event.type === 'result') done();
+        }
+      })();
+      await soldier.send(orders);
+      await Promise.race([finished, new Promise((r) => setTimeout(r, 10_000))]);
+      await soldier.close();
+      await pump;
+    } finally {
+      if (saved === undefined) delete process.env['FAKE_CLAUDE_MODE'];
+      else process.env['FAKE_CLAUDE_MODE'] = saved;
+    }
+
+    const names = new Map<string, string>();
+    for (const e of events) if (e.type === 'tool_use') names.set(e.toolUseId, e.name);
+    const results = events.filter(
+      (e): e is Extract<SoldierEvent, { type: 'tool_result' }> => e.type === 'tool_result',
+    );
+    const denied = events
+      .filter((e) => e.type === 'unknown' && e.harnessType === 'permission_denial')
+      .map((e) => ((e as { raw?: unknown }).raw as { tool_name?: string }).tool_name ?? '?');
+    const deniedIds = new Set(
+      events
+        .filter((e) => e.type === 'unknown' && e.harnessType === 'permission_denial')
+        .map((e) => ((e as { raw?: unknown }).raw as { tool_use_id?: string }).tool_use_id ?? ''),
+    );
+    return {
+      events,
+      denied,
+      used: results.filter((e) => !e.isError).map((e) => names.get(e.toolUseId) ?? '?'),
+      failed: results
+        .filter((e) => e.isError && !deniedIds.has(e.toolUseId))
+        .map((e) => names.get(e.toolUseId) ?? '?'),
+    };
+  }
+
+  test('with no permission argv it does real work — otherwise every assertion below is vacuous', async () => {
+    const dir = workDir('unconstrained');
+    const run = await work(dir, [], [], 'write out.txt hello\nread out.txt');
+
+    assert.deepEqual(run.denied, []);
+    assert.deepEqual(run.used, ['Write', 'Read']);
+    assert.equal(nodeFs.readFileSync(join(dir, 'out.txt'), 'utf8'), 'hello\n');
+    // The empty case belongs on the wire too. A consumer that only ever sees the key when it is
+    // populated is a consumer whose empty branch was never exercised.
+    const result = run.events.find((e) => e.type === 'result');
+    assert.deepEqual((result as { raw?: Record<string, unknown> }).raw?.['permission_denials'], []);
+  });
+
+  test('deny beats allow, and a denied tool leaves the filesystem UNTOUCHED', async () => {
+    const dir = workDir('deny-wins');
+    const run = await work(
+      dir,
+      ['Read', 'Write'],
+      [`Write(${dir}/**)`],
+      'write blocked.txt nope\nread blocked.txt',
+    );
+
+    assert.deepEqual(run.denied, ['Write'], 'the deny rule must outrank the allow entry');
+    assert.equal(
+      nodeFs.existsSync(join(dir, 'blocked.txt')),
+      false,
+      'a denial that still writes the file proves nothing at all',
+    );
+    // The Read that follows fails on a missing file — an ordinary tool error, NOT a denial.
+    assert.deepEqual(run.failed, ['Read']);
+    assert.deepEqual(run.denied, ['Write'], 'an ENOENT must never be filed as a ceiling breach');
+  });
+
+  test('a non-empty allow-list is EXHAUSTIVE: a tool it does not name is refused', async () => {
+    // This is what `--permission-mode dontAsk` means — there is nowhere to ask, so anything the
+    // role loadout does not grant is simply refused. A fake that only honoured the deny-list
+    // would model half the boundary and call it the whole one.
+    const dir = workDir('allow-exhaustive');
+    const run = await work(dir, ['Glob'], [], 'glob .\nwrite nope.txt x');
+
+    assert.deepEqual(run.used, ['Glob']);
+    assert.deepEqual(run.denied, ['Write']);
+    assert.equal(nodeFs.existsSync(join(dir, 'nope.txt')), false);
+  });
+
+  test('rules are PATH-scoped, not tool-scoped — a sibling path is still writable', async () => {
+    // The property that stops the lockout test passing for the wrong reason. If the fake refused
+    // every Write whenever any Write rule existed, a totally-denied workspace and a correctly
+    // scoped one would be indistinguishable.
+    const dir = workDir('path-scope');
+    const run = await work(
+      dir,
+      ['Write'],
+      [`Write(${join(dir, 'nested')}/**)`],
+      `write top.txt fine\nwrite ${join(dir, 'nested', 'deep', 'x.txt')} denied`,
+    );
+
+    assert.deepEqual(run.used, ['Write'], 'the unscoped sibling write must still land');
+    assert.deepEqual(run.denied, ['Write'], 'and only the scoped one is refused');
+    assert.equal(nodeFs.readFileSync(join(dir, 'top.txt'), 'utf8'), 'fine\n');
+    assert.equal(nodeFs.existsSync(join(dir, 'nested', 'deep', 'x.txt')), false);
+  });
+
+  test('`**` spans separators and `*` does not — the two globs the deny-list is built from', async () => {
+    const dir = workDir('glob-depth');
+    nodeFs.mkdirSync(join(dir, 'a', 'b'), { recursive: true });
+
+    const deep = await work(dir, ['Write'], [`Write(${dir}/**)`], `write ${join(dir, 'a', 'b', 'c.txt')} x`);
+    assert.deepEqual(deep.denied, ['Write'], '`**` must reach an arbitrarily deep descendant');
+
+    // `*` stops at one segment, so a nested path escapes a single-star rule. Pinned because
+    // silently widening `*` to `**` would make every scoped rule in GLOBAL_DENY broader than the
+    // real CLI applies it, and the fake would start failing runs the real thing allows.
+    const shallow = await work(dir, ['Write'], [`Write(${dir}/*)`], `write ${join(dir, 'a', 'b', 'd.txt')} x`);
+    assert.deepEqual(shallow.denied, []);
+    assert.deepEqual(shallow.used, ['Write']);
+  });
+
+  test('$AGENTIC_ARMY_HOME in a rule is expanded from the environment the adapter forwarded', async () => {
+    // `PROTECTED_CONFIG_GLOBS` ships the unexpanded spelling, and the adapter inherits the
+    // supervisor's environment wholesale, so this is the form that actually reaches a worker
+    // alongside the resolved one.
+    const home = workDir('army-home');
+    const tree = join(home, 'worktrees', 'cpt-01');
+    nodeFs.mkdirSync(tree, { recursive: true });
+
+    const saved = process.env['AGENTIC_ARMY_HOME'];
+    process.env['AGENTIC_ARMY_HOME'] = home;
+    try {
+      const run = await work(tree, ['Write'], ['Write($AGENTIC_ARMY_HOME/**)'], 'write x.txt x');
+      assert.deepEqual(run.denied, ['Write']);
+      assert.equal(nodeFs.existsSync(join(tree, 'x.txt')), false);
+    } finally {
+      if (saved === undefined) delete process.env['AGENTIC_ARMY_HOME'];
+      else process.env['AGENTIC_ARMY_HOME'] = saved;
+    }
+  });
+});
+
 describe('codex adapter lifecycle', { skip: WINDOWS ? 'POSIX shebang fakes' : false }, () => {
   const adapter = createCodexAdapter({ bin: FAKE_CODEX, timeoutMs: 10_000 });
 
@@ -1677,6 +2382,89 @@ describe('codex adapter lifecycle', { skip: WINDOWS ? 'POSIX shebang fakes' : fa
       if (saved === undefined) delete process.env['FAKE_CODEX_MODE'];
       else process.env['FAKE_CODEX_MODE'] = saved;
     }
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // THE SANDBOX, RUN RATHER THAN DECLARED.
+  //
+  // `codexConfinement` sorts every deny rule into `enforced` or `unenforceable`, and the tests
+  // below it assert on that classification — which is a claim about a region, checked by nothing
+  // that ever tried to write to it. This is the codex-shaped half of the blindness that let a
+  // completely denied claude worktree pass 621 green tests: a fake that never touches the disk
+  // reports a clean run whatever its confinement says.
+  // -------------------------------------------------------------------------------------------
+  async function codexWork(cwd: string, deny: string[], orders: string): Promise<SoldierEvent[]> {
+    const saved = process.env['FAKE_CODEX_MODE'];
+    process.env['FAKE_CODEX_MODE'] = 'work';
+    try {
+      const soldier = await adapter.spawn(spec({ harness: 'codex', cwd, deny, orders }));
+      const events = collect(soldier.stream());
+      await soldier.send(orders);
+      await soldier.close();
+      return await events;
+    } finally {
+      if (saved === undefined) delete process.env['FAKE_CODEX_MODE'];
+      else process.env['FAKE_CODEX_MODE'] = saved;
+    }
+  }
+
+  /** `exit_code` of each `tool_result`, in order — 0 for a command the sandbox allowed. */
+  function exitCodes(events: SoldierEvent[]): unknown[] {
+    return events
+      .filter((e) => e.type === 'tool_result')
+      .map((e) => ((e as { raw?: unknown }).raw as { item?: { exit_code?: unknown } })?.item?.exit_code);
+  }
+
+  test('a codex worker CAN write inside its own workspace, and cannot write outside it', async () => {
+    const base = realpathSync.native(nodeFs.mkdtempSync(join(tmpdir(), 'army-codex-work-')));
+    const tree = join(base, 'tree');
+    const home = join(base, 'army-home');
+    nodeFs.mkdirSync(tree, { recursive: true });
+    nodeFs.mkdirSync(home, { recursive: true });
+
+    // The rule the confinement classifier calls `enforced`. This is the run that checks it.
+    const deny = [`Write(${home}/**)`];
+    const confinement = codexConfinement(spec({ harness: 'codex', cwd: tree, deny }), {});
+    assert.deepEqual(confinement.breaches, [], 'precondition: the deny root is outside the tree');
+    assert.deepEqual(confinement.enforced, deny, 'precondition: it is claimed to be enforced');
+
+    const events = await codexWork(
+      tree,
+      deny,
+      `write ${join(tree, 'work.txt')} inside\nwrite ${join(home, 'config.toml')} outside`,
+    );
+
+    assert.deepEqual(exitCodes(events), [0, 1], 'the workspace write lands, the outside one does not');
+    assert.equal(nodeFs.readFileSync(join(tree, 'work.txt'), 'utf8'), 'inside\n');
+    assert.equal(
+      nodeFs.existsSync(join(home, 'config.toml')),
+      false,
+      'a refused write must touch nothing — `enforced` has to mean the file is not there',
+    );
+  });
+
+  test('reads are NOT confined, and the fake must not pretend otherwise', async () => {
+    // The measured asymmetry: `-s workspace-write` is a WRITE sandbox and a codex worker read a
+    // decoy private key. A fake that confined reads would certify a protection this harness does
+    // not provide — the expensive direction of wrong, because a read of a credential IS the
+    // exfiltration. This test exists so that "unenforceable" stays a demonstrated fact.
+    const base = realpathSync.native(nodeFs.mkdtempSync(join(tmpdir(), 'army-codex-read-')));
+    const tree = join(base, 'tree');
+    const secret = join(base, 'secrets', 'id_rsa');
+    nodeFs.mkdirSync(tree, { recursive: true });
+    nodeFs.mkdirSync(dirname(secret), { recursive: true });
+    nodeFs.writeFileSync(secret, 'PRIVATE KEY\n');
+
+    const deny = [`Read(${dirname(secret)}/**)`, `Write(${dirname(secret)}/**)`];
+    const confinement = codexConfinement(spec({ harness: 'codex', cwd: tree, deny }), {});
+    assert.deepEqual(confinement.unenforceable, [deny[0]], 'the read deny cannot be expressed');
+
+    const events = await codexWork(tree, deny, `read ${secret}`);
+    assert.deepEqual(exitCodes(events), [0], 'the read succeeds, outside every writable root');
+    const output = events
+      .filter((e) => e.type === 'tool_result')
+      .map((e) => ((e as { raw?: unknown }).raw as { item?: { aggregated_output?: string } })?.item?.aggregated_output);
+    assert.deepEqual(output, ['PRIVATE KEY\n']);
   });
 });
 

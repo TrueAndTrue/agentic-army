@@ -11,12 +11,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ProjectPolicy, Rung } from '../src/contracts/delivery.ts';
-import { RUNGS, effectiveRung } from '../src/contracts/delivery.ts';
+import { RUNGS, RUNG_LABEL, effectiveRung } from '../src/contracts/delivery.ts';
 import type { Verdict } from '../src/contracts/report.ts';
 import { armyBranch } from '../src/contracts/worktree.ts';
 import { ColdWorktreeProvider } from '../src/worktree/index.ts';
@@ -32,10 +41,12 @@ import {
   DeniedCommandError,
   assertGhAllowed,
   assertGitAllowed,
+  grantMergeAuthority,
+  prMergeArgs,
   probeGh,
   runGit,
 } from '../src/delivery/git.ts';
-import type { GhStatus } from '../src/delivery/git.ts';
+import type { GhStatus, MergeAuthority } from '../src/delivery/git.ts';
 import {
   IMPLEMENTED_RUNGS,
   RungNotImplementedError,
@@ -47,7 +58,12 @@ import {
   projectCeiling,
   runLadder,
 } from '../src/delivery/ladder.ts';
-import type { DeliveryConfig, DeliveryNoteCode } from '../src/delivery/ladder.ts';
+import type {
+  DeliveryConfig,
+  DeliveryNoteCode,
+  MergeRequest,
+  RunLadderInput,
+} from '../src/delivery/ladder.ts';
 
 // ---------------------------------------------------------------------------------------------
 // hermetic git — no global/system config, fixed identity, no credential prompts, no network
@@ -179,6 +195,174 @@ const VERDICT: Verdict = {
   testsRun: true,
   testCommand: 'npm test',
 };
+
+const PASS: Verdict = {
+  verdict: 'pass',
+  summary: 'The hill is taken and the suite is green.',
+  findings: [],
+  testsRun: true,
+  testCommand: 'npm test',
+};
+
+/** The evidence a caller must supply for rung 3. This is the only shape that merges. */
+const CLEARED: MergeRequest = { engineerStatus: 'done', retriesExhausted: false };
+
+// ---------------------------------------------------------------------------------------------
+// a stand-in for the host
+//
+// `gh` cannot be exercised here: it needs a network and a GitHub account, and this suite has
+// neither by design. So the HOST is stubbed and everything else is real — real repositories, a
+// real bare repo standing in for origin, a real durability push, a real subprocess for every gh
+// call, and the real allow-list running on every argv before the spawn. The stub performs a real
+// merge (it fast-forwards the bare repo's base branch), so "merged" is a fact about a repository
+// on disk rather than a string this suite agreed with itself about.
+//
+// WHAT THIS DOES NOT PROVE, stated here so nobody reads more into it later: that the real `gh`
+// accepts these flags, and that GitHub behaves as the stub does. Those remain code claims.
+// ---------------------------------------------------------------------------------------------
+
+const GH_STUB = `#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+
+const STATE = path.join(__dirname, 'state.json');
+const CALLS = path.join(__dirname, 'calls.jsonl');
+const argv = process.argv.slice(2);
+fs.appendFileSync(CALLS, JSON.stringify(argv) + '\\n');
+
+const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
+const save = () => fs.writeFileSync(STATE, JSON.stringify(state, null, 2));
+const out = (s) => { process.stdout.write(s + '\\n'); process.exit(0); };
+const fail = (s) => { process.stderr.write(s + '\\n'); process.exit(1); };
+const value = (name) => { const i = argv.indexOf(name); return i === -1 ? null : argv[i + 1]; };
+
+if (argv.includes('--version')) out('gh version 2.60.0 (stub)');
+const command = argv.filter((a) => !a.startsWith('-')).slice(0, 2).join(' ');
+
+if (command === 'auth status') out('github.com\\n  ✓ Logged in to github.com account army-stub');
+
+if (command === 'pr create') {
+  // Real gh refuses when the branch already has one, and names it. So does this.
+  if (state.prState !== 'NONE') {
+    fail('a pull request for branch "' + String(value('--head')) + '" already exists:\\n' + state.url);
+  }
+  state.prState = 'OPEN';
+  save();
+  out(state.url);
+}
+
+if (command === 'pr list') {
+  if (state.prState === 'NONE') out('[]');
+  out(JSON.stringify([{ url: state.url, state: state.prState }]));
+}
+
+if (command === 'pr review') {
+  if (state.mode === 'review-fails') fail('HTTP 403: Resource not accessible by integration');
+  state.reviews = (state.reviews || 0) + 1;
+  save();
+  out('Reviewed pull request');
+}
+
+if (command === 'pr view') {
+  if (state.mode === 'view-fails') fail('GraphQL: Could not resolve to a PullRequest');
+  const all = { state: state.prState, headRefOid: state.headRefOid, url: state.url };
+  const picked = {};
+  for (const field of (value('--json') || '').split(',')) {
+    if (Object.prototype.hasOwnProperty.call(all, field)) picked[field] = all[field];
+  }
+  out(JSON.stringify(picked));
+}
+
+if (command === 'pr merge') {
+  state.mergeAttempts = (state.mergeAttempts || 0) + 1;
+  save();
+  // Real gh refuses when the pin does not match; so does this.
+  if (value('--match-head-commit') !== state.headRefOid) {
+    fail('failed to merge: head commit changed on the pull request');
+  }
+  if (state.mode === 'protected') {
+    fail('Pull request is not mergeable: the base branch policy prohibits the merge.');
+  }
+  // The merge, actually performed against the bare repository standing in for the host.
+  execFileSync('git', ['--git-dir', state.bare, 'update-ref', 'refs/heads/' + state.base, state.headRefOid]);
+  state.prState = 'MERGED';
+  save();
+  if (state.mode === 'partial') fail('merged, but failed to delete branch: HTTP 422');
+  out('✓ Merged pull request #' + String(state.number || 1));
+}
+
+fail('stub gh: unsupported command: ' + argv.join(' '));
+`;
+
+interface GhStub {
+  /** Path to the executable, handed to the ladder as \`ghBinary\`. */
+  bin: string;
+  /** Every argv the ladder actually spawned, in order. */
+  calls: () => string[][];
+  merges: () => string[][];
+  state: () => Record<string, unknown>;
+}
+
+function ghStub(dir: string, init: Record<string, unknown>): GhStub {
+  const home = join(dir, 'ghbin');
+  mkdirSync(home, { recursive: true });
+  const bin = join(home, 'gh');
+  // Extensionless, so node decides the module system from the nearest package.json. Pin it.
+  writeFileSync(join(home, 'package.json'), '{"type":"commonjs"}\n');
+  writeFileSync(join(home, 'state.json'), JSON.stringify(init, null, 2));
+  writeFileSync(join(home, 'calls.jsonl'), '');
+  writeFileSync(bin, GH_STUB);
+  chmodSync(bin, 0o755);
+
+  const calls = (): string[][] =>
+    readFileSync(join(home, 'calls.jsonl'), 'utf8')
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line) => JSON.parse(line) as string[]);
+
+  return {
+    bin,
+    calls,
+    merges: () => calls().filter((argv) => argv[0] === 'pr' && argv[1] === 'merge'),
+    state: () => JSON.parse(readFileSync(join(home, 'state.json'), 'utf8')) as Record<string, unknown>,
+  };
+}
+
+const PR_URL = 'https://github.invalid/army/hill/pull/7';
+
+/** A stage with an origin, a PASS-worthy commit, and a host that will say yes. */
+async function mergeStage(
+  label: string,
+  overrides: Record<string, unknown> = {},
+): Promise<Stage & { gh: GhStub }> {
+  const s = await stage(label, { origin: true });
+  const gh = ghStub(s.dir, {
+    url: PR_URL,
+    prState: 'NONE',
+    headRefOid: s.sha,
+    bare: s.origin,
+    base: 'main',
+    mode: 'ok',
+    ...overrides,
+  });
+  return { ...s, gh };
+}
+
+function mergeInput(s: Stage & { gh: GhStub }, over: Partial<RunLadderInput> = {}): RunLadderInput {
+  return {
+    taskId: TASK_ID,
+    project: s.project,
+    worktree: s.worktree,
+    requested: 3,
+    config: config(s.archiveRoot, [{ project: s.project, ceiling: 3 }]),
+    verdict: PASS,
+    merge: CLEARED,
+    ghBinary: s.gh.bin,
+    ...over,
+  };
+}
 
 // ---------------------------------------------------------------------------------------------
 // the ceiling — global config only, keyed by absolute path, fail closed
@@ -328,32 +512,31 @@ test('merge requested on a PR-only repo is clamped to 2, and to 1 on a push-only
 });
 
 // ---------------------------------------------------------------------------------------------
-// rung 3 — unimplemented, and it refuses
+// rung 3 — implemented, and it needs a caller that implemented it too
 // ---------------------------------------------------------------------------------------------
 
-test('rung 3 is not implemented', () => {
-  assert.deepEqual([...IMPLEMENTED_RUNGS], [0, 1, 2]);
-  for (const rung of [0, 1, 2] as Rung[]) assert.equal(isImplementedRung(rung), true);
-  assert.equal(isImplementedRung(3), false);
+test('every rung is implemented, and rung 3 additionally needs its evidence', () => {
+  assert.deepEqual([...IMPLEMENTED_RUNGS], [0, 1, 2, 3]);
+  for (const rung of RUNGS) assert.equal(isImplementedRung(rung), true);
 });
 
-test('rung 3 REFUSES rather than silently doing rung 2', async () => {
-  const s = await stage('rung-3', { origin: true });
+test('rung 3 with no merge evidence REFUSES rather than silently doing rung 2', async () => {
+  const s = await stage('rung-3-no-evidence', { origin: true });
   const input = {
     taskId: TASK_ID,
     project: s.project,
     worktree: s.worktree,
     requested: 3 as Rung,
     config: config(s.archiveRoot, [{ project: s.project, ceiling: 3 }]),
-    verdict: VERDICT,
+    verdict: PASS,
     ghProbe: async (): Promise<GhStatus> => {
-      throw new Error('rung 3 must refuse before gh is ever consulted');
+      throw new Error('a rung-3 plan with no evidence must refuse before gh is ever consulted');
     },
   };
 
   const { plan, notes } = await planDelivery(input);
-  assert.equal(plan.rung, 3, 'the ceiling permits it; the implementation does not');
-  assert.ok(codes(notes).includes('rung-unimplemented'));
+  assert.equal(plan.rung, 3, 'the ceiling permits it');
+  assert.ok(codes(notes).includes('merge-planned'));
 
   await assert.rejects(
     () => runLadder(input),
@@ -361,6 +544,7 @@ test('rung 3 REFUSES rather than silently doing rung 2', async () => {
       assert.ok(error instanceof RungNotImplementedError);
       assert.equal(error.rung, 3);
       assert.match(error.message, /not implemented/);
+      assert.match(error.message, /merge evidence/);
       return true;
     },
   );
@@ -606,6 +790,436 @@ test('the ladder refuses a dirty worktree before anything is delivered', async (
     DurabilityError,
   );
   assert.equal(refSha(s.origin!, `refs/heads/${BRANCH}`), null);
+});
+
+// ---------------------------------------------------------------------------------------------
+// rung 3 — the merge, against a real local bare repo and a stubbed host
+// ---------------------------------------------------------------------------------------------
+
+test('rung 3 merges after a PASS, and the work is really on the base branch afterwards', async () => {
+  const s = await mergeStage('rung-3-merge');
+  const baseBefore = refSha(s.origin!, 'refs/heads/main');
+  assert.notEqual(baseBefore, s.sha);
+
+  // No injected probe: `probeGh` itself runs, against the stub, so the whole chain is exercised.
+  const result = await runLadder(mergeInput(s));
+
+  assert.equal(result.plan.rung, 3);
+  assert.equal(result.delivered, 3);
+  assert.equal(result.merge?.status, 'merged');
+  assert.equal(result.merge?.headCommit, s.sha);
+  assert.ok(codes(result.notes).includes('merged'));
+
+  // The fact, not the claim: the bare repository standing in for origin has the work on `main`.
+  assert.equal(refSha(s.origin!, 'refs/heads/main'), s.sha);
+  assert.equal(s.gh.state().prState, 'MERGED');
+
+  // Durability is unconditional and unchanged by the rung: the branch reached origin and the
+  // local marker ref was written, exactly as at rung 1.
+  assert.equal(refSha(s.origin!, `refs/heads/${BRANCH}`), s.sha);
+  assert.equal(result.durability.target.kind, 'remote');
+  assert.equal(refSha(s.project, durableRef(BRANCH)), s.sha);
+
+  // And the argv that did it: one merge, pinned to the reviewed commit, with nothing that
+  // overrides the host.
+  const merges = s.gh.merges();
+  assert.equal(merges.length, 1);
+  assert.deepEqual(merges[0], ['pr', 'merge', PR_URL, '--squash', '--match-head-commit', s.sha]);
+  for (const argv of s.gh.calls()) {
+    assert.ok(!argv.includes('--admin'), `no override may appear in any argv: ${argv.join(' ')}`);
+    assert.ok(!argv.includes('--auto'));
+    assert.ok(!argv.includes('--delete-branch'));
+    assert.ok(!argv.includes('--approve'));
+  }
+});
+
+test('running the same rung-3 delivery twice merges once', async () => {
+  const s = await mergeStage('rung-3-twice');
+  const first = await runLadder(mergeInput(s));
+  assert.equal(first.merge?.status, 'merged');
+
+  // The second run finds the pull request already there (gh refuses to open a second one),
+  // adopts it, and finds it merged. Nothing is opened twice and nothing is merged twice.
+  const second = await runLadder(mergeInput(s));
+  assert.equal(second.delivered, 3);
+  assert.equal(second.merge?.status, 'already-merged');
+  assert.equal(s.gh.merges().length, 1, 'exactly one merge across two runs');
+  assert.ok(codes(second.notes).includes('merge-noop'));
+  assert.match(
+    second.notes.find((n) => n.code === 'pr-opened')?.message ?? '',
+    /adopted the pull request/,
+  );
+  assert.equal(refSha(s.origin!, 'refs/heads/main'), s.sha);
+});
+
+test('a FAIL verdict cannot merge — the pull request stays open with the verdict on it', async () => {
+  const s = await mergeStage('rung-3-fail');
+  const result = await runLadder(mergeInput(s, { verdict: VERDICT }));
+
+  // The facts first, then what was said about them: an assertion order that fails on the world
+  // before it fails on the prose.
+  assert.equal(s.gh.merges().length, 0, 'the host was never asked');
+  assert.equal(refSha(s.origin!, 'refs/heads/main'), refSha(s.project, 'refs/heads/main'));
+  assert.equal(s.gh.state().prState, 'OPEN');
+
+  assert.equal(result.plan.rung, 3);
+  assert.equal(result.delivered, 2, 'the pull request is still the right outcome for a FAIL');
+  assert.equal(result.merge?.status, 'refused');
+  assert.match(result.merge?.detail ?? '', /FAIL/, 'the refusal must name the reason it refused');
+
+  const note = result.notes.find((n) => n.code === 'merge-refused');
+  assert.ok(note !== undefined, 'a rung that did not happen must never be silent');
+  assert.equal(note.level, 'warn');
+});
+
+test('a missing verdict cannot merge, and neither can an unposted one', async () => {
+  const missing = await mergeStage('rung-3-no-verdict');
+  const noVerdict = await runLadder(mergeInput(missing, { verdict: undefined }));
+  assert.equal(noVerdict.delivered, 2);
+  assert.equal(noVerdict.merge?.status, 'refused');
+  assert.match(noVerdict.merge?.detail ?? '', /no Inspector verdict/);
+  assert.equal(missing.gh.merges().length, 0);
+  assert.ok(codes(noVerdict.notes).includes('review-not-posted'));
+
+  // A PASS that could not be posted on the pull request leaves rung 2 incomplete, so rung 3
+  // never starts: no merge may rest on a judgement the reviewers cannot see.
+  const unposted = await mergeStage('rung-3-review-failed', { mode: 'review-fails' });
+  const result = await runLadder(mergeInput(unposted));
+  assert.equal(result.pr?.reviewPosted, false);
+  assert.equal(result.delivered, 2);
+  assert.equal(result.merge?.status, 'refused');
+  assert.match(result.merge?.detail ?? '', /rung 2 is incomplete/);
+  assert.equal(unposted.gh.merges().length, 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// what leaves this process and is read by someone else
+//
+// Two messages in the ladder are read by a HUMAN who is not holding this source: the body of the
+// pull request, which lands on a code host, and the note that says a review could not be posted,
+// which lands in front of the operator. Both were stating something other than the fact they
+// existed to state, and neither had a test — so both stayed wrong through the whole of rung 3
+// being built on top of them.
+// ---------------------------------------------------------------------------------------------
+
+test('the pull-request body names the rung being delivered, and never a literal one', async () => {
+  for (const rung of [2, 3] as Rung[]) {
+    const s = await mergeStage(`pr-body-rung-${String(rung)}`);
+    await runLadder(
+      mergeInput(s, {
+        requested: rung,
+        config: config(s.archiveRoot, [{ project: s.project, ceiling: rung }]),
+      }),
+    );
+
+    const create = s.gh.calls().find((argv) => argv[0] === 'pr' && argv[1] === 'create');
+    assert.ok(create !== undefined, `rung ${String(rung)} opened no pull request`);
+    const body = create[create.indexOf('--body') + 1] ?? '';
+
+    assert.ok(
+      body.includes(`rung ${String(rung)} (${RUNG_LABEL[rung]})`),
+      `a rung-${String(rung)} delivery described itself as something else:\n${body}`,
+    );
+    if (rung === 3) {
+      // The defect exactly: this pull request is merged minutes later by the rung it is denying.
+      assert.doesNotMatch(
+        body,
+        /rung 2\b/,
+        `a rung-3 delivery called itself rung 2 on the code host:\n${body}`,
+      );
+    }
+  }
+});
+
+test('a review the host refused quotes the HOST, not the command we sent it', async () => {
+  const s = await mergeStage('review-refused-quote', { mode: 'review-fails' });
+  const result = await runLadder(mergeInput(s));
+
+  assert.equal(result.pr?.reviewPosted, false);
+  const note = result.notes.find((n) => n.code === 'review-not-posted');
+  assert.ok(note !== undefined, 'a review that was not posted must never be silent');
+
+  // What the operator needs: why the remote said no.
+  assert.match(
+    note.message,
+    /HTTP 403: Resource not accessible by integration/,
+    `the host's reason is not in the note:\n${note.message}`,
+  );
+
+  // What they were given instead. `CommandError.message` opens with `<file> <argv…> exited <n>`
+  // and puts the host's words on the lines below, so taking its first line printed our own
+  // command — and for a review that argv ends in the verdict markdown, so the note trailed off
+  // into the model's prose where the reason should have been.
+  for (const ours of ['--body', 'pr review', '**Inspector verdict: PASS**', 'exited 1']) {
+    assert.ok(
+      !note.message.includes(ours),
+      `the note quotes our own command back at the reader (${ours}):\n${note.message}`,
+    );
+  }
+});
+
+test('a blocked Engineer and an exhausted retry budget cannot merge', async () => {
+  for (const [label, evidence] of [
+    ['blocked', { engineerStatus: 'blocked', retriesExhausted: false }],
+    ['failed', { engineerStatus: 'failed', retriesExhausted: false }],
+    ['retries exhausted', { engineerStatus: 'done', retriesExhausted: true }],
+  ] as [string, MergeRequest][]) {
+    const s = await mergeStage(`rung-3-${label.replace(/\s+/g, '-')}`);
+    const result = await runLadder(mergeInput(s, { merge: evidence }));
+    assert.equal(result.delivered, 2, label);
+    assert.equal(result.merge?.status, 'refused', label);
+    assert.equal(s.gh.merges().length, 0, label);
+    assert.equal(refSha(s.origin!, 'refs/heads/main'), refSha(s.project, 'refs/heads/main'), label);
+  }
+});
+
+test('a ceiling below 3 cannot merge, whatever the campaign asks for', async () => {
+  // Highest first: ceiling 2 is the one that has a pull request to merge and is therefore the
+  // only one where a broken clamp could actually land something.
+  for (const ceiling of [2, 1, 0] as Rung[]) {
+    const s = await mergeStage(`rung-3-ceiling-${String(ceiling)}`);
+    const result = await runLadder(
+      mergeInput(s, { config: config(s.archiveRoot, [{ project: s.project, ceiling }]) }),
+    );
+    assert.equal(s.gh.merges().length, 0, `ceiling ${String(ceiling)} asked the host to merge`);
+    assert.equal(
+      refSha(s.origin!, 'refs/heads/main'),
+      refSha(s.project, 'refs/heads/main'),
+      `ceiling ${String(ceiling)} moved the base branch`,
+    );
+    assert.equal(result.plan.ceiling, ceiling);
+    assert.equal(result.plan.rung, ceiling, 'the clamp, not the request, decides');
+    assert.equal(result.plan.clamped, true);
+    assert.equal(result.merge, null, `ceiling ${String(ceiling)} never reaches the merge rung`);
+    assert.ok(result.delivered <= 2);
+  }
+});
+
+test('an unparseable ceiling falls to 0, and never to 3', async () => {
+  const s = await mergeStage('rung-3-unparseable-ceiling');
+  const nonsense: unknown[] = ['3', 3.0001, null, Number.NaN, {}, [3], true, '', Number.POSITIVE_INFINITY];
+
+  for (const value of nonsense) {
+    const cfg = config(s.archiveRoot, [{ project: s.project, ceiling: value as Rung }]);
+    assert.equal(projectCeiling(cfg, s.project).ceiling, 0, String(value));
+    assert.equal(projectCeiling(cfg, s.project).source, 'fail-closed', String(value));
+
+    const { plan } = await planDelivery({
+      taskId: TASK_ID,
+      project: s.project,
+      requested: 3,
+      config: cfg,
+    });
+    assert.equal(plan.rung, 0, `ceiling ${String(value)} must fail closed at 0`);
+  }
+
+  // …and end to end: a rung-3 request against a garbage ceiling delivers rung 0 and asks the
+  // host nothing at all.
+  const result = await runLadder(
+    mergeInput(s, {
+      config: config(s.archiveRoot, [{ project: s.project, ceiling: 'three' as unknown as Rung }]),
+    }),
+  );
+  assert.equal(result.delivered, 0);
+  assert.equal(result.merge, null);
+  assert.equal(result.durability.target.kind, 'mirror', 'rung 0 keeps origin out of it');
+  assert.equal(s.gh.calls().length, 0, 'gh was never even probed');
+  assert.equal(refSha(s.origin!, `refs/heads/${BRANCH}`), null);
+});
+
+test("the host's refusal is reported faithfully and never worked around", async () => {
+  const s = await mergeStage('rung-3-branch-protection', { mode: 'protected' });
+  const result = await runLadder(mergeInput(s));
+
+  assert.equal(result.delivered, 2);
+  assert.equal(result.merge?.status, 'blocked');
+  assert.match(result.merge?.detail ?? '', /base branch policy prohibits the merge/);
+
+  const note = result.notes.find((n) => n.code === 'merge-blocked');
+  assert.ok(note !== undefined);
+  assert.match(note.message, /honoured as stated/);
+
+  // ONE attempt. No retry with different flags, no admin override, and the base branch is
+  // exactly where the host left it.
+  assert.equal(s.gh.merges().length, 1);
+  assert.equal(refSha(s.origin!, 'refs/heads/main'), refSha(s.project, 'refs/heads/main'));
+  assert.equal(s.gh.state().prState, 'OPEN');
+});
+
+test('a pull request that is already merged is a no-op, not a second merge', async () => {
+  const s = await mergeStage('rung-3-idempotent', { prState: 'MERGED' });
+  const result = await runLadder(mergeInput(s));
+
+  assert.equal(result.delivered, 3, 'the work IS merged; reporting less would be false');
+  assert.equal(result.merge?.status, 'already-merged');
+  assert.equal(s.gh.merges().length, 0, 'nothing is merged twice');
+  assert.ok(codes(result.notes).includes('merge-noop'));
+});
+
+test('a closed pull request is a decision, and is not merged over', async () => {
+  const s = await mergeStage('rung-3-closed', { prState: 'CLOSED' });
+  const result = await runLadder(mergeInput(s));
+  assert.equal(result.delivered, 2);
+  assert.equal(result.merge?.status, 'blocked');
+  assert.match(result.merge?.detail ?? '', /closed/);
+  assert.equal(s.gh.merges().length, 0);
+});
+
+test('a merge that half-succeeds is reported as uncertain, and is never retried', async () => {
+  const s = await mergeStage('rung-3-partial', { mode: 'partial' });
+  const result = await runLadder(mergeInput(s));
+
+  // The merge landed — the command failed afterwards. Reporting rung 2 here would be a lie in
+  // the comfortable direction, so the rung is 3 and the note is an error.
+  assert.equal(result.delivered, 3);
+  assert.equal(result.merge?.status, 'uncertain');
+  assert.equal(refSha(s.origin!, 'refs/heads/main'), s.sha);
+  assert.equal(s.gh.merges().length, 1, 'a merge with an unknown outcome is never re-sent');
+
+  const note = result.notes.find((n) => n.code === 'merge-uncertain');
+  assert.ok(note !== undefined);
+  assert.equal(note.level, 'error', 'this one needs a human');
+  assert.match(note.message, /Nothing is retried/);
+});
+
+test('a branch that moved after the verdict does not merge', async () => {
+  // A commit pushed to the branch between the Inspector reading it and the merge. The head the
+  // host reports is no longer the head that was passed.
+  const s = await mergeStage('rung-3-moved-head', {
+    headRefOid: '0123456789012345678901234567890123456789',
+  });
+  const result = await runLadder(mergeInput(s));
+
+  assert.equal(result.delivered, 2);
+  assert.equal(result.merge?.status, 'refused');
+  assert.match(result.merge?.detail ?? '', /nothing inspected/);
+  assert.equal(s.gh.merges().length, 0);
+  assert.equal(refSha(s.origin!, 'refs/heads/main'), refSha(s.project, 'refs/heads/main'));
+});
+
+test('a pull request whose state cannot be read is not merged on a guess', async () => {
+  const s = await mergeStage('rung-3-view-fails', { mode: 'view-fails' });
+  const result = await runLadder(mergeInput(s));
+  assert.equal(result.delivered, 2);
+  assert.equal(result.merge?.status, 'blocked');
+  assert.match(result.merge?.detail ?? '', /could not be read/);
+  assert.equal(s.gh.merges().length, 0);
+});
+
+test('rung 3 without a pull request stops at the rung it actually reached', async () => {
+  const s = await mergeStage('rung-3-no-gh');
+  const result = await runLadder(mergeInput(s, { ghProbe: async () => GH_MISSING }));
+  assert.equal(result.delivered, 1, 'the push happened; the pull request did not');
+  assert.equal(result.merge?.status, 'refused');
+  assert.match(result.merge?.detail ?? '', /no pull request to merge/);
+  assert.equal(s.gh.merges().length, 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// the merge authority — the only door `gh pr merge` has
+// ---------------------------------------------------------------------------------------------
+
+const HEAD_SHA = 'a'.repeat(40);
+const AUTHORITY = grantMergeAuthority({
+  ceiling: 3,
+  verdict: 'pass',
+  prRef: PR_URL,
+  headCommit: HEAD_SHA,
+})!;
+
+test('an authority is minted only from ceiling 3 and a PASS, and never otherwise', () => {
+  assert.ok(AUTHORITY !== null);
+  assert.equal(AUTHORITY.prRef, PR_URL);
+
+  const refused: Array<[string, Parameters<typeof grantMergeAuthority>[0]]> = [
+    ['ceiling 2', { ceiling: 2, verdict: 'pass', prRef: PR_URL, headCommit: HEAD_SHA }],
+    ['ceiling 0', { ceiling: 0, verdict: 'pass', prRef: PR_URL, headCommit: HEAD_SHA }],
+    ['ceiling 4', { ceiling: 4, verdict: 'pass', prRef: PR_URL, headCommit: HEAD_SHA }],
+    ['a FAIL', { ceiling: 3, verdict: 'fail', prRef: PR_URL, headCommit: HEAD_SHA }],
+    ['no verdict', { ceiling: 3, verdict: '', prRef: PR_URL, headCommit: HEAD_SHA }],
+    ['no pull request', { ceiling: 3, verdict: 'pass', prRef: '  ', headCommit: HEAD_SHA }],
+    ['an abbreviated sha', { ceiling: 3, verdict: 'pass', prRef: PR_URL, headCommit: 'a1b2c3d' }],
+    ['no commit at all', { ceiling: 3, verdict: 'pass', prRef: PR_URL, headCommit: '' }],
+  ];
+  for (const [label, input] of refused) {
+    assert.equal(grantMergeAuthority(input), null, label);
+  }
+});
+
+test('`gh pr merge` is refused without an authority, by every spelling, as before', () => {
+  const argv = prMergeArgs(PR_URL, HEAD_SHA);
+  assert.throws(() => assertGhAllowed(argv), DeniedCommandError, 'the exact argv the ladder sends');
+  assert.throws(() => assertGhAllowed(argv, undefined), DeniedCommandError);
+  // The refusal must name the reason, because this is the message a worker's operator reads.
+  try {
+    assertGhAllowed(argv);
+    assert.fail('unreachable');
+  } catch (error) {
+    assert.ok(error instanceof DeniedCommandError);
+    assert.match(error.message, /MergeAuthority/);
+  }
+});
+
+test('an authority merges one pull request at one commit, and nothing else', () => {
+  assert.doesNotThrow(() => assertGhAllowed(prMergeArgs(PR_URL, HEAD_SHA), AUTHORITY));
+  assert.doesNotThrow(() => assertGhAllowed(prMergeArgs(PR_URL, HEAD_SHA, 'merge'), AUTHORITY));
+  assert.doesNotThrow(() => assertGhAllowed(prMergeArgs(PR_URL, HEAD_SHA, 'rebase'), AUTHORITY));
+
+  const denied: Array<[string, string[]]> = [
+    ['another pull request', prMergeArgs('https://github.invalid/army/hill/pull/8', HEAD_SHA)],
+    ['another commit', prMergeArgs(PR_URL, 'b'.repeat(40))],
+    ['no pin at all', ['pr', 'merge', PR_URL, '--squash']],
+    ['a pin with no value', ['pr', 'merge', PR_URL, '--squash', '--match-head-commit']],
+    ['no method', ['pr', 'merge', PR_URL, '--match-head-commit', HEAD_SHA]],
+    ['two methods', ['pr', 'merge', PR_URL, '--squash', '--merge', '--match-head-commit', HEAD_SHA]],
+    ['a second pull request as an operand', ['pr', 'merge', PR_URL, '8', '--squash', '--match-head-commit', HEAD_SHA]],
+    // The three flags that would each undo the point of the rung.
+    ['--admin', ['pr', 'merge', PR_URL, '--squash', '--admin', '--match-head-commit', HEAD_SHA]],
+    ['--auto', ['pr', 'merge', PR_URL, '--squash', '--auto', '--match-head-commit', HEAD_SHA]],
+    ['--delete-branch', ['pr', 'merge', PR_URL, '--squash', '--delete-branch', '--match-head-commit', HEAD_SHA]],
+    ['-d, which is --delete-branch bundled', ['pr', 'merge', PR_URL, '--squash', '-d', '--match-head-commit', HEAD_SHA]],
+  ];
+  for (const [label, argv] of denied) {
+    assert.throws(() => assertGhAllowed(argv, AUTHORITY), DeniedCommandError, label);
+  }
+
+  // An authority whose own fields are wrong is refused at the guard as well as at the mint —
+  // the two checks are independent, so both would have to fail for a merge to escape.
+  const forged: MergeAuthority[] = [
+    { ceiling: 2, verdict: 'pass', prRef: PR_URL, headCommit: HEAD_SHA },
+    { ceiling: 3, verdict: 'fail', prRef: PR_URL, headCommit: HEAD_SHA },
+  ];
+  for (const authority of forged) {
+    assert.throws(() => assertGhAllowed(prMergeArgs(PR_URL, HEAD_SHA), authority), DeniedCommandError);
+  }
+});
+
+test('an authority unlocks the merge and NOTHING else — not gh api, not a force-push', async () => {
+  // Everything the gh allow-list refused before is still refused while holding one.
+  for (const argv of [
+    ['api', '-X', 'PUT', 'repos/org/repo/pulls/412/merge'],
+    ['api', 'repos/org/repo/pulls/412/merge'],
+    ['pr', 'review', '1', '--approve'],
+    ['repo', 'delete', 'org/repo'],
+    ['pr', '--repo', 'org/repo', 'merge', '412'],
+  ]) {
+    assert.throws(() => assertGhAllowed(argv, AUTHORITY), DeniedCommandError, argv.join(' '));
+  }
+
+  // And git's allow-list is a different guard entirely: the two bypasses that once landed a real
+  // force-push are refused with a merge authority in hand, because it is not an input to it.
+  const bypasses: string[][] = [
+    ['push', '/tmp/origin.git', '--', '+refs/heads/main:refs/heads/main'],
+    ['push', 'ext::sh -c touch% /tmp/pwned', 'refs/heads/main'],
+  ];
+  for (const argv of bypasses) {
+    assert.throws(() => assertGitAllowed(argv), DeniedCommandError, argv.join(' '));
+    await assert.rejects(() => runGit(argv), DeniedCommandError);
+  }
+  // The ordinary durability push is still allowed — the guard would be worthless if it were not.
+  assert.doesNotThrow(() =>
+    assertGitAllowed(['push', '/tmp/mirror.git', `refs/heads/${BRANCH}:refs/heads/${BRANCH}`]),
+  );
 });
 
 // ---------------------------------------------------------------------------------------------

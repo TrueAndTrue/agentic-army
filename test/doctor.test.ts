@@ -25,6 +25,7 @@ import ts from 'typescript';
 import { killProcessTree, probe, resolveBinary, spawnProbeChild } from '../src/setup/checks.ts';
 import { currentRepoRoot, decideCeiling, enlistCommand, mainRootFromCommonDir } from '../src/setup/enlist.ts';
 import { initialCommitCommand, quoteArg, unrunnableReason } from '../src/setup/fixes.ts';
+import { openNodeSqliteDb } from '../src/archive/db.ts';
 
 import {
   BIN_NAME,
@@ -53,6 +54,7 @@ import {
   installHint,
   legacyWorktreePoolDir,
   parseVersion,
+  resolveBinarySync,
   satisfiesMinimum,
   stubProbe,
   worktreePoolDir,
@@ -1329,7 +1331,331 @@ describe('node:sqlite warning containment', () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  // =========================================================================
+  // EVERY ROUTE, not the one that was checked.
+  //
+  // `army doctor`'s own sqlite line promises the reader: "that warning is
+  // filtered — and only that one — so it never reaches your terminal." That is
+  // a claim about the PROCESS, so it is only true if every route into
+  // `node:sqlite` filters. There were three, and the tests above drove one.
+  //
+  // The one nobody drove was `openReadOnlyDb` in `src/view/live.ts`, which
+  // built its own `createRequire` and filtered nothing — so `army view
+  // --source db` leaked the warning while doctor was on screen promising it
+  // could not. That is the promise this describe block exists to keep, failing
+  // on the very command whose output makes the promise.
+  //
+  // Table-driven, so adding a route means adding a row here rather than
+  // remembering to. The parser guard after it is what catches the person who
+  // forgets — it fails on a load site that does not filter, whether or not
+  // anyone thought to add the row.
+  // =========================================================================
+
+  const liveUrl = new URL('../src/view/live.ts', import.meta.url).href;
+  const dbUrl = new URL('../src/archive/db.ts', import.meta.url).href;
+
+  /** An existing SQLite file for the read-only route, built by the parent, whose stderr is not under test. */
+  function seedDb(): { file: string; cleanup: () => void } {
+    const tmp = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-ro-'));
+    const file = nodePath.join(tmp, 'campaign.db');
+    const db = openNodeSqliteDb(file);
+    db.exec('CREATE TABLE t (a INTEGER);');
+    db.close();
+    return { file, cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) };
+  }
+
+  const ROUTES: ReadonlyArray<{ name: string; source: (dbFile: string) => string }> = [
+    {
+      name: 'canImportSqlite — `army doctor`',
+      source: () =>
+        `import { canImportSqlite } from ${JSON.stringify(checksUrl)};\n` +
+        `const r = await canImportSqlite();\n` +
+        `if (!r.ok) throw new Error(String(r.error));\n`,
+    },
+    {
+      name: 'openNodeSqliteDb — the archive writer',
+      source: (dbFile) =>
+        `import { openNodeSqliteDb } from ${JSON.stringify(dbUrl)};\n` +
+        `const db = openNodeSqliteDb(${JSON.stringify(dbFile)});\n` +
+        `db.close();\n`,
+    },
+    {
+      name: 'openReadOnlyDb — `army view --source db`',
+      source: (dbFile) =>
+        `import { openReadOnlyDb } from ${JSON.stringify(liveUrl)};\n` +
+        `const db = openReadOnlyDb(${JSON.stringify(dbFile)});\n` +
+        `db.close();\n`,
+    },
+  ];
+
+  for (const route of ROUTES) {
+    it(`route is silent: ${route.name}`, () => {
+      const seeded = seedDb();
+      try {
+        const r = runChild(route.source(seeded.file));
+        assert.equal(r.code, 0, `child failed: ${r.stderr}`);
+        assert.doesNotMatch(
+          r.stderr,
+          /ExperimentalWarning/,
+          `${route.name} leaked the SQLite warning that doctor promises is filtered:\n${r.stderr}`,
+        );
+        assert.doesNotMatch(r.stderr, /SQLite is an experimental feature/);
+        assert.equal(r.stdout, '', `unexpected stdout: ${r.stdout}`);
+      } finally {
+        seeded.cleanup();
+      }
+    });
+
+    it(`route still lets other warnings through: ${route.name}`, () => {
+      // The cheap way to pass the test above is a global mute, and a global mute is a worse bug
+      // than the leak — it hides the next deprecation from everyone. Paired with every route, so
+      // a fourth route cannot buy silence with `removeAllListeners`.
+      const seeded = seedDb();
+      try {
+        const r = runChild(
+          `${route.source(seeded.file)}process.emitWarning('shed roof is rusting', 'DeprecationWarning');\n`,
+        );
+        assert.equal(r.code, 0, `child failed: ${r.stderr}`);
+        assert.match(r.stderr, /shed roof is rusting/, `${route.name} muted an unrelated warning`);
+      } finally {
+        seeded.cleanup();
+      }
+    });
+  }
+
+  /**
+   * The rows above are a list someone has to maintain. This is the guard that does not need one.
+   *
+   * It parses every source under `src/` and finds each place `node:sqlite` is actually LOADED —
+   * `require('node:sqlite')` or `import('node:sqlite')`, matched on the syntax tree rather than
+   * by grep so a mention in a comment or a doc block is not a hit and a load spread over two
+   * lines still is. Every module holding one must also call `installWarningFilter`.
+   *
+   * This is the assertion that was missing. The leak did not ship because someone disagreed about
+   * whether the warning should be filtered; it shipped because a third load site was added and
+   * nothing in the suite knew to look at it.
+   */
+  it('every module that loads node:sqlite installs the filter', () => {
+    const srcRoot = nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), '..', 'src');
+
+    const filesUnder = (dir: string): string[] =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const full = nodePath.join(dir, entry.name);
+        if (entry.isDirectory()) return filesUnder(full);
+        return entry.name.endsWith('.ts') ? [full] : [];
+      });
+
+    /** Loads of `node:sqlite`, and calls to the filter, as the parser sees them. */
+    function inspect(source: ts.SourceFile): { loads: number[]; filters: number } {
+      const loads: number[] = [];
+      let filters = 0;
+      const lineOf = (node: ts.Node): number =>
+        source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+      const walk = (node: ts.Node): void => {
+        if (ts.isCallExpression(node)) {
+          const [arg] = node.arguments;
+          if (
+            arg !== undefined &&
+            ts.isStringLiteralLike(arg) &&
+            arg.text === 'node:sqlite'
+          ) {
+            loads.push(lineOf(node));
+          }
+          if (ts.isIdentifier(node.expression) && node.expression.text === 'installWarningFilter') {
+            filters += 1;
+          }
+        }
+        ts.forEachChild(node, walk);
+      };
+      walk(source);
+      return { loads, filters };
+    }
+
+    const offenders: string[] = [];
+    let loadSites = 0;
+    for (const file of filesUnder(srcRoot)) {
+      const parsed = ts.createSourceFile(
+        file,
+        fs.readFileSync(file, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      const { loads, filters } = inspect(parsed);
+      loadSites += loads.length;
+      if (loads.length > 0 && filters === 0) {
+        const rel = nodePath.relative(nodePath.join(srcRoot, '..'), file);
+        offenders.push(`${rel}:${loads.join(',')} loads node:sqlite without calling installWarningFilter`);
+      }
+    }
+
+    // PINNED. A guard that silently finds nothing is a guard that has stopped guarding, and a
+    // refactor that renames the specifier is exactly how that happens quietly.
+    assert.ok(
+      loadSites >= 3,
+      `expected at least the three known node:sqlite load sites, found ${loadSites} — the detector has gone blind`,
+    );
+    assert.deepEqual(offenders, [], offenders.join('\n'));
+  });
 });
+
+// ===========================================================================
+// A printed command must mean what it reads as — asked of a real shell.
+//
+// `checks.ts` used to render paths through a `quoteIfNeeded` that wrapped them
+// in DOUBLE quotes. Inside double quotes POSIX still expands `$`, still runs a
+// backtick and still eats a `\`, so `mkdir -p "<dir>"` for a home containing
+// any of those is a line that reads as one directory and creates another —
+// inside a command doctor invites the reader to paste, and whose sibling in
+// `classifyStaleWorktreePool` ends in `rm -rf`.
+//
+// A unit test comparing strings cannot settle this. The disagreement is
+// between our idea of quoting and the SHELL's, so the shell is the one asked:
+// every case below goes through a real `/bin/sh`, and the assertion is on what
+// the filesystem looks like afterwards.
+// ===========================================================================
+
+describe(
+  'runs through a real /bin/sh',
+  { skip: process.platform === 'win32' ? 'POSIX shell quoting; cmd.exe is a different grammar' : false },
+  () => {
+    /** Hand `sh` one quoted word and ask what it made of it. Nothing is executed but `printf`. */
+    function wordFromShell(quoted: string): string {
+      const res = spawnSync('/bin/sh', ['-c', `printf '%s' ${quoted}`], { encoding: 'utf8' });
+      assert.equal(res.status, 0, `sh refused the line \`printf '%s' ${quoted}\`: ${res.stderr}`);
+      return res.stdout;
+    }
+
+    /**
+     * Names that separate "quoted" from "quoted correctly".
+     *
+     * Each one is a real thing a directory can be called and each one is rewritten by a shell if
+     * it is wrapped in double quotes: `$` interpolates, a backtick substitutes a command, `\`
+     * escapes the next character, and `!` is history expansion in an interactive shell.
+     */
+    const NASTY = [
+      'plain',
+      '/tmp/a b',
+      '/tmp/$HOME',
+      '/tmp/`id`',
+      '/tmp/a\\b',
+      '/tmp/"double"',
+      "/tmp/it's",
+      '/tmp/$(id) `id` "q" \\ ! & ; | > <',
+      '/tmp/a b $USER `hostname`',
+    ];
+
+    for (const value of NASTY) {
+      it(`sh reads back exactly what we quoted: ${JSON.stringify(value)}`, () => {
+        assert.equal(wordFromShell(quoteArg(value, 'linux')), value);
+      });
+    }
+
+    it('the OLD double-quote rendering is one the shell disagrees with', () => {
+      // The control. Without this the suite could pass while `quoteArg` had quietly become the
+      // broken version again and every "correct" assertion above was measuring nothing.
+      const doubled = (v: string): string => (/[\s"']/.test(v) ? `"${v}"` : v);
+      const victim = '/tmp/$HOME `id` dir';
+      assert.notEqual(
+        wordFromShell(doubled(victim)),
+        victim,
+        'the old renderer survived a real shell — then this whole section proves nothing',
+      );
+      assert.equal(wordFromShell(quoteArg(victim, 'linux')), victim);
+    });
+
+    /**
+     * The end-to-end claim, on the one fix doctor prints that WRITES.
+     *
+     * The line is generated by `classifyHome` exactly as `army doctor` prints it, executed by
+     * `/bin/sh` exactly as pasting it would, and then the filesystem is asked whether the
+     * directory that appeared is the directory that was on screen.
+     */
+    it('doctor’s `mkdir` fix creates the directory it displays, and only that one', () => {
+      const parent = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-quote-'));
+      try {
+        // `$`, a backtick and a space, as required — plus the `HOME` and `id` that make an
+        // unquoted or double-quoted rendering land somewhere else entirely.
+        const dir = nodePath.join(parent, 'war $HOME `id` archive');
+
+        const result = classifyHome({
+          dir,
+          exists: true,
+          writable: false,
+          creatable: false,
+          error: null,
+        });
+        assert.equal(result.outcome, 'blocking');
+        const fix = result.fix;
+        assert.ok(typeof fix === 'string' && fix.length > 0, 'the blocking home check must offer a fix');
+
+        // The directory is displayed to the reader inside this line. Read it out of the line
+        // itself, so what is asserted is what a person would have seen.
+        assert.ok(fix.includes(dir), `the fix does not contain the path it is about:\n${fix}`);
+
+        const res = spawnSync('/bin/sh', ['-c', fix], { encoding: 'utf8' });
+        assert.equal(res.status, 0, `the fix doctor printed failed in a real shell:\n${fix}\n${res.stderr}`);
+
+        assert.ok(
+          fs.statSync(dir).isDirectory(),
+          `the fix ran but did not create the directory it named:\n${fix}`,
+        );
+        // And nothing ELSE appeared. An expanded `$HOME` or an executed backtick shows up as a
+        // second, differently-named entry — the failure mode the string assertions cannot see.
+        assert.deepEqual(
+          fs.readdirSync(parent),
+          ['war $HOME `id` archive'],
+          'the shell created something other than, or as well as, the displayed directory',
+        );
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+      }
+    });
+
+    it('the `mv` branch moves the blocker it names, not a path the shell invented', () => {
+      const parent = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-quote-mv-'));
+      try {
+        const blocker = nodePath.join(parent, 'a $USER `id` file');
+        const dir = nodePath.join(blocker, 'home');
+        fs.writeFileSync(blocker, 'not a directory', 'utf8');
+
+        const fix = classifyHome({
+          dir,
+          exists: false,
+          writable: false,
+          creatable: false,
+          error: null,
+          blockedBy: blocker,
+        }).fix;
+        assert.ok(typeof fix === 'string');
+
+        const res = spawnSync('/bin/sh', ['-c', fix], { encoding: 'utf8' });
+        assert.equal(res.status, 0, `the fix failed in a real shell:\n${fix}\n${res.stderr}`);
+
+        // `.bak` holds the original bytes — proof `mv` was pointed at the file that was named,
+        // and that the `.bak` safety argument survives a name the shell would rewrite.
+        assert.equal(fs.readFileSync(`${blocker}.bak`, 'utf8'), 'not a directory');
+        assert.ok(fs.statSync(dir).isDirectory(), 'the home was not created after the blocker moved');
+      } finally {
+        fs.rmSync(parent, { recursive: true, force: true });
+      }
+    });
+
+    it('the stale-pool fix names the trees it displays, through the shell', () => {
+      // This fix ends in `rm -rf`, so it is NOT executed. What is checked is the part that makes
+      // running it safe: the shell must split the line into exactly the words doctor displayed.
+      const dir = '/tmp/army $HOME `id` pool';
+      const tree = `${dir}/trees/app-1/wt-01`;
+      const fix = classifyStaleWorktreePool({ dir, exists: true, trees: [tree], repos: [] }).fix;
+      assert.ok(typeof fix === 'string');
+
+      const args = fix.split(' && ');
+      assert.equal(args.length, 2, fix);
+      assert.equal(wordFromShell((args[0] as string).replace('git worktree remove ', '')), tree);
+      assert.equal(wordFromShell((args[1] as string).replace('rm -rf ', '')), dir);
+    });
+  },
+);
 
 // ===========================================================================
 // Never print a command the reader cannot run.
@@ -1455,7 +1781,23 @@ describe('detectInvocation', () => {
 
   it('quotes a path containing spaces so the suggestion can be pasted', () => {
     const r = detectInvocation({ ...base, cwd: '/elsewhere', argv1: '/My Code/army/src/cli.ts' });
-    assert.equal(r.command, 'node "/My Code/army/src/cli.ts"');
+    // SINGLE quotes, not double. This used to demand `"…"`, which is right only for a path whose
+    // only problem is whitespace; the moment the path also holds a `$` or a backtick, double
+    // quotes let the shell rewrite it. The case below is the one that made the difference visible,
+    // and `runs through a real /bin/sh` proves it against the shell rather than against a string.
+    assert.equal(r.command, "node '/My Code/army/src/cli.ts'");
+  });
+
+  it('quotes a path the shell would otherwise expand — `$`, backtick, backslash', () => {
+    const r = detectInvocation({
+      ...base,
+      cwd: '/elsewhere',
+      argv1: '/work/$HOME `id` \\x/src/cli.ts',
+    });
+    // Whatever the quoting, the payload must survive verbatim inside it. Under the old
+    // double-quoting this line read `node "/work/$HOME `id` \x/src/cli.ts"`, which a shell turns
+    // into a different path AND a command substitution.
+    assert.equal(r.command, "node '/work/$HOME `id` \\x/src/cli.ts'");
   });
 
   it('ignores an `army` on PATH that is some other program entirely', () => {
@@ -1570,133 +1912,520 @@ describe('detectInvocation', () => {
   });
 });
 
-describe('no command suggests a binary the reader may not have', () => {
-  // The end-to-end version of the property. `init` is run as `node src/cli.ts`, which is exactly
-  // the trial path the README advertises, and every command it names must be runnable as typed.
-  it('`node src/cli.ts init` suggests `node src/cli.ts enlist`, not `army enlist`', () => {
-    const tmp = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-suggest-'));
-    try {
-      const repoRoot = nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), '..');
-      const res = spawnSync(process.execPath, ['src/cli.ts', 'init', '--skip-doctor'], {
-        cwd: repoRoot,
-        encoding: 'utf8',
-        env: { ...process.env, AGENTIC_ARMY_HOME: nodePath.join(tmp, 'home'), NODE_OPTIONS: '' },
-      });
-      assert.equal(res.status, 0, `init failed: ${res.stderr}`);
-      assert.match(res.stdout, /node src\/cli\.ts enlist/);
-      // The bare `army …` form must not appear anywhere: it is the command that does not exist.
-      assert.doesNotMatch(res.stdout, /`army /);
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+// ===========================================================================
+// WHAT COUNTS AS A COMMAND — READ, NOT RETYPED
+//
+// Two guards below have to know which words after `army` mean "something to
+// type": the subprocess check on the CLI's own output, and the repo-wide scan
+// of every string in `src/**`. Both spelled the set out by hand as
+// `doctor|init|enlist|campaign|view|rebuild`, and both went stale the moment a
+// seventh command landed. `chat` shipped; neither list heard about it; a
+// hardcoded `army chat …` in a printed string would have walked through the
+// pair of them without a sound. A guard that enumerates by hand goes stale the
+// day the thing it guards grows, and it fails OPEN — silently widening the
+// hole it exists to close.
+//
+// So the set is read from the file that dispatches on it. `src/cli.ts` cannot
+// be imported: its last statement runs `run(process.argv.slice(2))` at the top
+// level, so importing it from a test would execute the CLI against the test
+// runner's own argv and set a failing `process.exitCode` for the whole suite.
+// It is parsed instead — with the same TypeScript parser the source guard
+// already uses, and for the same reason: only the syntax tree can tell a
+// registry from a paragraph about one.
+//
+// Three sources, unioned, so a command cannot hide in any of them: the keys of
+// `COMMAND_HELP`, the members of `SELF_DOCUMENTING`, and the `case` labels of
+// the switch in `run()`. The reading is then checked against the CLI's own
+// `commands:` line at runtime (see `an unknown command names the commands that
+// DO exist`), so a mistake here cannot quietly shrink either guard.
+// ===========================================================================
+
+const CLI_SOURCE = nodePath.join(
+  nodePath.dirname(new URL(import.meta.url).pathname),
+  '..',
+  'src',
+  'cli.ts',
+);
+
+type CliRegistries = {
+  /** Keys of `COMMAND_HELP` — the commands whose help text `src/cli.ts` owns. */
+  help: string[];
+  /** Members of `SELF_DOCUMENTING` — the commands that carry their own `--help`. */
+  selfDocumenting: string[];
+  /** `case '…':` in `run()`'s switch — what the file actually dispatches on. */
+  dispatched: string[];
+};
+
+function readCliRegistries(file: string): CliRegistries {
+  const source = ts.createSourceFile(
+    file,
+    fs.readFileSync(file, 'utf8'),
+    ts.ScriptTarget.ESNext,
+    true,
+  );
+  const found: CliRegistries = { help: [], selfDocumenting: [], dispatched: [] };
+
+  /** Every string literal under a node — how `new Set([...])` gives up its members. */
+  const stringsUnder = (node: ts.Node | undefined): string[] => {
+    const out: string[] = [];
+    const walk = (n: ts.Node): void => {
+      if (ts.isStringLiteralLike(n)) out.push(n.text);
+      ts.forEachChild(n, walk);
+    };
+    if (node !== undefined) walk(node);
+    return out;
+  };
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      if (node.name.text === 'COMMAND_HELP') {
+        const init = node.initializer;
+        if (init !== undefined && ts.isObjectLiteralExpression(init)) {
+          for (const property of init.properties) {
+            const name = property.name;
+            if (name === undefined) continue;
+            if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) found.help.push(name.text);
+          }
+        }
+      }
+      if (node.name.text === 'SELF_DOCUMENTING') {
+        found.selfDocumenting.push(...stringsUnder(node.initializer));
+      }
     }
+    if (ts.isCaseClause(node) && ts.isStringLiteralLike(node.expression)) {
+      found.dispatched.push(node.expression.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+const CLI_REGISTRIES = readCliRegistries(CLI_SOURCE);
+
+/** Every command `src/cli.ts` documents or routes. Sorted, so comparisons are order-free. */
+const CLI_COMMANDS = [
+  ...new Set([
+    ...CLI_REGISTRIES.help,
+    ...CLI_REGISTRIES.selfDocumenting,
+    ...CLI_REGISTRIES.dispatched,
+  ]),
+].sort();
+
+/**
+ * A command name, or a global flag: the words that make what precedes them an instruction.
+ *
+ * Longest first, so `--help` is never half-matched by `-h` sitting earlier in the alternation.
+ */
+const COMMAND_WORDS = [...CLI_COMMANDS, 'help', '--help', '--version', '-h', '-v'].sort(
+  (a, b) => b.length - a.length,
+);
+
+describe('the command set both guards use is read from src/cli.ts, not typed out', () => {
+  it('finds both registries and the switch', () => {
+    assert.ok(
+      CLI_REGISTRIES.help.length >= 4,
+      `COMMAND_HELP was not read: ${JSON.stringify(CLI_REGISTRIES.help)}`,
+    );
+    assert.ok(
+      CLI_REGISTRIES.selfDocumenting.length >= 3,
+      `SELF_DOCUMENTING was not read: ${JSON.stringify(CLI_REGISTRIES.selfDocumenting)}`,
+    );
+    assert.ok(
+      CLI_REGISTRIES.dispatched.length >= 7,
+      `run()'s switch was not read: ${JSON.stringify(CLI_REGISTRIES.dispatched)}`,
+    );
+  });
+
+  it('the two registries and the switch describe the same set of commands', () => {
+    // Not a restatement of the line above. A command routed by the switch but in neither
+    // registry has no `--help` at all, and one in a registry that the switch never reaches is
+    // documented and unreachable. Either is a defect, and either would also mean the derived
+    // set is bigger than what the CLI can actually be asked to do.
+    assert.deepEqual(
+      [...CLI_REGISTRIES.help, ...CLI_REGISTRIES.selfDocumenting].sort(),
+      [...CLI_REGISTRIES.dispatched].sort(),
+    );
+  });
+
+  it('grows with the file — `chat` is in it, and it was in neither hand-written list', () => {
+    assert.ok(
+      CLI_COMMANDS.includes('chat'),
+      `the derived set missed a command src/cli.ts routes: ${JSON.stringify(CLI_COMMANDS)}`,
+    );
+  });
+});
+
+// ===========================================================================
+// TWO MACHINES, BOTH BUILT BY THE TEST
+//
+// These are the only tests in this file that drive the real CLI as a child
+// process, and they are where hermeticity was quietly lost. `invokedAs()` asks
+// what `army` resolves to on PATH, and the child inherited the developer's. On
+// a machine where this checkout has been `npm link`ed, the global `army`
+// resolves to `dist/cli.js` — provably NOT the `src/cli.ts` now executing — so
+// the CLI correctly refused to advertise a bare `army` and printed an
+// unambiguous absolute path instead. Five assertions here demanded the literal
+// `node src/cli.ts` and failed. The product was right; the tests were reading
+// the laptop, and they only ever passed on a laptop with nothing installed.
+//
+// This repo has already paid for an ambient test once: `npm test` used to
+// execute the developer's real `~/.agentic-army` hooks, 31 times a run.
+//
+// So the child's PATH is CONSTRUCTED, and both answers are exercised on
+// purpose rather than one of them being whatever the machine happened to say:
+//
+//   CHECKOUT   nothing named `army` on PATH at all. The reader typed
+//              `node src/cli.ts`; that is what has to come back.
+//   INSTALLED  an `army` on PATH that symlinks to the very script running —
+//              the shape `npm i -g` and `npm link` leave behind. Here `army`
+//              is the correct answer and printing a path would be the defect.
+//
+// Neither was covered deliberately before: one was ambient, the other absent.
+// ===========================================================================
+
+describe('no command suggests a binary the reader may not have', () => {
+  const repoRoot = nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), '..');
+
+  /** Everything the child process is allowed to know about the machine it is running on. */
+  type World = {
+    /** Reads as the machine, in test titles. */
+    name: string;
+    /** Which of `FORMS` is correct here — the one form every printed command must use. */
+    form: string;
+    /** The exact prefix the CLI must print. */
+    self: string;
+    /** argv[1] for the child: the script this reader's `node` is pointed at. */
+    script: string;
+    /** The ONLY directory on the child's PATH. */
+    binDir: string;
+  };
+
+  const roots: string[] = [];
+  function scratch(tag: string): string {
+    const root = fs.mkdtempSync(nodePath.join(os.tmpdir(), `army-${tag}-`));
+    roots.push(root);
+    return root;
+  }
+  after(() => {
+    for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
   });
 
   /**
-   * Every command the top-level CLI names is one this reader can type.
+   * A PATH holding exactly what this world's reader has, and nothing else.
    *
-   * `src/cli.ts` is the file a checkout user meets first and it was the last one still hardcoding
-   * `army`: the FIRST RUN block handed a three-step recipe in which all three steps were
-   * `command not found`, and `unknown command "frobnicate"` answered with `Try \`army --help\``.
-   * Driven as a real subprocess because that is the only way `invokedAs()` sees a real argv.
+   * `node` is always on it: every suggestion in the CHECKOUT world begins with it, and the tests
+   * below RUN what the CLI printed rather than take its word for it.
    */
-  describe('the top-level CLI', () => {
-    const repoRoot = nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), '..');
+  function binDirWith(root: string, army: string | null): string {
+    const bin = nodePath.join(root, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.symlinkSync(process.execPath, nodePath.join(bin, 'node'));
+    if (army !== null) fs.symlinkSync(army, nodePath.join(bin, BIN_NAME));
+    return bin;
+  }
 
-    function cli(args: string[]): { code: number | null; out: string; err: string } {
-      const tmp = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-cli-'));
-      try {
-        const res = spawnSync(process.execPath, ['src/cli.ts', ...args], {
-          cwd: repoRoot,
-          encoding: 'utf8',
-          // `npm_lifecycle_*` leaks in when the suite is run through `npm test` and would make
-          // this assert the npm-script form on one machine and the node-script form on another.
-          env: {
-            ...process.env,
-            AGENTIC_ARMY_HOME: nodePath.join(tmp, 'home'),
-            NODE_OPTIONS: '',
-            npm_lifecycle_event: '',
-            npm_lifecycle_script: '',
-            npm_command: '',
-            npm_execpath: '',
-            npm_config_user_agent: '',
-          },
-        });
-        return { code: res.status, out: res.stdout, err: res.stderr };
-      } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
+  const checkout: World = (() => {
+    const root = scratch('checkout');
+    return {
+      name: 'a checkout with nothing installed',
+      form: 'node <script>',
+      // `cwd` is the repo, so `detectInvocation` shortens the script to the relative form — the
+      // one that survives being pasted back into the same shell.
+      self: `node ${nodePath.join('src', 'cli.ts')}`,
+      script: nodePath.join(repoRoot, 'src', 'cli.ts'),
+      binDir: binDirWith(root, null),
+    };
+  })();
+
+  const installed: World = (() => {
+    const root = scratch('installed');
+    /*
+     * What a global install actually leaves behind: a launcher on PATH that is a SYMLINK to the
+     * script it runs, so `realpath` collapses the two to one file. That identity — not the name
+     * `army` — is the whole of what `isSameInstall` accepts.
+     *
+     * The launcher cannot be a symlink straight to `src/cli.ts`: PATH resolution requires an
+     * executable file and a checked-out source file is mode 644. Nor can it be a shell shim,
+     * because a shim is a DIFFERENT file from the script and would be classified — correctly —
+     * as a foreign `army`. So it is a two-line entry point that imports the real CLI, and the
+     * PATH entry symlinks to that. The child is `node <entry>`; the PATH `army` is the same
+     * file; the CLI underneath is the same code the other world runs.
+     */
+    const entry = nodePath.join(root, 'cli.mjs');
+    fs.writeFileSync(
+      entry,
+      `#!/usr/bin/env node\nimport ${JSON.stringify(new URL('../src/cli.ts', import.meta.url).href)};\n`,
+      'utf8',
+    );
+    fs.chmodSync(entry, 0o755);
+    return {
+      name: 'a global install of this very checkout',
+      form: BIN_NAME,
+      self: BIN_NAME,
+      script: entry,
+      binDir: binDirWith(root, entry),
+    };
+  })();
+
+  const WORLDS = [checkout, installed];
+
+  /**
+   * The child's whole environment, built rather than inherited.
+   *
+   * Nothing from this shell reaches it. Not PATH, which is the point. Not the `npm_lifecycle_*`
+   * pair that `npm test` exports and that would otherwise have the CLI report the npm-script
+   * form under `npm test` and the node-script form under a bare `node --test`. And not HOME:
+   * `~/.agentic-army` is the developer's real archive and no test may go near it.
+   */
+  function envFor(world: World, home: string): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {
+      PATH: world.binDir,
+      HOME: home,
+      TMPDIR: home,
+      AGENTIC_ARMY_HOME: nodePath.join(home, 'archive'),
+    };
+    if (process.platform === 'win32') {
+      // Windows cannot start a process without these, and PATHEXT is how a bin is found there.
+      for (const key of ['SystemRoot', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP']) {
+        const value = process.env[key];
+        if (value !== undefined) env[key] = value;
       }
     }
+    return env;
+  }
 
-    /** The one form that is legal in this context: a heading, which NAMES the command. */
-    const HEADING_ONLY = /^army [a-z]+ — /m;
-    function assertNoBareArmy(text: string, what: string): void {
-      const offenders = text
-        .split('\n')
-        .filter((line) => /(^|[^\w./@-])army(:|\s+(?:doctor|init|enlist|campaign|view|rebuild|--help|-h))/.test(line))
-        .filter((line) => !HEADING_ONLY.test(line));
-      assert.deepEqual(offenders, [], `${what} names a command the reader cannot run:\n${text}`);
+  type Run = { code: number | null; out: string; err: string };
+
+  function runIn(world: World, exe: string, argv: string[]): Run {
+    const res = spawnSync(exe, argv, {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: envFor(world, scratch('home')),
+    });
+    return { code: res.status, out: res.stdout ?? '', err: res.stderr ?? '' };
+  }
+
+  /** Drive the CLI the way this world's reader has it installed. */
+  function cli(world: World, args: string[]): Run {
+    return runIn(world, process.execPath, [world.script, ...args]);
+  }
+
+  /**
+   * A printed command line, back into argv.
+   *
+   * `checks.ts` now renders through `quoteArg`, which emits SINGLE quotes on POSIX, so this is the
+   * inverse of that. It used to only understand double quotes, which is what `quoteIfNeeded`
+   * emitted — and it would have silently split `'/My Code/cli.ts'` into two argv entries the day
+   * the emitter changed, i.e. it agreed with the emitter's bug rather than with a shell.
+   *
+   * It is still a hand-rolled parser and therefore still only evidence about THIS suite's idea of
+   * quoting. The claim that the printed line means what it reads as is settled by handing it to a
+   * real `/bin/sh` — see `runs through a real /bin/sh` further down this file.
+   */
+  function argvOf(printed: string): string[] {
+    const tokens = printed.match(/'(?:[^']|'\\'')*'|"[^"]*"|\S+/g) ?? [];
+    return tokens.map((token) =>
+      token.startsWith("'") && token.endsWith("'") && token.length >= 2
+        ? token.slice(1, -1).replaceAll(`'\\''`, "'")
+        : token.replace(/^"(.*)"$/, '$1'),
+    );
+  }
+
+  /**
+   * Type what the CLI told the reader to type, and see whether it runs.
+   *
+   * The old assertion said `USAGE is not runnable` and checked a SPELLING — it never ran
+   * anything, and the spelling it demanded was only correct on a machine with no global install.
+   * Both halves are done properly here: the first word is resolved against the READER's PATH,
+   * which is what typing it does, and then the resolved program is executed.
+   */
+  function runsAsPrinted(world: World, printed: string, extra: string[]): Run {
+    const argv = argvOf(printed);
+    const head = argv[0] ?? '';
+    const exe = resolveBinarySync(head, { PATH: world.binDir }, process.platform);
+    assert.ok(exe !== null, `\`${head}\` does not resolve on this reader's PATH: ${printed}`);
+    return runIn(world, exe, [...argv.slice(1), ...extra]);
+  }
+
+  /**
+   * The invocation forms this CLI can print. Exactly one of them is right on a given machine.
+   *
+   * The command words come from `CLI_COMMANDS`, which is read out of `src/cli.ts` — the hand
+   * enumeration that used to sit here listed six of the seven.
+   */
+  const FORMS: ReadonlyArray<{ label: string; head: string }> = [
+    { label: BIN_NAME, head: BIN_NAME },
+    { label: 'node <script>', head: String.raw`node\s+(?:"[^"]*cli\.ts"|\S*cli\.ts)` },
+  ];
+
+  /** The one form legal in every world: a heading, which NAMES the command. */
+  const HEADING_ONLY = /^army [a-z]+ — /;
+
+  function mentionsACommand(head: string): RegExp {
+    return new RegExp(`(^|[^\\w./@-])(?:${head})(:|\\s+(?:${COMMAND_WORDS.join('|')})(?![\\w-]))`);
+  }
+
+  /**
+   * Every line that names a command names it in THIS reader's form.
+   *
+   * The predecessor could only say "not `army`", which is half the property — and the half that
+   * happens to hold on a laptop with nothing installed. On a machine where `army` IS this
+   * install, `army` is the right answer and a hardcoded `node src/cli.ts` is the defect. Stated
+   * as what it always meant, it holds in both directions: no form the reader did not invoke.
+   */
+  function assertOwnFormOnly(world: World, text: string, what: string): void {
+    const offenders: string[] = [];
+    for (const line of text.split('\n')) {
+      if (HEADING_ONLY.test(line.trim())) continue;
+      for (const form of FORMS) {
+        if (form.label !== world.form && mentionsACommand(form.head).test(line)) {
+          offenders.push(`${form.label}  ${line.trim()}`);
+        }
+      }
     }
+    assert.deepEqual(
+      offenders,
+      [],
+      `${what} names a command in a form this reader cannot run (expected \`${world.self}\`):\n${text}`,
+    );
+  }
 
-    it('an unknown command names the commands that DO exist, in the reader’s own form', () => {
-      const r = cli(['frobnicate']);
-      assert.equal(r.code, 1);
-      assert.match(r.err, /unknown command "frobnicate"/);
-      assert.match(r.err, /^node src\/cli\.ts: /m, `reported as something else:\n${r.err}`);
-      assert.match(r.err, /Try `node src\/cli\.ts --help`/);
-      // "You are wrong" and nothing about being right is half an error message.
-      for (const command of ['doctor', 'init', 'enlist', 'campaign', 'view', 'rebuild']) {
-        assert.ok(r.err.includes(command), `unknown-command help omits \`${command}\`:\n${r.err}`);
-      }
-      assertNoBareArmy(r.err, 'the unknown-command error');
-    });
+  /** The part of a USAGE line a reader can paste: everything before the first placeholder. */
+  function pasteableUsage(text: string, what: string): string {
+    const lines = text.split('\n');
+    const at = lines.findIndex((line) => line.trim() === 'USAGE');
+    assert.ok(at >= 0, `${what} has no USAGE section:\n${text}`);
+    const usage = lines.slice(at + 1).find((line) => line.trim() !== '');
+    assert.ok(usage !== undefined, `${what} has an empty USAGE section:\n${text}`);
+    return usage.trim().replace(/\s+(?:[[<]|"<).*$/, '');
+  }
 
-    it('an unknown top-level OPTION routes too', () => {
-      const r = cli(['--nope']);
-      assert.equal(r.code, 1);
-      assert.match(r.err, /unknown option --nope/);
-      assertNoBareArmy(r.err, 'the unknown-option error');
-    });
+  for (const world of WORLDS) {
+    describe(world.name, () => {
+      it('is the machine this test built, not the one the suite is running on', () => {
+        // The whole reason the five failures below were possible. Assert the constructed PATH
+        // says what the test decided it says, BEFORE trusting anything the child prints.
+        const found = resolveBinarySync(BIN_NAME, { PATH: world.binDir }, process.platform);
+        if (world.form === BIN_NAME) {
+          assert.ok(found !== null, `no ${BIN_NAME} on the PATH this world constructed`);
+          assert.equal(
+            fs.realpathSync(found),
+            fs.realpathSync(world.script),
+            `the ${BIN_NAME} on PATH is not the script under test, so this is the wrong world`,
+          );
+        } else {
+          assert.equal(found, null, `an ${BIN_NAME} leaked onto the constructed PATH: ${String(found)}`);
+        }
 
-    it('every `rebuild` parse error routes, and each one says what to try', () => {
-      for (const [args, expected] of [
-        [['rebuild', '--archive'], /--archive expects a path/],
-        [['rebuild', '--nope'], /unknown option --nope/],
-        [['rebuild', 'a', 'b'], /unexpected argument "b"/],
-      ] as Array<[string[], RegExp]>) {
-        const r = cli(args);
-        assert.equal(r.code, 1, `${args.join(' ')} did not fail: ${r.out}`);
-        assert.match(r.err, expected);
-        assert.match(r.err, /Try `node src\/cli\.ts rebuild --help`/, `no next step:\n${r.err}`);
-        assertNoBareArmy(r.err, `\`${args.join(' ')}\``);
-      }
-    });
+        // And whatever the CLI is about to call itself, that thing runs.
+        const r = runsAsPrinted(world, world.self, ['--version']);
+        assert.equal(r.code, 0, `\`${world.self} --version\` did not run: ${r.err}`);
+        assert.match(r.out, /^\d+\.\d+\.\d+/);
+      });
 
-    it('the FIRST RUN block is three commands this reader can actually paste', () => {
-      const r = cli(['--help']);
-      assert.equal(r.code, 0);
-      const firstRun = r.out.slice(r.out.indexOf('FIRST RUN'));
-      for (const step of ['doctor', 'init', 'enlist']) {
+      it('`init` suggests the next step in the reader’s own form', () => {
+        const r = cli(world, ['init', '--skip-doctor']);
+        assert.equal(r.code, 0, `init failed: ${r.err}`);
         assert.ok(
-          firstRun.includes(`node src/cli.ts ${step}`),
-          `FIRST RUN does not offer a runnable \`${step}\`:\n${firstRun}`,
+          r.out.includes(`${world.self} enlist`),
+          `init does not offer a runnable \`enlist\`:\n${r.out}`,
         );
-      }
-      assertNoBareArmy(r.out, 'the top-level help');
-    });
+        assertOwnFormOnly(world, r.out, 'init');
+      });
 
-    it('each command’s own --help routes its USAGE line', () => {
-      for (const command of ['doctor', 'init', 'enlist', 'rebuild', 'view', 'campaign']) {
-        const r = cli([command, '--help']);
-        assert.equal(r.code, 0, `${command} --help failed: ${r.err}`);
-        const usage = r.out.slice(r.out.indexOf('USAGE'));
+      it('an unknown command names the commands that DO exist, in the reader’s own form', () => {
+        const r = cli(world, ['frobnicate']);
+        assert.equal(r.code, 1);
+        assert.match(r.err, /unknown command "frobnicate"/);
         assert.ok(
-          usage.includes(`node src/cli.ts ${command}`),
-          `\`${command} --help\` USAGE is not runnable:\n${usage.split('\n').slice(0, 4).join('\n')}`,
+          r.err.split('\n').some((line) => line.startsWith(`${world.self}: `)),
+          `reported as something else:\n${r.err}`,
         );
-        assertNoBareArmy(r.out, `\`${command} --help\``);
-      }
+        assert.ok(r.err.includes(`Try \`${world.self} --help\``), `no next step:\n${r.err}`);
+        // "You are wrong" and nothing about being right is half an error message. This is also
+        // where the parsed registries meet reality: the set read out of `src/cli.ts` and the set
+        // the running CLI advertises have to be the same set, or one of the two guards below is
+        // quietly guarding a stale list.
+        const listed = /^\s*commands: (.+)$/m.exec(r.err)?.[1]?.split(', ') ?? [];
+        assert.deepEqual(
+          [...listed].sort(),
+          CLI_COMMANDS,
+          `the unknown-command error and src/cli.ts disagree about what exists:\n${r.err}`,
+        );
+        assertOwnFormOnly(world, r.err, 'the unknown-command error');
+      });
+
+      it('an unknown top-level OPTION routes too', () => {
+        const r = cli(world, ['--nope']);
+        assert.equal(r.code, 1);
+        assert.match(r.err, /unknown option --nope/);
+        assert.ok(r.err.includes(`Try \`${world.self} --help\``), `no next step:\n${r.err}`);
+        assertOwnFormOnly(world, r.err, 'the unknown-option error');
+      });
+
+      it('every `rebuild` parse error routes, and each one says what to try', () => {
+        for (const [args, expected] of [
+          [['rebuild', '--archive'], /--archive expects a path/],
+          [['rebuild', '--nope'], /unknown option --nope/],
+          [['rebuild', 'a', 'b'], /unexpected argument "b"/],
+        ] as Array<[string[], RegExp]>) {
+          const r = cli(world, args);
+          assert.equal(r.code, 1, `${args.join(' ')} did not fail: ${r.out}`);
+          assert.match(r.err, expected);
+          assert.ok(
+            r.err.includes(`Try \`${world.self} rebuild --help\``),
+            `no next step:\n${r.err}`,
+          );
+          assertOwnFormOnly(world, r.err, `\`${args.join(' ')}\``);
+        }
+      });
+
+      it('the FIRST RUN block is three commands this reader can actually paste', () => {
+        const r = cli(world, ['--help']);
+        assert.equal(r.code, 0);
+        const firstRun = r.out.slice(r.out.indexOf('FIRST RUN'));
+        for (const step of ['doctor', 'init', 'enlist']) {
+          // Runnable has two halves, and each is proved somewhere it can be proved cheaply:
+          // that `step` is a command this CLI routes (the derived set), and that `world.self`
+          // followed by a command actually executes (the USAGE test below runs all seven).
+          assert.ok(CLI_COMMANDS.includes(step), `FIRST RUN offers \`${step}\`, which is not a command`);
+          assert.ok(
+            firstRun.includes(`${world.self} ${step}`),
+            `FIRST RUN does not offer a runnable \`${step}\`:\n${firstRun}`,
+          );
+        }
+        assertOwnFormOnly(world, r.out, 'the top-level help');
+      });
+
+      it('each command’s own --help prints a USAGE line that actually runs', () => {
+        // Every command, from the derived set — the hand-written loop that used to be here ran
+        // six of the seven, and the one it skipped was `chat`.
+        for (const command of CLI_COMMANDS) {
+          const r = cli(world, [command, '--help']);
+          assert.equal(r.code, 0, `${command} --help failed: ${r.err}`);
+
+          const printed = pasteableUsage(r.out, `\`${command} --help\``);
+          // It routes...
+          assert.equal(
+            printed,
+            `${world.self} ${command}`,
+            `\`${command} --help\` USAGE names another invocation:\n${printed}`,
+          );
+          // ...and it RUNS, which is the thing the old assertion only claimed to check. What it
+          // printed, pasted back, has to reach this same help.
+          const again = runsAsPrinted(world, printed, ['--help']);
+          assert.equal(again.code, 0, `\`${printed}\` does not run: ${again.err}`);
+          assert.ok(
+            again.out.includes('USAGE'),
+            `\`${printed} --help\` printed no USAGE of its own:\n${again.out}`,
+          );
+
+          assertOwnFormOnly(world, r.out, `\`${command} --help\``);
+        }
+      });
     });
-  });
+  }
 });
 
 // ===========================================================================
@@ -1726,9 +2455,15 @@ describe('no source file hardcodes a command the reader may not be able to run',
    * Either the tool identifying itself (`army: unknown command`, `army view: …`) or a suggestion
    * (`army doctor`, `Try \`army --help\``). Both must be the form the reader actually invoked.
    * `~/.agentic-army`, `army/t-1` branches and `agentic-army` are excluded by the leading class.
+   *
+   * The command words are `COMMAND_WORDS`, read out of `src/cli.ts` rather than retyped here.
+   * They used to be six literals in this regex, and `chat` was not among them: a printed
+   * `army chat …` was invisible to the guard whose entire job is to see it. An eighth command
+   * now cannot be added without this pattern growing to cover it.
    */
-  const BARE_ARMY =
-    /(^|[^\w./@-])army(:|\s+(?:doctor|init|enlist|campaign|view|rebuild|help|--help|--version|-h|-v)\b)/;
+  const BARE_ARMY = new RegExp(
+    `(^|[^\\w./@-])army(:|\\s+(?:${COMMAND_WORDS.join('|')})\\b)`,
+  );
 
   /**
    * The one documented exception, stated by `src/command/index.ts` and followed by `src/cli.ts`

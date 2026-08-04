@@ -59,6 +59,19 @@ const CLAUDE_EFFORT: Record<ReasoningEffort, string> = {
 export interface ClaudeArgsOptions {
   /** Read `outputSchemaPath` off disk. Injectable so the pure arg tests need no fixtures. */
   readFile?: (path: string) => string;
+  /**
+   * Ask for `--include-partial-messages`, i.e. token-level `stream_event` lines.
+   *
+   * OFF BY DEFAULT, and the default is the whole point. Measured on claude 2.1.221, a 2217-char
+   * reply arrives as 32 deltas of ~69 chars, and those lines are 54% of the turn's total stdout —
+   * every one of them a duplicate of text the aggregate `assistant` message carries anyway. A
+   * campaign soldier has no reader at a prompt, so for it that is pure cost.
+   *
+   * Requesting the flag and then discarding what it produces would be worse still: the archive's
+   * one hard rule is that no line is dropped. So the flag is not requested unless somebody is
+   * going to consume it, and when it IS requested the normalizer emits every line it produces.
+   */
+  partialMessages?: boolean;
 }
 
 /**
@@ -118,6 +131,9 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
     '--permission-mode',
     'dontAsk',
   ];
+
+  // Token-level streaming. Opt-in — see `ClaudeArgsOptions.partialMessages`.
+  if (options?.partialMessages === true) args.push('--include-partial-messages');
 
   if (spec.model !== undefined && spec.model !== '') args.push('--model', spec.model);
   if (spec.effort !== undefined) args.push('--effort', CLAUDE_EFFORT[spec.effort]);
@@ -340,6 +356,13 @@ export interface ClaudeNormalizerOptions {
    * A predicate rather than a flag because the adapter's answer changes turn by turn.
    */
   interruptRequested?: () => boolean;
+  /**
+   * Carry `--include-partial-messages` text deltas as `assistant_text` / `subagent_text`.
+   *
+   * Must be set by whoever set `ClaudeArgsOptions.partialMessages`; the adapter ties the two
+   * together so they cannot disagree. See `SUPPRESSION` below for what turning it on changes.
+   */
+  partialText?: boolean;
 }
 
 export interface ClaudeNormalizer {
@@ -351,16 +374,53 @@ export interface ClaudeNormalizer {
 const DEPTH_TABLE_CAP = 8192;
 
 /**
+ * Bound on the per-message streamed-text table. A message has a handful of content blocks; a
+ * stream that somehow produced thousands is malformed, and the cap turns that into forgotten
+ * suppression (a duplicate line) rather than unbounded memory.
+ */
+const STREAMED_BLOCK_CAP = 256;
+
+/**
  * Stateful because `depth` is not on the wire.
  *
  * Claude gives us `parent_tool_use_id` and nothing else. Depth is recovered by remembering the
  * depth of the event that ISSUED each tool_use: anything whose `parent_tool_use_id` is that id
  * sits one level deeper. That reconstructs the whole org chart including a subagent that itself
  * spawns a subagent, which a flat `ptu === null ? 0 : 1` rule would flatten.
+ *
+ * ## SUPPRESSION — why turning on partial text does not double-render
+ *
+ * `--include-partial-messages` is PURELY ADDITIVE on the wire. Measured on claude 2.1.221 by
+ * running the same turn with and without it: the `assistant`, `user` and `result` lines are
+ * identical in shape, count and content, and the flag only interleaves extra `stream_event`
+ * lines. So the full text of a block arrives TWICE — once as a run of deltas, then again inside
+ * the aggregate `assistant` message.
+ *
+ * The rule lives here rather than in each consumer, because there are four of them and they do
+ * not share a base class: whatever a consumer does with `assistant_text`, the concatenation of
+ * every `assistant_text` this normalizer emits equals the soldier's output EXACTLY ONCE.
+ *
+ * The mechanism is exact-match reconciliation. Deltas are accumulated per content-block index;
+ * when the aggregate arrives, a text block whose text is byte-identical to an accumulated buffer
+ * is suppressed, and its buffer is consumed so a second identical block is not swallowed by the
+ * same one. Verified on three real turns plus a real mid-stream interrupt: every aggregate block
+ * was byte-identical to the concatenation of its deltas, including the truncated block left
+ * behind by the abort.
+ *
+ * Exact match, and not "we streamed something for this message", because the two mistakes are
+ * not symmetric. Suppressing wrongly LOSES text the soldier actually produced; failing to
+ * suppress shows a duplicate. So a mismatch — a future CLI that post-processes what it streamed —
+ * falls back to emitting the aggregate.
+ *
+ * The suppressed LINE is still emitted, as an `unknown` carrying its `raw`. `stream.jsonl` is
+ * replay truth and no line may vanish from it; what must not repeat is the TEXT.
  */
 export function createClaudeNormalizer(options?: ClaudeNormalizerOptions): ClaudeNormalizer {
   const childDepth = new Map<string, number>();
   const interruptRequested = options?.interruptRequested ?? ((): boolean => false);
+  const partialText = options?.partialText === true;
+  /** Text already delivered as deltas for the message now streaming, by content-block index. */
+  const streamed = new Map<number, string>();
 
   function remember(toolUseId: string, depth: number): void {
     childDepth.set(toolUseId, depth + 1);
@@ -373,6 +433,27 @@ export function createClaudeNormalizer(options?: ClaudeNormalizerOptions): Claud
   function depthFor(parentToolUseId: string | null): number {
     if (parentToolUseId === null) return 0;
     return childDepth.get(parentToolUseId) ?? 1;
+  }
+
+  /** Accumulate one delta against its block index. */
+  function streamedAppend(index: number, text: string): void {
+    if (!streamed.has(index) && streamed.size >= STREAMED_BLOCK_CAP) return;
+    streamed.set(index, (streamed.get(index) ?? '') + text);
+  }
+
+  /**
+   * Was this aggregate block's text already delivered as deltas? Consumes the buffer if so, so
+   * two identical blocks in one message are not both suppressed by a single run of deltas.
+   */
+  function alreadyStreamed(text: string): boolean {
+    if (!partialText) return false;
+    for (const [index, seen] of streamed) {
+      if (seen === text) {
+        streamed.delete(index);
+        return true;
+      }
+    }
+    return false;
   }
 
   return {
@@ -423,6 +504,78 @@ export function createClaudeNormalizer(options?: ClaudeNormalizerOptions): Claud
         ];
       }
 
+      /**
+       * `--include-partial-messages`. The line wraps a raw Anthropic streaming event in `event`
+       * and carries the same `session_id` / `parent_tool_use_id` envelope as every other line.
+       *
+       * Recorded from claude 2.1.221, one text block:
+       *
+       * ```
+       * stream_event event=message_start
+       * stream_event event=content_block_start  content_block={"type":"text","text":""} index=0
+       * stream_event event=content_block_delta  delta={"type":"text_delta","text":"The"} index=0
+       * stream_event event=content_block_delta  delta={"type":"text_delta","text":" quick..."}
+       * assistant    content=[{"type":"text","text":"The quick..."}]      <- the duplicate
+       * stream_event event=content_block_stop   index=0
+       * stream_event event=message_delta / message_stop
+       * ```
+       *
+       * Note the aggregate lands BEFORE `content_block_stop`, and a tool call's input arrives as
+       * `input_json_delta` fragments that are NOT individually parseable JSON. Only text and
+       * thinking are lifted to events; everything else stays `unknown`, because the aggregate
+       * `assistant` line is the authoritative tool_use (and the only one the depth table can
+       * key off).
+       */
+      if (kind === 'stream_event') {
+        const inner = rec['event'];
+        const innerType = isRecord(inner) ? str(inner['type']) : undefined;
+        const partialHarnessType = `stream_event/${innerType ?? '?'}`;
+
+        // A new message invalidates every buffer: indices restart at 0 on each one, and a message
+        // cut short by an interrupt must not leave a buffer that suppresses the NEXT message.
+        if (innerType === 'message_start') streamed.clear();
+
+        if (partialText && innerType === 'content_block_delta' && isRecord(inner)) {
+          const delta = inner['delta'];
+          const deltaType = isRecord(delta) ? str(delta['type']) : undefined;
+          // `thinking` is folded into the text stream exactly as the aggregate path folds a
+          // `thinking` block, so the two granularities stay interchangeable.
+          const text = !isRecord(delta)
+            ? undefined
+            : deltaType === 'text_delta'
+              ? str(delta['text'])
+              : deltaType === 'thinking_delta'
+                ? str(delta['thinking'])
+                : undefined;
+          // An EMPTY delta is not text. Measured: `thinking_delta` on the -p path is redacted to
+          // `{"thinking":"","estimated_tokens":150}` — the tokens are counted, the words are not
+          // sent — and `input_json_delta` opens with `""`. Carrying those as `assistant_text`
+          // would put a run of contentless events in the archive AND, worse, register an empty
+          // buffer that then suppresses the aggregate's own (equally empty) thinking block,
+          // making thinking behave differently with the flag than without it. Skipping them
+          // leaves the line an `unknown`, so nothing is dropped and nothing diverges.
+          if (text !== undefined && text !== '') {
+            const index = num(inner['index']) ?? 0;
+            streamedAppend(index, text);
+            // NOT VERIFIED AGAINST A LIVE SUBAGENT: every recorded partial stream carries
+            // `parent_tool_use_id: null`, so the nested branch below is written to mirror the
+            // aggregate path rather than measured. If forwarded partials turn out not to carry
+            // the envelope, this degrades to `unknown` — the text is still in the aggregate.
+            const subagentType = str(rec['subagent_type']);
+            if (parentToolUseId !== null) {
+              return [
+                subagentType === undefined
+                  ? { type: 'subagent_text', ...base, parentToolUseId, depth, text }
+                  : { type: 'subagent_text', ...base, parentToolUseId, depth, text, subagentType },
+              ];
+            }
+            return [{ type: 'assistant_text', ...base, text }];
+          }
+        }
+
+        return [{ type: 'unknown', ...base, harnessType: partialHarnessType }];
+      }
+
       if (kind === 'assistant' || kind === 'user') {
         const message = rec['message'];
         const content = isRecord(message) ? message['content'] : undefined;
@@ -430,6 +583,8 @@ export function createClaudeNormalizer(options?: ClaudeNormalizerOptions): Claud
 
         const subagentType = str(rec['subagent_type']);
         const events: SoldierEvent[] = [];
+        /** Text blocks dropped because the deltas already carried them, byte for byte. */
+        let suppressed = 0;
 
         for (const block of content) {
           if (!isRecord(block)) {
@@ -448,6 +603,12 @@ export function createClaudeNormalizer(options?: ClaudeNormalizerOptions): Claud
               // no user_text variant; keep it as unknown rather than passing it off as the
               // soldier's own words.
               events.push({ type: 'unknown', ...base, harnessType: 'user/text' });
+              continue;
+            }
+            // THE NO-DOUBLE-EMIT RULE. See `SUPPRESSION` on `createClaudeNormalizer`. A no-op
+            // unless partial text is on, so the default path is untouched.
+            if (alreadyStreamed(text)) {
+              suppressed += 1;
               continue;
             }
             if (parentToolUseId !== null) {
@@ -489,6 +650,11 @@ export function createClaudeNormalizer(options?: ClaudeNormalizerOptions): Claud
           events.push({ type: 'unknown', ...base, harnessType: `${kind}/${blockType ?? 'block'}` });
         }
 
+        // Every block was a duplicate of text already streamed. The TEXT must not repeat; the
+        // LINE must still reach `stream.jsonl`, because that file is the replay.
+        if (events.length === 0 && suppressed > 0) {
+          return [{ type: 'unknown', ...base, harnessType: `${kind}/text_streamed` }];
+        }
         return events.length === 0 ? unknown() : events;
       }
 
@@ -566,6 +732,19 @@ export interface ClaudeAdapterOptions {
   killGraceMs?: number;
   /** How long `interrupt()` waits for its `control_response` receipt. */
   interruptTimeoutMs?: number;
+  /**
+   * Token-level streaming: request `--include-partial-messages` AND carry its text deltas as
+   * `assistant_text` / `subagent_text`. One switch for both halves on purpose — a soldier that
+   * asked for the lines but did not normalise them would archive nothing but `unknown`, and one
+   * that normalised without asking would just be dead code.
+   *
+   * OFF BY DEFAULT. A caller with a human at a prompt (`army chat`) wants it; a campaign soldier
+   * does not, and the default is what keeps the campaign's narration, `army view`, the archive
+   * and the org-chart tracking seeing precisely what they saw before.
+   *
+   * `ARMY_CLAUDE_PARTIAL=1` turns it on out of band, mirroring `ARMY_CLAUDE_BIN`.
+   */
+  partialMessages?: boolean;
 }
 
 const DEFAULTS = {
@@ -582,6 +761,7 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): HarnessAdap
   const closeGraceMs = options?.closeGraceMs ?? DEFAULTS.closeGraceMs;
   const killGraceMs = options?.killGraceMs ?? DEFAULTS.killGraceMs;
   const interruptTimeoutMs = options?.interruptTimeoutMs ?? DEFAULTS.interruptTimeoutMs;
+  const partialMessages = options?.partialMessages ?? process.env['ARMY_CLAUDE_PARTIAL'] === '1';
 
   return {
     id: 'claude',
@@ -591,7 +771,15 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): HarnessAdap
       // `buildClaudeArgs`, which throws on a flag-like value or a non-UUID session id. A
       // synchronous throw from an async-typed method slips past every caller's `.catch()`.
       try {
-        return Promise.resolve(spawnClaude(spec, bin, closeGraceMs, killGraceMs, interruptTimeoutMs));
+        return Promise.resolve(
+          spawnClaude(spec, {
+            bin,
+            closeGraceMs,
+            killGraceMs,
+            interruptTimeoutMs,
+            partialMessages,
+          }),
+        );
       } catch (err) {
         return Promise.reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -602,14 +790,17 @@ export function createClaudeAdapter(options?: ClaudeAdapterOptions): HarnessAdap
 /** The default registry entry. */
 export const claudeAdapter: HarnessAdapter = createClaudeAdapter();
 
-function spawnClaude(
-  spec: SoldierSpec,
-  bin: string,
-  closeGraceMs: number,
-  killGraceMs: number,
-  interruptTimeoutMs: number,
-): Soldier {
-  const args = buildClaudeArgs(spec);
+interface SpawnSettings {
+  bin: string;
+  closeGraceMs: number;
+  killGraceMs: number;
+  interruptTimeoutMs: number;
+  partialMessages: boolean;
+}
+
+function spawnClaude(spec: SoldierSpec, settings: SpawnSettings): Soldier {
+  const { bin, closeGraceMs, killGraceMs, interruptTimeoutMs, partialMessages } = settings;
+  const args = buildClaudeArgs(spec, { partialMessages });
   const queue = createAsyncQueue<SoldierEvent>();
   const framer = createJsonlFramer();
   const startedAt = process.hrtime.bigint();
@@ -621,7 +812,10 @@ function spawnClaude(
   // the real CLI answers an interrupt with no turn in flight using a bare `control_response` and
   // NO `result`, so an unconditionally-armed flag would survive to misfile the next clean turn.
   let turnInFlight = false;
-  const normalizer = createClaudeNormalizer({ interruptRequested: () => interruptPending });
+  const normalizer = createClaudeNormalizer({
+    interruptRequested: () => interruptPending,
+    partialText: partialMessages,
+  });
 
   // Credentials are INHERITED, never injected. Inheriting process.env is what carries the
   // OAuth login (and CLAUDE_CONFIG_DIR, if the commander set one) into the worker.

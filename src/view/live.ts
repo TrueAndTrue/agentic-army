@@ -51,7 +51,7 @@ import type { AgentRow, CampaignRow, SignalRow, TaskRow } from '../contracts/arc
 import type { SoldierEvent } from '../contracts/harness.ts';
 import type { Db, DbFactory } from '../archive/db.ts';
 
-import { DEFAULT_BUSY_TIMEOUT_MS } from '../archive/db.ts';
+import { DEFAULT_BUSY_TIMEOUT_MS, installWarningFilter } from '../archive/db.ts';
 import {
   AGENT_JSON_FILENAME,
   agentDir,
@@ -344,8 +344,22 @@ interface NodeSqliteModule {
 const requireFromHere = createRequire(import.meta.url);
 let cachedModule: NodeSqliteModule | undefined;
 
+/**
+ * Load the driver, silently.
+ *
+ * `installWarningFilter()` is not decoration and it is not defensive: this was the third route to
+ * `node:sqlite` and the only one that did not filter, so `army view --source db` printed
+ * `ExperimentalWarning: SQLite is an experimental feature…` to stderr while `army doctor`'s own
+ * sqlite line was on screen promising that warning is filtered and never reaches your terminal.
+ * A `createRequire` of its own is fine; a warning policy of its own is not.
+ *
+ * It goes BEFORE the require, because the warning fires on load and a filter installed afterwards
+ * has nothing left to catch. The archive's filter is the only implementation — see
+ * `installWarningFilter` in `src/archive/db.ts` — so this route cannot drift from the promise.
+ */
 function loadNodeSqlite(): NodeSqliteModule {
   if (cachedModule === undefined) {
+    installWarningFilter();
     cachedModule = requireFromHere('node:sqlite') as NodeSqliteModule;
   }
   return cachedModule;
