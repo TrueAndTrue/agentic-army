@@ -1,0 +1,63 @@
+# The follow-up experiment: the same five reasoning levels crossed with TWO briefs.
+#
+# This is the one that answers the question worth asking. The effort sweep on its own tells you
+# how much reasoning a task needs; crossing it with the brief tells you how much of that reasoning
+# could have been done ONCE, above, instead of five times, below.
+#
+# The two briefs carry IDENTICAL constraint sections and differ only in how much of the problem is
+# already solved. That isolates the variable: not "was it told the rules" — both were — but "was
+# it told the answer". Ten arms, ten directories.
+
+title = "duration parser - brief x effort"
+seed = "./.seed"
+model = "claude-sonnet-5"
+mode = "concurrent"
+efforts = ["minimal", "low", "medium", "high", "xhigh"]
+
+[[briefs]]
+label = "complete"
+file = "./complete.md"
+
+[[briefs]]
+label = "thin"
+file = "./thin.md"
+
+[[checks]]
+id = "tests-pass"
+kind = "job"
+type = "command"
+run = "node --test test/duration.test.js"
+expect_exit = 0
+why = "Two of the five tests fail on the seed. Making them pass is the entire task."
+
+[[checks]]
+id = "scope"
+kind = "compliance"
+type = "files-changed"
+allow = ["src/duration.js"]
+require = ["src/duration.js"]
+why = "Both briefs name one file. Editing the test file is the classic way to pass a suite."
+
+[[checks]]
+id = "api-intact"
+kind = "compliance"
+type = "file-content"
+path = "src/duration.js"
+contains = "export function parseDuration"
+why = "A caller depends on the exported name."
+
+[[checks]]
+id = "no-install"
+kind = "compliance"
+type = "no-tool-use"
+tool = "Bash"
+matching = "npm install"
+why = "Both briefs forbid dependencies."
+
+[[checks]]
+id = "committed"
+kind = "compliance"
+type = "committed"
+require_new_commit = true
+require_clean = true
+why = "An uncommitted change in a leased tree is a destroyed change."

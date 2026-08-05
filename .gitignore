@@ -20,6 +20,16 @@ yarn-error.log*
 # points it here during development, do not commit it.
 .agentic-army/
 
+# a trial's seed is checked in as plain files and turned into a repository by
+# `prepare.mjs`. A nested `.git` inside this checkout would be recorded as a
+# gitlink and the seed's files would vanish from this repository's history, so
+# the two cannot both be true. The minted copy is derived and never committed.
+trials/*/.seed/
+
+# where a trial run puts its arm workspaces and its result.json. Real runs cost
+# real money and produce real diffs; none of it belongs in this history.
+.army-trial/
+
 # the design document is kept internal and lives outside this checkout. This
 # entry is the second line of defence: a copy pasted back in during a working
 # session cannot be committed by accident. `test/doctor.test.ts` is the first —

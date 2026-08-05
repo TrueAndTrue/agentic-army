@@ -347,6 +347,46 @@ army rebuild <campaign-id>  # one
 It exits 1 if rows were present in the files but did not make it into the index, and names every
 one of them.
 
+## `army trial`
+
+A campaign asks whether the work got done. A trial asks what a variable is *worth*: same model,
+same brief, same seed commit, one directory per arm, one thing changed. It exists because
+"engineers are taking too long" is not a claim you can act on until you know whether reasoning
+effort is buying anything.
+
+A trial is a TOML file naming a seed repository, a brief, a set of efforts, and the checks that
+decide whether an arm succeeded. `trials/duration/` is a worked example. Run `prepare.mjs`
+there first — it mints the seed as a real repository, which is checked in as plain files
+because a nested `.git` cannot live inside this checkout.
+
+Three things are measured, and none of them is the worker's opinion:
+
+| question | scored from |
+|---|---|
+| did it do the job | a command run in the arm's workspace, exit code compared |
+| did it follow orders | the git diff against the seed commit, and the recorded tool-call stream |
+| how fast | wall clock around the spawn, plus tool calls, tokens and cost |
+
+**Nothing reads the `Report` the worker returned.** A worker that believes it finished and did
+not is the most common failure recorded here, so a benchmark scored from self-reports measures
+how confidently a model writes a summary. `Report` is a good transport and a useless scoreboard.
+
+Before any arm is spawned, every `job` check is evaluated against an untouched copy of the seed.
+If one of them passes, the trial **refuses to run** and exits 2. A check that is already green
+scores every arm full marks forever, which is the benchmark equivalent of a test that has never
+been seen to fail.
+
+Two things the report is obliged to print, because leaving them out would fabricate a result.
+`--effort minimal` does not exist in claude and is mapped up to `low`, so a `minimal` arm and a
+`low` arm are byte-identical invocations; when two arms were sent the same value the report says
+so, and the gap between them is your run-to-run variance measured for free. And in concurrent
+mode — the default, because five arms contending simultaneously share that contention
+symmetrically — the wall column compares arms honestly against *each other* and must never be
+put in the same column as a serial run.
+
+Exit codes are 0 (every arm passed everything), 1 (something scored badly), 2 (the trial was
+refused and never ran). Three codes because a script needs to tell the second from the third.
+
 ## Where things live
 
 ```
@@ -417,7 +457,15 @@ end to end, Engineer through Inspector to durability; `chat`, against real claud
 one objective proposed, approved at the prompt, dispatched through the gate to a rung-0
 delivery, plus the refusal when the commander was asked to read a file, and a live interrupt
 mid-answer; `view`, `view --list`, `view --source db`,
-`view --follow`; `rebuild`. The `army` spelling in the first column of
+`view --follow`; `rebuild`; `trial`, twice against live claude — a five-arm effort sweep and a
+ten-arm brief-by-effort cross, 15 real Engineers in 15 directories. All 15 did the job; two
+failed a compliance check by leaving an untracked scratch file behind, which is the harness
+catching exactly what it was built to catch. **The effort axis produced no measurable
+difference in correctness on that task, and no usable timing signal either** — two arms sent
+the identical effort value finished 23s and 45s apart, a spread wider than anything between
+effort levels. Read that as "this task was too easy to separate them", not as "effort does not
+matter": a benchmark that cannot distinguish its conditions has measured the task, not the
+variable. The `army` spelling in the first column of
 [First run](#first-run) was checked too, against a built `dist/` on `PATH`, because the claim
 that suggestions match your invocation is only interesting if it holds in more than one form.
 

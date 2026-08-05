@@ -560,7 +560,7 @@ export interface SoldierRun {
   errors: string[];
 }
 
-async function runSoldier(
+export async function runSoldier(
   adapter: HarnessAdapter,
   spec: SoldierSpec,
   archive: CampaignArchive,

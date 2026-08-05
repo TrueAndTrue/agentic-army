@@ -91,6 +91,9 @@ CAMPAIGNS
                     you approve what it sends out.
   campaign          Run one objective end to end: Engineer, review gate,
                     delivery up to the project ceiling.
+  trial             Run a controlled reasoning-effort experiment: N arms of
+                    one seed and brief, scored from artifacts, never from a
+                    worker's own report.
   view              Read-only tree view of a campaign in flight.
   rebuild           Rebuild campaign.db from the files, which are truth.
 
@@ -305,7 +308,7 @@ function wantsHelp(argv: readonly string[]): boolean {
 }
 
 /** Commands that carry their own `--help` text, so it cannot drift from their own options. */
-const SELF_DOCUMENTING = new Set(['chat', 'campaign', 'view']);
+const SELF_DOCUMENTING = new Set(['chat', 'campaign', 'view', 'trial']);
 
 /**
  * Every command this file routes, in the order the help lists them.
@@ -314,7 +317,7 @@ const SELF_DOCUMENTING = new Set(['chat', 'campaign', 'view']);
  * command` can never advertise a stale set.
  */
 function knownCommands(): string[] {
-  const order = ['doctor', 'init', 'enlist', 'chat', 'campaign', 'view', 'rebuild'];
+  const order = ['doctor', 'init', 'enlist', 'chat', 'campaign', 'trial', 'view', 'rebuild'];
   const all = new Set([...Object.keys(COMMAND_HELP), ...SELF_DOCUMENTING]);
   return [...order.filter((c) => all.has(c)), ...[...all].filter((c) => !order.includes(c))];
 }
@@ -376,6 +379,17 @@ export async function run(argv: readonly string[]): Promise<number> {
     case 'campaign': {
       const { campaignCommand } = await import('./command/index.ts');
       return campaignCommand(rest);
+    }
+    case 'trial': {
+      const { trialCommand, TRIAL_HELP } = await import('./command/trial.ts');
+      // `TrialArgs` carries no `help` field — this is the one place `--help` is handled, exactly
+      // as `COMMAND_HELP` handles it for `doctor`/`init`/`enlist`/`rebuild` above, just resolved
+      // after the on-demand import rather than before it.
+      if (wantsHelp(rest)) {
+        process.stdout.write(TRIAL_HELP(self));
+        return 0;
+      }
+      return trialCommand(rest);
     }
     case 'view': {
       const { runView } = await import('./view/index.ts');
