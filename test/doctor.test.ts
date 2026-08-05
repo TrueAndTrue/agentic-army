@@ -917,8 +917,17 @@ describe('default config', () => {
     assert.equal(rules.length, 2);
 
     assert.equal(rules[0].when, 'Any change to any file.');
-    assert.deepEqual(rules[0].use, [{ harness: 'claude', model: 'claude-sonnet-5', effort: 'xhigh' }]);
-    assert.equal(rules[0].why, 'Engineers build on Claude.');
+    // Effort is `low` — a measured default, not a quota downgrade — conditional on the
+    // complete-spec guarantee described in the rule's own `why`. See DEFAULT_DISPATCH in
+    // src/config/load.ts, which this file is pinned byte-compatible with.
+    assert.deepEqual(rules[0].use, [{ harness: 'claude', model: 'claude-sonnet-5', effort: 'low' }]);
+    assert.equal(
+      rules[0].why,
+      'Engineers build on Claude. Effort is low by measured default, not by economy: a complete ' +
+        'spec produced byte-identical output at low and xhigh, 4x cheaper and 4x faster. A brief ' +
+        'dispatched without a complete spec never sees this value — UNSPECIFIED_BRIEF_EFFORT in ' +
+        "campaign.ts's dispatchFor escalates it to xhigh first.",
+    );
 
     assert.equal(rules[1].when, 'An Engineer has claimed done and its branch needs review.');
     assert.deepEqual(rules[1].use, [{ harness: 'codex', model: 'gpt-5.5', effort: 'high' }]);

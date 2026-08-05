@@ -57,8 +57,10 @@ import {
   renderDispatchResult,
   renderHumanTurn,
 } from '../src/chat/protocol.ts';
-import type { DispatchOutcomeFacts } from '../src/chat/protocol.ts';
+import type { DispatchOutcomeFacts, DispatchRequest } from '../src/chat/protocol.ts';
 import { renderStandingOrders } from '../src/chat/orders.ts';
+import { SPEC_FIELD_LABEL, SPEC_LIST_FIELDS, renderTechnicalSpec } from '../src/contracts/spec.ts';
+import type { TechnicalSpec } from '../src/contracts/spec.ts';
 import { ChatSession } from '../src/chat/session.ts';
 import { createClaudeAdapter } from '../src/harness/claude.ts';
 import type { HarnessAdapter, SoldierSpec } from '../src/contracts/harness.ts';
@@ -405,6 +407,19 @@ function readNulSeparated(file: string): string[] {
 /** A dispatch block, spelled the way the commander is told to spell it. */
 function dispatchBlock(objective: string, extra: Record<string, unknown> = {}): string {
   return ['```' + DISPATCH_FENCE, JSON.stringify({ objective, ...extra }), '```'].join('\n');
+}
+
+/** A fully-answered spec, matching the worked example in the standing orders. */
+function sampleSpec(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    objective: 'add a multiply function to calc.js',
+    filesInScope: ['calc.js'],
+    acceptance: ['node --test passes'],
+    behaviours: ['multiply(0, x) returns 0'],
+    decisions: ['multiply is a named export, matching add'],
+    constraints: ['no new dependencies'],
+    ...over,
+  };
 }
 
 interface Rig {
@@ -901,6 +916,127 @@ describe('a dispatch request can name an objective and nothing else', () => {
 });
 
 // ===============================================================================================
+// 3B. THE SPEC — an optional, fully-validated addition, not a second way to widen the request
+// ===============================================================================================
+
+describe('a dispatch request may carry a spec, fully validated or not at all', () => {
+  it('a block with an objective and a valid spec parses, carrying both', () => {
+    const objective = 'add a multiply function to calc.js';
+    const parsed = parseDispatchDirective(dispatchBlock(objective, { spec: sampleSpec() }));
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    const request: DispatchRequest = parsed.request;
+    assert.equal(request.objective, objective);
+    assert.ok(request.spec !== undefined, 'the parsed request lost the spec');
+    const spec = request.spec as TechnicalSpec;
+    assert.equal(spec.objective, objective);
+    assert.deepEqual(spec.filesInScope, ['calc.js']);
+    assert.deepEqual(spec.acceptance, ['node --test passes']);
+    assert.deepEqual(spec.behaviours, ['multiply(0, x) returns 0']);
+    assert.deepEqual(spec.decisions, ['multiply is a named export, matching add']);
+    assert.deepEqual(spec.constraints, ['no new dependencies']);
+  });
+
+  it('a spec missing a field is refused, naming the missing field', () => {
+    const spec = sampleSpec();
+    delete spec['constraints'];
+    const parsed = parseDispatchDirective(dispatchBlock('do the thing', { spec }));
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /constraints/);
+  });
+
+  it('a spec with an empty list is refused, naming the empty field', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('do the thing', { spec: sampleSpec({ acceptance: [] }) }),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /acceptance/);
+    assert.match(parsed.ok ? '' : parsed.reason, /empty/);
+  });
+
+  it('a spec with a blank entry is refused, naming the field', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('do the thing', { spec: sampleSpec({ behaviours: ['   '] }) }),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /behaviours/);
+    assert.match(parsed.ok ? '' : parsed.reason, /blank/);
+  });
+
+  it('a spec with an entry containing a newline is refused, naming the field', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('do the thing', {
+        spec: sampleSpec({ decisions: ['line one\nline two'] }),
+      }),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /decisions/);
+    assert.match(parsed.ok ? '' : parsed.reason, /newline/);
+  });
+
+  it('a spec with an unknown key is refused, naming the offending key', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('do the thing', { spec: sampleSpec({ risk: 'high' }) }),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /risk/);
+  });
+
+  it('a block with objective, spec, and a third key is refused, naming the third key', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('do the thing', { spec: sampleSpec(), rung: 3 }),
+    );
+    assert.equal(parsed.ok, false);
+    // `names rung,` and NOT `spec` — `spec` is a known key now, so it must not be named as an
+    // offender alongside `rung`. Before this change `spec` itself was unknown too, and the old
+    // message read "names spec, rung, …" — matching a bare /rung/ regardless of which code ran.
+    assert.match(parsed.ok ? '' : parsed.reason, /names rung,/);
+  });
+
+  it('a spec.objective that disagrees with the block\'s objective is refused, naming both', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('add a multiply function', {
+        spec: sampleSpec({ objective: 'add a divide function' }),
+      }),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /add a multiply function/);
+    assert.match(parsed.ok ? '' : parsed.reason, /add a divide function/);
+  });
+
+  it('a block with an objective and no spec parses exactly as it does today', () => {
+    const objective = 'add a multiply function to calc.js';
+    const parsed = parseDispatchDirective(dispatchBlock(objective));
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    assert.deepEqual(parsed.request, { objective });
+    assert.equal(Object.hasOwn(parsed.request, 'spec'), false, 'a spec appeared from nowhere');
+  });
+});
+
+// ===============================================================================================
+// 3C. THE STANDING ORDERS INTERROGATE — the commander is told what six questions to ask
+// ===============================================================================================
+
+describe('the standing orders name every spec field and the fenced shape to carry it in', () => {
+  it('names all six spec field labels, and the fence tag the block is wrapped in', () => {
+    const orders = renderStandingOrders({
+      project: '/tmp/some-project',
+      ceiling: 2,
+      requestedRung: 2,
+      maxAttempts: 3,
+    });
+    for (const field of ['objective', ...SPEC_LIST_FIELDS] as (keyof typeof SPEC_FIELD_LABEL)[]) {
+      assert.ok(
+        orders.includes(SPEC_FIELD_LABEL[field]),
+        `the standing orders never name the field ${SPEC_FIELD_LABEL[field]}`,
+      );
+    }
+    assert.ok(orders.includes(DISPATCH_FENCE), 'the standing orders never show the fence tag');
+    assert.match(orders, /"objective":/, 'no worked example of the dispatch block with a spec');
+    assert.match(orders, /"spec":/, 'no worked example of the dispatch block with a spec');
+  });
+});
+
+// ===============================================================================================
 // 4. THE TURN-AUTHORITY GATE
 // ===============================================================================================
 
@@ -1106,6 +1242,44 @@ describe('nothing is dispatched without a keystroke', () => {
     assert.equal(report['testsRun'], true);
     assert.ok(typeof report['archive'] === 'string');
     assert.ok(!JSON.stringify(report).includes('stream.jsonl'), 'a transcript pointer is not a transcript');
+  });
+
+  it('the confirmation prompt shows the spec in full when the proposal carries one', async () => {
+    const objective = 'add a multiply function to calc.js';
+    const spec = sampleSpec({ objective }) as unknown as TechnicalSpec;
+    const rig = makeRig('confirm-spec', [
+      'at your orders.',
+      `on it.\n\n${dispatchBlock(objective, { spec })}`,
+      'the Inspector passed it.',
+    ]);
+    const io = createScriptedIo(['we need multiply', 'y']);
+    await chat(rig, io);
+
+    // The SAME bytes a worker would read — the one renderer, shown to the human before approval.
+    const rendered = renderTechnicalSpec(spec);
+    assert.ok(
+      io.transcript.includes(rendered),
+      'the confirmation prompt did not show the spec, or showed something other than renderTechnicalSpec\'s bytes',
+    );
+    assert.ok(io.transcript.includes(objective), 'the objective line is still shown');
+  });
+
+  it('the confirmation prompt is unchanged when no spec is proposed', async () => {
+    const rig = makeRig('confirm-no-spec', [
+      'at your orders.',
+      `on it.\n\n${dispatchBlock('add a multiply function to calc.js')}`,
+      'the Inspector passed it.',
+    ]);
+    const io = createScriptedIo(['we need multiply', 'y']);
+    await chat(rig, io);
+
+    assert.ok(!io.transcript.includes('THE SPEC'), 'a spec heading appeared with no spec proposed');
+    for (const field of SPEC_LIST_FIELDS) {
+      assert.ok(
+        !io.transcript.includes(SPEC_FIELD_LABEL[field]),
+        `the field label ${SPEC_FIELD_LABEL[field]} leaked into a spec-less confirmation`,
+      );
+    }
   });
 });
 

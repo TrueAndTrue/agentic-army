@@ -655,7 +655,7 @@ export function toolNamesOf(rules: readonly string[]): string[] {
   return out;
 }
 
-function subordinateBriefing(
+export function subordinateBriefing(
   rank: Rank,
   role: Role,
   tools: readonly string[],
@@ -667,6 +667,25 @@ function subordinateBriefing(
     'the unit that fielded you. Do the one thing you were sent to do and report back.',
     '',
     `Your tools are: ${tools.join(', ')}.`,
+    // Terse, deliberately — this briefing is paid for on every subagent spawn.
+    //
+    // The effort sentence is worded as INHERITANCE rather than as a fact about this subordinate,
+    // because that is what it is: `SubagentDefinition` carries a description, a prompt and a tool
+    // list, and `buildAgentsJson` emits exactly those three. There is no effort field and no model
+    // field, so a native subagent runs inside its parent's process at its parent's effort. Saying
+    // "you run at low effort" flatly would be false for precisely the subordinates that matter
+    // most — the ones fielded by an Engineer that was escalated to `xhigh` for arriving without a
+    // spec, which is the case where a briefing telling them not to think would be worst.
+    //
+    // What is true in BOTH cases is the instruction underneath: an ambiguity resolved by guessing
+    // looks like an answer and is the expensive failure, and one NAMED back costs a single turn.
+    'You do not get a reasoning budget of your own — you run inside the unit that fielded you, ' +
+      'at whatever effort it was given, and by default that is LOW. That is deliberate: the ' +
+      'decisions were supposed to be made before you were sent. You are NOT being asked to make ' +
+      'design decisions. If your ' +
+      'orders are ambiguous, under-specified, or seem to need a choice nobody told you how to ' +
+      'make, REPORT THE GAP in your answer — name what is missing — instead of resolving it ' +
+      'yourself and carrying on.',
     writes
       ? ''
       : 'You hold no editing tool and no shell, and this is deliberate rather than an oversight: ' +

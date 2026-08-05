@@ -234,10 +234,53 @@ said so. And **durability happened before the lease was returned**, so the commi
 worktree being reset and handed to the next campaign; it is readable out of the mirror
 afterwards with plain `git`.
 
+## The spec, and why the workers are cheap
+
+Engineers dispatch at **`low`** reasoning effort. That is not a cost saving, and it is only safe
+because of what sits above it — see [What a trial measured](#what-a-trial-measured) for the run
+that decided it. Under a complete brief every effort level solved the same task, `low` included,
+in 1m12s for 29 cents. Under a one-line brief six of eight attempts failed, and six of those
+failures were one missing sentence that nobody derived.
+
+So the cheap default is **coupled to the brief, not chosen despite it**:
+
+- A dispatch carrying a validated `TechnicalSpec` runs the Engineer at the configured effort.
+- A dispatch carrying only a free-text objective escalates it to `xhigh` — `UNSPECIFIED_BRIEF_EFFORT`
+  in `src/command/campaign.ts`. Failing toward *more* reasoning when the brief is thin is the safe
+  direction, and it is what the trial's one reliable thin-brief success actually needed.
+
+A spec has six fields, and all six are required: objective, files in scope, acceptance, behaviours
+and edge cases, decisions already made, and constraints. Validation is **structural only** —
+present, single line, within caps. It never judges content, because you approve the spec before
+anything spawns and a validator that filled a gap in would have answered one of the six questions
+itself.
+
+```sh
+army campaign --spec ./spec.json          # a spec you wrote
+army campaign "fix the flaky test"        # no spec: still works, escalated to xhigh
+```
+
+**The awareness runs the whole way down.** The commander is told its Engineer is cheap and
+literal. The Engineer is told the same about the Sergeants it fields, and that it owes each of
+them the same six answers it was owed. The Sergeant is told that if its orders are ambiguous the
+correct move is to **report the gap upward, not resolve it** — a guess that looks like an answer
+is the expensive failure; a named gap costs one turn.
+
+One thing that briefing is careful *not* to say is that a subagent runs at low effort. It has no
+effort of its own: `--agents` carries a description, a prompt and a tool list, so a native
+subagent runs inside its parent at its parent's effort — which is `xhigh` whenever that parent
+was escalated for arriving without a spec. A test asserts the wording stays inherited rather than
+flat, because the sentence reads fine either way.
+
 ## `army chat`
 
 A campaign is one objective, decided up front. `chat` is the other shape: a live session with a
 **COL·COMMANDER** that can raise work mid-conversation.
+
+It will not propose a dispatch until it can fill all six spec fields. It interrogates one question
+at a time, carries its own recommended answer on each so you can agree with a word, and when you
+genuinely do not know something it records the decision it took on your behalf under *Decisions
+already made* and says so. The failure being replaced is the assumption nobody wrote down.
 
 ```sh
 army chat
@@ -481,6 +524,13 @@ that suggestions match your invocation is only interesting if it holds in more t
   repository on this machine, and the gates, the argv, the idempotence and the reporting are all
   demonstrated. What is NOT demonstrated: that the real `gh` accepts these flags, and that
   GitHub's branch protection refuses the way the stand-in does. Those two remain code claims.
+- **The spec path against a live commander.** `TechnicalSpec` validation, the effort coupling, the
+  `--spec` flag, the interrogation text and every briefing that carries the spec downward are
+  covered by tests and were exercised end to end in-process — a spec parsed out of a dispatch
+  block reaches `renderEngineerOrders` with every entry intact, and `dispatchFor` returns `low`
+  with a spec and `xhigh` without. What has NOT happened is a live `chat` session where a real
+  commander interrogated a real human and produced a spec it then dispatched. The wording of the
+  interrogation is a code claim until that runs.
 - **The retry path.** The Inspector passed on attempt 1, so no second Engineer was fielded.
 - **Raising a ceiling from a real TTY.** Only the non-interactive refusal was observed.
 - **Windows.** Untested, and never claimed otherwise. Paths are built with `node:path` and the

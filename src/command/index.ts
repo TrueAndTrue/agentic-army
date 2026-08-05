@@ -6,11 +6,14 @@
  * calling `runCampaign` directly, with no argv, no terminal and no process to inspect.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { AgentIdInUseError, archiveDurabilityNote } from '../archive/archive.ts';
 import { RUNG_LABEL, RUNGS } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
+import { validateTechnicalSpec } from '../contracts/spec.ts';
+import type { TechnicalSpec } from '../contracts/spec.ts';
 import { WORKTREE_PROVIDER_IDS } from '../contracts/worktree.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import { invokedAs } from '../setup/checks.ts';
@@ -47,11 +50,22 @@ army campaign — run one objective end to end
 
 USAGE
   ${invokedAs()} campaign "<objective>" [options]
+  ${invokedAs()} campaign --spec <path> [options]
 
 OPTIONS
   --rung <0|1|2|3>     Highest delivery rung to attempt. Clamped by the project
                        ceiling, never raised by this flag. Default 2 — a merge is
                        asked for by name, never arrived at by default.
+  --spec <path>        A JSON file holding the six answers a TechnicalSpec asks
+                       for (objective, filesInScope, acceptance, behaviours,
+                       decisions, constraints) — see src/contracts/spec.ts. A
+                       spec that fails validation refuses to run rather than
+                       falling back to a free-text campaign. The objective
+                       becomes spec.objective; a positional objective ALSO
+                       given must match it exactly. Without a spec the
+                       Engineer's reasoning effort escalates, on the theory
+                       that a worker doing its own thinking needs the budget
+                       for it.
   --attempts <n>       Total Engineer attempts including the first. Default 3.
   --cwd <dir>          Project to fight the campaign in. Default: this directory.
   --provider <id>      Worktree provider. There is one pooled provider today;
@@ -89,6 +103,8 @@ export interface CampaignArgs {
   cwd?: string;
   provider?: WorktreeProviderId;
   campaignId?: string;
+  /** Raw `--spec` path, unread and unvalidated. `campaignCommand` does the I/O. */
+  specPath?: string;
   json: boolean;
   help: boolean;
 }
@@ -166,6 +182,12 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
         args.campaignId = value;
         break;
       }
+      case '--spec': {
+        const value = next();
+        if (value === undefined) throw new UsageError('--spec expects a path');
+        args.specPath = value;
+        break;
+      }
       default:
         if (arg.startsWith('-')) throw new UsageError(`unknown option ${arg}`);
         positional.push(arg);
@@ -176,7 +198,11 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
   if (!args.help) {
     // Both of these are the FIRST thing a new user can get wrong, and both used to answer with a
     // diagnosis and no example. The shape of the thing being asked for is the fix.
-    if (positional.length === 0) {
+    //
+    // A spec carries its own objective (`spec.objective`), so `--spec` alone is a complete
+    // campaign with zero positional arguments — the "objective is required" refusal only fires
+    // when there is neither a positional objective nor a spec to take one from.
+    if (positional.length === 0 && args.specPath === undefined) {
       throw new UsageError(
         `an objective is required, e.g. ${invokedAs()} campaign "add a multiply function to calc.js"`,
       );
@@ -187,7 +213,7 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
           `${invokedAs()} campaign "…"`,
       );
     }
-    args.objective = positional[0] as string;
+    if (positional.length === 1) args.objective = positional[0] as string;
   }
   return args;
 }
@@ -308,6 +334,13 @@ export interface CampaignCommandDeps {
   overrides?: Partial<CampaignOptions>;
   /** The environment the charset is detected from. Defaults to the real one. */
   env?: Record<string, string | undefined>;
+  /**
+   * Swap `runCampaign` itself. Test seam only — the CLI always uses the real one. Lets a test
+   * confirm the CLI skin read `--spec`, validated it and built `options.spec` correctly without
+   * paying for a whole campaign against real harnesses, the same reason `overrides.adapters`
+   * exists on `runCampaign` itself.
+   */
+  runCampaignFn?: (options: CampaignOptions) => Promise<CampaignResult>;
 }
 
 /**
@@ -380,11 +413,62 @@ export async function campaignCommand(
     return 0;
   }
 
+  // ---- `--spec` ---------------------------------------------------------------------------
+  //
+  // Read, parsed and validated HERE, before a single soldier is dispatched, and every failure
+  // mode below refuses rather than falling back to a free-text campaign. A user who typed
+  // `--spec` and silently got the expensive unspecified path — `UNSPECIFIED_BRIEF_EFFORT`, an
+  // Engineer making decisions nobody reviewed — has been lied to; the whole value of a spec is
+  // that a human approved it before anything spawned.
+  let spec: TechnicalSpec | undefined;
+  if (args.specPath !== undefined) {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(args.specPath, 'utf8');
+    } catch (error) {
+      stderr.write(
+        `${self} campaign: could not read --spec ${args.specPath}: ` +
+          `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return 1;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      stderr.write(
+        `${self} campaign: ${args.specPath} is not valid JSON: ` +
+          `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return 1;
+    }
+    const validated = validateTechnicalSpec(parsed);
+    if (!validated.ok) {
+      // The validator's OWN sentence, verbatim, plus the path — never paraphrased.
+      stderr.write(`${self} campaign: ${args.specPath}: ${validated.reason}\n`);
+      return 1;
+    }
+    spec = validated.spec;
+    // A positional objective is optional with `--spec` — the spec carries its own — but if BOTH
+    // are given they must agree. Silently preferring one over the other is how a user ends up
+    // reviewing a branch built against an objective they did not think they asked for.
+    if (args.objective !== '' && args.objective !== spec.objective) {
+      stderr.write(
+        `${self} campaign: the objective on the command line (${JSON.stringify(args.objective)}) ` +
+          `does not match spec.objective in ${args.specPath} (${JSON.stringify(spec.objective)}). ` +
+          'Pass one or the other.\n',
+      );
+      return 1;
+    }
+    args.objective = spec.objective;
+  }
+
   const sink = progressSinkFor(args, stdout, stderr, self, deps.env ?? process.env);
 
   const options: CampaignOptions = {
     objective: args.objective,
     onProgress: sink.emit,
+    ...(spec === undefined ? {} : { spec }),
     ...(args.cwd === undefined ? {} : { cwd: args.cwd }),
     ...(args.requestedRung === undefined ? {} : { requestedRung: args.requestedRung }),
     ...(args.maxAttempts === undefined ? {} : { maxAttempts: args.maxAttempts }),
@@ -396,7 +480,8 @@ export async function campaignCommand(
 
   let result: CampaignResult;
   try {
-    result = await runCampaign(options);
+    const run = deps.runCampaignFn ?? runCampaign;
+    result = await run(options);
   } catch (error) {
     // Before the report, and before the error line: the ticker owns the cursor's line, and an
     // error printed over a half-drawn spinner frame is an error the reader cannot read.

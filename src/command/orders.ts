@@ -38,6 +38,8 @@
 import type { Report, Verdict } from '../contracts/report.ts';
 import { RUNG_LABEL } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
+import { renderTechnicalSpec, SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../contracts/spec.ts';
+import type { TechnicalSpec } from '../contracts/spec.ts';
 
 // ---------------------------------------------------------------------------------------------
 // The original orders — the campaign's own words, held verbatim
@@ -78,6 +80,12 @@ export interface EngineerOrdersInput {
    * It is the reverse direction — reviewee's narrative → reviewer — that is forbidden.
    */
   previousVerdict?: Verdict;
+  /**
+   * The commander's spec, when the dispatch carried one. Supervisor-origin, approved by a human
+   * before this Engineer existed — the opposite direction from `previousVerdict` above, which is
+   * why it is safe to render here in full. See `src/contracts/spec.ts` for what it buys.
+   */
+  spec?: TechnicalSpec;
 }
 
 function findingLines(verdict: Verdict): string[] {
@@ -104,6 +112,34 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
   lines.push('');
   lines.push(orders.objective);
   lines.push('');
+
+  // THE MOST IMPORTANT CONTENT IN THIS DOCUMENT, so it sits directly under the objective and
+  // above every section of housekeeping below it. See `src/contracts/spec.ts`: a trial measured
+  // that whether these six questions were answered upstream — not the Engineer's own reasoning
+  // budget — was what separated a 1m12s pass from a 9m42s one.
+  if (input.spec !== undefined) {
+    lines.push(renderTechnicalSpec(input.spec));
+    lines.push(
+      'These decisions were made ABOVE you, before this attempt began, and a human approved ' +
+        'them before you existed. They are not open for you to revisit: do not re-derive them, ' +
+        'improve on them, or quietly substitute your own idea of a better one. If you believe ' +
+        'one of them is WRONG, say so in your report as a finding — do not act on it silently. ' +
+        'An Inspector reviews this branch against the objective either way, so a silent ' +
+        'substitution is found regardless, and declaring it costs you nothing.',
+    );
+    lines.push('');
+  } else {
+    lines.push('## NO SPEC WAS PROVIDED');
+    lines.push('');
+    lines.push(
+      'This objective was dispatched as free text — none of the questions a spec would have ' +
+        'answered for you were asked in advance. You will have to make the design decisions ' +
+        'yourself: scope, acceptance, edge cases, the lot. Every decision you make in their ' +
+        'place MUST be recorded in your report, one finding each, so the next attempt is not ' +
+        'built on an assumption nobody else can see.',
+    );
+    lines.push('');
+  }
 
   if (input.previousVerdict !== undefined) {
     lines.push('## THE INSPECTOR FAILED YOUR PREVIOUS ATTEMPT');
@@ -160,6 +196,24 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
   lines.push('- Commit everything you change. An uncommitted file is a destroyed file here.');
   lines.push('- Do not push. Durability and delivery are handled above you.');
   lines.push('');
+
+  // The downward clause. You may field SERGEANT subagents, and they are cheap for exactly one
+  // reason: they run at low effort and take your brief on faith. An ambiguity you would have
+  // asked a human about, a SERGEANT guesses at or drops — silently, because it has no channel to
+  // ask. You owe it the completeness this brief owes you, or it fails the same way a thin brief
+  // failed in the trial `UNSPECIFIED_BRIEF_EFFORT` is named for.
+  lines.push('## IF YOU FIELD SUBORDINATES');
+  lines.push('');
+  lines.push(
+    'You may field SERGEANT subagents to fan this work out. They run at LOW reasoning effort ' +
+      "and are literal: anything your sub-brief leaves ambiguous is guessed at or missed, never " +
+      'queried back to you. You owe each subordinate the same completeness this brief owes you ' +
+      '— a named file scope, an explicit finish line, the edge cases spelled out, and any ' +
+      'design decision already taken. The same six questions apply going down: ' +
+      `${(['objective', ...SPEC_LIST_FIELDS] as const).map((field) => SPEC_FIELD_LABEL[field]).join(', ')}.`,
+  );
+  lines.push('');
+
   lines.push('## WHEN YOU ARE DONE');
   lines.push('');
   lines.push(
@@ -271,6 +325,15 @@ export interface InspectorBrief {
   baseCommit?: string;
   /** Review round, 1-based. Present so a second review can say so; carries no narrative. */
   round: number;
+  /**
+   * The commander's spec, when the dispatch carried one.
+   *
+   * SUPERVISOR-ORIGIN, not the reviewee's — a human approved it before the Engineer existed, so
+   * including it does not violate the one rule this file exists to enforce. It strengthens the
+   * review: an Inspector that knows the specified edge cases can check them by name instead of
+   * guessing at what "the objective" implied.
+   */
+  spec?: TechnicalSpec;
 }
 
 /**
@@ -298,6 +361,14 @@ export function renderInspectorBrief(brief: InspectorBrief): string {
   lines.push('');
   lines.push(orders.objective);
   lines.push('');
+
+  if (brief.spec !== undefined) {
+    // Supervisor-owned and human-approved before the Engineer existed — never the reviewee's
+    // narrative. See `InspectorBrief.spec`.
+    lines.push(renderTechnicalSpec(brief.spec, '## THE SPEC THE WORK WAS ASKED AGAINST'));
+    lines.push('');
+  }
+
   lines.push('## WHAT YOU HAVE BEEN GIVEN, AND WHAT YOU HAVE NOT');
   lines.push('');
   lines.push(`- Branch: \`${facts.branch}\` in the worktree at \`${worktree}\`.`);
@@ -365,6 +436,13 @@ export interface InspectorBriefInput {
   /** What the tree was handed out at, from `git rev-parse HEAD` before the Engineer ran. */
   baseCommit?: string;
   round: number;
+  /**
+   * The commander's spec, when the dispatch carried one. Take it from the SUPERVISOR's own copy
+   * — `CampaignOptions.spec` — never from a `Report`. See `InspectorBrief.spec`: this is the one
+   * field on this input that IS allowed to carry structured content, because it does not
+   * originate from the party under review.
+   */
+  spec?: TechnicalSpec;
 
   // ---- structurally unreachable, on purpose -------------------------------------------------
   /** @deprecated Never. The Inspector is briefed from the original orders. */
@@ -407,6 +485,7 @@ export function briefInspectorFromAttempt(input: InspectorBriefInput): string {
     round: input.round,
   };
   if (input.baseCommit !== undefined) brief.baseCommit = input.baseCommit;
+  if (input.spec !== undefined) brief.spec = input.spec;
   return renderInspectorBrief(brief);
 }
 

@@ -56,22 +56,49 @@ export const CONFIG_VERSION = 1;
 /**
  * The static vendor split — Inspectors on codex, every other role on claude — used when the
  * config is absent or has no usable rules. Unlike a ceiling, a dispatch default has no blast
- * radius — the worst case is a job running on the wrong vendor — so falling back to a working
- * default here is safe, whereas falling back to a working default for a ceiling would be the
- * whole vulnerability.
+ * radius in the sense that matters for merge authority — the worst case used to be simply "a job
+ * runs on the wrong vendor". It is now SLIGHTLY less true than that: the worst case also includes
+ * "a job runs at the wrong reasoning level", because the Engineer rule below sets `effort`, not
+ * only `harness`. That is still a cost-and-time mistake, never an authority one — a ceiling still
+ * bounds what the job may do — so falling back to a working default here remains safe; it is just
+ * no longer costless to get wrong, which is the whole reason the change is documented this
+ * carefully instead of being a quiet one-line edit.
  *
  * The split is enacted by `dispatchFor` in `src/command/campaign.ts` and is a function of the
  * ROLE alone; what these rules supply is the `model` and `effort` for whichever harness the role
  * chose. The `when` strings below are labels — see `DispatchRule.when`, which nothing matches on.
  *
  * Kept byte-compatible with the `[[dispatch.rules]]` block that `army init` writes.
+ *
+ * WHY THE ENGINEER RULE READS `effort: 'low'`, NOT `'xhigh'`.
+ *
+ * A controlled trial ran one coding task at all five reasoning levels under two briefs that
+ * carried identical constraints and differed only in whether the thinking had been done above.
+ * Under a COMPLETE brief every effort level succeeded, including `low` — 1m12s, $0.29 — and
+ * `xhigh` produced a byte-identical outcome for 4x the cost and 4x the time. Under a THIN brief
+ * six of eight arms failed, all six on the same missing sentence a complete brief would have
+ * stated and nobody derived; `xhigh` was the one effort level that still got there, at 9m42s and
+ * $1.64.
+ *
+ * So `low` is the right default ONLY in a system that guarantees a complete spec, and this file
+ * is not that guarantee by itself — it is the third leg of one. The other two: the commander now
+ * interrogates the human until it can fill a six-field `TechnicalSpec`, and a dispatch made
+ * without one is escalated back up automatically — `UNSPECIFIED_BRIEF_EFFORT` in
+ * `src/command/campaign.ts`'s `dispatchFor` raises an unspecified brief to `xhigh` regardless of
+ * what this rule says. `low` here is therefore a measured default conditioned on that escalation
+ * existing, not a claim that `low` is enough on its own — see the reasoning-class rule above
+ * `REASONING_EFFORTS` in `src/contracts/harness.ts` for the line between the two.
  */
 export const DEFAULT_DISPATCH: DispatchConfig = {
   rules: [
     {
       when: 'Any change to any file.',
-      use: [{ harness: 'claude', model: 'claude-sonnet-5', effort: 'xhigh' }],
-      why: 'Engineers build on Claude.',
+      use: [{ harness: 'claude', model: 'claude-sonnet-5', effort: 'low' }],
+      why:
+        'Engineers build on Claude. Effort is low by measured default, not by economy: a ' +
+        'complete spec produced byte-identical output at low and xhigh, 4x cheaper and 4x ' +
+        'faster. A brief dispatched without a complete spec never sees this value — ' +
+        "UNSPECIFIED_BRIEF_EFFORT in campaign.ts's dispatchFor escalates it to xhigh first.",
     },
     {
       when: 'An Engineer has claimed done and its branch needs review.',

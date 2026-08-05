@@ -77,6 +77,7 @@ import { RUNG_LABEL, effectiveRung } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import type { HarnessAdapter, HarnessId, SoldierEvent } from '../contracts/harness.ts';
 import { codePointLength } from '../contracts/report.ts';
+import { renderTechnicalSpec } from '../contracts/spec.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import type { DeliveryConfig } from '../delivery/ladder.ts';
 import { projectCeiling } from '../delivery/ladder.ts';
@@ -601,6 +602,13 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       });
 
       io.write(`\n  ◇ proposed objective\n     ${proposal.objective}\n`);
+      // A human approving a one-line objective while a full spec silently rides along has not
+      // approved the spec — so when one is present, it is shown in full, beneath the objective,
+      // in the SAME bytes `renderTechnicalSpec` puts into the Engineer's orders and the
+      // Inspector's brief. One renderer, so what is approved here is what a worker later reads.
+      if (proposal.spec !== undefined) {
+        io.write(`\n${renderTechnicalSpec(proposal.spec)}\n`);
+      }
       const answer = await io.nextLine(CONFIRM_PROMPT);
       if (answer === null) {
         archive.appendSignal({
@@ -671,6 +679,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         result = await runDispatch({
           onProgress: narrate,
           objective: proposal.objective,
+          ...(proposal.spec === undefined ? {} : { spec: proposal.spec }),
           cwd: project,
           env,
           home,

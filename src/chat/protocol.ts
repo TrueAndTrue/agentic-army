@@ -30,11 +30,14 @@
  *
  * ## Rule 2 is enforced by the SHAPE OF `DispatchRequest`, and then by a human keystroke
  *
- * `DispatchRequest` has exactly one field. Not "one field plus some defaults" — one. The rung,
- * the project, the attempt budget, the worktree provider and the army home are settings of the
- * SESSION, chosen by the human before the conversation started, and there is no parameter through
- * which the model can name any of them. The tempting spellings are declared `?: never` so that
- * reaching for one is a compile error rather than a review question.
+ * `DispatchRequest` has exactly two fields: `objective`, and `spec` — the six-question structure
+ * from `src/contracts/spec.ts` that answers what a free-text objective cannot. Not "two fields
+ * plus some defaults". The rung, the project, the attempt budget, the worktree provider and the
+ * army home are settings of the SESSION, chosen by the human before the conversation started, and
+ * there is no parameter through which the model can name any of them. The tempting spellings are
+ * declared `?: never` so that reaching for one is a compile error rather than a review question.
+ * `spec` does not weaken this: it is validated, structural, and still describes only the work — it
+ * carries no field a `?: never` entry below does not already forbid by name.
  *
  * That still leaves the model itself persuadable, and no shape of type fixes that. What fixes it
  * is that the parsed objective is printed and must be confirmed by a keystroke before anything is
@@ -45,6 +48,8 @@
 import type { Rung } from '../contracts/delivery.ts';
 import type { Finding, Severity } from '../contracts/report.ts';
 import { MAX_FINDINGS, SUMMARY_MAX_CHARS, codePointLength } from '../contracts/report.ts';
+import type { TechnicalSpec } from '../contracts/spec.ts';
+import { validateTechnicalSpec } from '../contracts/spec.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Caps
@@ -82,10 +87,22 @@ export const CHAT_PROTOCOL_VERSION = 1;
  * error. The runtime half is `parseDispatchDirective`, which rejects any key it does not know —
  * so `{"objective": "...", "rung": 3}` is refused rather than silently trimmed. Trimming would
  * mean the model learned that asking costs nothing.
+ *
+ * `spec` is the one addition to this shape, and it is additive rather than a widening: it does
+ * not open a new way to name a rung, a project, a harness or any of the other `never` fields
+ * below — it is the six-question structure `src/contracts/spec.ts` defines, validated by the
+ * same function a spec file off disk would be, and refused rather than repaired on any defect.
  */
 export interface DispatchRequest {
   /** One line. The whole of what the commander is asking for. */
   objective: string;
+  /**
+   * The technical spec, when the dispatch carried one. Optional because a free-text objective is
+   * still a valid dispatch — the commander is not required to have interrogated the human before
+   * every request, only told to (see `orders.ts`). When present, it is a fully validated
+   * `TechnicalSpec`: `parseDispatchDirective` refuses rather than forwards a malformed one.
+   */
+  spec?: TechnicalSpec;
 
   // ---- structurally unreachable, on purpose -------------------------------------------------
   /** @deprecated Never. The delivery ceiling is the project's, and the rung is the human's. */
@@ -159,6 +176,15 @@ export function dispatchBlocksIn(reply: string): string[] {
  *   - An UNKNOWN KEY is a refusal, not a field to drop. Dropping `"rung": 3` teaches the model
  *     that naming a rung is free; refusing teaches it that the rung is not its to name.
  *   - A MULTI-LINE objective is a refusal. See `OBJECTIVE_MAX_CHARS`.
+ *
+ * The known-key set is `objective` and `spec` — the ONLY addition this file makes to the
+ * whitelist, and made for the reason the standing orders now interrogate for: a free-text
+ * objective cannot carry the six questions a cheap worker needs answered, and `spec` is where
+ * they go. A malformed `spec` is a refusal carrying `validateTechnicalSpec`'s reason verbatim,
+ * never a silently dropped field — dropping it would downgrade the dispatch to the free-text
+ * path while the commander believed it had specified the work. A `spec.objective` that disagrees
+ * with the block's own `objective` is refused too, naming both: two spellings of what is being
+ * built is exactly the ambiguity a spec exists to remove.
  */
 export function parseDispatchDirective(reply: string): DirectiveParse {
   const blocks = dispatchBlocksIn(reply);
@@ -186,7 +212,8 @@ export function parseDispatchDirective(reply: string): DirectiveParse {
   }
 
   const record = parsed as Record<string, unknown>;
-  const extra = Object.keys(record).filter((key) => key !== 'objective');
+  const KNOWN_KEYS = ['objective', 'spec'];
+  const extra = Object.keys(record).filter((key) => !KNOWN_KEYS.includes(key));
   if (extra.length > 0) {
     return {
       ok: false,
@@ -219,7 +246,26 @@ export function parseDispatchDirective(reply: string): DirectiveParse {
       reason: `the objective is ${String(length)} characters; the cap is ${String(OBJECTIVE_MAX_CHARS)}`,
     };
   }
-  return { ok: true, request: { objective: trimmed } };
+
+  if (!('spec' in record)) return { ok: true, request: { objective: trimmed } };
+
+  // A malformed spec is a REFUSAL carrying the validator's reason verbatim, never a dropped
+  // field — see the doc comment above. `validateTechnicalSpec` is the same parser a spec file off
+  // disk goes through, so a dispatch block gets no gentler a reading than any other untrusted spec.
+  const specResult = validateTechnicalSpec(record['spec']);
+  if (!specResult.ok) {
+    return { ok: false, reason: `the dispatch block's spec is invalid: ${specResult.reason}` };
+  }
+  if (specResult.spec.objective !== trimmed) {
+    return {
+      ok: false,
+      reason:
+        `the dispatch block's objective and its spec.objective disagree: ` +
+        `${JSON.stringify(trimmed)} versus ${JSON.stringify(specResult.spec.objective)}. Two ` +
+        'spellings of what is being built is the ambiguity a spec exists to remove.',
+    };
+  }
+  return { ok: true, request: { objective: trimmed, spec: specResult.spec } };
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -81,6 +81,7 @@ import type {
 } from '../contracts/harness.ts';
 import type { Rank, Role } from '../contracts/ranks.ts';
 import type { Report, Verdict } from '../contracts/report.ts';
+import type { TechnicalSpec } from '../contracts/spec.ts';
 import {
   REPORT_SCHEMA_PATH,
   SUMMARY_MAX_CHARS,
@@ -301,6 +302,14 @@ export interface WriteStream {
 export interface CampaignOptions {
   /** The `army campaign "<objective>"` argument, verbatim. Never paraphrased downstream. */
   objective: string;
+  /**
+   * The technical spec, when the dispatch carried one. Absent means a free-text objective.
+   *
+   * The concurrent chat unit codes against exactly this name and shape — do not rename it. It is
+   * threaded to `renderEngineerOrders` and `briefInspectorFromAttempt` verbatim, and it is what
+   * `dispatchFor` reads to decide whether the ENGINEER needs `UNSPECIFIED_BRIEF_EFFORT`.
+   */
+  spec?: TechnicalSpec;
   /** Where the campaign was launched. Defaults to `process.cwd()`. */
   cwd?: string;
   /** Highest rung to attempt, before the project ceiling clamps it. Defaults to 2. */
@@ -961,9 +970,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         worktree,
         attempt,
         ...(previousVerdict === undefined ? {} : { previousVerdict }),
+        ...(options.spec === undefined ? {} : { spec: options.spec }),
       });
 
-      const engineerTarget = dispatchFor(config, 'ENGINEER');
+      const engineerTarget = dispatchFor(config, 'ENGINEER', options.spec !== undefined);
       const engineerSpec = buildSoldierSpec({
         agentId: engineerId,
         rank: 'CAPTAIN',
@@ -1150,9 +1160,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         worktree,
         ...(baseCommit === null ? {} : { baseCommit }),
         round: attempt,
+        // Supervisor's own copy, never the Report's. See `SupervisorFacts` in orders.ts for why
+        // this is a safe origin and `Report` is not.
+        ...(options.spec === undefined ? {} : { spec: options.spec }),
       });
 
-      const inspectorTarget = dispatchFor(config, 'INSPECTOR');
+      const inspectorTarget = dispatchFor(config, 'INSPECTOR', options.spec !== undefined);
       const inspectorSpec = buildSoldierSpec({
         agentId: inspectorId,
         rank: 'CAPTAIN',
@@ -2066,20 +2079,54 @@ async function writeDiffFor(
 }
 
 /**
+ * The reasoning effort an ENGINEER is dispatched at when its orders carry no `TechnicalSpec`.
+ *
+ * ## Why this is an ESCALATION and not a downgrade
+ *
+ * A trial ran the same task at all five reasoning levels under two briefs carrying identical
+ * constraints, differing only in whether the thinking had been done above. Under a COMPLETE brief
+ * every effort level succeeded, including the lowest, in 1m12s for $0.29. Under a THIN brief six
+ * of eight arms failed; the one that succeeded reliably was `xhigh`, at 9m42s and $1.64 — 8x the
+ * time and 5.7x the cost of just writing the brief.
+ *
+ * The config's own default effort is moving to `low` in a concurrent unit — cheap, because a
+ * spec is expected to carry the thinking. This constant is what happens when that expectation is
+ * false: the worker has to do the thinking itself instead of executing someone else's, and it
+ * needs the budget for it. Failing toward MORE reasoning when the brief is thin is the safe
+ * direction, and it is what the trial's one reliably successful thin arm actually needed.
+ */
+export const UNSPECIFIED_BRIEF_EFFORT: ReasoningEffort = 'xhigh';
+
+/**
  * The static vendor split, read from the config's `rules[]` with the built-in default as
  * the fallback. Deliberately dumb: v1 matches by role, not by natural language, and the rules
  * array exists so the upgrade to quota-resolved candidates is a config change, not a rewrite.
+ *
+ * `hasSpec` is read for the ENGINEER only, and only to decide effort: a spec present means the
+ * decisions were made upstream, so the configured effort — whatever it is, cheap or not — is left
+ * alone; a spec absent overrides it to `UNSPECIFIED_BRIEF_EFFORT`, because the alternative is a
+ * cheap worker silently answering questions nobody asked it. An INSPECTOR reviews the finished
+ * branch against the objective regardless of how it got there, so `hasSpec` is not read for it —
+ * passed through only so both call sites share one signature.
  */
-function dispatchFor(
+export function dispatchFor(
   config: { dispatch: { rules: { when: string; use: { harness: HarnessId; model?: string; effort?: ReasoningEffort }[] }[] } },
   role: Role,
+  hasSpec: boolean,
 ): { harness: HarnessId; model?: string; effort?: ReasoningEffort } {
   const wanted = role === 'INSPECTOR' ? 'codex' : 'claude';
+  let target: { harness: HarnessId; model?: string; effort?: ReasoningEffort } = { harness: wanted };
   for (const rule of config.dispatch.rules) {
-    const target = rule.use[0];
-    if (target !== undefined && target.harness === wanted) return target;
+    const candidate = rule.use[0];
+    if (candidate !== undefined && candidate.harness === wanted) {
+      target = candidate;
+      break;
+    }
   }
-  return { harness: wanted };
+  if (role === 'ENGINEER' && !hasSpec) {
+    return { ...target, effort: UNSPECIFIED_BRIEF_EFFORT };
+  }
+  return target;
 }
 
 function adapterFor(options: CampaignOptions, harness: HarnessId): HarnessAdapter {

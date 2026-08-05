@@ -52,6 +52,7 @@ import {
   toolNameOf,
   ROLE_ALLOW,
   SPAWN_TOOLS,
+  subordinateBriefing,
 } from '../src/command/permissions.ts';
 import {
   maxSubagentDepth,
@@ -63,7 +64,7 @@ import {
 import type { Rank } from '../src/contracts/ranks.ts';
 import { buildClaudeEnv, SUBAGENT_DEPTH_ENV_VAR } from '../src/harness/claude.ts';
 import type { TreeModel } from '../src/view/tree.ts';
-import type { SubagentDefinition } from '../src/contracts/harness.ts';
+import type { HarnessId, ReasoningEffort, SubagentDefinition } from '../src/contracts/harness.ts';
 import { worktreesRootFor } from '../src/config/paths.ts';
 import {
   ENGINEER_NARRATIVE_KEYS,
@@ -75,7 +76,9 @@ import {
 import type { OriginalOrders } from '../src/command/orders.ts';
 import {
   LEASE_STATES,
+  UNSPECIFIED_BRIEF_EFFORT,
   buildSoldierSpec,
+  dispatchFor,
   mergeEvidence,
   parseStructured,
   resolveProjectRoot,
@@ -98,6 +101,8 @@ import { rebuildCampaign } from '../src/archive/rebuild.ts';
 import { runView } from '../src/view/index.ts';
 import type { Report, Verdict } from '../src/contracts/report.ts';
 import type { GhStatus } from '../src/delivery/git.ts';
+import { SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../src/contracts/spec.ts';
+import type { TechnicalSpec } from '../src/contracts/spec.ts';
 
 // ===============================================================================================
 // Scaffolding
@@ -925,6 +930,99 @@ describe('the review gate', () => {
 });
 
 // ===============================================================================================
+// 1b. THE SPEC — carried into the Engineer's orders and the Inspector's brief, or explicitly
+// noted as absent. See `src/contracts/spec.ts` for the trial this is built on.
+// ===============================================================================================
+
+const SAMPLE_SPEC: TechnicalSpec = {
+  objective: 'Add a `multiply` function to calc.js with a test that covers negative operands.',
+  filesInScope: ['calc.js', 'calc.test.js'],
+  acceptance: ['`npm test` passes', 'multiply(-2, 3) === -6'],
+  behaviours: ['multiplying two negatives yields a positive', 'multiplying by zero yields zero'],
+  decisions: ['use plain `*`, no BigInt'],
+  constraints: ['do not touch `add` or `subtract`'],
+};
+
+describe('the spec — carried into a brief, or explicitly absent', () => {
+  it('renderEngineerOrders with a spec renders every entry of every field, and says the decisions are not open', () => {
+    const withSpec = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: SAMPLE_SPEC,
+    });
+    for (const field of SPEC_LIST_FIELDS) {
+      for (const entry of SAMPLE_SPEC[field]) {
+        assert.ok(withSpec.includes(entry), `${field} entry ${JSON.stringify(entry)} is missing`);
+      }
+    }
+    assert.match(withSpec, /not open for you to revisit/i);
+    assert.doesNotMatch(withSpec, /NO SPEC WAS PROVIDED/);
+  });
+
+  it('renderEngineerOrders without a spec says it is working without one, and carries none of the spec headings', () => {
+    const withoutSpec = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+    });
+    assert.match(withoutSpec, /NO SPEC WAS PROVIDED/);
+    assert.match(withoutSpec, /make the design decisions yourself/i);
+    assert.match(withoutSpec, /MUST be recorded in your report/i);
+    for (const field of SPEC_LIST_FIELDS) {
+      assert.ok(
+        !withoutSpec.includes(`### ${SPEC_FIELD_LABEL[field]}`),
+        `the ### ${SPEC_FIELD_LABEL[field]} heading leaked with no spec present`,
+      );
+    }
+    assert.ok(!withoutSpec.includes('## THE SPEC\n'), 'the spec heading leaked with no spec present');
+  });
+
+  it('renderEngineerOrders names the six field labels in the downward passage to a fielded subordinate', () => {
+    // Present whether or not THIS attempt carries a spec — it is about what the Engineer owes
+    // a SERGEANT it fields, not about what it was itself given.
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+    });
+    assert.match(orders, /IF YOU FIELD SUBORDINATES/);
+    assert.match(orders, /LOW reasoning effort/i);
+    for (const field of ['objective', ...SPEC_LIST_FIELDS] as const) {
+      assert.ok(
+        orders.includes(SPEC_FIELD_LABEL[field]),
+        `the downward passage is missing the field label ${SPEC_FIELD_LABEL[field]}`,
+      );
+    }
+  });
+
+  it("the Inspector's brief carries the spec when one is present, and never when it is not", () => {
+    const withSpec = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+      spec: SAMPLE_SPEC,
+    });
+    for (const entry of SAMPLE_SPEC.acceptance) assert.ok(withSpec.includes(entry));
+    for (const entry of SAMPLE_SPEC.behaviours) assert.ok(withSpec.includes(entry));
+    assert.match(withSpec, /THE SPEC THE WORK WAS ASKED AGAINST/);
+
+    const withoutSpec = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+    });
+    assert.doesNotMatch(withoutSpec, /THE SPEC THE WORK WAS ASKED AGAINST/);
+    for (const entry of SAMPLE_SPEC.acceptance) assert.ok(!withoutSpec.includes(entry));
+  });
+});
+
+// ===============================================================================================
 // 2. PERMISSIONS — the global deny and the per-role allow-lists
 // ===============================================================================================
 
@@ -1144,6 +1242,28 @@ describe('permissions', () => {
       // on the command line as a real one.
       for (const rule of [...spec.allow, ...spec.deny]) assert.ok(!rule.startsWith('-'), rule);
     }
+  });
+
+  it('subordinateBriefing tells the floor to report a gap rather than resolve it', () => {
+    const briefing = subordinateBriefing('SERGEANT', 'ENGINEER', ['Read', 'Grep', 'Glob', 'TodoWrite'], false, false);
+    assert.match(briefing, /\bLOW\b/);
+    assert.match(briefing, /REPORT THE GAP/i);
+    assert.match(briefing, /not being asked to make design decisions/i);
+
+    // The effort claim must be INHERITANCE, never a flat fact about this subordinate.
+    // `SubagentDefinition` carries description/prompt/tools and nothing else — `buildAgentsJson`
+    // emits exactly those three — so a native subagent runs at its PARENT'S effort. An Engineer
+    // that arrived without a spec is escalated to `xhigh` by `UNSPECIFIED_BRIEF_EFFORT`, and the
+    // subordinates it fields then run at `xhigh` too. "You run at low effort" would be false for
+    // exactly those units, which are the ones a briefing telling them not to think would harm
+    // most. This asserts the wording stays honest, because the sentence reads fine either way.
+    assert.doesNotMatch(
+      briefing,
+      /you (?:are )?run(?:ning)? at low reasoning effort/i,
+      'the briefing states low effort as a fact about the subordinate; it is inherited from the ' +
+        'parent and is xhigh whenever the parent was escalated for arriving without a spec',
+    );
+    assert.match(briefing, /inside the unit that fielded you|whatever effort it was given/i);
   });
 });
 
@@ -1458,6 +1578,21 @@ describe('parsing', () => {
     assert.throws(() => parseCampaignArgs(['a', '--rung', '9']), /--rung expects/);
     assert.throws(() => parseCampaignArgs(['a', '--nope']), /unknown option/);
     assert.equal(parseCampaignArgs(['--help']).help, true);
+  });
+
+  it('parseCampaignArgs handles --spec, and a missing path is a usage error', () => {
+    const withObjective = parseCampaignArgs(['--spec', '/tmp/spec.json', 'the objective']);
+    assert.equal(withObjective.specPath, '/tmp/spec.json');
+    assert.equal(withObjective.objective, 'the objective');
+
+    // `--spec` alone is a complete campaign — a spec carries its own objective, so no positional
+    // is required and none is thrown for.
+    const specOnly = parseCampaignArgs(['--spec', '/tmp/spec.json']);
+    assert.equal(specOnly.specPath, '/tmp/spec.json');
+    assert.equal(specOnly.objective, '');
+
+    assert.throws(() => parseCampaignArgs(['--spec']), /--spec expects a path/);
+    assert.throws(() => parseCampaignArgs([]), /objective is required/, 'no spec and no objective still refuses');
   });
 
   it('resolveProjectRoot collapses a linked worktree onto its main repo', async () => {
@@ -3317,6 +3452,47 @@ describe('the delivery ceiling, end to end', () => {
 });
 
 // ===============================================================================================
+// 7b. DISPATCH — the ENGINEER's effort escalates when its orders carry no spec, and only then
+// ===============================================================================================
+
+type DispatchConfig = {
+  dispatch: { rules: { when: string; use: { harness: HarnessId; model?: string; effort?: ReasoningEffort }[] }[] };
+};
+
+/** A dispatch config whose configured effort is a value nothing here defaults to. */
+function dispatchConfigAt(effort: ReasoningEffort): DispatchConfig {
+  return {
+    dispatch: {
+      rules: [
+        { when: 'engineer', use: [{ harness: 'claude', effort }] },
+        { when: 'inspector', use: [{ harness: 'codex', effort }] },
+      ],
+    },
+  };
+}
+
+describe('dispatchFor — effort coupled to whether a spec was carried', () => {
+  it('an ENGINEER with no spec is escalated to UNSPECIFIED_BRIEF_EFFORT, not the configured effort', () => {
+    // Configured at something other than `xhigh` on purpose: if the override were applied
+    // unconditionally (or the configured value passed through unread), this would go green for
+    // the wrong reason.
+    assert.notEqual(UNSPECIFIED_BRIEF_EFFORT, 'medium');
+    const target = dispatchFor(dispatchConfigAt('medium'), 'ENGINEER', false);
+    assert.equal(target.effort, UNSPECIFIED_BRIEF_EFFORT);
+  });
+
+  it('an ENGINEER with a spec keeps the configured effort, unchanged', () => {
+    const target = dispatchFor(dispatchConfigAt('medium'), 'ENGINEER', true);
+    assert.equal(target.effort, 'medium');
+  });
+
+  it("the INSPECTOR's effort is unaffected by spec presence either way", () => {
+    assert.equal(dispatchFor(dispatchConfigAt('medium'), 'INSPECTOR', false).effort, 'medium');
+    assert.equal(dispatchFor(dispatchConfigAt('medium'), 'INSPECTOR', true).effort, 'medium');
+  });
+});
+
+// ===============================================================================================
 // 8. The CLI skin
 // ===============================================================================================
 
@@ -3465,6 +3641,137 @@ describe('army campaign (the command)', () => {
     // actually fail.
     assert.match(out, / view 2026-/);
     assert.match(out, /synchronous=NORMAL/, 'ARCHIVE_DURABILITY_NOTE is not rendered anywhere');
+  });
+});
+
+// ===============================================================================================
+// 8a. `--spec` — read, validated, and never silently dropped
+// ===============================================================================================
+
+/** A stub `CampaignResult`, for tests that only care what reached `runCampaign`. */
+function stubCampaignResult(): CampaignResult {
+  return {
+    campaignId: 'stub',
+    campaignRoot: '/tmp/stub-root',
+    project: '/tmp/stub-project',
+    taskId: 't-stub',
+    branch: 'army/t-stub',
+    status: 'done',
+    outcome: 'delivered',
+    attempts: [],
+    report: null,
+    verdict: null,
+    requestedRung: 0,
+    ceiling: 0,
+    deliveredRung: 0,
+    retriesExhausted: false,
+    delivery: null,
+    lease: { state: 'released', path: null, leaseId: null, reason: 'stub' },
+    notes: [],
+    exitCode: 0,
+  };
+}
+
+const VALID_SPEC_JSON = {
+  objective: 'Add a multiply function to calc.js',
+  filesInScope: ['calc.js'],
+  acceptance: ['`npm test` passes'],
+  behaviours: ['multiplying two negatives yields a positive'],
+  decisions: ['use plain `*`, no BigInt'],
+  constraints: ['do not touch add or subtract'],
+};
+
+describe('army campaign --spec', () => {
+  it('a spec that fails validation exits non-zero and prints the reason verbatim, plus the path', async () => {
+    const dir = mkTmp('spec-invalid');
+    const specPath = path.join(dir, 'spec.json');
+    // Missing every list field — `validateTechnicalSpec` refuses on the first one it checks.
+    fs.writeFileSync(specPath, JSON.stringify({ objective: 'x' }));
+
+    let err = '';
+    const code = await campaignCommand(['--spec', specPath], {
+      stdout: { write: () => undefined },
+      stderr: { write: (t) => void (err += t) },
+    });
+    assert.equal(code, 1);
+    assert.ok(err.includes(specPath), 'the spec path is missing from the error');
+    assert.match(err, /spec\.filesInScope must be an array of strings/);
+  });
+
+  it('invalid JSON in the spec file is refused the same way — no silent fallback', async () => {
+    const dir = mkTmp('spec-badjson');
+    const specPath = path.join(dir, 'spec.json');
+    fs.writeFileSync(specPath, '{ not json');
+    let err = '';
+    const code = await campaignCommand(['--spec', specPath], {
+      stdout: { write: () => undefined },
+      stderr: { write: (t) => void (err += t) },
+    });
+    assert.equal(code, 1);
+    assert.ok(err.includes(specPath));
+  });
+
+  it('a valid spec reaches runCampaign with options.spec set, with no positional objective needed', async () => {
+    const dir = mkTmp('spec-valid');
+    const specPath = path.join(dir, 'spec.json');
+    fs.writeFileSync(specPath, JSON.stringify(VALID_SPEC_JSON));
+
+    let captured: CampaignOptions | null = null;
+    const stub = stubCampaignResult();
+    const code = await campaignCommand(['--spec', specPath], {
+      stdout: { write: () => undefined },
+      stderr: { write: () => undefined },
+      runCampaignFn: async (options) => {
+        captured = options;
+        return stub;
+      },
+    });
+    assert.equal(code, stub.exitCode);
+    assert.ok(captured, 'runCampaign was never called');
+    const seen: CampaignOptions = captured;
+    assert.deepEqual(seen.spec, VALID_SPEC_JSON);
+    assert.equal(seen.objective, VALID_SPEC_JSON.objective);
+  });
+
+  it('a positional objective that disagrees with spec.objective is an error naming both', async () => {
+    const dir = mkTmp('spec-mismatch');
+    const specPath = path.join(dir, 'spec.json');
+    fs.writeFileSync(specPath, JSON.stringify(VALID_SPEC_JSON));
+
+    let err = '';
+    let called = false;
+    const code = await campaignCommand(['a completely different objective', '--spec', specPath], {
+      stdout: { write: () => undefined },
+      stderr: { write: (t) => void (err += t) },
+      runCampaignFn: async () => {
+        called = true;
+        return stubCampaignResult();
+      },
+    });
+    assert.equal(code, 1);
+    assert.ok(!called, 'runCampaign ran despite the disagreement');
+    assert.match(err, /a completely different objective/);
+    assert.match(err, /Add a multiply function to calc\.js/);
+  });
+
+  it('a positional objective that AGREES with spec.objective is accepted', async () => {
+    const dir = mkTmp('spec-agree');
+    const specPath = path.join(dir, 'spec.json');
+    fs.writeFileSync(specPath, JSON.stringify(VALID_SPEC_JSON));
+
+    let captured: CampaignOptions | null = null;
+    const stub = stubCampaignResult();
+    const code = await campaignCommand([VALID_SPEC_JSON.objective, '--spec', specPath], {
+      stdout: { write: () => undefined },
+      stderr: { write: () => undefined },
+      runCampaignFn: async (options) => {
+        captured = options;
+        return stub;
+      },
+    });
+    assert.equal(code, stub.exitCode);
+    assert.ok(captured, 'runCampaign was never called');
+    assert.deepEqual((captured as CampaignOptions).spec, VALID_SPEC_JSON);
   });
 });
 

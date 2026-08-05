@@ -34,6 +34,7 @@ import { runCampaign } from '../command/campaign.ts';
 import type { ArchiveConfig } from '../archive/archive.ts';
 import type { Env } from '../config/paths.ts';
 import type { Rung } from '../contracts/delivery.ts';
+import type { TechnicalSpec } from '../contracts/spec.ts';
 import type { GhStatus } from '../delivery/git.ts';
 import type { HarnessAdapter, HarnessId } from '../contracts/harness.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
@@ -53,6 +54,12 @@ import { cappedFindings } from './protocol.ts';
 export interface DispatchInput {
   /** The objective, exactly as the human approved it. */
   objective: string;
+  /**
+   * The spec, when the approved dispatch carried one. Threaded straight through to
+   * `runCampaign` as `options.spec` — exactly as `objective` is threaded, and for the same
+   * reason: this is the human's approval, not a new indirection to keep in step with it.
+   */
+  spec?: TechnicalSpec;
   cwd: string;
   env: Env;
   home: string;
@@ -112,6 +119,7 @@ export function runDispatch(input: DispatchInput): Promise<CampaignResult> {
     home: input.home,
     requestedRung: input.requestedRung,
     maxAttempts: input.maxAttempts,
+    ...(input.spec === undefined ? {} : { spec: input.spec }),
     ...(input.worktreeProvider === undefined ? {} : { worktreeProvider: input.worktreeProvider }),
     ...(input.worktreeRoot === undefined ? {} : { worktreeRoot: input.worktreeRoot }),
     ...(input.claudeBin === undefined ? {} : { claudeBin: input.claudeBin }),

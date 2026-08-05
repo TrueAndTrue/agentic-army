@@ -33,7 +33,18 @@ export type HarnessId = (typeof HARNESS_IDS)[number];
  * not a promise that every harness honours every level.
  *
  * NEVER downgrade the reasoning class to conserve quota (firstmate's hardest dispatch rule):
- * report that the strongest-class choice cannot proceed instead.
+ * report that the strongest-class choice cannot proceed instead. Draw this precisely, because
+ * `DEFAULT_DISPATCH` in `src/config/load.ts` now dispatches Engineers at `low` and a reader who
+ * only sees that will assume the rule above was quietly abandoned. It was not.
+ *
+ * What the rule forbids is SILENTLY TRADING CORRECTNESS FOR COST UNDER PRESSURE — dropping a
+ * class because quota is short, or a run looks expensive, and not saying so. That is absolute
+ * and this change does not touch it. What it does not forbid is a MEASURED DEFAULT CHOSEN ON
+ * EVIDENCE, where the cheaper class was shown to produce identical outcomes under a condition
+ * the system enforces — here, a complete spec, with automatic escalation to the top class when
+ * one is not guaranteed. The test that separates the two cases: if the reason for the lower
+ * class is a fact about the BUDGET, it is forbidden; if it is a fact about the measured OUTCOME
+ * under a guaranteed input, it is a default.
  */
 export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];

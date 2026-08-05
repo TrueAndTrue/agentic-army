@@ -279,11 +279,28 @@ default_ceiling = 0
 # When that day comes, one rule carries over verbatim: never downgrade reasoning
 # class to conserve quota. Report that the strongest-class choice cannot proceed
 # instead.
+#
+# THE ENGINEER RULE'S effort BELOW READS "low", NOT "xhigh" — READ THIS FIRST.
+#
+# A controlled trial ran one coding task at all five reasoning levels under two
+# briefs that differed only in whether the thinking had been done above. Under a
+# COMPLETE brief every level succeeded, including low — 4x cheaper and 4x faster
+# than xhigh for a byte-identical outcome. Under a THIN brief six of eight arms
+# failed on the same sentence a complete brief would have stated; xhigh was the
+# one level that still got there.
+#
+# So low is only the right default in a system that guarantees a complete spec,
+# and this file is one leg of that guarantee, not the whole of it: the commander
+# now interrogates you until it can fill a six-field spec, and a dispatch made
+# without one is escalated back to xhigh automatically (UNSPECIFIED_BRIEF_EFFORT
+# in campaign.ts's dispatchFor). This is a measured default, not a quota
+# downgrade — see the reasoning-class rule above REASONING_EFFORTS in
+# src/contracts/harness.ts for the line between the two.
 
 [[dispatch.rules]]
 when = "Any change to any file."
-use = [ { harness = "claude", model = "claude-sonnet-5", effort = "xhigh" } ]
-why = "Engineers build on Claude."
+use = [ { harness = "claude", model = "claude-sonnet-5", effort = "low" } ]
+why = "Engineers build on Claude. Effort is low by measured default, not by economy: a complete spec produced byte-identical output at low and xhigh, 4x cheaper and 4x faster. A brief dispatched without a complete spec never sees this value — UNSPECIFIED_BRIEF_EFFORT in campaign.ts's dispatchFor escalates it to xhigh first."
 
 [[dispatch.rules]]
 when = "An Engineer has claimed done and its branch needs review."

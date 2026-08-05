@@ -83,6 +83,7 @@ import { parse as parseTomlForTest } from 'smol-toml';
 // config loading — src/config/{paths,load}.ts
 import { armyHome, configPath } from '../src/config/paths.ts';
 import {
+  DEFAULT_DISPATCH,
   PROJECTS_SECTION,
   clampCeiling,
   loadConfig,
@@ -1107,6 +1108,53 @@ test('the config that `army init` actually writes parses cleanly', () => {
     'the static vendor split: Engineers on claude, Inspectors on codex',
   );
   assert.equal(config.dispatch.rules[1]?.use[0]?.effort, 'high');
+});
+
+/**
+ * The measured default itself. Engineers dispatch at `low` — a complete spec was shown to
+ * produce a byte-identical outcome to `xhigh` for 4x less cost and time — and the Inspector rule
+ * is untouched: a reviewer works from a branch it did not write and gets no spec advantage from
+ * that trial, so it keeps its own effort.
+ */
+test('DEFAULT_DISPATCH: Engineer effort is low, Inspector effort is unchanged', () => {
+  const engineer = DEFAULT_DISPATCH.rules.find((r) => r.use[0]?.harness === 'claude');
+  const inspector = DEFAULT_DISPATCH.rules.find((r) => r.use[0]?.harness === 'codex');
+  assert.equal(engineer?.use[0]?.effort, 'low', 'Engineer rule must dispatch at the measured default');
+  assert.equal(inspector?.use[0]?.effort, 'high', 'Inspector rule must be untouched by the Engineer change');
+});
+
+/**
+ * `low` is a DEFAULT, not a ceiling. A config that has already opted an Engineer into `xhigh` —
+ * by hand, or because it predates this change — must have that value survive parsing untouched,
+ * so nobody mistakes the new default for something that overrides an explicit setting.
+ */
+test('an explicit Engineer effort in the config overrides the low default', () => {
+  const toml = [
+    '[[dispatch.rules]]',
+    'when = "Any change to any file."',
+    'use = [ { harness = "claude", model = "claude-sonnet-5", effort = "xhigh" } ]',
+    'why = "this repo always wants the strongest class"',
+  ].join('\n');
+  const { config, warnings } = parseConfig(toml, '/tmp/h/config.toml');
+  assert.deepEqual(warnings, []);
+  assert.equal(config.dispatch.rules[0]?.use[0]?.effort, 'xhigh', 'explicit config value must survive');
+});
+
+/**
+ * `defaultConfigToml()` and `DEFAULT_DISPATCH` are documented as byte-compatible (see the
+ * comment above `DEFAULT_DISPATCH` in src/config/load.ts). Parse what `army init` actually
+ * writes and check the Engineer rule reads back at the same effort the in-memory default uses.
+ */
+test('the config.toml that `army init` writes parses back to Engineer effort low', () => {
+  const { config, warnings } = parseConfig(defaultConfigToml(), '/tmp/h/config.toml');
+  assert.deepEqual(warnings, []);
+  const engineer = config.dispatch.rules.find((r) => r.use[0]?.harness === 'claude');
+  assert.equal(engineer?.use[0]?.effort, 'low');
+  assert.equal(
+    engineer?.use[0]?.effort,
+    DEFAULT_DISPATCH.rules.find((r) => r.use[0]?.harness === 'claude')?.use[0]?.effort,
+    'the written file and the in-memory default must agree',
+  );
 });
 
 test('dispatch rules survive junk without taking a vendor offline', () => {

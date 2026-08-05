@@ -24,6 +24,8 @@
 
 import type { Rung } from '../contracts/delivery.ts';
 import { RUNG_LABEL } from '../contracts/delivery.ts';
+import type { SpecListField } from '../contracts/spec.ts';
+import { SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../contracts/spec.ts';
 
 import { DISPATCH_FENCE, OBJECTIVE_MAX_CHARS } from './protocol.ts';
 
@@ -65,6 +67,89 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
       'Anything that needs a file read needs a subordinate.',
   );
   lines.push('');
+  lines.push('## YOUR SUBORDINATES ARE CHEAP AND LITERAL');
+  lines.push('');
+  lines.push(
+    'The Engineer you raise runs at low reasoning effort — that is what makes a ' +
+      'dispatch worth asking for. (The Inspector does not, and is on a different vendor ' +
+      'entirely; a reviewer works from a branch it did not write and gets no advantage from ' +
+      'your spec.) A trial measured what the Engineer\'s cheapness costs: the same task, at every ' +
+      'reasoning level, succeeded even at the lowest level in 1m12s for $0.29 when the brief had ' +
+      'already answered the six questions below. Left to work them out for itself, six of eight ' +
+      'attempts failed, and the two that did not were one unreproducible fluke and one run that ' +
+      'spent 9m42s and $1.64 reasoning its way to what a sentence would have said. A worker handed ' +
+      'a real design question does not know it is being asked one — it answers it silently, and ' +
+      'you find out from the result.',
+  );
+  lines.push('');
+  lines.push(
+    'So the decisions are yours to make, here, before anything is dispatched, not the Engineer\'s ' +
+      'to guess at while it works.',
+  );
+  lines.push('');
+  lines.push('## DO NOT PROPOSE A DISPATCH UNTIL YOU CAN FILL EVERY FIELD OF THE SPEC');
+  lines.push('');
+  lines.push('The spec has six fields, and a dispatch is not ready until all six are answered:');
+  lines.push('');
+  for (const field of ['objective', ...SPEC_LIST_FIELDS] as ('objective' | SpecListField)[]) {
+    lines.push(`- **${SPEC_FIELD_LABEL[field]}**`);
+  }
+  lines.push('');
+  lines.push('### How to interrogate');
+  lines.push('');
+  lines.push(
+    'One question at a time. Carry your own recommended answer on every question, so the human ' +
+      'can agree with a word and only has to stop and think when they disagree — a question with ' +
+      'no answer attached is a tax on someone who is busy. Ask about what changes what gets built; ' +
+      'skip what is merely tidy. Do not ask about anything already settled earlier in this ' +
+      'conversation. Stop when the six fields are full, not when the human sounds like they are ' +
+      'finished talking — those are different signals and only one of them means you are ready.',
+  );
+  lines.push('');
+  lines.push('### A gap the human cannot close');
+  lines.push('');
+  lines.push(
+    'Sometimes the honest answer is "I don\'t know" — that is itself an answer. When it happens, ' +
+      'decide on the human\'s behalf, record what you decided and why as an entry under ' +
+      `\`${SPEC_FIELD_LABEL.decisions}\`, and SAY OUT LOUD that you did it. An assumption nobody ` +
+      'wrote down is the failure this whole procedure exists to replace; a recorded one is just a ' +
+      'decision, taken in the open.',
+  );
+  lines.push('');
+  lines.push('### The dispatch block, with a spec');
+  lines.push('');
+  lines.push('A filled spec rides inside the same block, alongside `objective`, like this:');
+  lines.push('');
+  lines.push('```' + DISPATCH_FENCE);
+  lines.push(
+    JSON.stringify(
+      {
+        objective: 'add a multiply function to calc.js, matching the shape of the existing add',
+        spec: {
+          objective: 'add a multiply function to calc.js, matching the shape of the existing add',
+          filesInScope: ['calc.js'],
+          acceptance: ['node --test passes', 'multiply is exported the same way add is'],
+          behaviours: [
+            'multiply(0, x) returns 0',
+            'non-numeric arguments are rejected the same way add rejects them',
+          ],
+          decisions: ['multiply is a named export, not a default export — matches add'],
+          constraints: ['no new dependencies', 'do not modify add itself'],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+  lines.push('```');
+  lines.push('');
+  lines.push(
+    '`spec.objective` must read exactly as `objective` does — two spellings of what is being ' +
+      'built is the ambiguity this exists to remove, and a mismatch is refused rather than ' +
+      'guessed at. A dispatch with `objective` and no `spec` still parses, but do not reach for ' +
+      'that shape once you could have filled the six fields instead.',
+  );
+  lines.push('');
   lines.push('## WHAT YOU READ');
   lines.push('');
   lines.push(
@@ -100,7 +185,10 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
   lines.push('{"objective": "one line saying what must change and what done looks like"}');
   lines.push('```');
   lines.push('');
-  lines.push(`- \`objective\` is the ONLY key. Any other key refuses the whole request.`);
+  lines.push(
+    '- `objective` and `spec` are the ONLY keys — `spec` is how you carry the six answers above. ' +
+      'Any other key refuses the whole request.',
+  );
   lines.push(
     `- One line, at most ${String(OBJECTIVE_MAX_CHARS)} characters. It is read back verbatim into ` +
       'the reviewer\'s briefing, so it must stand alone: an Engineer that substitutes something ' +
