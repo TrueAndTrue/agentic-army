@@ -260,6 +260,23 @@ export interface TrialSpec {
   mode: TrialMode;
   /** Absolute path of the directory the arm workspaces and the result are written under. */
   outDir: string;
+  /**
+   * Per-arm wall-clock ceiling, in ms. Absent means the adapter's own default.
+   *
+   * That default (`DEFAULTS.closeGraceMs` in `src/harness/claude.ts`) is 300_000 — five minutes
+   * after `runSoldier` closes stdin before the adapter escalates to SIGTERM — and for a campaign
+   * soldier that is a reasonable backstop. A trial is a different animal: it is explicitly for
+   * tasks that may take five to fifteen minutes, so that same constant is a silent hard ceiling on
+   * every arm, and an arm that is still working correctly at 300.2s is killed exactly as dead as
+   * one that hung.
+   *
+   * The distinction that matters is CENSORED versus FAILED. An arm that hit this ceiling produced
+   * no result because the clock ran out, not because the work was wrong — a `status: 'timeout'` row
+   * sitting next to nine rows of real pass/fail data. A reader who averages it in with the rest has
+   * measured the ceiling, not the worker, and the report has to say so out loud rather than let a
+   * zero look like the same kind of zero as an arm that tried and got it wrong.
+   */
+  armTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -323,6 +340,11 @@ export interface TrialResult {
    * result that ran anyway.
    */
   vacuous: readonly string[];
+  /**
+   * Echo of `TrialSpec.armTimeoutMs`, carried here so `renderTrialResult` can name the ceiling in
+   * seconds next to a timed-out arm without threading the spec itself through to render time.
+   */
+  armTimeoutMs?: number;
 }
 
 /** `passed / total` for one kind, over a finished arm. */

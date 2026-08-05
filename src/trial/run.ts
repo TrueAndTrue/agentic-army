@@ -53,7 +53,7 @@ import type {
 
 import { buildSoldierSpec, runSoldier } from '../command/campaign.ts';
 import { createCampaign } from '../archive/archive.ts';
-import { claudeAdapter } from '../harness/claude.ts';
+import { claudeAdapter, createClaudeAdapter } from '../harness/claude.ts';
 
 import { collectEvidence, inspectSeed, materializeArm } from './workspace.ts';
 import { evaluateChecks, vacuousJobChecks } from './checks.ts';
@@ -184,7 +184,17 @@ function isResultEvent(event: SoldierEvent): event is ResultEvent {
 export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
   const spec = options.spec;
   const now = options.now ?? Date.now;
-  const adapter = options.adapter ?? claudeAdapter;
+  // The default adapter only, and only when the trial itself minted it: an INJECTED adapter is
+  // the caller's own (a test's fake, or a future CLI override) and reconfiguring it out from under
+  // the caller would be surprising and unnecessary — the caller already had every chance to pass
+  // its own `closeGraceMs`. `spec.armTimeoutMs` exists to raise the adapter's silent five-minute
+  // ceiling (see the field's doc in `src/contracts/trial.ts`), so it is threaded through only on
+  // the path that constructs the adapter in the first place.
+  const adapter =
+    options.adapter ??
+    (spec.armTimeoutMs !== undefined
+      ? createClaudeAdapter({ closeGraceMs: spec.armTimeoutMs })
+      : claudeAdapter);
   const exec = options.exec ?? defaultCheckExec;
   const onProgress = options.onProgress;
   const home = options.home;
@@ -209,6 +219,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
       outDir: spec.outDir,
       arms: [],
       vacuous,
+      ...(spec.armTimeoutMs !== undefined ? { armTimeoutMs: spec.armTimeoutMs } : {}),
     };
   }
 
@@ -341,5 +352,6 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     outDir: spec.outDir,
     arms,
     vacuous: [],
+    ...(spec.armTimeoutMs !== undefined ? { armTimeoutMs: spec.armTimeoutMs } : {}),
   };
 }

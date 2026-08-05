@@ -312,6 +312,32 @@ orders = "do it"
     assert.equal(spec.checks.length, 1);
     assert.ok(warnings.some((w) => w.includes('frobnicate')), JSON.stringify(warnings));
   });
+
+  // ---------------------------------------------------------------------------------------------
+  // arm_timeout_ms — the per-arm wall-clock ceiling. Absent means "the adapter's own default";
+  // present means real money is riding on the value, so anything short of a positive integer
+  // throws rather than being coerced. See the field's doc in src/contracts/trial.ts.
+  // ---------------------------------------------------------------------------------------------
+
+  it('parses arm_timeout_ms to armTimeoutMs', () => {
+    const { text, specPath } = specFor('orders = "x"\narm_timeout_ms = 600000', 'arm-timeout-ok');
+    const { spec } = parseTrialSpec(text, specPath, '/tmp/out');
+    assert.equal(spec.armTimeoutMs, 600000);
+  });
+
+  it('leaves armTimeoutMs undefined when arm_timeout_ms is absent', () => {
+    const { text, specPath } = specFor('orders = "x"', 'arm-timeout-absent');
+    const { spec } = parseTrialSpec(text, specPath, '/tmp/out');
+    assert.equal(spec.armTimeoutMs, undefined);
+  });
+
+  for (const bad of ['0', '-1', '1.5', '"600000"', 'true']) {
+    it(`throws on arm_timeout_ms = ${bad}, naming the key`, () => {
+      const label = `arm-timeout-bad-${bad.replace(/[^a-z0-9]/gi, '')}`;
+      const { text, specPath } = specFor(`orders = "x"\narm_timeout_ms = ${bad}`, label);
+      assert.throws(() => parseTrialSpec(text, specPath, '/tmp/out'), /arm_timeout_ms/);
+    });
+  }
 });
 
 // ===============================================================================================
@@ -465,6 +491,23 @@ describe('renderTrialResult', () => {
     const serial = renderTrialResult(trialResult({ mode: 'serial' }));
     assert.match(concurrent, /concurrent mode/);
     assert.doesNotMatch(serial, /concurrent mode/);
+  });
+
+  it('a timed-out arm with a known armTimeoutMs prints the ceiling in seconds and the caveat', () => {
+    const out = renderTrialResult(
+      trialResult({
+        armTimeoutMs: 600_000,
+        arms: [armResult({ arm: trialArm({ id: 'timed-out' }), status: 'timeout' })],
+      }),
+    );
+    assert.match(out, /600s/);
+    assert.match(out, /CENSORED/);
+  });
+
+  it('a result with no timed-out arm prints neither the ceiling nor the caveat', () => {
+    const out = renderTrialResult(trialResult({ armTimeoutMs: 600_000 }));
+    assert.doesNotMatch(out, /600s/);
+    assert.doesNotMatch(out, /CENSORED/);
   });
 });
 

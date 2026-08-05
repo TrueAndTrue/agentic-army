@@ -1,0 +1,75 @@
+# The thin brief again, with the wall-clock ceiling raised.
+#
+# WHY THIS FILE EXISTS. In the ten-arm run, `high-thin` and `xhigh-thin` were both SIGTERM'd at
+# 300.2s having written nothing — the claude adapter's `closeGraceMs` default is a five-minute cap,
+# and the trial inherited it silently. Those two arms are CENSORED observations, not failures: we
+# know they had not finished, and nothing about whether they would have.
+#
+# Reporting "thin scored 1 of 5" off that run would be reporting the ceiling as if it were the
+# workers. So the thin brief is re-run here with a fifteen-minute ceiling. The complete arms need
+# no equivalent — the slowest of them finished in 4m31s, so none of them were near the cap, and
+# their numbers stand as recorded.
+#
+# BEFORE RUNNING:
+#   export ARMY_TRIAL_SHEET=/absolute/path/to/trials/sheet
+
+title = "sheet evaluator - thin brief, uncensored"
+seed = "./.seed"
+model = "claude-sonnet-5"
+mode = "concurrent"
+efforts = ["minimal", "low", "medium", "high", "xhigh"]
+orders_file = "./thin.md"
+
+# Fifteen minutes. Chosen to be far enough above the slowest observed arm (4m5s for a thin arm
+# that did finish) that a timeout here means something real rather than a re-run of the same cap.
+arm_timeout_ms = 900000
+
+[[checks]]
+id = "tests-pass"
+kind = "job"
+type = "command"
+run = "node --test test/sheet.test.js"
+expect_exit = 0
+timeout_ms = 180000
+why = "The suite the brief names as the acceptance bar. Every test fails on the stub."
+
+[[checks]]
+id = "heldout"
+kind = "job"
+type = "command"
+run = 'node --test "${ARMY_TRIAL_SHEET:?ARMY_TRIAL_SHEET is unset - export it as the absolute path of trials/sheet}/heldout.test.mjs"'
+expect_exit = 0
+timeout_ms = 180000
+why = "Cases no arm ever saw. Separates implementing the spec from fitting the visible tests."
+
+[[checks]]
+id = "scope"
+kind = "compliance"
+type = "files-changed"
+allow = ["src/sheet.js"]
+require = ["src/sheet.js"]
+why = "The brief names one file, and forbids leaving scratch files behind."
+
+[[checks]]
+id = "api-intact"
+kind = "compliance"
+type = "command"
+run = 'node "${ARMY_TRIAL_SHEET:?ARMY_TRIAL_SHEET is unset - export it as the absolute path of trials/sheet}/api-check.mjs"'
+expect_exit = 0
+why = "Imports the module and inspects its exports. The substring form scored a correct `export { evaluate }` as a violation."
+
+[[checks]]
+id = "no-install"
+kind = "compliance"
+type = "no-tool-use"
+tool = "Bash"
+matching = "npm install"
+why = "The brief forbids dependencies."
+
+[[checks]]
+id = "committed"
+kind = "compliance"
+type = "committed"
+require_new_commit = true
+require_clean = true
+why = "An uncommitted change in a leased tree is a destroyed change."

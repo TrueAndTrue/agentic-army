@@ -355,9 +355,15 @@ same brief, same seed commit, one directory per arm, one thing changed. It exist
 effort is buying anything.
 
 A trial is a TOML file naming a seed repository, a brief, a set of efforts, and the checks that
-decide whether an arm succeeded. `trials/duration/` is a worked example. Run `prepare.mjs`
-there first — it mints the seed as a real repository, which is checked in as plain files
-because a nested `.git` cannot live inside this checkout.
+decide whether an arm succeeded. `trials/duration/` and `trials/sheet/` are worked examples.
+Run `trials/prepare.mjs <name>` first — it mints that trial's seed as a real repository, which
+is checked in as plain files because a nested `.git` cannot live inside this checkout.
+
+`trials/sheet/` is the one built to discriminate: a formula evaluator with a tokeniser, a
+precedence-correct parser, cycle detection that must not take the rest of the sheet down with
+it, and an empty-cell rule the obvious implementation gets wrong. It carries a second job check
+run against a **held-out suite the arms never see**, which is what separates implementing the
+specification from fitting the visible tests.
 
 Three things are measured, and none of them is the worker's opinion:
 
@@ -457,15 +463,9 @@ end to end, Engineer through Inspector to durability; `chat`, against real claud
 one objective proposed, approved at the prompt, dispatched through the gate to a rung-0
 delivery, plus the refusal when the commander was asked to read a file, and a live interrupt
 mid-answer; `view`, `view --list`, `view --source db`,
-`view --follow`; `rebuild`; `trial`, twice against live claude — a five-arm effort sweep and a
-ten-arm brief-by-effort cross, 15 real Engineers in 15 directories. All 15 did the job; two
-failed a compliance check by leaving an untracked scratch file behind, which is the harness
-catching exactly what it was built to catch. **The effort axis produced no measurable
-difference in correctness on that task, and no usable timing signal either** — two arms sent
-the identical effort value finished 23s and 45s apart, a spread wider than anything between
-effort levels. Read that as "this task was too easy to separate them", not as "effort does not
-matter": a benchmark that cannot distinguish its conditions has measured the task, not the
-variable. The `army` spelling in the first column of
+`view --follow`; `rebuild`; `trial`, five times against live claude across two seeds — 32 arms
+spawned, 30 of which produced a result. What that measured is written up under
+[What a trial measured](#what-a-trial-measured) below. The `army` spelling in the first column of
 [First run](#first-run) was checked too, against a built `dist/` on `PATH`, because the claim
 that suggestions match your invocation is only interesting if it holds in more than one form.
 
@@ -485,6 +485,54 @@ that suggestions match your invocation is only interesting if it holds in more t
 - **Raising a ceiling from a real TTY.** Only the non-interactive refusal was observed.
 - **Windows.** Untested, and never claimed otherwise. Paths are built with `node:path` and the
   glyph set falls back to ASCII on a codepage-437 console, but neither has been run there.
+
+## What a trial measured
+
+Two seeds, five runs, 32 arms. Every number below is off artifacts — the workspace's git state
+and the recorded event stream — never off what a worker said about itself.
+
+**The first seed could not separate its conditions.** A duration-string parser, 15 arms: all 15
+did the job, at every effort level, under both briefs. Two arms sent the *identical* effort
+value finished 23s and 45s apart, a spread wider than anything between effort levels. That is a
+benchmark measuring the task rather than the variable, and the honest report of it is "too easy",
+not "effort does not matter".
+
+**The second seed separated them cleanly.** A spreadsheet formula evaluator — tokeniser,
+precedence-correct parser, memoised evaluation, cycle detection that must not take the rest of
+the sheet down with it, and an empty-cell rule the obvious implementation gets wrong. Two briefs
+carrying identical constraint sections, differing only in whether the thinking had been done
+above. Scored against the visible suite *and* a held-out suite no arm ever saw.
+
+| brief | effort | job | wall | cost |
+|---|---|---|---|---|
+| complete | minimal | pass | 55s | $0.48 |
+| complete | **low** | **pass** | **1m12s** | **$0.29** |
+| complete | medium | pass | 1m38s | $0.62 |
+| complete | high | pass | 3m44s | $0.93 |
+| complete | xhigh | pass | 4m31s | $1.27 |
+| thin | minimal | 1 of 2 runs | ~2m50s | $0.71 |
+| thin | low | fail | ~3m20s | $0.71 |
+| thin | medium | fail | ~4m10s | $0.95 |
+| thin | high | fail | 5m49s | $1.03 |
+| thin | **xhigh** | **pass** | **9m42s** | **$1.64** |
+
+The complete brief succeeded at **every** effort level, including the lowest. The thin brief
+succeeded reliably only at the highest — and the one low-effort thin arm that passed did not
+reproduce, the same cell failing when it was run again.
+
+**The two boldface rows are the finding.** Identical outcome — both suites green, every
+constraint obeyed — for **8× the wall clock and 5.7× the cost**. Maximum reasoning effort can
+substitute for a specification. It is the most expensive way to buy one.
+
+The failures name their own mechanism rather than merely correlating. Six of the eight thin arms
+failed on `-0` normalisation, and one also scanned a range column-major when choosing which error
+to surface. Both rules are stated in the complete brief and appear **nowhere in the visible
+tests**. The complete arms did not derive them; they were told them.
+
+Two caveats the numbers carry. Wall-clock figures come from concurrent runs, so they compare
+arms against each other and not against anything recorded elsewhere. And `minimal` does not exist
+in claude — it is mapped up to `low` — so those two rows are byte-identical invocations, which is
+where the run-to-run variance above was measured from.
 
 ## License
 

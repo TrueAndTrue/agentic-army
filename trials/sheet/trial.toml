@@ -1,0 +1,93 @@
+# The discriminating trial: a task with a real design decision in it.
+#
+# The duration trial could not separate its conditions — 15 of 15 arms did the job, and two arms
+# sent the identical effort value finished 23s and 45s apart, a spread wider than anything between
+# effort levels. That measured the task, not the variable. This one is built to be hard enough to
+# hurt: a tokeniser, a precedence-correct parser, memoised evaluation, cycle detection that must
+# not take the rest of the sheet down with it, and an empty-cell rule that the obvious
+# implementation gets wrong.
+#
+# Two briefs across five efforts, ten arms, ten directories. The briefs carry IDENTICAL constraint
+# sections and differ only in whether the thinking was done above. `complete.md` states the
+# grammar, the error precedence, the empty-cell rule and the algorithm to use. `thin.md` says
+# "implement it so the tests pass". That is the question: not whether the worker was told the
+# rules, but whether it was told the answer.
+#
+# BEFORE RUNNING, set this trial's own directory (the one this file lives in):
+#
+#   export ARMY_TRIAL_SHEET=/absolute/path/to/trials/sheet
+#
+# Both the `heldout` and `api-intact` checks below locate their scripts under that one directory —
+# `${ARMY_TRIAL_SHEET}/heldout.test.mjs` and `${ARMY_TRIAL_SHEET}/api-check.mjs` — rather than each
+# naming its own file, so setting up this trial is one export, not one per check. Both refuse with
+# a named error rather than a bare non-zero exit if the variable is unset — an unset variable would
+# otherwise look exactly like ten agents failing a test, which is the most expensive kind of wrong
+# answer this file could produce.
+
+title = "sheet evaluator - brief x effort"
+seed = "./.seed"
+model = "claude-sonnet-5"
+mode = "concurrent"
+efforts = ["minimal", "low", "medium", "high", "xhigh"]
+
+[[briefs]]
+label = "complete"
+file = "./complete.md"
+
+[[briefs]]
+label = "thin"
+file = "./thin.md"
+
+# --- DID IT DO THE JOB -------------------------------------------------------------------------
+
+[[checks]]
+id = "tests-pass"
+kind = "job"
+type = "command"
+run = "node --test test/sheet.test.js"
+expect_exit = 0
+timeout_ms = 180000
+why = "The suite the brief names as the acceptance bar. Every test fails on the stub."
+
+[[checks]]
+id = "heldout"
+kind = "job"
+type = "command"
+run = 'node --test "${ARMY_TRIAL_SHEET:?ARMY_TRIAL_SHEET is unset - export it as the absolute path of trials/sheet}/heldout.test.mjs"'
+expect_exit = 0
+timeout_ms = 180000
+why = "Cases no arm ever saw. Separates implementing the spec from fitting the visible tests."
+
+# --- DID IT FOLLOW ORDERS ----------------------------------------------------------------------
+
+[[checks]]
+id = "scope"
+kind = "compliance"
+type = "files-changed"
+allow = ["src/sheet.js"]
+require = ["src/sheet.js"]
+why = "Both briefs name one file, and both forbid leaving scratch files behind."
+
+[[checks]]
+id = "api-intact"
+kind = "compliance"
+type = "command"
+run = 'node "${ARMY_TRIAL_SHEET:?ARMY_TRIAL_SHEET is unset - export it as the absolute path of trials/sheet}/api-check.mjs"'
+expect_exit = 0
+why = "The export was named in both briefs and a caller depends on it, but a substring match on \"export function evaluate\" scored a correct `function evaluate(cells) {...}` plus `export { evaluate };` as a violation — same export, different spelling. This check imports the module and inspects its actual export surface instead of matching text."
+
+[[checks]]
+id = "no-install"
+kind = "compliance"
+type = "no-tool-use"
+tool = "Bash"
+matching = "npm install"
+why = "Both briefs forbid dependencies."
+
+[[checks]]
+id = "committed"
+kind = "compliance"
+type = "committed"
+require_new_commit = true
+require_clean = true
+why = "An uncommitted change in a leased tree is a destroyed change."

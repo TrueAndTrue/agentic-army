@@ -20,8 +20,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = join(here, 'seed');
-const target = join(here, '.seed');
+const which = process.argv[2];
+
+if (which === undefined) {
+  console.error('usage: prepare.mjs <trial-directory-name>   e.g. duration, sheet');
+  process.exit(1);
+}
+
+const source = join(here, which, 'seed');
+const target = join(here, which, '.seed');
 
 if (!existsSync(source)) {
   console.error(`no seed source at ${source}`);
@@ -40,7 +47,7 @@ git('init', '--quiet', '--initial-branch=main');
 git('config', 'user.email', 'seed@agentic-army.invalid');
 git('config', 'user.name', 'Trial Seed');
 git('add', '--all');
-git('commit', '--quiet', '--message', 'seed: duration parser with known defects');
+git('commit', '--quiet', '--message', `seed: ${which}`);
 
 const head = git('rev-parse', 'HEAD').toString().trim();
 console.log(`${target}\n${head}`);

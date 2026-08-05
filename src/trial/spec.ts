@@ -143,6 +143,28 @@ function parseBriefs(raw: unknown, specDir: string): ResolvedBrief[] {
 // Efforts and arms
 // -------------------------------------------------------------------------------------------
 
+/**
+ * `arm_timeout_ms` -> `TrialSpec.armTimeoutMs`. See the field's doc in `src/contracts/trial.ts`
+ * for why it exists; this is the strict half.
+ *
+ * Absent means "use the adapter's own default" and is left undefined rather than defaulted here
+ * — inventing a number in the parser would hide the adapter's actual ceiling behind a second one.
+ * Present means it is about to gate real spend on a real experiment, so anything that is not
+ * cleanly a positive integer of milliseconds THROWS rather than being coerced or rounded: a typo'd
+ * `arm_timeout_ms = 0` silently ignored would run every arm against the adapter's five-minute
+ * default while the operator believes they raised it, and that is a worse outcome than a spec that
+ * refuses to parse.
+ */
+function parseArmTimeoutMs(raw: unknown): number | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) {
+    throw new Error(
+      `arm_timeout_ms: expected a positive integer number of milliseconds, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return raw;
+}
+
 function parseEfforts(raw: unknown): ReasoningEffort[] {
   if (raw === undefined) return [...REASONING_EFFORTS];
   if (!Array.isArray(raw) || raw.length === 0) {
@@ -369,6 +391,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
   'orders_file',
   'briefs',
   'checks',
+  'arm_timeout_ms',
 ]);
 
 const DEFAULT_MODEL = 'claude-sonnet-5';
@@ -424,6 +447,7 @@ export function parseTrialSpec(text: string, specPath: string, outDir: string): 
 
   const arms = buildArms(efforts, briefs, model);
   const checks = parseChecks(data['checks'], warnings);
+  const armTimeoutMs = parseArmTimeoutMs(data['arm_timeout_ms']);
 
   for (const key of Object.keys(data)) {
     if (!KNOWN_TOP_LEVEL_KEYS.has(key)) {
@@ -431,6 +455,14 @@ export function parseTrialSpec(text: string, specPath: string, outDir: string): 
     }
   }
 
-  const spec: TrialSpec = { title, seed, arms, checks, mode, outDir };
+  const spec: TrialSpec = {
+    title,
+    seed,
+    arms,
+    checks,
+    mode,
+    outDir,
+    ...(armTimeoutMs !== undefined ? { armTimeoutMs } : {}),
+  };
   return { spec, warnings };
 }

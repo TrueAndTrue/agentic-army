@@ -84,6 +84,24 @@ function renderTable(arms: readonly ArmResult[]): string[] {
 // Failures, statuses, and the two disclosures the mode and the effort mapping owe the reader
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * One line for an arm whose `status` was not `'ok'`.
+ *
+ * `'timeout'` gets its own wording rather than the generic `status timeout`: it is the one status
+ * this file owes an explanation to, because it is not a report of what the worker did — it is a
+ * report that the clock ran out before the worker could report anything at all. `armTimeoutMs`,
+ * when known, names the ceiling in seconds so the reader does not have to go dig it out of the
+ * spec to know how much runway the arm actually had.
+ */
+function statusLine(result: ArmResult, armTimeoutMs: number | undefined): string {
+  if (result.status !== 'timeout') {
+    return `${result.arm.id}: status ${result.status}`;
+  }
+  const ceiling =
+    armTimeoutMs === undefined ? '' : ` (the ${(armTimeoutMs / 1000).toFixed(0)}s per-arm ceiling)`;
+  return `${result.arm.id}: hit the wall-clock ceiling and was killed before it produced a result — status timeout${ceiling}`;
+}
+
 function renderFailures(result: ArmResult): string[] {
   const failed = result.checks.filter((check) => !check.passed);
   if (failed.length === 0) return [];
@@ -154,7 +172,16 @@ export function renderTrialResult(result: TrialResult): string {
 
   const notOk = result.arms.filter((r) => r.status !== 'ok');
   if (notOk.length > 0) {
-    for (const r of notOk) lines.push(`${r.arm.id}: status ${r.status}`);
+    for (const r of notOk) lines.push(statusLine(r, result.armTimeoutMs));
+    lines.push('');
+  }
+
+  const timedOut = result.arms.some((r) => r.status === 'timeout');
+  if (timedOut) {
+    lines.push(
+      'a timed-out arm produced no result at all — it is a CENSORED observation, not a failed one, ' +
+        'and must not be read as a worker that tried the task and got it wrong.',
+    );
     lines.push('');
   }
 

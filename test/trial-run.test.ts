@@ -386,6 +386,60 @@ describe('runTrial — arms', () => {
 });
 
 // ===============================================================================================
+// armTimeoutMs — the per-arm wall-clock ceiling (see src/contracts/trial.ts for the field's why)
+// ===============================================================================================
+
+describe('runTrial — armTimeoutMs', () => {
+  test('an injected adapter is used as-is when armTimeoutMs is set — the trial does not construct its own', async () => {
+    const seed = makeSeed('armtimeout-injected');
+    const home = mkTmp('armtimeout-injected-home');
+    const outDir = mkTmp('armtimeout-injected-out');
+    const handle = makeFakeAdapter(() => scriptedEvents());
+
+    const spec: TrialSpec = {
+      title: 'armTimeoutMs injected-adapter trial',
+      seed,
+      arms: [arm({ id: 'arm-a' })],
+      checks: [],
+      mode: 'concurrent',
+      outDir,
+      armTimeoutMs: 600_000,
+    };
+
+    const result = await runTrial({ spec, home, adapter: handle.adapter });
+
+    // If runTrial ever built its own adapter instead of honouring the injected one, the fake
+    // would never be spawned and this arm would instead try (and fail) to launch a real `claude`.
+    assert.equal(
+      handle.spawnCount,
+      1,
+      'an injected adapter must be spawned as-is; the trial has no business reconfiguring it',
+    );
+    assert.equal(result.arms[0]?.status, 'ok');
+  });
+
+  test('TrialResult.armTimeoutMs round-trips from the spec', async () => {
+    const seed = makeSeed('armtimeout-roundtrip');
+    const home = mkTmp('armtimeout-roundtrip-home');
+    const outDir = mkTmp('armtimeout-roundtrip-out');
+    const handle = makeFakeAdapter(() => scriptedEvents());
+
+    const spec: TrialSpec = {
+      title: 'armTimeoutMs roundtrip trial',
+      seed,
+      arms: [arm({ id: 'arm-a' })],
+      checks: [],
+      mode: 'concurrent',
+      outDir,
+      armTimeoutMs: 42_000,
+    };
+
+    const result = await runTrial({ spec, home, adapter: handle.adapter });
+    assert.equal(result.armTimeoutMs, 42_000);
+  });
+});
+
+// ===============================================================================================
 // The --effort drift detector
 // ===============================================================================================
 
