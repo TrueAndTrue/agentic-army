@@ -102,6 +102,18 @@ export interface EngineerOrdersInput {
    */
   previousMissingBehaviours?: readonly number[];
   /**
+   * One supervisor-written sentence about a previous attempt that failed at the HARNESS level —
+   * a timeout, a crash, a report that never validated — rather than at a gate. Present only on a
+   * retry after such a failure, the same way `previousAcceptance` rides only after a gate
+   * failure: an attempt can end with no verdict and no gate output at all, and the fresh
+   * Engineer inheriting that attempt's worktree deserves one line saying what became of its
+   * predecessor, e.g. `attempt 1 ended with adapter status timeout and produced no report`.
+   *
+   * Supervisor-origin: composed by the campaign from the adapter's own status, never from
+   * anything the previous Engineer wrote.
+   */
+  previousFailure?: string;
+  /**
    * The commander's spec, when the dispatch carried one. Supervisor-origin, approved by a human
    * before this Engineer existed — the opposite direction from `previousVerdict` above, which is
    * why it is safe to render here in full. See `src/contracts/spec.ts` for what it buys.
@@ -162,6 +174,16 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
       lines.push('');
       for (const command of input.spec.verify) lines.push(`- \`${command}\``);
       lines.push('');
+      // True since Fix A: `verifyAllowRules` turns each approved verify command into an exact
+      // Bash allow rule on this Engineer's own loadout. Without this sentence the field failure
+      // repeats in miniature — a worker that has just read the loadout section believes bare
+      // `node` is off-limits and skips the one check its orders told it to run.
+      lines.push(
+        'These exact commands are within your authority to run: each one was approved by a human ' +
+          'with the spec and is on your Bash allow-list VERBATIM. Run them exactly as written — ' +
+          'a variation (an added flag, a different path) is a different command and is not.',
+      );
+      lines.push('');
     }
   } else {
     lines.push('## NO SPEC WAS PROVIDED');
@@ -172,6 +194,22 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
         'yourself: scope, acceptance, edge cases, the lot. Every decision you make in their ' +
         'place MUST be recorded in your report, one finding each, so the next attempt is not ' +
         'built on an assumption nobody else can see.',
+    );
+    lines.push('');
+  }
+
+  // Same prominence as the gate and verdict sections below, and the same direction of travel:
+  // this is the SUPERVISOR's account of what happened to the previous attempt, not the previous
+  // Engineer's. One sentence, because that is all the campaign knows — a timed-out process left
+  // no findings to itemise, and padding the line out would imply it did.
+  if (input.previousFailure !== undefined) {
+    lines.push('## YOUR PREVIOUS ATTEMPT DID NOT COMPLETE');
+    lines.push('');
+    lines.push(input.previousFailure);
+    lines.push('');
+    lines.push(
+      'This is the same worktree that attempt worked in — inspect `git status` and `git log` ' +
+        'before assuming a clean slate, and commit or build on whatever is already there.',
     );
     lines.push('');
   }
@@ -270,6 +308,17 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
     '- A refusal is not a wall to report back about. It means you reached for the wrong tool: ' +
       'use `Read` instead of `cat`, and try again. Reporting `blocked` because Bash refused ' +
       '`cat` wastes the whole attempt.',
+  );
+  // MEASURED on the second live failure this section carries a scar from: an Engineer whose
+  // verify command missed the allow-list retried the same denied command three times and timed
+  // out. The bullet above says "try again" and means "with a different TOOL" — a worker under
+  // pressure read it as "retry the command", so the distinction is now spelled out.
+  lines.push(
+    '- A permission denial is a fact about your loadout, not a transient error: the allow-list ' +
+      'is fixed for the life of this process, so the SAME command will be denied every time. ' +
+      'Never retry a denied command verbatim. If no allowed tool can do what a denied command ' +
+      'did, and that blocks an acceptance criterion, stop and report `blocked`, naming the ' +
+      'denied command in your summary.',
   );
   lines.push('');
   lines.push('## YOUR WORKING ENVIRONMENT');

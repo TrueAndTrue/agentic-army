@@ -39,6 +39,63 @@
  * `OBJECTIVE_MAX_CHARS` and it is here for the same reason.
  */
 
+/**
+ * The command spellings every worker is denied, no override, at any rank.
+ *
+ * THE ONE COPY. `src/command/permissions.ts` re-exports this list and derives its
+ * `Bash(<spelling>:*)` deny rules from it — the enforcement lives there; the spellings live here
+ * because the spec validator below also reads them, and `contracts` is the leaf layer: a
+ * `contracts -> command` import would point the dependency arrows the wrong way, and a second
+ * hand-maintained copy would be a second thing to keep in step, where the copy that drifts is the
+ * one that is enforced.
+ *
+ * Why the VALIDATOR reads a permissions list at all: a field failure. A commander is free to put
+ * any command into `spec.verify`, the human approves it, and Fix A turns each approved command
+ * into an exact Bash allow rule for the Engineer — but deny beats allow in claude's engine, so a
+ * verify command that collides with one of these spellings is dead on arrival: the Engineer is
+ * refused it on every try, the acceptance gate runs it anyway, and nobody learns why until the
+ * retry budget is gone. Refusing the spec up front, with the entry and the rule named, is the
+ * cheap version of that afternoon.
+ */
+export const DENIED_COMMAND_SPELLINGS: readonly string[] = Object.freeze([
+  'git push --force',
+  'git push -f',
+  'git push --force-with-lease',
+  'git push --mirror',
+  'git push --delete',
+  'npm publish',
+  'pnpm publish',
+  'yarn publish',
+  'gh pr merge',
+  'gh api',
+  'gh auth token',
+]);
+
+/**
+ * Lower-cased, whitespace-collapsed, trimmed — the spelling-insensitive form both sides of the
+ * collision check are compared in. `GIT  push --Force-with-lease origin x` is the same command.
+ */
+function normalizeCommand(command: string): string {
+  return command.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * The denied spelling a verify command collides with, or `null`.
+ *
+ * A STRING-PREFIX match, deliberately, because that is what the deny rule is: `Bash(x:*)` in
+ * claude's rule grammar constrains the start of the command line and nothing after it, so
+ * `git push --force-with-lease origin x` is exactly as dead as `npm publish` bare. Token-wise
+ * matching would call `git push --force-with-lease` unrelated to the `git push --force` rule that
+ * also refuses it. `git push origin x` starts with no denied spelling and passes.
+ */
+export function deniedSpellingFor(command: string): string | null {
+  const normalized = normalizeCommand(command);
+  for (const spelling of DENIED_COMMAND_SPELLINGS) {
+    if (normalized.startsWith(normalizeCommand(spelling))) return spelling;
+  }
+  return null;
+}
+
 /** Per-entry ceiling. Matches `OBJECTIVE_MAX_CHARS` — one readable line, not a paragraph. */
 export const SPEC_ENTRY_MAX_CHARS = 500;
 
@@ -246,6 +303,21 @@ export function validateTechnicalSpec(value: unknown): SpecParse {
     for (let i = 0; i < rawVerify.length; i += 1) {
       const problem = badEntry(rawVerify[i]);
       if (problem !== null) return { ok: false, reason: `spec.verify[${String(i)}] ${problem}` };
+      // Refuse, never repair — the module's standing philosophy. These strings are EXECUTED and,
+      // once approved, become exact Bash allow rules for the Engineer; a command the global
+      // deny-list refuses can never pass (deny wins over allow), so a spec naming one as proof of
+      // done is a spec that fails every attempt for a reason nobody is shown. Name the entry and
+      // the rule instead, here, before anything spawns.
+      const denied = deniedSpellingFor(rawVerify[i] as string);
+      if (denied !== null) {
+        return {
+          ok: false,
+          reason:
+            `spec.verify[${String(i)}] (${JSON.stringify(rawVerify[i])}) collides with the denied ` +
+            `command \`${denied}\` — the global deny-list refuses that command for every worker, ` +
+            'no override, so this check could never exit 0. Name a different proof of done.',
+        };
+      }
     }
     verify = rawVerify as readonly string[];
   }

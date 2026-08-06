@@ -50,6 +50,7 @@ import {
   subagentDeny,
   subagentRosterFor,
   toolNameOf,
+  verifyAllowRules,
   ROLE_ALLOW,
   SPAWN_TOOLS,
   subordinateBriefing,
@@ -64,7 +65,16 @@ import {
 import type { Rank } from '../src/contracts/ranks.ts';
 import { buildClaudeEnv, SUBAGENT_DEPTH_ENV_VAR } from '../src/harness/claude.ts';
 import type { TreeModel } from '../src/view/tree.ts';
-import type { HarnessId, ReasoningEffort, SubagentDefinition } from '../src/contracts/harness.ts';
+import type {
+  CloseResult,
+  HarnessAdapter,
+  HarnessId,
+  ReasoningEffort,
+  Soldier,
+  SoldierEvent,
+  SoldierSpec,
+  SubagentDefinition,
+} from '../src/contracts/harness.ts';
 import { worktreesRootFor } from '../src/config/paths.ts';
 import {
   ENGINEER_NARRATIVE_KEYS,
@@ -83,10 +93,11 @@ import {
   dispatchFor,
   mergeEvidence,
   parseStructured,
+  recordDenials,
   resolveProjectRoot,
   runCampaign,
 } from '../src/command/campaign.ts';
-import type { CampaignNote, CampaignOptions, CampaignResult, CoverageReport } from '../src/command/campaign.ts';
+import type { CampaignNote, CampaignNoteCode, CampaignOptions, CampaignResult, CoverageReport } from '../src/command/campaign.ts';
 import {
   PROGRESS_LEASE_STATES,
   createProgressSink,
@@ -99,6 +110,7 @@ import { FIX_KINDS, unrunnableReason } from '../src/setup/fixes.ts';
 import type { Fix } from '../src/setup/fixes.ts';
 import { PROTECTED_CONFIG_GLOBS } from '../src/setup/init.ts';
 import { AgentIdInUseError, createCampaign } from '../src/archive/archive.ts';
+import type { CampaignArchive } from '../src/archive/archive.ts';
 import { rebuildCampaign } from '../src/archive/rebuild.ts';
 import { runView } from '../src/view/index.ts';
 import type { Report, Verdict } from '../src/contracts/report.ts';
@@ -1154,6 +1166,69 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
     assert.doesNotMatch(withoutVerify, /run against your branch mechanically/i);
   });
 
+  it('the orders say what a denial MEANS: the same command is denied every time — report blocked, never retry it', () => {
+    // With and without a spec: the loadout is the same either way, and so is the failure this
+    // passage exists for — the field Engineer that retried one denied verify command into a
+    // timeout.
+    for (const spec of [undefined, SAMPLE_SPEC]) {
+      const orders = renderEngineerOrders({
+        orders: ORDERS,
+        branch: 'army/t-abc123',
+        worktree: '/tmp/wt-01',
+        attempt: 1,
+        ...(spec === undefined ? {} : { spec }),
+      });
+      assert.match(orders, /denial is a fact about your loadout/i);
+      assert.match(orders, /denied every time/i);
+      assert.match(orders, /Never retry a denied command/i);
+      assert.match(orders, /report `blocked`, naming the denied command/i);
+    }
+  });
+
+  it("with spec.verify the orders say those exact commands are within the Engineer's authority to run", () => {
+    const specWithVerify: TechnicalSpec = { ...SAMPLE_SPEC, verify: ['node --check webvitals.js'] };
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: specWithVerify,
+    });
+    assert.match(orders, /within your authority to run/i);
+    assert.match(orders, /allow-list VERBATIM/);
+
+    // No verify, no authority claim — the sentence would be false without Fix A's rules behind it.
+    const withoutVerify = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: SAMPLE_SPEC,
+    });
+    assert.doesNotMatch(withoutVerify, /within your authority to run/i);
+  });
+
+  it("a retry after a harness-level failure carries the supervisor's one-line account of it", () => {
+    const line = 'attempt 1 ended with adapter status timeout and produced no report';
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 2,
+      previousFailure: line,
+    });
+    assert.match(orders, /YOUR PREVIOUS ATTEMPT DID NOT COMPLETE/);
+    assert.ok(orders.includes(line), 'the supervisor\'s sentence about the failed attempt is missing');
+
+    const first = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+    });
+    assert.doesNotMatch(first, /DID NOT COMPLETE/);
+  });
+
   it('none of the behaviour-accounting or verify wording appears when the spec is absent', () => {
     const brief = briefInspectorFromAttempt({
       orders: ORDERS,
@@ -1354,6 +1429,68 @@ describe('permissions', () => {
     assert.match(deny, /~\/\.aws/);
     assert.match(deny, /\*\*\/\.env/);
     assert.match(deny, /credentials/);
+  });
+
+  it('verifyAllowRules carries each approved command VERBATIM, as an EXACT rule — no `:*`', () => {
+    const commands = [
+      'node --check webvitals.js',
+      "sh -c 'node webvitals.js 2>/dev/null; test $? -eq 1'",
+      '  node webvitals.js https://example.com  ',
+      '',
+      '   ',
+    ];
+    assert.deepEqual(verifyAllowRules(commands), [
+      'Bash(node --check webvitals.js)',
+      "Bash(sh -c 'node webvitals.js 2>/dev/null; test $? -eq 1')",
+      'Bash(node webvitals.js https://example.com)',
+    ]);
+    // Bare specifier = exact match in claude's rule grammar; the `:*` prefix form would turn an
+    // approved command into a licence for `<command>; anything-else`.
+    for (const rule of verifyAllowRules(commands)) {
+      assert.ok(!rule.includes(':*'), `verify rule is a prefix, not an exact match: ${rule}`);
+    }
+    // The known limitation, pinned rather than solved: a command containing `)` still travels
+    // verbatim — whatever claude's parser makes of the rule, OUR emitted string is the human's.
+    assert.deepEqual(verifyAllowRules(['test $(echo 1) -eq 1']), ['Bash(test $(echo 1) -eq 1)']);
+  });
+
+  it('buildSoldierSpec threads verify commands into the ENGINEER allow-list, and refuses every other role', () => {
+    const verify = ['node --check webvitals.js', 'node webvitals.js https://example.com --detail'];
+    const spec = buildSoldierSpec({
+      agentId: 'cpt-01',
+      rank: 'CAPTAIN',
+      role: 'ENGINEER',
+      harness: 'claude',
+      cwd: '/tmp/wt-01',
+      orders: 'do the thing',
+      home: '/tmp/army-home',
+      verifyCommands: verify,
+    });
+    // The role loadout PLUS the exact rules — nothing replaced, nothing prefixed.
+    for (const rule of ROLE_ALLOW.ENGINEER) assert.ok(spec.allow.includes(rule), `lost ${rule}`);
+    for (const command of verify) {
+      assert.ok(spec.allow.includes(`Bash(${command})`), `missing exact rule for ${command}`);
+    }
+    // The global deny-list is emitted unchanged — deny beats allow, so the ceiling still holds.
+    for (const rule of DENIED_COMMAND_RULES) assert.ok(spec.deny.includes(rule), `deny lost ${rule}`);
+
+    // ENGINEER only. The Inspector's brief already says the gate ran these commands before it
+    // was spawned, and codex has no per-tool rules anyway — a widened non-Engineer loadout here
+    // would bypass the guards inside permissionsFor, so it refuses.
+    assert.throws(
+      () =>
+        buildSoldierSpec({
+          agentId: 'cpt-02',
+          rank: 'CAPTAIN',
+          role: 'INSPECTOR',
+          harness: 'codex',
+          cwd: '/tmp/wt-01',
+          orders: 'review it',
+          home: '/tmp/army-home',
+          verifyCommands: verify,
+        }),
+      /ENGINEER/,
+    );
   });
 
   it('resolves ~ and $AGENTIC_ARMY_HOME to absolute globs as well', () => {
@@ -2570,6 +2707,256 @@ describe('the acceptance gate', () => {
 });
 
 // ===============================================================================================
+// 5c-bis. THE VERIFY COMMANDS ARE THE ENGINEER'S AUTHORITY — the root cause of the webvitals
+// field failure: a spec ordered the Engineer to run `node --check webvitals.js`, the allow-list
+// had no spelling of `node`, and the worker retried the denial into a timeout.
+// ===============================================================================================
+
+describe("the spec's approved verify commands reach the Engineer as exact allow rules", () => {
+  it('ON THE WIRE: a campaign with spec.verify spawns its Engineer with those exact rules in --allowedTools', async () => {
+    const repo = makeRepo('verify-authority');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('verify-authority', 'ok', ['pass']);
+    const { run } = fakeVerifyRun({});
+    const verify = ['node --check webvitals.js', 'node webvitals.js https://example.com --detail'];
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], verify };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+
+    const argv = JSON.parse(
+      fs.readFileSync(bins.claudeArgvLog, 'utf8').split('\n')[0] ?? '[]',
+    ) as string[];
+    const at = argv.indexOf('--allowedTools');
+    assert.notEqual(at, -1, `--allowedTools never reached execve:\n${argv.join(' ')}`);
+    const allowed: string[] = [];
+    for (let i = at + 1; i < argv.length && !(argv[i] as string).startsWith('--'); i += 1) {
+      allowed.push(argv[i] as string);
+    }
+    for (const command of verify) {
+      assert.ok(
+        allowed.includes(`Bash(${command})`),
+        `the Engineer was ordered to run ${JSON.stringify(command)} and its allow-list has no ` +
+          `exact rule for it:\n${allowed.join('\n')}`,
+      );
+      assert.ok(
+        !allowed.includes(`Bash(${command}:*)`),
+        'a verify rule reached the wire as a prefix rather than an exact match',
+      );
+    }
+    // The role loadout is still there, and the global deny-list is emitted unchanged beside it.
+    for (const rule of ROLE_ALLOW.ENGINEER) assert.ok(allowed.includes(rule), `lost ${rule}`);
+    for (const rule of DENIED_COMMAND_RULES) {
+      assert.ok(argv.includes(rule), `the deny-list lost ${rule} when verify rules were added`);
+    }
+  });
+});
+
+// ===============================================================================================
+// 5c-ter. A HARNESS-LEVEL FAILURE CONSUMES AN ATTEMPT — the same field failure, one layer up:
+// the timed-out attempt ended the whole campaign after attempt 1 despite `maxAttempts: 3`.
+// ===============================================================================================
+
+/**
+ * In-process scripted adapters, recording every `SoldierSpec` they were handed.
+ *
+ * The process-based fakes above cannot end with adapter status `timeout` — that status is minted
+ * by the adapter's own wall-clock escalation, not by anything a child process can say on the
+ * wire — so the attempt-budget tests script the adapter itself. The `done` engineer still does
+ * real git work in the real leased worktree, because durability and delivery are part of what
+ * the retry has to survive.
+ */
+function scriptedAdapters(engineerPlan: readonly ('timeout' | 'done')[]): {
+  adapters: Partial<Record<HarnessId, HarnessAdapter>>;
+  engineerSpecs: SoldierSpec[];
+  inspectorSpecs: SoldierSpec[];
+} {
+  const engineerSpecs: SoldierSpec[] = [];
+  const inspectorSpecs: SoldierSpec[] = [];
+
+  const soldier = (
+    spec: SoldierSpec,
+    events: SoldierEvent[],
+    close: CloseResult,
+    act?: (orders: string) => void,
+  ): Soldier => {
+    let release: () => void = () => {};
+    const sent = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return {
+      id: spec.agentId,
+      spec,
+      send(text: string): Promise<void> {
+        act?.(text);
+        release();
+        return Promise.resolve();
+      },
+      stream(): AsyncIterable<SoldierEvent> {
+        return (async function* (): AsyncGenerator<SoldierEvent> {
+          await sent;
+          yield* events;
+        })();
+      },
+      interrupt: () => Promise.resolve(),
+      close: () => Promise.resolve(close),
+    };
+  };
+
+  const resultEvent = (payload: unknown): SoldierEvent => ({
+    ts: new Date().toISOString(),
+    raw: { result: JSON.stringify(payload) },
+    parentToolUseId: null,
+    depth: 0,
+    type: 'result',
+    status: 'ok',
+  });
+
+  let engineerRuns = 0;
+  const claude: HarnessAdapter = {
+    id: 'claude',
+    supportsDuplex: true,
+    spawn(spec: SoldierSpec): Promise<Soldier> {
+      engineerSpecs.push(spec);
+      const mode = engineerPlan[Math.min(engineerRuns, engineerPlan.length - 1)] as 'timeout' | 'done';
+      engineerRuns += 1;
+      if (mode === 'timeout') {
+        // No events and no report — what a wall-clock kill actually leaves behind.
+        return Promise.resolve(soldier(spec, [], { exitCode: null, status: 'timeout' }));
+      }
+      const events: SoldierEvent[] = [];
+      return Promise.resolve(
+        soldier(spec, events, { exitCode: 0, status: 'ok' }, (orders) => {
+          const branch = /`(army\/[A-Za-z0-9._/-]+)`/.exec(orders)?.[1] ?? 'army/unknown';
+          const g = (...a: string[]): void =>
+            void execFileSync('git', a, { cwd: spec.cwd, env: GIT_ENV, stdio: 'pipe' });
+          g('checkout', '-B', branch);
+          fs.writeFileSync(
+            path.join(spec.cwd, 'ENGINEER.md'),
+            `scripted attempt pid ${String(process.pid)} ${String(Date.now())}\n`,
+          );
+          g('add', '-A');
+          g('commit', '--quiet', '-m', 'army: scripted attempt');
+          events.push(
+            resultEvent({
+              status: 'done',
+              summary: `cut ${branch} and committed`,
+              findings: [],
+              artifacts: [{ kind: 'branch', ref: branch }],
+              branch,
+            }),
+          );
+        }),
+      );
+    },
+  };
+
+  const codex: HarnessAdapter = {
+    id: 'codex',
+    supportsDuplex: false,
+    spawn(spec: SoldierSpec): Promise<Soldier> {
+      inspectorSpecs.push(spec);
+      const verdict: Verdict = {
+        verdict: 'pass',
+        summary: 'the branch does what the original objective asked',
+        findings: [],
+        testsRun: true,
+      };
+      return Promise.resolve(soldier(spec, [resultEvent(verdict)], { exitCode: 0, status: 'ok' }));
+    },
+  };
+
+  return { adapters: { claude, codex }, engineerSpecs, inspectorSpecs };
+}
+
+describe('a harness-level failure consumes an attempt, not the campaign', () => {
+  it('timeout on attempt 1, done on attempt 2: the campaign delivers, and the retry brief says what happened', async () => {
+    const repo = makeRepo('attempt-budget');
+    const home = makeHome({ [repo]: 0 });
+    const { adapters, engineerSpecs, inspectorSpecs } = scriptedAdapters(['timeout', 'done']);
+    const result = await campaign({
+      objective: 'Add a multiply function',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 3,
+      adapters,
+    });
+
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(
+      result.attempts.length,
+      2,
+      'one harness failure must consume ONE attempt of the budget, not the campaign',
+    );
+    assert.equal(result.attempts[0]?.engineerStatus, 'timeout');
+    assert.equal(result.attempts[0]?.report, null);
+    assert.equal(result.attempts[0]?.inspectorAgentId, null, 'a timed-out attempt must not be reviewed');
+    assert.equal(result.attempts[1]?.report?.status, 'done');
+    assert.equal(result.attempts[1]?.verdict?.verdict, 'pass');
+
+    // The failure was noted at WARN — an attempt failing is commentary while budget remains —
+    // in the existing retry vocabulary.
+    assert.ok(
+      result.notes.some(
+        (n) => n.level === 'warn' && n.code === 'engineer' && /adapter status timeout/.test(n.message),
+      ),
+      `no warn-level engineer note:\n${JSON.stringify(result.notes, null, 2)}`,
+    );
+    assert.ok(result.notes.some((n) => n.code === 'retry' && /nothing reviewable/.test(n.message)));
+
+    // A fresh agent, the SAME leased worktree, and one supervisor-written sentence about the
+    // predecessor in its orders.
+    assert.equal(engineerSpecs.length, 2);
+    assert.equal(inspectorSpecs.length, 1);
+    const second = engineerSpecs[1] as SoldierSpec;
+    assert.notEqual(engineerSpecs[0]?.agentId, second.agentId);
+    assert.equal(engineerSpecs[0]?.cwd, second.cwd);
+    assert.match(second.orders, /YOUR PREVIOUS ATTEMPT DID NOT COMPLETE/);
+    assert.ok(
+      second.orders.includes('attempt 1 ended with adapter status timeout and produced no report'),
+      'the previousFailure line is missing from the retry orders',
+    );
+
+    // The per-attempt archive rows survived the change: both attempts, both agents, rebuildable.
+    assertReadableArchive(result);
+    const signals = fs.readFileSync(path.join(result.campaignRoot, 'signals.jsonl'), 'utf8');
+    assert.match(signals, new RegExp(engineerSpecs[0]?.agentId ?? 'cpt-01'));
+    assert.match(signals, new RegExp(second.agentId));
+  });
+
+  it('with maxAttempts: 1 the same failure ends the campaign as engineer-failed, as it always did', async () => {
+    const repo = makeRepo('attempt-budget-one');
+    const home = makeHome({ [repo]: 0 });
+    const { adapters, engineerSpecs } = scriptedAdapters(['timeout', 'done']);
+    const result = await campaign({
+      objective: 'Add a multiply function',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 1,
+      adapters,
+    });
+    assert.equal(result.outcome, 'engineer-failed');
+    assert.equal(result.attempts.length, 1);
+    assert.equal(engineerSpecs.length, 1, 'a spent budget must not spawn another Engineer');
+    assert.ok(
+      result.notes.some((n) => n.level === 'error' && n.code === 'engineer'),
+      'the final attempt failing is an error, with the diagnosis attached',
+    );
+    assertReadableArchive(result);
+  });
+});
+
+// ===============================================================================================
 // 5d. BEHAVIOUR COVERAGE, END TO END — an Inspector that skips a numbered clause has not
 // reviewed the work, whatever `verdict` it wrote.
 // ===============================================================================================
@@ -2663,10 +3050,14 @@ describe('failure paths', () => {
     const repo = makeRepo('crash');
     const home = makeHome({ [repo]: 0 });
     const bins = makeHarnesses('crash', 'crash', ['pass']);
+    // Pinned to one attempt: a harness-level failure now consumes an attempt and retries, and
+    // this test is about the DIAGNOSIS of a crashed Engineer, not the retry budget — the budget
+    // has its own test ('a harness-level failure consumes an attempt').
     const result = await campaign({
       objective: 'Add a multiply function',
       cwd: repo,
       home,
+      maxAttempts: 1,
       claudeBin: bins.claudeBin,
       codexBin: bins.codexBin,
     });
@@ -2693,10 +3084,12 @@ describe('failure paths', () => {
     const repo = makeRepo('badreport');
     const home = makeHome({ [repo]: 0 });
     const bins = makeHarnesses('badreport', 'bad-report', ['pass']);
+    // maxAttempts: 1 — this test is about the refusal to inspect, not the retry budget.
     const result = await campaign({
       objective: 'Add a multiply function',
       cwd: repo,
       home,
+      maxAttempts: 1,
       claudeBin: bins.claudeBin,
       codexBin: bins.codexBin,
     });
@@ -2711,10 +3104,12 @@ describe('failure paths', () => {
     const repo = makeRepo('blocked');
     const home = makeHome({ [repo]: 0 });
     const bins = makeHarnesses('blocked', 'blocked', ['pass']);
+    // maxAttempts: 1 — this test is about a `blocked` report not delivering, not the retry budget.
     const result = await campaign({
       objective: 'Add a multiply function',
       cwd: repo,
       home,
+      maxAttempts: 1,
       claudeBin: bins.claudeBin,
       codexBin: bins.codexBin,
     });
@@ -2986,6 +3381,66 @@ describe('failure paths', () => {
     assert.match(signals, /npm publish/);
     assert.ok(result.notes.some((note) => note.code === 'permission-denied'));
     assert.equal(result.lease.state, 'released');
+  });
+
+  it('a denial NOTE is a sentence — tool and command — and the raw denial stays in the archive', () => {
+    const signals: string[] = [];
+    const notes: { level: string; message: string }[] = [];
+    const archive = {
+      appendSignal: (row: { body: string }): void => void signals.push(row.body),
+    } as unknown as CampaignArchive;
+    const note = (level: CampaignNote['level'], _code: CampaignNoteCode, message: string): void =>
+      void notes.push({ level, message });
+
+    recordDenials(
+      archive,
+      'cpt-01',
+      [
+        {
+          tool_name: 'Bash',
+          tool_use_id: 'toolu_01AbCdEf',
+          tool_input: { command: 'node --check webvitals.js' },
+        },
+        { tool_name: 'WebFetch', tool_use_id: 'toolu_02GhIjKl', tool_input: { url: 'https://example.com' } },
+      ],
+      note,
+    );
+
+    // The field transcript printed `⚠ cpt-01 was denied: {"tool_name":"Bash","tool_use_id":…}` —
+    // raw JSON at a human. The note is now the sentence a reader actually needed.
+    assert.equal(notes[0]?.message, 'cpt-01 denied Bash: node --check webvitals.js');
+    // A non-Bash denial names the tool and, best-effort, its input keys.
+    assert.equal(notes[1]?.message, 'cpt-01 denied WebFetch (input: url)');
+    for (const item of notes) {
+      assert.ok(!item.message.includes('tool_use_id'), `raw JSON leaked into a note: ${item.message}`);
+    }
+
+    // The hint, ONCE per agent — not once per denial.
+    const hints = notes.filter((n) => /will not succeed on retry/.test(n.message));
+    assert.equal(hints.length, 1, `the hint printed ${String(hints.length)} times`);
+    assert.match(hints[0]?.message ?? '', /allow-list is fixed for the life of the agent/);
+
+    // The ARCHIVE keeps the evidence: the full raw denial, tool_use_id and all.
+    assert.equal(signals.length, 2, 'the archive must carry one row per denial, nothing extra');
+    assert.match(signals[0] ?? '', /permission denied/);
+    assert.match(signals[0] ?? '', /toolu_01AbCdEf/);
+
+    // A command is capped at ~160 characters through the existing `cap` helper.
+    const longNotes: { level: string; message: string }[] = [];
+    recordDenials(
+      archive,
+      'cpt-02',
+      [{ tool_name: 'Bash', tool_input: { command: `node ${'x'.repeat(400)}` } }],
+      (level, _code, message) => void longNotes.push({ level, message }),
+    );
+    const long = longNotes[0]?.message ?? '';
+    assert.ok(long.length <= 'cpt-02 denied Bash: '.length + 160, `uncapped command in note: ${String(long.length)} chars`);
+    assert.ok(long.endsWith('…'), 'a clipped command must say it was clipped');
+
+    // No denials: no notes, no hint, no rows.
+    const quiet: unknown[] = [];
+    recordDenials(archive, 'cpt-03', [], (level, _code, message) => void quiet.push(message));
+    assert.deepEqual(quiet, []);
   });
 
   it('and the signal log says out loud which denials never reach it', () => {

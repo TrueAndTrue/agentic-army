@@ -4,6 +4,7 @@
  *
  * ```
  * ALLOW  ENGINEER   Read Grep Glob, Edit Write, Bash(git*|test|build|lint)
+ *                   + the spec's approved `verify` commands, as EXACT Bash rules
  *        INSPECTOR  Read Grep Glob, Bash(test|lint)
  *
  * NARROW (by rank, subtracted from whatever the role asked for)
@@ -82,9 +83,18 @@ import {
   WRITES_FILES,
   writesFiles,
 } from '../contracts/ranks.ts';
+import { DENIED_COMMAND_SPELLINGS } from '../contracts/spec.ts';
 import { isInsideOrEqual, worktreesRootFor } from '../config/paths.ts';
 import { invokedAs } from '../setup/checks.ts';
 import { PROTECTED_CONFIG_GLOBS, protectedConfigGlobs } from '../setup/init.ts';
+
+/**
+ * Re-exported so this module stays the one place a reader looks for what is denied. The list
+ * itself lives in `src/contracts/spec.ts` — the spec validator refuses `verify` commands that
+ * collide with it, and contracts is the leaf layer, so the copy had to live where both readers
+ * can reach it without a wrong-way import. There is still exactly one copy.
+ */
+export { DENIED_COMMAND_SPELLINGS } from '../contracts/spec.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Role allow-lists
@@ -137,6 +147,44 @@ export const INSPECTOR_BASH_PREFIXES: readonly string[] = Object.freeze(
 
 function bashRules(prefixes: readonly string[]): string[] {
   return prefixes.map((prefix) => `Bash(${prefix}:*)`);
+}
+
+/**
+ * The spec's own `verify` commands as EXACT-match Bash allow rules, for the ENGINEER that has to
+ * run them.
+ *
+ * ## Why this exists — a field failure, not a convenience
+ *
+ * A spec named `node --check webvitals.js` as proof of done. The Engineer's orders told it to run
+ * that command before reporting done; `ENGINEER_BASH_PREFIXES` allows `git`, test, build and lint
+ * runners — not bare `node`, not `sh` — so the command was denied, retried, denied again, and the
+ * attempt timed out having delivered nothing. The gate then ran the same command itself. A worker
+ * ordered to run a command and structurally refused it is not a permission boundary working; it
+ * is two halves of one campaign contradicting each other.
+ *
+ * ## Why this does not widen the boundary
+ *
+ * These strings come from the spec, and the human at the terminal approves the spec — verify
+ * commands shown verbatim — before anything spawns (or authored them outright in `--spec` mode).
+ * That approval is the authorization for THESE EXACT STRINGS, which is why the rules are exact
+ * matches: bare `Bash(<command>)` in claude's rule grammar is an exact match, and `:*` — the
+ * prefix form every role loadout uses — is deliberately NOT emitted, so `node --check x.js` does
+ * not become a licence for `node --check x.js; rm -rf .`. The global deny-list is emitted
+ * unchanged and deny wins over allow in claude's engine, so a hostile verify command that collides
+ * with a denied prefix stays dead — and `validateTechnicalSpec` refuses it earlier, with a reason.
+ *
+ * Known limitation, stated rather than solved: a command containing `)` may interact badly with
+ * the `Tool(specifier)` rule grammar — the campaign cannot verify claude's parser from here, so
+ * the command travels verbatim and the rule carries whatever the human approved.
+ */
+export function verifyAllowRules(commands: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const command of commands) {
+    const trimmed = command.trim();
+    if (trimmed === '') continue;
+    out.push(`Bash(${trimmed})`);
+  }
+  return out;
 }
 
 /**
@@ -226,20 +274,17 @@ function denyPaths(tools: readonly string[], globs: readonly string[]): string[]
   return out;
 }
 
-/** The three denied commands, in every spelling a `Bash(...)` prefix rule can carry. */
-export const DENIED_COMMAND_RULES: readonly string[] = Object.freeze([
-  'Bash(git push --force:*)',
-  'Bash(git push -f:*)',
-  'Bash(git push --force-with-lease:*)',
-  'Bash(git push --mirror:*)',
-  'Bash(git push --delete:*)',
-  'Bash(npm publish:*)',
-  'Bash(pnpm publish:*)',
-  'Bash(yarn publish:*)',
-  'Bash(gh pr merge:*)',
-  'Bash(gh api:*)',
-  'Bash(gh auth token:*)',
-]);
+/**
+ * The three denied commands, in every spelling a `Bash(...)` prefix rule can carry.
+ *
+ * DERIVED, not declared: the spellings themselves live in `src/contracts/spec.ts` (re-exported
+ * above), because the spec validator refuses a `verify` command that collides with one of them and
+ * `contracts` is the leaf layer — it cannot import from here. One list, two readers; the rules on
+ * the wire and the refusal in the validator cannot drift apart.
+ */
+export const DENIED_COMMAND_RULES: readonly string[] = Object.freeze(
+  DENIED_COMMAND_SPELLINGS.map((spelling) => `Bash(${spelling}:*)`),
+);
 
 /**
  * The global deny-list — every role, no override, at any rank.

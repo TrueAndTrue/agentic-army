@@ -158,6 +158,7 @@ import {
   permissionsFor,
   subagentDeny,
   subagentRosterFor,
+  verifyAllowRules,
 } from './permissions.ts';
 
 // ---------------------------------------------------------------------------------------------
@@ -506,6 +507,17 @@ export interface BuildSpecInput {
   /** Resolved army home, so the deny-list carries absolute globs as well as `~`-relative ones. */
   home: string;
   /**
+   * The spec's `verify` commands, for an ENGINEER whose orders instruct it to run them.
+   *
+   * Each becomes an EXACT-match `Bash(<command>)` allow rule via `verifyAllowRules` — see that
+   * function for the field failure this closes and why the human's approval of the spec is the
+   * authorization for these exact strings. ENGINEER only: the Inspector's brief already states
+   * the commands were executed by the gate before it was spawned, and the codex harness has no
+   * per-tool rules to carry them anyway. `buildSoldierSpec` refuses the combination for any
+   * other role rather than widening a loadout that never asked.
+   */
+  verifyCommands?: readonly string[];
+  /**
    * Issue this worker a roster of subordinates it may field as native subagents.
    *
    * OPT-IN, and default-off, which is the conservative direction: a worker with no roster is
@@ -534,6 +546,29 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
   assertNoFlagLikeRules(deny, 'global deny-list');
   const who = `${input.agentId} (${input.rank}·${input.role})`;
   assertGlobalDenyIntact(deny, who);
+
+  // ---- the spec's own verify commands, as exact allow rules -------------------------------
+  //
+  // AFTER `permissionsFor` and its guards, and ENGINEER-only by refusal: `assertCommanderLoadout`
+  // and the rank narrowing both run inside `permissionsFor`, so rules appended here are rules
+  // those guards never saw. Appending to the one role whose loadout already holds a scoped shell
+  // widens nothing those guards protect; appending to any other role would be a back door past
+  // them, so it throws instead. Deny still wins over allow in claude's engine, so the global
+  // deny-list above is untouched by this and still holds.
+  if (input.verifyCommands !== undefined) {
+    if (input.role !== 'ENGINEER') {
+      throw new Error(
+        `refusing to spawn ${who}: verify-command allow rules are the ENGINEER's alone. The ` +
+          'Inspector is told the gate already ran them, and every other role holds no shell to ' +
+          'run them with — widening another loadout here would bypass the guards inside ' +
+          'permissionsFor.',
+      );
+    }
+    for (const rule of verifyAllowRules(input.verifyCommands)) {
+      if (!allow.includes(rule)) allow.push(rule);
+    }
+  }
+  assertNoFlagLikeRules(allow, `${input.role} allow-list (with verify rules)`);
 
   // ---- the lower half of the org chart ---------------------------------------------------
   //
@@ -1089,6 +1124,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     let previousAcceptance: AcceptanceResult | undefined;
     /** Set only when the PREVIOUS attempt's verdict left one or more behaviours unaccounted for. */
     let previousMissingBehaviours: number[] | undefined;
+    /** Set only when the PREVIOUS attempt failed at the harness level. See the engineer branch. */
+    let previousFailure: string | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const engineerId = nextAgentId();
@@ -1100,6 +1137,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         ...(previousVerdict === undefined ? {} : { previousVerdict }),
         ...(previousAcceptance === undefined ? {} : { previousAcceptance }),
         ...(previousMissingBehaviours === undefined ? {} : { previousMissingBehaviours }),
+        ...(previousFailure === undefined ? {} : { previousFailure }),
         ...(options.spec === undefined ? {} : { spec: options.spec }),
       });
 
@@ -1115,10 +1153,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         orders: engineerOrders,
         outputSchemaPath: REPORT_SCHEMA_PATH,
         home,
-        // The Engineer is the one unit in this campaign that decomposes. It holds the worktree,
-        // the branch and the report, and its subordinates hold none of those — they read, and
-        // they hand back capped answers it acts on. Only offered on the harness that has a
-        // subagent model; `buildSoldierSpec` refuses the combination rather than dropping it.
+        // Approved with the spec; see `BuildSpecInput.verifyCommands`.
+        ...(options.spec?.verify === undefined ? {} : { verifyCommands: options.spec.verify }),
+        // The one unit here that decomposes: it holds the worktree, the branch and the report;
+        // its subordinates read and answer. Claude-only; `buildSoldierSpec` refuses otherwise.
         fanOut: engineerTarget.harness === 'claude',
       });
 
@@ -1232,24 +1270,57 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           report === null
             ? `returned no valid report (adapter status ${engineerRun.status})`
             : `reported status ${report.status}`;
-        note(
-          'error',
-          'engineer',
-          `${engineerId} ${why}. Not sending this to inspection.`,
-          diagnoseSoldierFailure({
-            role: 'Engineer',
-            agentId: engineerId,
-            harness: engineerSpec.harness,
-            campaignRoot: archive.root,
-            status: engineerRun.status,
-            errors: engineerRun.errors,
-            structuredArrived: report !== null,
-          }),
-        );
+        const diagnosis = diagnoseSoldierFailure({
+          role: 'Engineer',
+          agentId: engineerId,
+          harness: engineerSpec.harness,
+          campaignRoot: archive.root,
+          status: engineerRun.status,
+          errors: engineerRun.errors,
+          structuredArrived: report !== null,
+        });
         finalReport = report;
-        outcome = 'engineer-failed';
-        break;
+        // A harness-level failure consumes AN ATTEMPT, not the campaign. The contract with the
+        // human is `maxAttempts` — the commander says "three Engineer attempts" out loud — and
+        // the field failure this rewrites was one timed-out process ending a campaign that had
+        // two budgeted attempts left. Only the FINAL attempt failing this way ends the loop.
+        if (attempt >= maxAttempts) {
+          // The budget is spent: the campaign stops because there is nothing left to try, which
+          // is exactly what `retriesExhausted` reports (and what rung 3's merge gate reads).
+          retriesExhausted = true;
+          note(
+            'error',
+            'engineer',
+            `${engineerId} ${why}. Not sending this to inspection.`,
+            diagnosis,
+          );
+          outcome = 'engineer-failed';
+          break;
+        }
+        note(
+          'warn',
+          'engineer',
+          `${engineerId} ${why}. Failing attempt ${String(attempt)} of ${String(maxAttempts)}.`,
+          diagnosis,
+        );
+        note(
+          'info',
+          'retry',
+          'retrying with a fresh Engineer against the same task; the previous attempt produced ' +
+            'nothing reviewable.',
+        );
+        // One supervisor-written sentence into the next attempt's orders — the same channel
+        // `previousAcceptance` uses, and the same direction of travel: the adapter's status, not
+        // the dead Engineer's narrative.
+        previousFailure =
+          `attempt ${String(attempt)} ended with adapter status ${engineerRun.status} and ` +
+          (report === null ? 'produced no report' : `reported status ${report.status}`);
+        archive.updateTask(task.id, { agentId: null, status: 'in_flight' });
+        continue;
       }
+      // This attempt came back whole, so no stale harness-failure line from an EARLIER attempt
+      // may ride into a LATER retry brief (a gate or verdict retry would otherwise carry it).
+      previousFailure = undefined;
       finalReport = report;
       archive.updateTask(task.id, { branch });
 
@@ -2322,8 +2393,18 @@ async function releaseLease(input: SettleLeaseInput, why: string): Promise<Lease
  * breach was recorded — is drawing a conclusion the rows cannot carry. The evidence that a
  * subordinate was refused at depth is the `is_error` tool_result in `stream.jsonl`, which is
  * archived losslessly and is the only place it survives.
+ *
+ * ## The note is a sentence; the signal keeps the evidence
+ *
+ * The ARCHIVE row carries the raw denial object serialized, because the archive is evidence and
+ * a projection of evidence is a loss. The NOTE — the line a human actually reads on a live
+ * terminal — used to carry the same serialized object, and the field transcript shows what that
+ * costs: `⚠ cpt-01 was denied: {"tool_name":"Bash","tool_use_id":"toolu_..."...}` scrolling past
+ * a person trying to learn which command was refused. So the note extracts `tool_name` and, for
+ * Bash, `tool_input.command` (other tools get their input keys, best-effort), capped at 160
+ * characters. Exported for the unit test that pins both spellings.
  */
-function recordDenials(
+export function recordDenials(
   archive: CampaignArchive,
   agentId: string,
   denials: readonly unknown[],
@@ -2337,8 +2418,37 @@ function recordDenials(
       kind: 'status',
       body: `permission denied: ${body}`,
     });
-    note('warn', 'permission-denied', `${agentId} was denied: ${body}`);
+    note('warn', 'permission-denied', `${agentId} ${describeDenial(denial)}`);
   }
+  // Once per agent per campaign, not per denial — every agent id passes through here exactly
+  // once, on its one run. The hint exists because the field Engineer retried one denied command
+  // three times and timed out: the human watching needed the sentence more than the model did.
+  if (denials.length > 0) {
+    note(
+      'warn',
+      'permission-denied',
+      'a denied command will not succeed on retry — the allow-list is fixed for the life of the agent',
+    );
+  }
+}
+
+/** `denied Bash: node --check webvitals.js` — the human-facing half of one denial. */
+function describeDenial(denial: unknown): string {
+  if (isRecord(denial) && typeof denial['tool_name'] === 'string') {
+    const tool = denial['tool_name'];
+    const input = denial['tool_input'];
+    if (tool === 'Bash' && isRecord(input) && typeof input['command'] === 'string') {
+      return `denied ${tool}: ${cap(input['command'], 160)}`;
+    }
+    if (isRecord(input) && Object.keys(input).length > 0) {
+      // Best-effort for a non-Bash tool: the input KEYS say what kind of call it was without
+      // betting on any one tool's schema.
+      return `denied ${tool} (input: ${cap(Object.keys(input).join(', '), 160)})`;
+    }
+    return `denied ${tool}`;
+  }
+  // A shape this function does not recognise still gets reported, as it always was.
+  return `was denied: ${cap(typeof denial === 'string' ? denial : JSON.stringify(denial))}`;
 }
 
 /** `git diff <base>..<branch>` into `diff.patch`. Best effort — a missing diff is not a failure. */

@@ -69,13 +69,21 @@ import {
   RELEASE_OUTCOMES,
   WORKTREE_PROVIDER_IDS,
   armyBranch,
+  // spec
+  DENIED_COMMAND_SPELLINGS,
+  validateTechnicalSpec,
 } from '../src/contracts/index.ts';
 
 import type { Rank, Report, Role, Rung, Verdict } from '../src/contracts/index.ts';
 
 // The loadout table itself, so the claims a contract file makes about a role's tools are checked
 // against the rules this process actually puts on a command line — not against a retyped list.
-import { ROLE_ALLOW, toolNameOf } from '../src/command/permissions.ts';
+import {
+  DENIED_COMMAND_RULES,
+  DENIED_COMMAND_SPELLINGS as REEXPORTED_DENIED_COMMAND_SPELLINGS,
+  ROLE_ALLOW,
+  toolNameOf,
+} from '../src/command/permissions.ts';
 import { CHAT_HELP } from '../src/command/chat.ts';
 import { SLASH_HELP } from '../src/chat/run.ts';
 
@@ -2393,4 +2401,65 @@ test('LIVE: claude --json-schema accepts verdict.v1.json and returns a valid Ver
   ]);
   const result = validateVerdict(lastJsonObject(out));
   assert.equal(result.ok, true, result.ok ? '' : JSON.stringify(result.errors));
+});
+
+// -----------------------------------------------------------------------------------------------
+// The spec validator refuses `verify` commands the global command deny-list would kill anyway.
+//
+// Deny beats allow in claude's engine, so a verify command colliding with a denied spelling can
+// never exit 0 for the Engineer ordered to run it — the honest moment to say so is validation,
+// with the entry and the rule named, not three denied retries into a timeout.
+// -----------------------------------------------------------------------------------------------
+
+/** A spec that passes every structural check, so each test below varies exactly one thing. */
+function specWithVerify(verify: unknown): Record<string, unknown> {
+  return {
+    objective: 'add a multiply function to calc.js',
+    filesInScope: ['calc.js'],
+    acceptance: ['node --test passes'],
+    behaviours: ['multiply(0, x) returns 0'],
+    decisions: ['multiply is a named export'],
+    constraints: ['no new dependencies'],
+    verify,
+  };
+}
+
+test('a verify command colliding with a denied spelling is REFUSED, naming the entry and the rule', () => {
+  const forcePush = 'git push --force-with-lease origin x';
+  const result = validateTechnicalSpec(specWithVerify(['node --test', forcePush]));
+  assert.equal(result.ok, false);
+  const reason = result.ok ? '' : result.reason;
+  assert.match(reason, /spec\.verify\[1\]/, 'the refusal must name WHICH entry');
+  assert.ok(reason.includes(forcePush), `the refusal must quote the entry:\n${reason}`);
+  assert.match(reason, /git push --force/, 'the refusal must name the denied rule it collides with');
+  assert.match(reason, /deny/i, 'the refusal must say WHY: the deny-list would refuse it anyway');
+});
+
+test('a benign push spelling is NOT refused — the collision is on the denied spellings, not on `git push`', () => {
+  // `git push origin x` shares two leading tokens with five denied spellings and collides with
+  // none of them: every denied spelling is longer, and the match is a prefix of the COMMAND.
+  const result = validateTechnicalSpec(specWithVerify(['git push origin x', 'node --test']));
+  assert.equal(result.ok, true, result.ok ? '' : result.reason);
+});
+
+test('the collision match ignores case and repeated whitespace', () => {
+  for (const spelled of [
+    'GIT  Push   --Force-with-lease origin x',
+    'NPM   PUBLISH',
+    'gh  API repos/x',
+  ]) {
+    const result = validateTechnicalSpec(specWithVerify([spelled]));
+    assert.equal(result.ok, false, `${spelled} slipped past the denied-command check`);
+    assert.match(result.ok ? '' : result.reason, /denied command/);
+  }
+});
+
+test('there is exactly one copy of the denied spellings, and the deny rules are derived from it', () => {
+  // `src/command/permissions.ts` re-exports the contracts list — same frozen array, by identity,
+  // so the validator's refusals and the wire's deny rules cannot drift apart.
+  assert.equal(REEXPORTED_DENIED_COMMAND_SPELLINGS, DENIED_COMMAND_SPELLINGS);
+  assert.deepEqual(
+    [...DENIED_COMMAND_RULES],
+    DENIED_COMMAND_SPELLINGS.map((spelling) => `Bash(${spelling}:*)`),
+  );
 });
