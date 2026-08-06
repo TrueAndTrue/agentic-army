@@ -40,6 +40,8 @@ import { RUNG_LABEL } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import { renderTechnicalSpec, SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../contracts/spec.ts';
 import type { TechnicalSpec } from '../contracts/spec.ts';
+import type { AcceptanceResult } from '../contracts/verify.ts';
+import { renderAcceptanceFailure } from '../verify/index.ts';
 
 // ---------------------------------------------------------------------------------------------
 // The original orders — the campaign's own words, held verbatim
@@ -80,6 +82,25 @@ export interface EngineerOrdersInput {
    * It is the reverse direction — reviewee's narrative → reviewer — that is forbidden.
    */
   previousVerdict?: Verdict;
+  /**
+   * The acceptance gate's result from the previous attempt, when THAT was what failed it —
+   * `spec.verify` commands run mechanically against the branch, before an Inspector was ever
+   * spawned. See `src/verify/gate.ts`.
+   *
+   * Supervisor-origin, like `previousVerdict`: these are commands the SPEC named and a real
+   * process actually ran, not the Engineer's account of anything. Rendered with the same
+   * prominence as `previousVerdict`'s findings, because an attempt can fail for gate reasons,
+   * verdict reasons, or both, and the retry brief has to carry whichever actually happened.
+   */
+  previousAcceptance?: AcceptanceResult;
+  /**
+   * 1-based behaviour indices the previous attempt's Inspector never gave a verdict entry for —
+   * present only when incomplete behaviour coverage was (part of) why that attempt was retried.
+   * Rendered against `spec.behaviours`, which travels in this same input, because an index with
+   * no text next to it is not an instruction the Engineer can act on. See `behaviourCoverage` in
+   * `campaign.ts`.
+   */
+  previousMissingBehaviours?: readonly number[];
   /**
    * The commander's spec, when the dispatch carried one. Supervisor-origin, approved by a human
    * before this Engineer existed — the opposite direction from `previousVerdict` above, which is
@@ -128,6 +149,20 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
         'substitution is found regardless, and declaring it costs you nothing.',
     );
     lines.push('');
+    // The mechanical half of acceptance. See `src/contracts/spec.ts`'s incident note: a
+    // criterion left in prose was never executed by anything. These ARE executed, against your
+    // branch, after you report done — running them yourself first means you find out about a
+    // failure before the gate does, instead of costing a whole retry to learn it.
+    if (input.spec.verify !== undefined) {
+      lines.push(
+        `The \`${SPEC_FIELD_LABEL.verify}\` below are run against your branch mechanically ` +
+          'after you report done, and each must exit 0. Run them yourself, in this worktree, ' +
+          'before you report done:',
+      );
+      lines.push('');
+      for (const command of input.spec.verify) lines.push(`- \`${command}\``);
+      lines.push('');
+    }
   } else {
     lines.push('## NO SPEC WAS PROVIDED');
     lines.push('');
@@ -153,6 +188,57 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
         'above and commit again. Do NOT start over, and do NOT narrow the objective to whatever ' +
         'the findings happened to mention: the Inspector is briefed from the OBJECTIVE above, ' +
         'not from your report, so anything you quietly drop will fail again.',
+    );
+    lines.push('');
+  }
+
+  // Same prominence as `previousVerdict`'s findings above, and for the same reason: this is what
+  // actually failed the previous attempt, before an Inspector was ever spawned on it. See the
+  // incident on `TechnicalSpec.verify` — these are commands, they were RUN, not read, and every
+  // one of them must exit 0.
+  if (
+    input.previousAcceptance !== undefined &&
+    input.previousAcceptance.ran &&
+    !input.previousAcceptance.passed
+  ) {
+    lines.push('## THE ACCEPTANCE GATE FAILED YOUR PREVIOUS ATTEMPT');
+    lines.push('');
+    lines.push(
+      "These are the spec's own `verify` commands. They were RUN — mechanically, in your " +
+        'worktree, before an Inspector was ever spawned — and at least one did not exit 0:',
+    );
+    lines.push('');
+    lines.push(renderAcceptanceFailure(input.previousAcceptance).trim());
+    lines.push('');
+    lines.push(
+      'Fix these before anything else. An Inspector is not spent on a branch that fails commands ' +
+        'the spec itself named as proof of done.',
+    );
+    lines.push('');
+  }
+
+  // The behaviour-coverage incident, on the Engineer's side of the gate: a clause the previous
+  // Inspector never gave a verdict entry for is not evidence it was implemented — it is evidence
+  // the review skipped it, which this campaign refused to trust silently. Naming the index alone
+  // is not an instruction; the text next to it, from `input.spec`, is.
+  if (input.previousMissingBehaviours !== undefined && input.previousMissingBehaviours.length > 0) {
+    lines.push('## THE PREVIOUS REVIEW DID NOT ACCOUNT FOR EVERY BEHAVIOUR');
+    lines.push('');
+    lines.push(
+      "The Inspector's verdict on your previous attempt left one or more numbered behaviours " +
+        'with no entry at all — not `met`, not `not-met`, not even `not-verified`. A clause with ' +
+        'no entry looks identical to a clean bill of health, so this campaign refused to trust ' +
+        'it and retried instead of delivering. These were never accounted for:',
+    );
+    lines.push('');
+    for (const index of input.previousMissingBehaviours) {
+      const text = input.spec?.behaviours[index - 1];
+      lines.push(text === undefined ? `${String(index)}. (behaviour ${String(index)})` : `${String(index)}. ${text}`);
+    }
+    lines.push('');
+    lines.push(
+      'Make sure each one is genuinely implemented before this attempt reports done — the retry ' +
+        'is reviewed against the same numbering.',
     );
     lines.push('');
   }
@@ -337,6 +423,54 @@ export interface InspectorBrief {
 }
 
 /**
+ * The numbered behaviour list and the accounting instructions that ride with it — Inspector-only,
+ * and deliberately NOT the bullets `renderTechnicalSpec` already renders under `### Behaviours
+ * and edge cases`. The number is the contract: `BehaviourVerdict.behaviour` is a 1-based index
+ * into the spec's `behaviours`, so the Inspector has to see the same numbering the verdict is
+ * checked against, not a restatement of it — a verdict that quotes a clause back is reviewing its
+ * own paraphrase, and a paraphrase is exactly how clause 2 became "descending, no tie-break" in
+ * the incident this whole mechanism exists for. See `src/contracts/report.ts`.
+ */
+function renderBehaviourAccounting(spec: TechnicalSpec): string[] {
+  const lines: string[] = [];
+  lines.push('## EVERY NUMBERED BEHAVIOUR NEEDS AN ANSWER');
+  lines.push('');
+  lines.push(
+    'Numbered on purpose: `behaviours[].behaviour` in your verdict refers to a clause by this ' +
+      'number, not by restating its text. A restated clause is a paraphrase, and a paraphrase is ' +
+      'where a clause quietly turns into an easier one.',
+  );
+  lines.push('');
+  spec.behaviours.forEach((entry, i) => lines.push(`${String(i + 1)}. ${entry}`));
+  lines.push('');
+  lines.push(
+    'Return exactly one `behaviours` entry per number above. `not-verified` is the honest answer ' +
+      'when you could not check something — it is NOT a failure, and it is strictly better than ' +
+      'leaving the clause out: a clause you do not mention is a clause nobody knows was skipped, ' +
+      'which looks identical to a clean bill of health and is the exact failure this field exists ' +
+      'to make impossible.',
+  );
+  lines.push('');
+  lines.push(
+    '**THE TRAP THIS EXISTS FOR:** the Engineer wrote the tests as well as the code, so a green ' +
+      'suite is not evidence a clause was implemented — its suite can only be blind in exactly ' +
+      'the place its own code is blind. A behaviour with no test near it is precisely where to ' +
+      'look, and the way to check one is to exercise it directly, not to re-run a suite that may ' +
+      'never have touched it.',
+  );
+  lines.push('');
+  if (spec.verify !== undefined) {
+    lines.push(
+      `The \`${SPEC_FIELD_LABEL.verify}\` were already run mechanically before this branch was ` +
+        'fielded to you, and passed — you do not need to re-run them. Spend your time on the ' +
+        'behaviours a shell command cannot check.',
+    );
+    lines.push('');
+  }
+  return lines;
+}
+
+/**
  * The Inspector's `orders.md`.
  *
  * Reads the original objective back verbatim and names the branch. It also tells the Inspector,
@@ -367,6 +501,7 @@ export function renderInspectorBrief(brief: InspectorBrief): string {
     // narrative. See `InspectorBrief.spec`.
     lines.push(renderTechnicalSpec(brief.spec, '## THE SPEC THE WORK WAS ASKED AGAINST'));
     lines.push('');
+    lines.push(...renderBehaviourAccounting(brief.spec));
   }
 
   lines.push('## WHAT YOU HAVE BEEN GIVEN, AND WHAT YOU HAVE NOT');
@@ -544,8 +679,42 @@ export function renderVerdictMd(agentId: string, verdict: Verdict): string {
     '',
     ...renderFindings(verdict.findings),
     '',
+    ...renderBehaviourVerdicts(verdict.behaviours),
   ];
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * The per-behaviour accounting, in the file a human actually opens.
+ *
+ * MEASURED GAP, and the reason this exists. On the first live campaign to use the field, codex
+ * returned all five determinations correctly — and none of them reached the archive. The JSON
+ * artifact projects a `Verdict` into the cross-role `Report` shape, which has no room for them,
+ * and this renderer stopped at `findings`. The accounting survived only inside an escaped string
+ * in `stream.jsonl`.
+ *
+ * That is close to useless for the thing it was built for. The whole point of forcing one entry
+ * per clause is that a human can see the clause nobody checked; a determination that exists but
+ * cannot be read has not made anything visible. `not-verified` rows are called out separately
+ * below the table for the same reason — they are the rows worth a second look, and a reader
+ * scanning a table of fifteen will not find them.
+ */
+function renderBehaviourVerdicts(behaviours: Verdict['behaviours']): string[] {
+  if (behaviours === undefined || behaviours.length === 0) return [];
+  const lines: string[] = ['## Behaviours', ''];
+  for (const entry of [...behaviours].sort((a, b) => a.behaviour - b.behaviour)) {
+    lines.push(`- **${String(entry.behaviour)}. ${entry.status}** — ${entry.note}`);
+  }
+  lines.push('');
+  const unverified = behaviours.filter((b) => b.status === 'not-verified').map((b) => b.behaviour);
+  if (unverified.length > 0) {
+    lines.push(
+      `**${String(unverified.length)} behaviour(s) were NOT verified: ${unverified.sort((a, b) => a - b).join(', ')}.** ` +
+        'A pass with unverified clauses is a pass on what was checked, not on the whole spec.',
+    );
+    lines.push('');
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------------------------

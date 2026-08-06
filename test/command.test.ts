@@ -72,11 +72,13 @@ import {
   briefInspectorFromAttempt,
   renderEngineerOrders,
   renderInspectorBrief,
+  renderVerdictMd,
 } from '../src/command/orders.ts';
 import type { OriginalOrders } from '../src/command/orders.ts';
 import {
   LEASE_STATES,
   UNSPECIFIED_BRIEF_EFFORT,
+  behaviourCoverage,
   buildSoldierSpec,
   dispatchFor,
   mergeEvidence,
@@ -84,7 +86,7 @@ import {
   resolveProjectRoot,
   runCampaign,
 } from '../src/command/campaign.ts';
-import type { CampaignNote, CampaignOptions, CampaignResult } from '../src/command/campaign.ts';
+import type { CampaignNote, CampaignOptions, CampaignResult, CoverageReport } from '../src/command/campaign.ts';
 import {
   PROGRESS_LEASE_STATES,
   createProgressSink,
@@ -103,6 +105,7 @@ import type { Report, Verdict } from '../src/contracts/report.ts';
 import type { GhStatus } from '../src/delivery/git.ts';
 import { SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../src/contracts/spec.ts';
 import type { TechnicalSpec } from '../src/contracts/spec.ts';
+import type { CommandRunner } from '../src/contracts/verify.ts';
 
 // ===============================================================================================
 // Scaffolding
@@ -365,6 +368,13 @@ interface FakeCodexOptions {
   verdicts: ('pass' | 'fail')[];
   briefLog?: string;
   argvLog?: string;
+  /**
+   * Full `Verdict` objects, one per review round (last reused past the end) — takes precedence
+   * over the `verdicts` pass/fail templates when present. This is the seam the behaviour-coverage
+   * tests need: they have to control `behaviours` on the wire, which the two-word template
+   * cannot express.
+   */
+  verdictObjects?: Verdict[];
 }
 
 function writeFakeCodex(dir: string, name: string, options: FakeCodexOptions): string {
@@ -375,6 +385,7 @@ function writeFakeCodex(dir: string, name: string, options: FakeCodexOptions): s
 import { writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 
 const VERDICTS = ${JSON.stringify(options.verdicts)};
+const VERDICT_OBJECTS = ${JSON.stringify(options.verdictObjects ?? null)};
 const COUNTER = ${JSON.stringify(counter)};
 const BRIEF_LOG = ${JSON.stringify(options.briefLog ?? null)};
 const ARGV_LOG = ${JSON.stringify(options.argvLog ?? null)};
@@ -391,18 +402,23 @@ if (BRIEF_LOG) appendFileSync(BRIEF_LOG, prompt + '\\n\\u0000\\n');
 let n = 0;
 try { n = Number(readFileSync(COUNTER, 'utf8')) || 0; } catch { n = 0; }
 writeFileSync(COUNTER, String(n + 1));
-const which = VERDICTS[Math.min(n, VERDICTS.length - 1)];
 
 say({ type: 'thread.started', thread_id: '019fc000-0000-7000-8000-00000000fake' });
 say({ type: 'turn.started' });
 
-const verdict = which === 'pass'
-  ? { verdict: 'pass', summary: 'the branch does what the original objective asked',
-      findings: [], testsRun: true, testCommand: 'node --test' }
-  : { verdict: 'fail', summary: 'the objective asked for one thing and the branch does another',
-      findings: [{ severity: 'blocker', message: 'requirement was substituted, not met',
-                   file: 'calc.js', line: 1 }],
-      testsRun: true, testCommand: 'node --test' };
+let verdict;
+if (VERDICT_OBJECTS) {
+  verdict = VERDICT_OBJECTS[Math.min(n, VERDICT_OBJECTS.length - 1)];
+} else {
+  const which = VERDICTS[Math.min(n, VERDICTS.length - 1)];
+  verdict = which === 'pass'
+    ? { verdict: 'pass', summary: 'the branch does what the original objective asked',
+        findings: [], testsRun: true, testCommand: 'node --test' }
+    : { verdict: 'fail', summary: 'the objective asked for one thing and the branch does another',
+        findings: [{ severity: 'blocker', message: 'requirement was substituted, not met',
+                     file: 'calc.js', line: 1 }],
+        testsRun: true, testCommand: 'node --test' };
+}
 const payload = JSON.stringify(verdict);
 
 say({ type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: payload } });
@@ -621,6 +637,8 @@ function makeHarnesses(
   label: string,
   engineer: EngineerMode,
   verdicts: ('pass' | 'fail')[],
+  /** See `FakeCodexOptions.verdictObjects` — needed to control `Verdict.behaviours` on the wire. */
+  verdictObjects?: Verdict[],
 ): HarnessBins {
   const dir = mkTmp(`bins-${label}`);
   const briefLog = path.join(dir, 'briefs.txt');
@@ -632,7 +650,11 @@ function makeHarnesses(
       argvLog: claudeArgvLog,
       ordersLog,
     }),
-    codexBin: writeFakeCodex(dir, 'fake-codex.mjs', { verdicts, briefLog }),
+    codexBin: writeFakeCodex(dir, 'fake-codex.mjs', {
+      verdicts,
+      briefLog,
+      ...(verdictObjects === undefined ? {} : { verdictObjects }),
+    }),
     briefLog,
     ordersLog,
     claudeArgvLog,
@@ -646,6 +668,38 @@ function readNulSeparated(file: string): string[] {
     .split('\u0000')
     .map((chunk) => chunk.trim())
     .filter((chunk) => chunk !== '');
+}
+
+interface FakeVerifyCall {
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+}
+
+/**
+ * A `CommandRunner` that never spawns — see `test/verify.test.ts`'s own reasoning: a gate test
+ * that shells out is testing the operating system, not the sequencing this file owns. Every
+ * command not named in `responses` exits 0 with empty output, which is enough for the tests here
+ * that only care about ONE command's outcome.
+ */
+function fakeVerifyRun(
+  responses: Record<
+    string,
+    { exitCode: number; stdout?: string; stderr?: string; timedOut?: boolean }
+  >,
+): { run: CommandRunner; calls: FakeVerifyCall[] } {
+  const calls: FakeVerifyCall[] = [];
+  const run: CommandRunner = (command, cwd, timeoutMs) => {
+    calls.push({ command, cwd, timeoutMs });
+    const canned = responses[command];
+    return Promise.resolve({
+      exitCode: canned?.exitCode ?? 0,
+      stdout: canned?.stdout ?? '',
+      stderr: canned?.stderr ?? '',
+      timedOut: canned?.timedOut ?? false,
+    });
+  };
+  return { run, calls };
 }
 
 /** Run a campaign with every environmental thing pinned to a temp directory. */
@@ -1020,6 +1074,105 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
     assert.doesNotMatch(withoutSpec, /THE SPEC THE WORK WAS ASKED AGAINST/);
     for (const entry of SAMPLE_SPEC.acceptance) assert.ok(!withoutSpec.includes(entry));
   });
+
+  it("the Inspector brief numbers the spec's behaviours 1.…N. and instructs one verdict entry per number, not-verified included", () => {
+    const brief = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+      spec: SAMPLE_SPEC,
+    });
+    SAMPLE_SPEC.behaviours.forEach((entry, i) => {
+      assert.ok(
+        brief.includes(`${String(i + 1)}. ${entry}`),
+        `behaviour ${String(i + 1)} is not explicitly numbered`,
+      );
+    });
+    assert.match(brief, /one .?behaviours.? entry.* per number/i);
+    assert.match(brief, /not-verified/i);
+    assert.match(brief, /is NOT a failure/i);
+    assert.match(brief, /clause you do not mention is a clause nobody knows was skipped/i);
+  });
+
+  it('the Inspector brief warns that the Engineer authored its own tests, so a green suite is not evidence a clause was covered', () => {
+    const brief = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+      spec: SAMPLE_SPEC,
+    });
+    assert.match(brief, /the Engineer wrote the tests as well as the code/i);
+    assert.match(brief, /green suite is not evidence/i);
+  });
+
+  it('with a `verify` list, the Inspector brief says those commands already ran and passed — no need to re-run them', () => {
+    const specWithVerify: TechnicalSpec = { ...SAMPLE_SPEC, verify: ['npm test', 'npm run typecheck'] };
+    const brief = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+      spec: specWithVerify,
+    });
+    assert.match(brief, /already run mechanically.*and passed/i);
+    assert.match(brief, /do not need to re-run them/i);
+
+    const withoutVerify = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+      spec: SAMPLE_SPEC,
+    });
+    assert.doesNotMatch(withoutVerify, /already run mechanically/i);
+  });
+
+  it('renderEngineerOrders with spec.verify renders each command verbatim in backticks, and tells the Engineer to run them first', () => {
+    const specWithVerify: TechnicalSpec = { ...SAMPLE_SPEC, verify: ['npm test', 'npm run typecheck'] };
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: specWithVerify,
+    });
+    for (const command of specWithVerify.verify ?? []) {
+      assert.ok(orders.includes(`\`${command}\``), `command ${command} is not rendered verbatim in backticks`);
+    }
+    assert.match(orders, /run them yourself.*before you report done/i);
+    assert.match(orders, /run against your branch mechanically after you report done/i);
+
+    const withoutVerify = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: SAMPLE_SPEC,
+    });
+    assert.doesNotMatch(withoutVerify, /run against your branch mechanically/i);
+  });
+
+  it('none of the behaviour-accounting or verify wording appears when the spec is absent', () => {
+    const brief = briefInspectorFromAttempt({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      round: 1,
+    });
+    assert.doesNotMatch(brief, /EVERY NUMBERED BEHAVIOUR NEEDS AN ANSWER/);
+    assert.doesNotMatch(brief, /the Engineer wrote the tests as well as the code/i);
+    assert.doesNotMatch(brief, /already run mechanically/i);
+
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+    });
+    assert.doesNotMatch(orders, /run against your branch mechanically/i);
+  });
 });
 
 // ===============================================================================================
@@ -1264,6 +1417,47 @@ describe('permissions', () => {
         'parent and is xhigh whenever the parent was escalated for arriving without a spec',
     );
     assert.match(briefing, /inside the unit that fielded you|whatever effort it was given/i);
+  });
+
+  // MEASURED GAP. On the first live campaign to use per-behaviour verdicts, codex returned all
+  // five determinations correctly and NONE of them reached the archive: the JSON artifact
+  // projects a Verdict into the cross-role Report shape, which has no room for them, and this
+  // renderer stopped at `findings`. The accounting survived only inside an escaped string in
+  // `stream.jsonl`. Forcing one entry per clause buys nothing if a human cannot read the clause
+  // nobody checked, so the human-facing file is asserted here.
+  it('renderVerdictMd carries the per-behaviour accounting and calls out what went unverified', () => {
+    const verdict: Verdict = {
+      verdict: 'pass',
+      summary: 'looks fine',
+      findings: [],
+      testsRun: true,
+      testCommand: 'node --test',
+      behaviours: [
+        { behaviour: 2, status: 'not-verified', note: 'could not exercise the tie-break' },
+        { behaviour: 1, status: 'met', note: 'exercised directly' },
+        { behaviour: 3, status: 'not-met', note: 'missing' },
+      ],
+    };
+    const md = renderVerdictMd('cpt-02', verdict);
+
+    for (const note of ['exercised directly', 'could not exercise the tie-break', 'missing']) {
+      assert.ok(md.includes(note), `the note ${JSON.stringify(note)} is not in the rendered verdict`);
+    }
+    // Sorted by index, not in the order the model happened to emit them.
+    assert.ok(
+      md.indexOf('**1. met**') < md.indexOf('**2. not-verified**'),
+      'behaviours render in the order returned rather than by index',
+    );
+    // The unverified ones are called out separately — a reader scanning fifteen rows will not
+    // otherwise find the one nobody checked, which is the whole reason the field exists.
+    assert.match(md, /NOT verified: 2\b/);
+
+    // And a verdict with no accounting renders no section at all, rather than an empty heading.
+    const { behaviours: _dropped, ...withoutBehaviours } = verdict;
+    assert.ok(
+      !renderVerdictMd('cpt-02', withoutBehaviours).includes('Behaviours'),
+      'a verdict carrying no behaviours still rendered a Behaviours section',
+    );
   });
 });
 
@@ -2082,6 +2276,381 @@ describe('a full campaign — Inspector FAILS, then PASSES on the retry', () => 
       .filter((line) => line.trim() !== '')
       .map((line) => JSON.parse(line) as { id: string; parent_task_id: string | null; title: string });
     assert.ok(tasks.some((t) => t.parent_task_id === result.taskId && /^review /.test(t.title)));
+  });
+});
+
+// ===============================================================================================
+// 5b. `behaviourCoverage` — pure, and the mechanism behind CHANGE 2
+//
+// The incident: a spec listed six behaviours, clause 2 was never implemented, and the verdict
+// came back `findings: []`, `verdict: pass` because nothing anywhere counted the clauses that
+// were answered against the clauses that existed. This function is that count, and every one of
+// these tests was watched red before it was green: each assertion below was checked against a
+// `behaviourCoverage` that unconditionally returned `complete: true` first, to confirm the test
+// actually exercises the accounting rather than trivially passing.
+// ===============================================================================================
+
+describe('behaviourCoverage — is the verdict answering the same numbered list the spec asked?', () => {
+  const spec3: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: ['a', 'b', 'c'] };
+
+  function verdictWith(behaviours?: Verdict['behaviours']): Verdict {
+    return {
+      verdict: 'pass',
+      summary: 'ok',
+      findings: [],
+      testsRun: true,
+      ...(behaviours === undefined ? {} : { behaviours }),
+    };
+  }
+
+  const emptyReport: CoverageReport = {
+    missing: [],
+    duplicated: [],
+    outOfRange: [],
+    unverified: [],
+    complete: true,
+  };
+
+  it('every index accounted for exactly once is complete', () => {
+    const coverage = behaviourCoverage(
+      spec3,
+      verdictWith([
+        { behaviour: 1, status: 'met', note: 'checked' },
+        { behaviour: 2, status: 'met', note: 'checked' },
+        { behaviour: 3, status: 'met', note: 'checked' },
+      ]),
+    );
+    assert.deepEqual(coverage, emptyReport);
+  });
+
+  it('one missing index is reported, and coverage is incomplete', () => {
+    const coverage = behaviourCoverage(
+      spec3,
+      verdictWith([
+        { behaviour: 1, status: 'met', note: 'checked' },
+        { behaviour: 3, status: 'met', note: 'checked' },
+      ]),
+    );
+    assert.deepEqual(coverage.missing, [2]);
+    assert.equal(coverage.complete, false);
+  });
+
+  it('a duplicated index is reported, even though every index is otherwise present', () => {
+    const coverage = behaviourCoverage(
+      spec3,
+      verdictWith([
+        { behaviour: 1, status: 'met', note: 'checked' },
+        { behaviour: 1, status: 'met', note: 'checked again' },
+        { behaviour: 2, status: 'met', note: 'checked' },
+        { behaviour: 3, status: 'met', note: 'checked' },
+      ]),
+    );
+    assert.deepEqual(coverage.duplicated, [1]);
+    assert.deepEqual(coverage.missing, []);
+    assert.equal(coverage.complete, false);
+  });
+
+  it('an out-of-range index is reported, and never confused with a real one', () => {
+    const coverage = behaviourCoverage(
+      spec3,
+      verdictWith([
+        { behaviour: 1, status: 'met', note: 'checked' },
+        { behaviour: 2, status: 'met', note: 'checked' },
+        { behaviour: 3, status: 'met', note: 'checked' },
+        { behaviour: 7, status: 'met', note: 'off the end' },
+      ]),
+    );
+    assert.deepEqual(coverage.outOfRange, [7]);
+    assert.deepEqual(coverage.missing, [], 'an out-of-range entry must not also read as a missing one');
+    // `complete` is deliberately false here too — CHANGE 2 treats anything in `missing`,
+    // `duplicated` OR `outOfRange` as an incomplete review, not only a missing index.
+    assert.equal(coverage.complete, false);
+  });
+
+  it('`not-verified` entries are collected in `unverified`, and do NOT make coverage incomplete', () => {
+    const coverage = behaviourCoverage(
+      spec3,
+      verdictWith([
+        { behaviour: 1, status: 'met', note: 'checked' },
+        { behaviour: 2, status: 'not-verified', note: 'could not exercise this directly' },
+        { behaviour: 3, status: 'met', note: 'checked' },
+      ]),
+    );
+    assert.deepEqual(coverage.unverified, [2]);
+    assert.equal(coverage.complete, true, 'not-verified is the honest answer, not a gap');
+  });
+
+  it('no spec means complete, with every list empty', () => {
+    assert.deepEqual(behaviourCoverage(undefined, verdictWith([{ behaviour: 1, status: 'met', note: 'x' }])), emptyReport);
+  });
+
+  it('a spec with an empty behaviours list means complete — there is nothing to account for', () => {
+    const spec0: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [] };
+    assert.deepEqual(behaviourCoverage(spec0, verdictWith([])), emptyReport);
+  });
+
+  it('a null verdict means complete, with every list empty', () => {
+    assert.deepEqual(behaviourCoverage(spec3, null), emptyReport);
+  });
+
+  it('a spec with behaviours but `verdict.behaviours` entirely absent leaves EVERY index missing', () => {
+    const coverage = behaviourCoverage(spec3, verdictWith(undefined));
+    assert.deepEqual(coverage.missing, [1, 2, 3]);
+    assert.equal(coverage.complete, false);
+  });
+});
+
+// ===============================================================================================
+// 5c. THE ACCEPTANCE GATE — runs before the Inspector, on a `done` report, when `spec.verify`
+// carries commands. See `src/verify/gate.ts` for the incident: a criterion left in prose that
+// nothing ever executed.
+// ===============================================================================================
+
+describe('the acceptance gate', () => {
+  it('runs with `spec.verify`, against the Engineer\'s leased worktree as cwd', async () => {
+    const repo = makeRepo('gate-cwd');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-cwd', 'ok', ['pass']);
+    const { run, calls } = fakeVerifyRun({ 'npm test': { exitCode: 0 } });
+    // `behaviours: []` — this test is about the gate's cwd, not behaviour coverage, and the fake
+    // Inspector's plain `pass` template carries no `behaviours` at all. A spec WITH behaviours
+    // and a verdict that never accounts for them is exactly what the coverage tests below cover.
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], verify: ['npm test'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.command, 'npm test');
+    assert.ok(result.lease.path !== null);
+    assert.equal(calls[0]?.cwd, result.lease.path, "the gate's cwd was not the Engineer's worktree");
+  });
+
+  it('a failing gate fails the attempt, and the Inspector is never spawned', async () => {
+    const repo = makeRepo('gate-fail');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-fail', 'ok', ['pass']);
+    const { run } = fakeVerifyRun({
+      'npm test': { exitCode: 1, stderr: 'SENTINEL-GATE-FAILURE: 1 test failed' },
+    });
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, verify: ['npm test'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 1,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'engineer-failed', renderCampaignResult(result));
+    // THE WHOLE POINT: a spawn counter for the Inspector role is 0. `briefLog` is appended to
+    // exactly once per codex invocation — see `writeFakeCodex` — so its emptiness IS that counter.
+    assert.equal(
+      readNulSeparated(bins.briefLog).length,
+      0,
+      'the Inspector was spawned despite a failing acceptance gate',
+    );
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.attempts[0]?.inspectorAgentId, null);
+    assert.equal(result.attempts[0]?.acceptance?.ran, true);
+    assert.equal(result.attempts[0]?.acceptance?.passed, false);
+    assert.equal(result.acceptance?.ran, true);
+    assert.equal(result.acceptance?.passed, false);
+    assert.ok(result.notes.some((n) => n.code === 'acceptance' && n.level === 'error'));
+  });
+
+  it('a passing gate proceeds to the Inspector', async () => {
+    const repo = makeRepo('gate-pass');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-pass', 'ok', ['pass']);
+    const { run } = fakeVerifyRun({ 'npm test': { exitCode: 0 } });
+    // See the `behaviours: []` note in the cwd test above — orthogonal to what this test covers.
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], verify: ['npm test'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(readNulSeparated(bins.briefLog).length, 1, 'the Inspector was never spawned');
+    assert.equal(result.acceptance?.ran, true);
+    assert.equal(result.acceptance?.passed, true);
+  });
+
+  it('with no `spec.verify`, the gate does not run, the injected runner is never called, and the result says so rather than reporting a pass', async () => {
+    const repo = makeRepo('gate-none');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-none', 'ok', ['pass']);
+    const { run, calls } = fakeVerifyRun({});
+    // See the `behaviours: []` note above — this test is about `spec.verify` being absent, not
+    // about behaviour coverage.
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(calls.length, 0, 'the injected runner was called with no `verify` commands to run');
+    assert.equal(result.acceptance?.ran, false);
+    assert.equal(result.acceptance?.passed, false, 'a gate that never ran must not report as passed');
+    assert.match(renderCampaignResult(result), /acceptance not run/);
+  });
+
+  it('does not run when the Engineer reported `blocked`', async () => {
+    const repo = makeRepo('gate-blocked');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-blocked', 'blocked', ['pass']);
+    const { run, calls } = fakeVerifyRun({ 'npm test': { exitCode: 0 } });
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, verify: ['npm test'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 1,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'engineer-failed', renderCampaignResult(result));
+    assert.equal(calls.length, 0, 'the gate ran despite the Engineer never reporting done');
+    assert.equal(result.attempts[0]?.acceptance, null);
+  });
+
+  it('the retry brief contains the failed command and its output', async () => {
+    const repo = makeRepo('gate-retry-brief');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-retry-brief', 'ok', ['pass']);
+    const { run } = fakeVerifyRun({
+      'npm test': { exitCode: 0 },
+      'node calc.js': { exitCode: 1, stderr: 'SENTINEL-CALC-FAILURE: unexpected token' },
+    });
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, verify: ['npm test', 'node calc.js'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 2,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.attempts.length, 2, renderCampaignResult(result));
+    const orders = readNulSeparated(bins.ordersLog);
+    assert.equal(orders.length, 2);
+    const retry = orders[1] as string;
+    assert.match(retry, /THE ACCEPTANCE GATE FAILED YOUR PREVIOUS ATTEMPT/);
+    assert.ok(retry.includes('node calc.js'), 'the failed command is not in the retry brief');
+    assert.ok(retry.includes('SENTINEL-CALC-FAILURE'), "the failed command's output is not in the retry brief");
+  });
+});
+
+// ===============================================================================================
+// 5d. BEHAVIOUR COVERAGE, END TO END — an Inspector that skips a numbered clause has not
+// reviewed the work, whatever `verdict` it wrote.
+// ===============================================================================================
+
+describe('behaviour coverage, end to end', () => {
+  it('an incomplete-coverage verdict that says PASS still fails the attempt and retries', async () => {
+    const repo = makeRepo('coverage-incomplete');
+    const home = makeHome({ [repo]: 0 });
+    // Clause 2 has NO entry at all — the incident `Verdict.behaviours` exists for, reproduced.
+    const incompletePass: Verdict = {
+      verdict: 'pass',
+      summary: 'looks right to me',
+      findings: [],
+      testsRun: true,
+      behaviours: [{ behaviour: 1, status: 'met', note: 'checked directly' }],
+    };
+    const completePass: Verdict = {
+      verdict: 'pass',
+      summary: 'looks right to me, on a second look',
+      findings: [],
+      testsRun: true,
+      behaviours: [
+        { behaviour: 1, status: 'met', note: 'checked directly' },
+        { behaviour: 2, status: 'met', note: 'checked directly, this time' },
+      ],
+    };
+    const bins = makeHarnesses('coverage-incomplete', 'ok', ['pass', 'pass'], [incompletePass, completePass]);
+    const result = await campaign({
+      objective: SAMPLE_SPEC.objective,
+      spec: SAMPLE_SPEC,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 3,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(result.attempts.length, 2, 'an incomplete-coverage PASS did not trigger a retry');
+    assert.equal(
+      result.attempts[0]?.verdict?.verdict,
+      'pass',
+      "the FIRST Inspector's own verdict really did say pass",
+    );
+    assert.ok(result.notes.some((n) => n.code === 'coverage' && n.level === 'error'));
+
+    // The retry brief names the missing behaviour by index AND by its text — an index alone is
+    // not an instruction the next Engineer can act on.
+    const orders = readNulSeparated(bins.ordersLog);
+    assert.equal(orders.length, 2);
+    const retry = orders[1] as string;
+    assert.match(retry, /THE PREVIOUS REVIEW DID NOT ACCOUNT FOR EVERY BEHAVIOUR/);
+    assert.ok(retry.includes(SAMPLE_SPEC.behaviours[1] as string));
+  });
+
+  it('a complete verdict with `not-verified` entries delivers, and the indices are visible', async () => {
+    const repo = makeRepo('coverage-unverified');
+    const home = makeHome({ [repo]: 0 });
+    const verdict: Verdict = {
+      verdict: 'pass',
+      summary: 'looks right to me',
+      findings: [],
+      testsRun: true,
+      behaviours: [
+        { behaviour: 1, status: 'met', note: 'checked directly' },
+        { behaviour: 2, status: 'not-verified', note: 'could not exercise this edge case' },
+      ],
+    };
+    const bins = makeHarnesses('coverage-unverified', 'ok', ['pass'], [verdict]);
+    const result = await campaign({
+      objective: SAMPLE_SPEC.objective,
+      spec: SAMPLE_SPEC,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.deepEqual(result.unverifiedBehaviours, [2]);
+    assert.match(renderCampaignResult(result), /1 of 2 behaviours were not verified: 2/);
   });
 });
 
@@ -3589,6 +4158,8 @@ describe('army campaign (the command)', () => {
       delivery: null,
       lease: { state: 'released' as const, path: null, leaseId: null, reason: 'ok' },
       notes: [],
+      acceptance: null,
+      unverifiedBehaviours: [],
       exitCode: 0,
     };
     const verdictOf = (testsRun: boolean): Verdict => ({
@@ -3611,6 +4182,7 @@ describe('army campaign (the command)', () => {
             verdict: verdictOf(testsRun),
             engineerStatus: 'ok',
             costUsd: null,
+            acceptance: null,
           },
         ],
       } as CampaignResult);
@@ -3668,6 +4240,8 @@ function stubCampaignResult(): CampaignResult {
     delivery: null,
     lease: { state: 'released', path: null, leaseId: null, reason: 'stub' },
     notes: [],
+    acceptance: null,
+    unverifiedBehaviours: [],
     exitCode: 0,
   };
 }
@@ -4081,6 +4655,7 @@ describe('the campaign screen only names commands that exist on this machine', (
         verdict: null,
         engineerStatus: 'ok',
         costUsd: null,
+        acceptance: null,
       },
     ],
     report: null,
@@ -4092,6 +4667,8 @@ describe('the campaign screen only names commands that exist on this machine', (
     delivery: null,
     lease: { state: 'never-acquired', path: null, leaseId: null, reason: 'none' },
     notes: [],
+    acceptance: null,
+    unverifiedBehaviours: [],
     exitCode: 1,
   };
 

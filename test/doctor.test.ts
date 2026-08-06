@@ -2615,6 +2615,32 @@ describe('no source file hardcodes a command the reader may not be able to run',
     return (source as unknown as { parseDiagnostics?: readonly ts.Diagnostic[] }).parseDiagnostics ?? [];
   }
 
+  /**
+   * Does the file contain a string token, according to the SCANNER rather than the AST walk?
+   *
+   * The second opinion behind the zero-literal check below. `skipTrivia: true` means comments
+   * never reach the token stream, so a file whose only quote characters live in prose answers
+   * `false` — which a regex over the raw bytes could not do.
+   */
+  function hasStringTokens(file: string): boolean {
+    const scanner = ts.createScanner(
+      ts.ScriptTarget.ESNext,
+      true,
+      ts.LanguageVariant.Standard,
+      fs.readFileSync(file, 'utf8'),
+    );
+    for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+      if (
+        token === ts.SyntaxKind.StringLiteral ||
+        token === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+        token === ts.SyntaxKind.TemplateHead
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function tsFilesUnder(dir: string): string[] {
     return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const full = nodePath.join(dir, entry.name);
@@ -2665,11 +2691,24 @@ describe('no source file hardcodes a command the reader may not be able to run',
       .map((f) => nodePath.relative(srcRoot, f));
     assert.deepEqual(broken, [], 'the scan saw no strings in these files, so it guarded nothing');
     // And no file is silently empty of literals for some other reason.
+    //
+    // The corroborating question used to be "does the raw text contain a quote character", and
+    // that was a heuristic over BYTES standing in for a fact about CODE. It reported
+    // `contracts/verify.ts` — a file of nothing but type declarations and doc comments — as a
+    // parser failure, because its prose says `spec's` and cites `CheckExec` in backticks. Quotes
+    // in a comment are not string literals, and a guard that cannot tell the two apart is the
+    // pattern-not-parser mistake happening inside the parser guard itself.
+    //
+    // So the corroboration is now a SECOND, INDEPENDENT mechanism: the scanner tokenises with
+    // trivia skipped, so comments never reach it. If it finds a string token where the AST walk
+    // found none, the AST walk is broken — which is the actual property this test wants and
+    // strictly stronger than the regex, because it also catches a walk that silently stops
+    // descending rather than only one that fails to parse.
     for (const file of files) {
       if (literalsOf(file).length === 0) {
         assert.ok(
-          !/["'`]/.test(fs.readFileSync(file, 'utf8')),
-          `${nodePath.relative(srcRoot, file)} has quotes but the parser found no literals`,
+          !hasStringTokens(file),
+          `${nodePath.relative(srcRoot, file)} has string tokens but the AST walk found no literals`,
         );
       }
     }

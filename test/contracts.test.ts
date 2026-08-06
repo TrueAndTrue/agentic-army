@@ -42,6 +42,8 @@ import {
   VERDICT_VALUES,
   SEVERITIES,
   ARTIFACT_KINDS,
+  BEHAVIOUR_STATUSES,
+  BEHAVIOUR_VERDICT_KEYS,
   REPORT_REQUIRED_KEYS,
   REPORT_OPTIONAL_KEYS,
   VERDICT_REQUIRED_KEYS,
@@ -771,6 +773,28 @@ test('verdict.v1.json satisfies strict mode against the TS key manifests', () =>
     FINDING_OPTIONAL_KEYS,
     'verdict.$defs.finding',
   );
+});
+
+test('verdict.behaviours is nullable and listed in required — the schema-drift guard for the incident this field exists to prevent', () => {
+  // `behaviours` is in VERDICT_OPTIONAL_KEYS (report.ts), so `assertStrictObject` above already
+  // covers this indirectly — this test names the property explicitly so a future edit that
+  // narrows `assertStrictObject`'s scope cannot silently stop checking the one field this whole
+  // change was for.
+  assert.ok(verdictSchema.required.includes('behaviours'), 'behaviours must be in required');
+  assert.deepEqual(verdictSchema.properties.behaviours.type, ['array', 'null']);
+  assert.equal(verdictSchema.properties.behaviours.maxItems, 30);
+});
+
+test('$defs/behaviourVerdict matches BEHAVIOUR_VERDICT_KEYS in both directions', () => {
+  const def = verdictSchema.$defs.behaviourVerdict;
+  assert.equal(def.type, 'object');
+  assert.equal(def.additionalProperties, false);
+  assert.deepEqual(sorted(Object.keys(def.properties)), sorted([...BEHAVIOUR_VERDICT_KEYS]));
+  assert.deepEqual(sorted(def.required), sorted([...BEHAVIOUR_VERDICT_KEYS]));
+});
+
+test('$defs/behaviourVerdict.status enum matches BEHAVIOUR_STATUSES', () => {
+  assert.deepEqual(verdictSchema.$defs.behaviourVerdict.properties.status.enum, [...BEHAVIOUR_STATUSES]);
 });
 
 test('a strict-mode instance — nulls where TS says optional — is accepted by the validators', () => {

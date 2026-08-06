@@ -31,7 +31,6 @@
  * itself (`./workspace.ts`) is written to never throw at all.
  */
 
-import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 
 import type {
@@ -54,6 +53,7 @@ import type {
 import { buildSoldierSpec, runSoldier } from '../command/campaign.ts';
 import { createCampaign } from '../archive/archive.ts';
 import { claudeAdapter, createClaudeAdapter } from '../harness/claude.ts';
+import { runCommand } from '../verify/exec.ts';
 
 import { collectEvidence, inspectSeed, materializeArm } from './workspace.ts';
 import { evaluateChecks, vacuousJobChecks } from './checks.ts';
@@ -79,56 +79,6 @@ export const TRIAL_EFFECTIVE_EFFORT: Record<ReasoningEffort, string> = {
   high: 'high',
   xhigh: 'xhigh',
 };
-
-// ---------------------------------------------------------------------------------------------
-// The default CommandCheck runner
-// ---------------------------------------------------------------------------------------------
-
-/**
- * The real process runner behind a `CommandCheck`. Shells out with `shell: true` deliberately —
- * `run` is the trial author's own command, trusted the same way a `package.json` script is (see
- * `CommandCheck` in `src/contracts/trial.ts`), and it is expected to use shell syntax (`&&`,
- * pipes) the way an npm script does.
- */
-function defaultCheckExec(
-  command: string,
-  cwd: string,
-  timeoutMs: number,
-): Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }> {
-  return new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    let settled = false;
-
-    const child = spawn(command, { cwd, shell: true });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, timeoutMs);
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-
-    const finish = (exitCode: number | null): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ exitCode, stdout, stderr, timedOut });
-    };
-
-    child.on('close', (code) => finish(code));
-    child.on('error', (error) => {
-      stderr += `\n${error.message}`;
-      finish(null);
-    });
-  });
-}
 
 // ---------------------------------------------------------------------------------------------
 // Options
@@ -195,7 +145,7 @@ export async function runTrial(options: RunTrialOptions): Promise<TrialResult> {
     (spec.armTimeoutMs !== undefined
       ? createClaudeAdapter({ closeGraceMs: spec.armTimeoutMs })
       : claudeAdapter);
-  const exec = options.exec ?? defaultCheckExec;
+  const exec = options.exec ?? runCommand;
   const onProgress = options.onProgress;
   const home = options.home;
 

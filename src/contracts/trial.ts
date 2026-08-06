@@ -34,6 +34,7 @@
  */
 
 import type { ReasoningEffort, SoldierEvent, SoldierStatus } from './harness.ts';
+import type { CommandRunner } from './verify.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Checks
@@ -206,12 +207,16 @@ export interface CheckResult {
   detail: string;
 }
 
-/** Run a command for a `CommandCheck`. Injected so the pure checks need no child processes. */
-export type CheckExec = (
-  command: string,
-  cwd: string,
-  timeoutMs: number,
-) => Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }>;
+/**
+ * Run a command for a `CommandCheck`. Injected so the pure checks need no child processes.
+ *
+ * An alias, not a second declaration that happens to match `CommandRunner` (`./verify.ts`): the
+ * trial's `CommandCheck`s and the campaign's acceptance gate (`src/verify/gate.ts`) both need "run
+ * this command, report exit/stdout/stderr/timedOut", and a shape restated in two files drifts the
+ * moment one of them gains a field the other doesn't. `CommandResult` there is structurally this
+ * type today, so the alias costs nothing and removes a place the two could disagree.
+ */
+export type CheckExec = CommandRunner;
 
 // ---------------------------------------------------------------------------------------------
 // Arms

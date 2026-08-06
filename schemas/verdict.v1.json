@@ -3,7 +3,7 @@
   "description": "The Inspector's return. Passed to codex as --output-schema <path>, which takes the file path; passed to claude as --json-schema <json>, which takes the file CONTENTS inline — the claude adapter reads this file and inlines it, because passing a path fails with \"--json-schema is not valid JSON\". The Inspector is briefed from the ORIGINAL ORDERS plus the branch, never from the Engineer's account of what it did. Mirrors src/contracts/report.ts — test/contracts.test.ts fails if the two drift. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` at every level and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Both rules are asserted by test/contracts.test.ts.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings", "testsRun", "testCommand"],
+  "required": ["verdict", "summary", "findings", "testsRun", "testCommand", "behaviours"],
   "properties": {
     "verdict": {
       "type": "string",
@@ -31,9 +31,38 @@
       "description": "The exact command run, so a human can reproduce the verdict. null when no tests were run.",
       "minLength": 1,
       "maxLength": 512
+    },
+    "behaviours": {
+      "type": ["array", "null"],
+      "description": "One entry per NUMBERED behaviour in the spec — index-matched, not restated. null when the campaign was run from a free-text objective and there is no spec to account for. When a spec was supplied, every one of its behaviours must appear exactly once here; a behaviour the Inspector could not check is 'not-verified', not an entry left out. A missing number is indistinguishable from a clause nobody looked at, which is the failure this field exists to make impossible.",
+      "maxItems": 30,
+      "items": { "$ref": "#/$defs/behaviourVerdict" }
     }
   },
   "$defs": {
+    "behaviourVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["behaviour", "status", "note"],
+      "properties": {
+        "behaviour": {
+          "type": "integer",
+          "description": "1-based index into the spec's behaviours list. The number is the contract — it lines this entry up with the clause without restating its text, because a restated clause is a paraphrase and a paraphrase is where a clause quietly becomes an easier one.",
+          "minimum": 1
+        },
+        "status": {
+          "type": "string",
+          "description": "met = verified to hold. not-met = verified to be absent or wrong. not-verified = the Inspector could not check this one. not-verified is an honest answer, not a failure — it is strictly better than omitting the entry, because an omission looks identical to a clean bill of health.",
+          "enum": ["met", "not-met", "not-verified"]
+        },
+        "note": {
+          "type": "string",
+          "description": "One line: how it was checked, or why it could not be.",
+          "minLength": 1,
+          "maxLength": 280
+        }
+      }
+    },
     "finding": {
       "type": "object",
       "additionalProperties": false,

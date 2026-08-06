@@ -96,6 +96,35 @@ export interface TechnicalSpec {
   decisions: readonly string[];
   /** What the worker must not do. Forbidden actions, dependencies, files, shortcuts. */
   constraints: readonly string[];
+  /**
+   * The executable half of `acceptance` — shell commands that must exit 0 in the worktree.
+   *
+   * ## Why this is separate from `acceptance` rather than replacing it
+   *
+   * `acceptance` is prose, addressed to a human approving the spec and to a worker reading its
+   * orders. "invalid input paths exit with code 1 and a message on stderr" is a good criterion
+   * and not a command. Turning that field into commands would lose the criteria that cannot be
+   * one; deciding which entries are runnable by looking at the text would be pattern-matching
+   * prose, which this repo does not do. So the two coexist and the split is structural.
+   *
+   * ## The incident
+   *
+   * A commander wrote `node expenses.js sample-expenses.json prints an aligned table` into
+   * `acceptance`. The Engineer created `expenses.json` instead. The Inspector ran the CLI against
+   * the file that existed, passed the branch, and the criterion — run verbatim afterwards — exits
+   * 1. Nothing in the system had ever executed it, because prose does not execute.
+   *
+   * ## Optional, and its absence is reported rather than assumed
+   *
+   * Not every task has a runnable check, and forcing one would produce `true` and a gate that is
+   * theatre. So this may be absent — but `AcceptanceResult.ran` carries that fact outward, and a
+   * campaign that ran no gate says so. An unrun check must never look like a passed one.
+   *
+   * These strings are executed. They come from the commander and are shown to the human in full
+   * at the approval prompt before anything spawns, which is the same trust path as every other
+   * field — but it is worth knowing that this is the one field with a process behind it.
+   */
+  verify?: readonly string[];
 }
 
 /** The five list fields, in the order they are asked for and rendered. */
@@ -109,13 +138,14 @@ export const SPEC_LIST_FIELDS = [
 export type SpecListField = (typeof SPEC_LIST_FIELDS)[number];
 
 /** Human-facing names, for the commander's questions and the confirmation prompt. */
-export const SPEC_FIELD_LABEL: Record<SpecListField | 'objective', string> = {
+export const SPEC_FIELD_LABEL: Record<SpecListField | 'objective' | 'verify', string> = {
   objective: 'Objective',
   filesInScope: 'Files in scope',
   acceptance: 'Acceptance',
   behaviours: 'Behaviours and edge cases',
   decisions: 'Decisions already made',
   constraints: 'Constraints',
+  verify: 'Verification commands',
 };
 
 export type SpecParse =
@@ -147,7 +177,7 @@ export function validateTechnicalSpec(value: unknown): SpecParse {
   }
   const record = value as Record<string, unknown>;
 
-  const known: string[] = ['objective', ...SPEC_LIST_FIELDS];
+  const known: string[] = ['objective', ...SPEC_LIST_FIELDS, 'verify'];
   const extra = Object.keys(record).filter((key) => !known.includes(key));
   if (extra.length > 0) {
     return {
@@ -191,6 +221,35 @@ export function validateTechnicalSpec(value: unknown): SpecParse {
     lists[field] = raw as readonly string[];
   }
 
+  // `verify` is the one optional field, and absent is NOT the same as empty. Absent means the
+  // commander had nothing mechanically checkable; `[]` means it answered the question with
+  // nothing, which is the shape that would let a gate look run when it never was. Refuse it, and
+  // let the absence be reported honestly by `AcceptanceResult.ran` instead.
+  const rawVerify = record['verify'];
+  let verify: readonly string[] | undefined;
+  if (rawVerify !== undefined) {
+    if (!Array.isArray(rawVerify)) {
+      return { ok: false, reason: 'spec.verify must be an array of shell commands' };
+    }
+    if (rawVerify.length === 0) {
+      return {
+        ok: false,
+        reason: 'spec.verify is empty. Omit the field entirely if nothing here is runnable — an empty list would report as a gate that ran.',
+      };
+    }
+    if (rawVerify.length > SPEC_MAX_ENTRIES) {
+      return {
+        ok: false,
+        reason: `spec.verify has ${String(rawVerify.length)} entries, over the ${String(SPEC_MAX_ENTRIES)} cap.`,
+      };
+    }
+    for (let i = 0; i < rawVerify.length; i += 1) {
+      const problem = badEntry(rawVerify[i]);
+      if (problem !== null) return { ok: false, reason: `spec.verify[${String(i)}] ${problem}` };
+    }
+    verify = rawVerify as readonly string[];
+  }
+
   const spec: TechnicalSpec = {
     objective: (record['objective'] as string).trim(),
     filesInScope: lists['filesInScope'] as readonly string[],
@@ -198,6 +257,7 @@ export function validateTechnicalSpec(value: unknown): SpecParse {
     behaviours: lists['behaviours'] as readonly string[],
     decisions: lists['decisions'] as readonly string[],
     constraints: lists['constraints'] as readonly string[],
+    ...(verify === undefined ? {} : { verify }),
   };
 
   const total = specTotalChars(spec);
@@ -217,6 +277,7 @@ export function specTotalChars(spec: TechnicalSpec): number {
   for (const field of SPEC_LIST_FIELDS) {
     for (const entry of spec[field]) total += entry.length;
   }
+  for (const entry of spec.verify ?? []) total += entry.length;
   return total;
 }
 
@@ -237,6 +298,16 @@ export function renderTechnicalSpec(spec: TechnicalSpec, heading = '## THE SPEC'
     lines.push(`### ${SPEC_FIELD_LABEL[field]}`);
     lines.push('');
     for (const entry of spec[field]) lines.push(`- ${entry}`);
+    lines.push('');
+  }
+  // Rendered LAST and only when present, because this is the field with a process behind it and
+  // the human approving the spec has to see every command that will be run, verbatim.
+  if (spec.verify !== undefined) {
+    lines.push(`### ${SPEC_FIELD_LABEL.verify}`);
+    lines.push('');
+    lines.push('These are executed in the worktree; each must exit 0.');
+    lines.push('');
+    for (const entry of spec.verify) lines.push(`- \`${entry}\``);
     lines.push('');
   }
   return lines.join('\n');

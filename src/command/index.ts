@@ -251,6 +251,38 @@ export function renderCampaignResult(result: CampaignResult, self: string = invo
     const durability = result.delivery.durability;
     lines.push(`  durable   ${durability.target.kind} ${durability.target.url}`);
   }
+  // -----------------------------------------------------------------------------------------
+  // THE ACCEPTANCE GATE, NAMED ON EVERY SCREEN — this is the line the incident on
+  // `TechnicalSpec.verify` (`src/contracts/spec.ts`) exists to force into being. An unrun check
+  // must never look like a passed one, so this prints even when there is nothing to praise: a
+  // spec with no `verify` commands, or no spec at all, says so in as many words rather than
+  // leaving the reader to infer "delivered" means "and it was mechanically checked".
+  // -----------------------------------------------------------------------------------------
+  if (result.acceptance !== null && result.acceptance.ran) {
+    if (result.acceptance.passed) {
+      lines.push('  acceptance passed — every `verify` command exited 0');
+    } else {
+      const failed = result.acceptance.outcomes
+        .filter((outcome) => !outcome.passed)
+        .map((outcome) => outcome.command);
+      lines.push(`  acceptance FAILED — ${failed.join(', ')}`);
+    }
+  } else {
+    lines.push(
+      '  acceptance not run — no `verify` commands were checked mechanically; nothing above ' +
+        'confirms it',
+    );
+  }
+  // Delivered, but the Inspector said so about fewer clauses than the spec had. Not a failure —
+  // `not-verified` is the Inspector telling the truth — but a human reading "delivered" has to
+  // also be able to read this.
+  if (result.unverifiedBehaviours.length > 0) {
+    const total = result.verdict?.behaviours?.length ?? result.unverifiedBehaviours.length;
+    lines.push(
+      `  ${String(result.unverifiedBehaviours.length)} of ${String(total)} behaviours were not ` +
+        `verified: ${result.unverifiedBehaviours.join(', ')}`,
+    );
+  }
   lines.push(`  worktree  ${result.lease.state} — ${result.lease.reason}`);
   lines.push('');
 

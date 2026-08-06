@@ -1010,6 +1010,30 @@ describe('a dispatch request may carry a spec, fully validated or not at all', (
     assert.deepEqual(parsed.request, { objective });
     assert.equal(Object.hasOwn(parsed.request, 'spec'), false, 'a spec appeared from nowhere');
   });
+
+  // `parseDispatchDirective` routes a `spec` object through `validateTechnicalSpec`, the same
+  // parser a spec file off disk goes through — so `verify` is already wired up there. These two
+  // tests assert the WIRING, not the parser (which src/contracts/spec.ts, owned elsewhere, already
+  // covers): a dispatch block is not a second, gentler reading of a spec.
+  it('a dispatch block carrying a valid `verify` array parses, and the array survives intact', () => {
+    const objective = 'add a multiply function to calc.js';
+    const parsed = parseDispatchDirective(
+      dispatchBlock(objective, { spec: sampleSpec({ verify: ['node --test', 'node calc.js --check'] }) }),
+    );
+    assert.ok(parsed.ok, parsed.ok ? '' : parsed.reason);
+    const spec = (parsed.ok ? parsed.request.spec : undefined) as TechnicalSpec | undefined;
+    assert.ok(spec !== undefined, 'the parsed request lost the spec');
+    assert.deepEqual(spec?.verify, ['node --test', 'node calc.js --check']);
+  });
+
+  it('a dispatch block carrying `verify: []` is refused — the contract rejects an empty list', () => {
+    const parsed = parseDispatchDirective(
+      dispatchBlock('do the thing', { spec: sampleSpec({ verify: [] }) }),
+    );
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /verify/);
+    assert.match(parsed.ok ? '' : parsed.reason, /empty/);
+  });
 });
 
 // ===============================================================================================
@@ -1017,7 +1041,7 @@ describe('a dispatch request may carry a spec, fully validated or not at all', (
 // ===============================================================================================
 
 describe('the standing orders name every spec field and the fenced shape to carry it in', () => {
-  it('names all six spec field labels, and the fence tag the block is wrapped in', () => {
+  it('names all six required spec field labels, and the fence tag the block is wrapped in', () => {
     const orders = renderStandingOrders({
       project: '/tmp/some-project',
       ceiling: 2,
@@ -1033,6 +1057,34 @@ describe('the standing orders name every spec field and the fenced shape to carr
     assert.ok(orders.includes(DISPATCH_FENCE), 'the standing orders never show the fence tag');
     assert.match(orders, /"objective":/, 'no worked example of the dispatch block with a spec');
     assert.match(orders, /"spec":/, 'no worked example of the dispatch block with a spec');
+  });
+
+  it('names the seventh, optional field — `Verification commands` — and shows it in the worked example', () => {
+    const orders = renderStandingOrders({
+      project: '/tmp/some-project',
+      ceiling: 2,
+      requestedRung: 2,
+      maxAttempts: 3,
+    });
+    assert.ok(
+      orders.includes(SPEC_FIELD_LABEL.verify),
+      'the standing orders never name the Verification commands field',
+    );
+    assert.match(orders, /"verify":/, 'no worked example of the dispatch block carries verify');
+    assert.match(orders, /optional/i);
+    // Not "six fields" unqualified any more — the spec has seven, one of them optional.
+    assert.match(orders, /seven fields/i);
+  });
+
+  it('warns that `verify` must stay consistent with `filesInScope`, naming the incident that made it matter', () => {
+    const orders = renderStandingOrders({
+      project: '/tmp/some-project',
+      ceiling: 2,
+      requestedRung: 2,
+      maxAttempts: 3,
+    });
+    assert.match(orders, /filesInScope/);
+    assert.match(orders, /sample-expenses\.json|only meaningful if that file/i);
   });
 });
 

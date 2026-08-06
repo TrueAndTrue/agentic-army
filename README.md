@@ -260,6 +260,40 @@ army campaign --spec ./spec.json          # a spec you wrote
 army campaign "fix the flaky test"        # no spec: still works, escalated to xhigh
 ```
 
+## Two gates, because a reviewer is not a review
+
+A campaign delivered work that passed review and was wrong, in two different ways. Both fixes
+exist because of that run, and both are aimed at a failure the Inspector could not have caught by
+trying harder.
+
+**The acceptance gate.** A spec's `acceptance` entries are prose — they get read, not executed.
+So a criterion reading `node app.js sample.json prints a table` sat in a brief while the Engineer
+created `app.json`, and the criterion, run verbatim afterwards, exits 1. `verify` is the
+executable half: shell commands that must exit 0, run in the worktree **before the Inspector is
+fielded**. A branch that fails its own acceptance commands is not ready for a human-grade review,
+and the Inspector runs on a metered account whose quota is the scarcest thing here — so failing
+early costs nothing and hands the retry Engineer an exact command and its output.
+
+`verify` is optional, and its absence is *reported*, never assumed. A gate that did not run comes
+back `passed: false`, because a gate that did not run has not passed anything.
+
+**Per-behaviour verdicts.** The second defect was subtler. A spec listed six behaviours; clause 2
+was never implemented. The Engineer wrote the tests as well as the code, so its suite was blind in
+exactly the place its code was — and the Inspector's mutation check disturbed the ordering the
+tests *do* cover, reading as confirmation on the one clause that was broken. The verdict came back
+`findings: []`, `pass`. Nothing recorded that clause 2 had never been considered.
+
+A verdict now carries one determination per numbered behaviour: `met`, `not-met`, or
+`not-verified`. Incomplete coverage fails the attempt even on a `pass` — an Inspector that skipped
+clauses has not reviewed the work. `not-verified` does **not** fail: it is the honest answer, and
+making it a failure would only teach the model to claim `met`. Unverified clauses are surfaced on
+the result and in the verdict file instead.
+
+Measured on the first live run to use it: codex returned all five determinations, each noting that
+the behaviour was *exercised directly* rather than inferred from the suite — and its own first
+attempt at a verdict was `fail` with every clause `not-verified`, because it had not yet run
+anything. The escape hatch got used honestly before it was ever needed dishonestly.
+
 **The awareness runs the whole way down.** The commander is told its Engineer is cheap and
 literal. The Engineer is told the same about the Sergeants it fields, and that it owes each of
 them the same six answers it was owed. The Sergeant is told that if its orders are ambiguous the

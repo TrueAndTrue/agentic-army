@@ -89,11 +89,19 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
   lines.push('');
   lines.push('## DO NOT PROPOSE A DISPATCH UNTIL YOU CAN FILL EVERY FIELD OF THE SPEC');
   lines.push('');
-  lines.push('The spec has six fields, and a dispatch is not ready until all six are answered:');
+  lines.push(
+    'The spec has seven fields. Six of them are not optional — a dispatch is not ready until all ' +
+      'six are answered:',
+  );
   lines.push('');
   for (const field of ['objective', ...SPEC_LIST_FIELDS] as ('objective' | SpecListField)[]) {
     lines.push(`- **${SPEC_FIELD_LABEL[field]}**`);
   }
+  lines.push('');
+  lines.push(
+    `- **${SPEC_FIELD_LABEL.verify}** — the seventh field, and the only one that is optional. ` +
+      'See below.',
+  );
   lines.push('');
   lines.push('### How to interrogate');
   lines.push('');
@@ -116,6 +124,33 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
       'decision, taken in the open.',
   );
   lines.push('');
+  lines.push(`### ${SPEC_FIELD_LABEL.verify} — the executable half of acceptance`);
+  lines.push('');
+  lines.push(
+    `\`${SPEC_FIELD_LABEL.verify}\` is where an acceptance criterion stops being prose and starts ` +
+      'being something that runs. Every criterion under `Acceptance` that CAN be written as a ' +
+      'shell command exiting 0 belongs here too — verbatim, in the exact form a shell will ' +
+      'actually accept, not a paraphrase of it.',
+  );
+  lines.push('');
+  lines.push(
+    'It is the one field that is optional, and leaving it out is a real decision with a real ' +
+      'cost: no mechanical check runs at all, and that absence is REPORTED rather than assumed ' +
+      "— it does not quietly read as \"nothing needed checking\". Omit it only when nothing about " +
+      'the task is genuinely runnable, not because writing the command was more work than ' +
+      'describing it.',
+  );
+  lines.push('');
+  lines.push(
+    'Keep it consistent with `Files in scope`. A criterion naming a file — `node app.js ' +
+      'sample.json` — is only meaningful if that file is one `filesInScope` actually names; a ' +
+      '`verify` command that names a file the Engineer was never told it could touch is a check ' +
+      'that is guaranteed to run against whatever the Engineer created instead. This is the exact ' +
+      'defect that first exposed the need for this field: a commander wrote the command against ' +
+      '`sample-expenses.json`, the Engineer built `expenses.json`, and nothing ever ran the ' +
+      'command until it was too late to matter.',
+  );
+  lines.push('');
   lines.push('### The dispatch block, with a spec');
   lines.push('');
   lines.push('A filled spec rides inside the same block, alongside `objective`, like this:');
@@ -135,6 +170,7 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
           ],
           decisions: ['multiply is a named export, not a default export — matches add'],
           constraints: ['no new dependencies', 'do not modify add itself'],
+          verify: ['node --test'],
         },
       },
       null,
@@ -147,7 +183,7 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
     '`spec.objective` must read exactly as `objective` does — two spellings of what is being ' +
       'built is the ambiguity this exists to remove, and a mismatch is refused rather than ' +
       'guessed at. A dispatch with `objective` and no `spec` still parses, but do not reach for ' +
-      'that shape once you could have filled the six fields instead.',
+      'that shape once you could have filled the six required fields instead.',
   );
   lines.push('');
   lines.push('## WHAT YOU READ');
@@ -186,8 +222,8 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
   lines.push('```');
   lines.push('');
   lines.push(
-    '- `objective` and `spec` are the ONLY keys — `spec` is how you carry the six answers above. ' +
-      'Any other key refuses the whole request.',
+    '- `objective` and `spec` are the ONLY keys — `spec` is how you carry the seven fields above, ' +
+      'six required and `verify` optional. Any other key refuses the whole request.',
   );
   lines.push(
     `- One line, at most ${String(OBJECTIVE_MAX_CHARS)} characters. It is read back verbatim into ` +

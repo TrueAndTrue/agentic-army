@@ -89,6 +89,8 @@ import {
   validateReport,
   validateVerdict,
 } from '../contracts/report.ts';
+import type { AcceptanceResult, CommandRunner } from '../contracts/verify.ts';
+import { DEFAULT_VERIFY_TIMEOUT_MS } from '../contracts/verify.ts';
 import type { Lease, ReleaseResult } from '../contracts/worktree.ts';
 import { armyBranch } from '../contracts/worktree.ts';
 
@@ -119,6 +121,7 @@ import type {
   MergeRequest,
 } from '../delivery/ladder.ts';
 import { RungNotImplementedError, projectCeiling, runLadder } from '../delivery/ladder.ts';
+import { runAcceptanceGate } from '../verify/index.ts';
 import { createClaudeAdapter } from '../harness/claude.ts';
 import { createCodexAdapter, isCodexSoldier } from '../harness/codex.ts';
 import { getAdapter } from '../harness/index.ts';
@@ -211,6 +214,16 @@ export type CampaignNoteCode =
   | 'lease'
   | 'inspector'
   | 'engineer'
+  /**
+   * A `spec.verify` command failed against the Engineer's own branch, mechanically, before an
+   * Inspector was spawned. See `src/verify/gate.ts` for the incident this exists for.
+   */
+  | 'acceptance'
+  /**
+   * The Inspector's verdict did not account for every numbered behaviour — missing, duplicated,
+   * or out of range. See `behaviourCoverage`; this is a gap in the REVIEW, not the work.
+   */
+  | 'coverage'
   | 'retry'
   | 'aborted';
 
@@ -251,6 +264,12 @@ export interface AttemptRecord {
   /** Terminal disposition of the Engineer process, from the adapter. */
   engineerStatus: string;
   costUsd: number | null;
+  /**
+   * This attempt's acceptance-gate result. `null` when the Engineer never reported `done`, so
+   * the gate was never a candidate to run at all — distinct from `{ ran: false, ... }`, which
+   * means it WAS a candidate but `spec.verify` had no commands. See `runAcceptanceGate`.
+   */
+  acceptance: AcceptanceResult | null;
 }
 
 export interface CampaignResult {
@@ -280,6 +299,28 @@ export interface CampaignResult {
   delivery: LadderResult | null;
   lease: LeaseDisposition;
   notes: CampaignNote[];
+  /**
+   * The acceptance gate's result for the LAST attempt this campaign made — see
+   * `AttemptRecord.acceptance` for the full per-attempt history. `null` only when no attempt's
+   * Engineer ever reported `done`, so the gate was never a candidate to run at all.
+   *
+   * `{ ran: false, ... }` is itself a reportable state, not an absence — a spec carrying no
+   * `verify` commands (or no spec at all) leaves this here, and `renderCampaignResult` says so
+   * rather than staying quiet. An unrun check must never read as a passed one; see the incident
+   * `src/verify/gate.ts` exists for.
+   */
+  acceptance: AcceptanceResult | null;
+  /**
+   * 1-based behaviour indices the Inspector answered `not-verified` on the verdict that
+   * DELIVERED this campaign. Empty whenever nothing is unverified, nothing was delivered, or the
+   * campaign carried no spec with behaviours.
+   *
+   * NOT a failure — `not-verified` is the Inspector telling the truth about what it could not
+   * check, and `behaviourCoverage` treats it as complete coverage on purpose. But it has to be
+   * VISIBLE, so it travels here and `renderCampaignResult` names it: a human reading "delivered"
+   * should also read how many behaviours were never actually checked.
+   */
+  unverifiedBehaviours: number[];
   /**
    * 0 only when the Inspector passed AND delivery ran without an error-level note.
    *
@@ -338,6 +379,11 @@ export interface CampaignOptions {
   /** Binaries. Test seam — the fakes go here, so no test ever spawns a real model. */
   claudeBin?: string;
   codexBin?: string;
+  /**
+   * The acceptance gate's process runner. Injected so tests never spawn a process. Defaults to
+   * the real runner (`runCommand`, via `runAcceptanceGate`'s own default).
+   */
+  verifyRun?: CommandRunner;
   /** Full adapter override, for a test that needs to model a harness that is not installed. */
   adapters?: Partial<Record<HarnessId, HarnessAdapter>>;
   /** Injected so rung-2 behaviour is testable with no network and no GitHub account. */
@@ -682,6 +728,82 @@ export async function resolveProjectRoot(cwd: string): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Behaviour coverage — is the verdict answering the same numbered list the spec asked?
+// ---------------------------------------------------------------------------------------------
+
+export interface CoverageReport {
+  /** 1-based behaviour indices with no entry in the verdict. */
+  missing: number[];
+  /** Indices named more than once. */
+  duplicated: number[];
+  /** Indices outside 1..N. */
+  outOfRange: number[];
+  /** Indices the Inspector answered `not-verified`. */
+  unverified: number[];
+  /** True when every index 1..N appears exactly once. */
+  complete: boolean;
+}
+
+/**
+ * Whether a `Verdict` accounted for every numbered behaviour in a spec.
+ *
+ * PURE — this is the incident on `Verdict.behaviours` (`src/contracts/report.ts`) made
+ * checkable rather than merely asked for: a spec listed six behaviours, clause 2 was never
+ * implemented, and the verdict came back `findings: []`, `verdict: pass` because nothing
+ * anywhere counted the clauses that were answered against the clauses that existed. This
+ * function is that count.
+ *
+ * A spec with no behaviours, a missing spec, or a null verdict all answer `complete: true` with
+ * every list empty — there is nothing to account for, and inventing a failure out of the absence
+ * of a spec would block every free-text campaign, which asked no numbered questions to skip.
+ *
+ * `not-verified` is deliberately NOT a gap: it counts toward `missing`'s complement (the index
+ * IS present) and is instead surfaced separately, in `unverified`, because it is the Inspector
+ * telling the truth about what it could not check rather than omitting the clause — see
+ * `renderBehaviourAccounting` in `orders.ts`. An index that is simply absent from the verdict is
+ * the one thing this function refuses to wave through.
+ */
+export function behaviourCoverage(
+  spec: TechnicalSpec | undefined,
+  verdict: Verdict | null,
+): CoverageReport {
+  const total = spec?.behaviours.length ?? 0;
+  const empty: CoverageReport = {
+    missing: [],
+    duplicated: [],
+    outOfRange: [],
+    unverified: [],
+    complete: true,
+  };
+  if (total === 0 || verdict === null) return empty;
+
+  const entries = verdict.behaviours ?? [];
+  const counts = new Map<number, number>();
+  const outOfRangeSet = new Set<number>();
+  const unverifiedSet = new Set<number>();
+  for (const entry of entries) {
+    if (entry.behaviour < 1 || entry.behaviour > total) {
+      outOfRangeSet.add(entry.behaviour);
+      continue;
+    }
+    counts.set(entry.behaviour, (counts.get(entry.behaviour) ?? 0) + 1);
+    if (entry.status === 'not-verified') unverifiedSet.add(entry.behaviour);
+  }
+
+  const missing: number[] = [];
+  const duplicated: number[] = [];
+  for (let i = 1; i <= total; i += 1) {
+    const count = counts.get(i) ?? 0;
+    if (count === 0) missing.push(i);
+    if (count > 1) duplicated.push(i);
+  }
+  const outOfRange = [...outOfRangeSet].sort((a, b) => a - b);
+  const unverified = [...unverifiedSet].sort((a, b) => a - b);
+  const complete = missing.length === 0 && duplicated.length === 0 && outOfRange.length === 0;
+  return { missing, duplicated, outOfRange, unverified, complete };
+}
+
+// ---------------------------------------------------------------------------------------------
 // The campaign
 // ---------------------------------------------------------------------------------------------
 
@@ -871,6 +993,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
    * stopped because there was nothing left to try.
    */
   let retriesExhausted = false;
+  /** Set only on the attempt that DELIVERS. See `CampaignResult.unverifiedBehaviours`. */
+  let unverifiedBehaviours: number[] = [];
   let delivery: LadderResult | null = null;
   let baseCommit: string | null = null;
   /** The status this campaign intends to record, then what the archive says it recorded. */
@@ -961,6 +1085,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     // ---- the attempt loop -------------------------------------------------------------
     const maxAttempts = Math.max(1, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
     let previousVerdict: Verdict | undefined;
+    /** Set only when the PREVIOUS attempt was failed by the acceptance gate. See CHANGE 1/3. */
+    let previousAcceptance: AcceptanceResult | undefined;
+    /** Set only when the PREVIOUS attempt's verdict left one or more behaviours unaccounted for. */
+    let previousMissingBehaviours: number[] | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const engineerId = nextAgentId();
@@ -970,6 +1098,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         worktree,
         attempt,
         ...(previousVerdict === undefined ? {} : { previousVerdict }),
+        ...(previousAcceptance === undefined ? {} : { previousAcceptance }),
+        ...(previousMissingBehaviours === undefined ? {} : { previousMissingBehaviours }),
         ...(options.spec === undefined ? {} : { spec: options.spec }),
       });
 
@@ -1051,6 +1181,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         verdict: null,
         engineerStatus: engineerRun.status,
         costUsd: engineerRun.costUsd,
+        acceptance: null,
       };
       attempts.push(record);
 
@@ -1139,6 +1270,85 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           body: cap(`branch mismatch: issued ${branch}, reported ${claim}`),
         });
       }
+
+      // ---- THE ACCEPTANCE GATE -------------------------------------------------
+      //
+      // BEFORE the Inspector, not after, and this ordering is the whole point of the change. Two
+      // reasons, both worth writing down rather than assuming they are obvious:
+      //
+      //   1. A branch that fails commands the SPEC ITSELF named as proof of done is not ready
+      //      for a human-grade review — it is reviewing an intermediate state as if it were the
+      //      final one.
+      //   2. The Inspector runs on a metered vendor account whose quota is the scarcest thing in
+      //      this whole pipeline. Spending it on a branch a mechanical check already refutes is
+      //      exactly the waste this ordering exists to prevent.
+      //
+      // See `src/verify/gate.ts` for the incident this module exists for: a criterion
+      // (`node expenses.js sample-expenses.json prints an aligned table`) left in prose, never
+      // executed by anything, satisfied by an Engineer under a different reading of it, and
+      // passed by an Inspector that only read the diff. `runAcceptanceGate` is the thing that
+      // actually runs it — only when the Engineer claimed `done`; a `blocked` or `failed` report
+      // already failed this attempt above, and the gate would add nothing to that.
+      const acceptance = await runAcceptanceGate({
+        ...(options.spec?.verify === undefined ? {} : { commands: options.spec.verify }),
+        cwd: worktree,
+        ...(options.verifyRun === undefined ? {} : { run: options.verifyRun }),
+        timeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
+        // Reuses the campaign's own progress channel rather than a bespoke one — a gate command
+        // starting and finishing is exactly the kind of "is this still alive" narration
+        // `ProgressEvent`'s `note` kind already exists for.
+        onProgress: (line) => progress({ kind: 'note', level: 'info', message: line }),
+      });
+      record.acceptance = acceptance;
+
+      if (acceptance.ran && !acceptance.passed) {
+        const failedCommands = acceptance.outcomes
+          .filter((outcome) => !outcome.passed)
+          .map((outcome) => outcome.command);
+        note(
+          'error',
+          'acceptance',
+          `${engineerId}'s branch failed its own acceptance commands (${failedCommands.join(', ')}). ` +
+            'Not spending an Inspector on a branch a mechanical check already refutes.',
+          noFix(
+            `the commands are the spec's own, run against ${branch} exactly as written — that is ` +
+              'a fact about the work, not an environment fault. The full output is in ' +
+              `${archive.root}/agents/${engineerId}/report.md, and it is carried into the next ` +
+              'Engineer attempt directly.',
+          ),
+        );
+        previousAcceptance = acceptance;
+        previousVerdict = undefined;
+        previousMissingBehaviours = undefined;
+        if (attempt >= maxAttempts) {
+          retriesExhausted = true;
+          note(
+            'error',
+            'retry',
+            `the acceptance gate failed on ${String(maxAttempts)} attempt(s); the retry budget (a ` +
+              'CPT may retry an Inspector fail, and this is the same budget) is exhausted. Not ' +
+              'delivering.',
+            noFix(
+              'the commands the spec named still fail — that is a verdict on the work, not an ' +
+                `environment fault, so there is nothing to run. The output is in ${archive.root}` +
+                '/agents/*/report.md; the branch is durable and can be picked up by hand.',
+            ),
+          );
+          outcome = 'engineer-failed';
+          break;
+        }
+        note(
+          'info',
+          'retry',
+          'retrying with a fresh Engineer against the same task; the acceptance gate failed.',
+        );
+        archive.updateTask(task.id, { agentId: null, status: 'in_flight' });
+        continue;
+      }
+      // This attempt's gate either passed or never ran — either way, nothing about acceptance is
+      // why a LATER attempt would be retried, so any stale failure from an EARLIER attempt must
+      // not keep riding along into the next brief.
+      previousAcceptance = undefined;
 
       // ---- THE REVIEW GATE ----------------------------------------------------
       //
@@ -1308,14 +1518,78 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       }
 
       finalVerdict = verdict;
+
+      // ---- BEHAVIOUR COVERAGE --------------------------------------------------
+      //
+      // Checked BEFORE the pass/fail branch below, and it can override a `pass`. See
+      // `behaviourCoverage`: an Inspector that skipped a numbered clause has not reviewed the
+      // work, whatever it wrote in `verdict`. Because `not-verified` is available and explicitly
+      // blessed as the honest answer, full coverage is always achievable without lying — so a
+      // clause with no entry at all is a gap in the REVIEW, not a limitation the campaign should
+      // tolerate quietly. This is the mechanism for the incident on `Verdict.behaviours`: a
+      // verdict of `findings: []`, `verdict: pass` that never recorded clause 2 had gone
+      // unconsidered.
+      const coverage = behaviourCoverage(options.spec, verdict);
+      if (!coverage.complete) {
+        const gaps: string[] = [];
+        if (coverage.missing.length > 0) gaps.push(`missing: ${coverage.missing.join(', ')}`);
+        if (coverage.duplicated.length > 0) gaps.push(`duplicated: ${coverage.duplicated.join(', ')}`);
+        if (coverage.outOfRange.length > 0) {
+          gaps.push(`out of range: ${coverage.outOfRange.join(', ')}`);
+        }
+        note(
+          'error',
+          'coverage',
+          `${inspectorId}'s verdict does not account for every numbered behaviour (${gaps.join('; ')}). ` +
+            `Treating this attempt as failed even though the verdict said ${verdict.verdict} — a ` +
+            'clause with no entry looks identical to a clean bill of health, and this campaign ' +
+            'refuses to trust that silently.',
+          noFix(
+            'the gap is in the REVIEW, not necessarily the work — the Inspector could have ' +
+              'marked the clause `not-verified` and did not. There is no command that fixes a ' +
+              `missing review entry. Its verdict is in ${archive.root}/agents/${inspectorId}/` +
+              'report.md; a fresh Engineer attempt is retried, and a fresh Inspector reviews it.',
+          ),
+        );
+        previousMissingBehaviours = coverage.missing;
+        previousVerdict = verdict.verdict === 'fail' ? verdict : undefined;
+        if (attempt >= maxAttempts) {
+          retriesExhausted = true;
+          note(
+            'error',
+            'retry',
+            `behaviour coverage stayed incomplete for ${String(maxAttempts)} attempt(s); the ` +
+              'retry budget is exhausted. Not delivering.',
+            noFix(
+              `the Inspector's own review is what is incomplete, and its findings are in ` +
+                `${archive.root}/agents/*/report.md; the branch is durable and can be picked up ` +
+                'by hand.',
+            ),
+          );
+          outcome = 'inspector-failed';
+          break;
+        }
+        note(
+          'info',
+          'retry',
+          'retrying with a fresh Engineer against the same task; behaviour coverage was incomplete.',
+        );
+        archive.updateTask(task.id, { agentId: null, status: 'in_flight' });
+        continue;
+      }
+
       if (verdict.verdict === 'pass') {
         note('info', 'inspector', `${inspectorId} PASSED ${branch}: ${cap(verdict.summary, 120)}`);
         outcome = 'delivered';
+        // Coverage is complete here by construction (the branch above `continue`d otherwise), so
+        // `unverified` is exactly the set a human reading "delivered" still needs to see.
+        unverifiedBehaviours = coverage.unverified;
         break;
       }
 
       note('warn', 'inspector', `${inspectorId} FAILED ${branch}: ${cap(verdict.summary, 120)}`);
       previousVerdict = verdict;
+      previousMissingBehaviours = undefined;
       if (attempt >= maxAttempts) {
         // Recorded BEFORE the note and the break, so the flag is true from the instant the fact
         // is true rather than from the instant something happens to read it.
@@ -1515,6 +1789,11 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   const campaignRoot = archive.root;
   const finalStatus = intendedStatus;
   const deliveredRung = delivery?.delivered ?? null;
+  // The LAST attempt's own gate result — see `CampaignResult.acceptance`. `attempts` is never
+  // empty on a path that reaches here with a meaningful acceptance state; on one that is (an
+  // abort before any Engineer ran), `null` is exactly right: there was no attempt for a gate to
+  // be a candidate against.
+  const acceptance = attempts[attempts.length - 1]?.acceptance ?? null;
 
   // `outcome === 'delivered'` alone was enough while the only error-level DELIVERY note came from
   // `runLadder` throwing, which also set `outcome = 'delivery-failed'`. Rung 3 broke that pairing:
@@ -1542,6 +1821,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     delivery,
     lease: leaseDisposition,
     notes,
+    acceptance,
+    unverifiedBehaviours,
     exitCode,
   };
 }

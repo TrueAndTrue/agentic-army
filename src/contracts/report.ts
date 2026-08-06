@@ -91,6 +91,44 @@ export interface Report {
  * progress, it renders a judgement, and `testsRun: false` with `verdict: 'pass'` is a
  * distinguishable — and suspicious — state that a shared shape would hide.
  */
+/**
+ * What an Inspector determined about ONE enumerated behaviour of the spec.
+ *
+ * ## The incident this exists for
+ *
+ * A spec listed six behaviours. Clause 2 was "rows sorted by total descending; ties broken
+ * alphabetically by category". The Engineer implemented `sort((a, b) => b.total - a.total)` — no
+ * tie-break — and wrote the tests itself, so its suite was blind in exactly the place its code
+ * was. The Inspector ran that suite (14 green), and even mutated the sort order to check the
+ * tests had teeth. They went red, so it concluded sorting was covered. It was not: the mutation
+ * disturbed the descending order the tests DO check, and left the tie-break they do not.
+ *
+ * The verdict came back `findings: []`, `verdict: pass`. Nothing anywhere recorded that clause 2
+ * had never been considered — a silent omission is indistinguishable from a clean bill of health.
+ *
+ * ## Why an array of these, rather than a better prompt
+ *
+ * Asking an Inspector to "check every behaviour" is a request. Requiring one entry per behaviour
+ * is a shape: a verdict that skips clause 2 is now a verdict with a hole in it that the campaign
+ * can see and say so. `not-verified` exists so full coverage is always achievable honestly — an
+ * Inspector that could not check something says so instead of quietly omitting it, and an
+ * omission it CANNOT make silently is one it has no reason to lie about.
+ */
+export const BEHAVIOUR_STATUSES = ['met', 'not-met', 'not-verified'] as const;
+export type BehaviourStatus = (typeof BEHAVIOUR_STATUSES)[number];
+
+export interface BehaviourVerdict {
+  /**
+   * 1-based index into the spec's `behaviours`, so a reader lines the two up without matching
+   * prose. An index rather than the text: a restated behaviour is a paraphrase, and a paraphrase
+   * is where a clause quietly becomes a different, easier clause.
+   */
+  behaviour: number;
+  status: BehaviourStatus;
+  /** One line: how it was checked, or why it could not be. */
+  note: string;
+}
+
 export interface Verdict {
   verdict: VerdictValue;
   summary: string;
@@ -99,6 +137,14 @@ export interface Verdict {
   testsRun: boolean;
   /** The exact command run, so a human can reproduce the verdict. */
   testCommand?: string;
+  /**
+   * One determination per enumerated behaviour, when the campaign supplied a spec.
+   *
+   * Optional in the type because a campaign run from a free-text objective has no behaviours to
+   * account for. When a spec WAS supplied, the campaign checks the coverage and reports what is
+   * missing — see `BehaviourVerdict`.
+   */
+  behaviours?: BehaviourVerdict[];
 }
 
 /*
@@ -123,7 +169,7 @@ export interface Verdict {
 export const REPORT_REQUIRED_KEYS = ['status', 'summary', 'findings', 'artifacts'] as const;
 export const REPORT_OPTIONAL_KEYS = ['branch', 'costUsd'] as const;
 export const VERDICT_REQUIRED_KEYS = ['verdict', 'summary', 'findings', 'testsRun'] as const;
-export const VERDICT_OPTIONAL_KEYS = ['testCommand'] as const;
+export const VERDICT_OPTIONAL_KEYS = ['testCommand', 'behaviours'] as const;
 export const FINDING_REQUIRED_KEYS = ['severity', 'message'] as const;
 export const FINDING_OPTIONAL_KEYS = ['file', 'line'] as const;
 export const ARTIFACT_REQUIRED_KEYS = ['kind', 'ref'] as const;
@@ -394,6 +440,8 @@ export function validateVerdict(u: unknown): ValidationResult<Verdict> {
     testCommand = checkString(u.testCommand, SHORT_STRING_MAX_CHARS, 'testCommand', errors);
   }
 
+  const behaviours = checkBehaviourVerdicts(u.behaviours, 'behaviours', errors);
+
   if (
     errors.length > 0 ||
     verdict === undefined ||
@@ -406,5 +454,48 @@ export function validateVerdict(u: unknown): ValidationResult<Verdict> {
 
   const value: Verdict = { verdict, summary, findings, testsRun };
   if (testCommand !== undefined) value.testCommand = testCommand;
+  if (behaviours !== undefined) value.behaviours = behaviours;
   return { ok: true, value };
 }
+
+/**
+ * Validate the per-behaviour accounting. Absent is legal — a free-text campaign has no spec to
+ * account for — so this returns `undefined` for absent and pushes errors only for a MALFORMED
+ * array. Whether the coverage is COMPLETE is not decidable here: it depends on how many
+ * behaviours the spec had, which this module has never seen. The campaign checks that, where the
+ * spec is in hand.
+ */
+function checkBehaviourVerdicts(
+  u: unknown,
+  path: string,
+  errors: string[],
+): BehaviourVerdict[] | undefined {
+  if (isAbsent(u)) return undefined;
+  if (!Array.isArray(u)) {
+    errors.push(`${path}: expected array`);
+    return undefined;
+  }
+  const out: BehaviourVerdict[] = [];
+  for (let i = 0; i < u.length; i += 1) {
+    const raw: unknown = u[i];
+    const where = `${path}[${String(i)}]`;
+    if (!isPlainObject(raw)) {
+      errors.push(`${where}: expected object`);
+      continue;
+    }
+    checkKeys(raw, BEHAVIOUR_VERDICT_KEYS, [], where, errors);
+    const status = checkEnum(raw.status, BEHAVIOUR_STATUSES, `${where}.status`, errors);
+    const note = checkString(raw.note, SUMMARY_MAX_CHARS, `${where}.note`, errors);
+    const index = raw.behaviour;
+    if (typeof index !== 'number' || !Number.isInteger(index) || index < 1) {
+      errors.push(`${where}.behaviour: expected a 1-based integer index into the spec's behaviours`);
+      continue;
+    }
+    if (status === undefined || note === undefined) continue;
+    out.push({ behaviour: index, status, note });
+  }
+  return out;
+}
+
+/** Every key a `BehaviourVerdict` may carry. All required — there is no optional half. */
+export const BEHAVIOUR_VERDICT_KEYS = ['behaviour', 'status', 'note'] as const;
