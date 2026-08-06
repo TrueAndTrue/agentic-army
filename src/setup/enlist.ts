@@ -47,6 +47,7 @@
  */
 
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { RUNG_MEANING, type Rung } from '../contracts/index.ts';
@@ -100,7 +101,15 @@ export function parseCeiling(raw: string | undefined): CeilingParse {
 // Repo discovery
 // ---------------------------------------------------------------------------
 
-export type RepoLookup = { ok: true; root: string } | { ok: false; error: string; fix: string };
+/**
+ * `reason` lets a caller act on WHY the lookup failed without parsing `error`. `enlistCommand`
+ * needs exactly that: auto-init is right for `no-repo` and wrong for the other three — creating a
+ * repository because `git` timed out would be inventing consent nobody gave. `error` and `fix`
+ * stay byte-for-byte what they were before this discriminator existed, so no existing output moves.
+ */
+export type RepoLookup =
+  | { ok: true; root: string }
+  | { ok: false; error: string; fix: string; reason: 'git-missing' | 'git-timeout' | 'no-repo' | 'git-silent' };
 
 /**
  * Derive the MAIN repository root from git's common dir.
@@ -140,10 +149,10 @@ export async function currentRepoRoot(): Promise<RepoLookup> {
   // Deliberately NOT --show-toplevel; see mainRootFromCommonDir above.
   let result = await probe('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], 5000);
   if (!result.found) {
-    return { ok: false, error: 'git is not on PATH', fix: `${invokedAs()} doctor` };
+    return { ok: false, error: 'git is not on PATH', fix: `${invokedAs()} doctor`, reason: 'git-missing' };
   }
   if (result.timedOut) {
-    return { ok: false, error: 'git timed out', fix: `${invokedAs()} doctor` };
+    return { ok: false, error: 'git timed out', fix: `${invokedAs()} doctor`, reason: 'git-timeout' };
   }
   if (result.code !== 0) {
     // --path-format arrived in git 2.31 but our floor is 2.20 (worktree
@@ -156,15 +165,85 @@ export async function currentRepoRoot(): Promise<RepoLookup> {
       ok: false,
       error: `${process.cwd()} is not inside a git repository`,
       fix: 'cd into a repository first, or run `git init`',
+      reason: 'no-repo',
     };
   }
   const commonDir = result.stdout.trim().split('\n')[0] ?? '';
   if (commonDir === '') {
-    return { ok: false, error: 'git returned no repository root', fix: `${invokedAs()} doctor` };
+    return { ok: false, error: 'git returned no repository root', fix: `${invokedAs()} doctor`, reason: 'git-silent' };
   }
   // git prints forward slashes even on Windows; path.resolve normalises so the
   // config key is the same string every time on a given machine.
   return { ok: true, root: await physicalPath(mainRootFromCommonDir(commonDir)) };
+}
+
+// ---------------------------------------------------------------------------
+// Auto-init
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether `enlist` should turn a bare directory into a repository, or refuse and say why.
+ *
+ * A pure function so the two guards are testable without spawning git. Only two directories are
+ * refused, deliberately narrow: a directory nested under `$HOME` is where every ordinary project
+ * lives, and treating "under home" as dangerous would make the common case refuse.
+ *
+ *   - `os.homedir()` itself: `git init` there does not scope to a project, it scopes to
+ *     everything the user owns. The first `git add .` or accidental commit would start pulling in
+ *     unrelated directories underneath it.
+ *   - a filesystem root: nothing meaningful is ever the repository root at `/` or `C:\`; landing
+ *     here is a wrong `cd`, not an intentional new project.
+ *
+ * `home` is a parameter rather than read from `os.homedir()` internally so a test can point it at
+ * a temp directory without touching the real one.
+ */
+export type AutoInitDecision = { kind: 'init'; dir: string } | { kind: 'refuse'; reason: string };
+
+export function decideAutoInit(dir: string, home: string): AutoInitDecision {
+  const resolvedDir = path.resolve(dir);
+  const resolvedHome = path.resolve(home);
+  if (resolvedDir === resolvedHome) {
+    return {
+      kind: 'refuse',
+      reason:
+        `${resolvedDir} is your home directory. Initialising a repository here would make every ` +
+        `directory beneath ${resolvedHome} part of one repository, not just the project you meant ` +
+        'to enlist. cd into the project directory first, or run `git init` there yourself.',
+    };
+  }
+  const root = path.parse(resolvedDir).root;
+  if (resolvedDir === root) {
+    return {
+      kind: 'refuse',
+      reason:
+        `${resolvedDir} is a filesystem root, not a project directory. Initialising a repository ` +
+        'here is almost certainly the wrong directory. cd into the project directory first, or ' +
+        'run `git init` there yourself.',
+    };
+  }
+  return { kind: 'init', dir: resolvedDir };
+}
+
+/**
+ * `git init` and the empty commit `campaign` needs, run through the same `probe` seam as every
+ * other git call in this file. Both steps are reported so the caller can tell "no repository" (the
+ * init failed, fatal) from "repository exists but nothing to detach a lease to" (the commit
+ * failed, a warning `enlistCommand` already knows how to print). The usual cause of the second is
+ * a machine with no `user.email` configured — real, and not a reason to refuse the enlistment.
+ *
+ * Deliberately does not `git add` anything first: an auto-init that swept up whatever was already
+ * sitting in the directory would be a surprise commit of files the user never asked to track.
+ */
+export type AutoInitOutcome = { ok: true; committed: boolean } | { ok: false; error: string };
+
+export async function autoInitRepo(): Promise<AutoInitOutcome> {
+  const init = await probe('git', ['init', '-q'], 5000);
+  if (!init.found || init.timedOut || init.code !== 0) {
+    const detail = init.stderr.trim();
+    return { ok: false, error: `git init failed${detail === '' ? '' : `: ${detail}`}` };
+  }
+  const commit = await probe('git', ['commit', '--allow-empty', '-m', 'init'], 5000);
+  return { ok: true, committed: !commit.timedOut && commit.code === 0 };
 }
 
 /**
@@ -191,11 +270,12 @@ export async function repoHasCommits(root: string): Promise<boolean | null> {
 // ---------------------------------------------------------------------------
 
 export type EnlistArgs =
-  | { ok: true; ceiling: Rung | null }
+  | { ok: true; ceiling: Rung | null; init: boolean }
   | { ok: false; error: string };
 
 export function parseEnlistArgs(argv: readonly string[]): EnlistArgs {
   let ceiling: Rung | null = null;
+  let init = true;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] ?? '';
     if (arg === '--ceiling') {
@@ -207,13 +287,15 @@ export function parseEnlistArgs(argv: readonly string[]): EnlistArgs {
       const parsed = parseCeiling(arg.slice('--ceiling='.length));
       if (!parsed.ok) return { ok: false, error: parsed.error };
       ceiling = parsed.value;
+    } else if (arg === '--no-init') {
+      init = false;
     } else if (arg.startsWith('-')) {
       return { ok: false, error: `unknown option ${arg}` };
     } else {
       return { ok: false, error: `unexpected argument ${JSON.stringify(arg)} — enlist takes no positional arguments` };
     }
   }
-  return { ok: true, ceiling };
+  return { ok: true, ceiling, init };
 }
 
 // ---------------------------------------------------------------------------
@@ -297,12 +379,29 @@ export async function enlistCommand(
   const args = parseEnlistArgs(argv);
   if (!args.ok) {
     err(
-      `${self} enlist: ${args.error}\n\nUsage: ${self} enlist [--ceiling 0|1|2|3]\n`,
+      `${self} enlist: ${args.error}\n\nUsage: ${self} enlist [--ceiling 0|1|2|3] [--no-init]\n`,
     );
     return 1;
   }
 
-  const repo = await currentRepoRoot();
+  let repo = await currentRepoRoot();
+  if (!repo.ok && repo.reason === 'no-repo' && args.init) {
+    const decision = decideAutoInit(process.cwd(), os.homedir());
+    if (decision.kind === 'refuse') {
+      err(`${self} enlist: ${decision.reason}\n`);
+      return 1;
+    }
+    const outcome = await autoInitRepo();
+    if (!outcome.ok) {
+      err(`${self} enlist: ${outcome.error}\n`);
+      return 1;
+    }
+    out(`\n  created a git repository in ${decision.dir}\n`);
+    // Re-derive rather than trust `decision.dir`: the real root goes through
+    // `mainRootFromCommonDir` and `fs.realpath`, and shortcutting that here is how it would
+    // silently diverge from every other route to a repo root in this file.
+    repo = await currentRepoRoot();
+  }
   if (!repo.ok) {
     err(`${self} enlist: ${repo.error}\n  fix: ${repo.fix}\n`);
     return 1;

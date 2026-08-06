@@ -24,7 +24,13 @@ import { parse as parseToml } from 'smol-toml';
 import ts from 'typescript';
 
 import { killProcessTree, probe, resolveBinary, spawnProbeChild } from '../src/setup/checks.ts';
-import { currentRepoRoot, decideCeiling, enlistCommand, mainRootFromCommonDir } from '../src/setup/enlist.ts';
+import {
+  currentRepoRoot,
+  decideAutoInit,
+  decideCeiling,
+  enlistCommand,
+  mainRootFromCommonDir,
+} from '../src/setup/enlist.ts';
 import { initialCommitCommand, quoteArg, unrunnableReason } from '../src/setup/fixes.ts';
 import { openNodeSqliteDb } from '../src/archive/db.ts';
 
@@ -882,11 +888,14 @@ describe('parseCeiling', () => {
 
 describe('parseEnlistArgs', () => {
   it('defaults to no explicit ceiling', () => {
-    assert.deepEqual(parseEnlistArgs([]), { ok: true, ceiling: null });
+    assert.deepEqual(parseEnlistArgs([]), { ok: true, ceiling: null, init: true });
   });
   it('accepts both --ceiling spellings', () => {
-    assert.deepEqual(parseEnlistArgs(['--ceiling', '2']), { ok: true, ceiling: 2 });
-    assert.deepEqual(parseEnlistArgs(['--ceiling=3']), { ok: true, ceiling: 3 });
+    assert.deepEqual(parseEnlistArgs(['--ceiling', '2']), { ok: true, ceiling: 2, init: true });
+    assert.deepEqual(parseEnlistArgs(['--ceiling=3']), { ok: true, ceiling: 3, init: true });
+  });
+  it('--no-init opts out of auto-init', () => {
+    assert.deepEqual(parseEnlistArgs(['--no-init']), { ok: true, ceiling: null, init: false });
   });
   it('rejects out-of-range and unknown flags', () => {
     assert.equal(parseEnlistArgs(['--ceiling', '4']).ok, false);
@@ -3221,38 +3230,40 @@ describe(
 // concurrently-running suite sees.
 // ===========================================================================
 
+// Module scope because `enlist auto-init` (below) drives the real command exactly the same way
+// and a second copy of a child-process harness is how they would silently diverge.
+const CLI = nodePath.join(
+  nodePath.dirname(new URL(import.meta.url).pathname),
+  '..',
+  'src',
+  'cli.ts',
+);
+
+type Run = { code: number | null; out: string; err: string };
+
+function runCli(args: string[], cwd: string, home: string): Run {
+  const res = spawnSync(process.execPath, [CLI, ...args], {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      AGENTIC_ARMY_HOME: home,
+      NODE_OPTIONS: '',
+      // A real machine has a git identity; these stand in for the global config a user has
+      // and a temp directory does not. Nothing else about the emitted command is changed.
+      GIT_AUTHOR_NAME: 'Army Test',
+      GIT_AUTHOR_EMAIL: 'test@army.invalid',
+      GIT_COMMITTER_NAME: 'Army Test',
+      GIT_COMMITTER_EMAIL: 'test@army.invalid',
+    },
+  });
+  return { code: res.status, out: res.stdout, err: res.stderr };
+}
+
 describe(
   'enlist notices a repository with no commits',
   { skip: gitPath === null ? 'git not on PATH' : false },
   () => {
-    const CLI = nodePath.join(
-      nodePath.dirname(new URL(import.meta.url).pathname),
-      '..',
-      'src',
-      'cli.ts',
-    );
-
-    type Run = { code: number | null; out: string; err: string };
-
-    function runCli(args: string[], cwd: string, home: string): Run {
-      const res = spawnSync(process.execPath, [CLI, ...args], {
-        cwd,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          AGENTIC_ARMY_HOME: home,
-          NODE_OPTIONS: '',
-          // A real machine has a git identity; these stand in for the global config a user has
-          // and a temp directory does not. Nothing else about the emitted command is changed.
-          GIT_AUTHOR_NAME: 'Army Test',
-          GIT_AUTHOR_EMAIL: 'test@army.invalid',
-          GIT_COMMITTER_NAME: 'Army Test',
-          GIT_COMMITTER_EMAIL: 'test@army.invalid',
-        },
-      });
-      return { code: res.status, out: res.stdout, err: res.stderr };
-    }
-
     function emptyRepo(tmp: string): string {
       const repo = nodePath.join(tmp, 'repo');
       fs.mkdirSync(repo, { recursive: true });
@@ -3357,6 +3368,224 @@ describe(
           run.out.includes(initialCommitCommand(repo)),
           `expected the fix to name ${quoteArg(repo)}, got:\n${run.out}`,
         );
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  },
+);
+
+// ===========================================================================
+// `army enlist` auto-initialises a bare directory instead of refusing.
+//
+// The old behaviour told the reader to run `git init` themselves and stopped.
+// That is exactly the fix `enlist` already knows how to name — `campaign`
+// hits the same refusal one command later if only `git init` is suggested —
+// so `enlist` now does both halves itself, unless a safety guard says not to.
+// ===========================================================================
+
+describe('decideAutoInit', () => {
+  it('refuses the home directory', () => {
+    const home = nodePath.join(os.tmpdir(), 'army-decide-home');
+    const decision = decideAutoInit(home, home);
+    assert.equal(decision.kind, 'refuse');
+    assert.match((decision as { reason: string }).reason, /home directory/);
+  });
+
+  it('refuses a filesystem root', () => {
+    const root = nodePath.parse(os.tmpdir()).root;
+    const decision = decideAutoInit(root, nodePath.join(os.tmpdir(), 'army-decide-home'));
+    assert.equal(decision.kind, 'refuse');
+    assert.match((decision as { reason: string }).reason, /filesystem root/);
+  });
+
+  it('initialises an ordinary directory nested under home', () => {
+    const home = nodePath.join(os.tmpdir(), 'army-decide-home');
+    const project = nodePath.join(home, 'projects', 'widget');
+    const decision = decideAutoInit(project, home);
+    assert.deepEqual(decision, { kind: 'init', dir: nodePath.resolve(project) });
+  });
+});
+
+describe(
+  'enlist auto-init',
+  { skip: gitPath === null ? 'git not on PATH' : false },
+  () => {
+    it('creates a repository, commits, registers at ceiling 0, and exits 0', () => {
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-autoinit-')));
+      try {
+        const home = nodePath.join(tmp, 'home');
+        const dir = nodePath.join(tmp, 'project');
+        fs.mkdirSync(dir, { recursive: true });
+
+        const run = runCli(['enlist'], dir, home);
+        assert.equal(run.code, 0, `did not auto-init and enlist:\n${run.err}`);
+        assert.ok(fs.existsSync(nodePath.join(dir, '.git')), 'no repository was created');
+
+        // 2. Said a repository was created, naming the directory, before the enlistment lines.
+        const createdAt = run.out.indexOf('created a git repository');
+        const enlistedAt = run.out.indexOf('enlisted');
+        assert.notEqual(createdAt, -1, `no "created a git repository" line:\n${run.out}`);
+        assert.notEqual(enlistedAt, -1, `no "enlisted" line:\n${run.out}`);
+        assert.ok(createdAt < enlistedAt, `creation notice did not come first:\n${run.out}`);
+        assert.match(run.out, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+        // 1 & 3. One empty commit exists, so HEAD resolves and the no-commits warning is silent.
+        assert.equal(
+          execFileSync('git', ['-C', dir, 'rev-parse', '--verify', '--quiet', 'HEAD'], { encoding: 'utf8' })
+            .trim().length > 0,
+          true,
+        );
+        assert.doesNotMatch(run.out, /has no commits/, 'warned about commits on a repo it just committed to');
+
+        // Registered at ceiling 0.
+        const cfg = fs.readFileSync(nodePath.join(home, 'config.toml'), 'utf8');
+        assert.match(cfg, /ceiling = 0/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('--no-init restores the exact former refusal', () => {
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-noinit-')));
+      try {
+        const home = nodePath.join(tmp, 'home');
+        const dir = nodePath.join(tmp, 'project');
+        fs.mkdirSync(dir, { recursive: true });
+
+        const run = runCli(['enlist', '--no-init'], dir, home);
+        assert.equal(run.code, 1);
+        assert.match(run.err, /is not inside a git repository/);
+        assert.match(run.err, /fix: cd into a repository first, or run `git init`/);
+        assert.ok(!fs.existsSync(nodePath.join(dir, '.git')), 'a repository was created despite --no-init');
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses at the home directory and creates nothing there', () => {
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-homerefuse-')));
+      try {
+        const fakeHome = nodePath.join(tmp, 'fakehome');
+        fs.mkdirSync(fakeHome, { recursive: true });
+        const armyHome = nodePath.join(tmp, 'armyhome');
+
+        const res = spawnSync(process.execPath, [CLI, 'enlist'], {
+          cwd: fakeHome,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            AGENTIC_ARMY_HOME: armyHome,
+            NODE_OPTIONS: '',
+            HOME: fakeHome,
+            USERPROFILE: fakeHome,
+            GIT_AUTHOR_NAME: 'Army Test',
+            GIT_AUTHOR_EMAIL: 'test@army.invalid',
+            GIT_COMMITTER_NAME: 'Army Test',
+            GIT_COMMITTER_EMAIL: 'test@army.invalid',
+          },
+        });
+
+        assert.equal(res.status, 1);
+        assert.match(res.stderr, /home directory/);
+        assert.ok(!fs.existsSync(nodePath.join(fakeHome, '.git')), 'a repository was created at fake home');
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses at a filesystem root and creates nothing there', () => {
+      const root = nodePath.parse(os.tmpdir()).root;
+      let writable = true;
+      try {
+        fs.accessSync(root, fs.constants.W_OK);
+      } catch {
+        writable = false;
+      }
+      if (!writable) return;
+
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-rootrefuse-')));
+      try {
+        const armyHome = nodePath.join(tmp, 'armyhome');
+        const fakeHome = nodePath.join(tmp, 'fakehome');
+        fs.mkdirSync(fakeHome, { recursive: true });
+
+        const res = spawnSync(process.execPath, [CLI, 'enlist'], {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            AGENTIC_ARMY_HOME: armyHome,
+            NODE_OPTIONS: '',
+            HOME: fakeHome,
+            USERPROFILE: fakeHome,
+            GIT_AUTHOR_NAME: 'Army Test',
+            GIT_AUTHOR_EMAIL: 'test@army.invalid',
+            GIT_COMMITTER_NAME: 'Army Test',
+            GIT_COMMITTER_EMAIL: 'test@army.invalid',
+          },
+        });
+
+        assert.equal(res.status, 1);
+        assert.match(res.stderr, /filesystem root/);
+        assert.ok(!fs.existsSync(nodePath.join(root, '.git')), 'a repository was created at the filesystem root');
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('a repository nested inside one already there is untouched — no init, no extra output', () => {
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-nested-')));
+      try {
+        const home = nodePath.join(tmp, 'home');
+        const repo = nodePath.join(tmp, 'repo');
+        fs.mkdirSync(repo, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'ignore' });
+        execFileSync(
+          'git',
+          ['-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-q', '--allow-empty', '-m', 'init'],
+          { cwd: repo, stdio: 'ignore' },
+        );
+        const sub = nodePath.join(repo, 'nested');
+        fs.mkdirSync(sub, { recursive: true });
+
+        const run = runCli(['enlist'], sub, home);
+        assert.equal(run.code, 0, run.err);
+        assert.doesNotMatch(run.out, /created a git repository/, 'auto-init fired inside an existing repository');
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('a failed empty commit is not fatal — the repository is still registered, and the existing no-commits warning fires', () => {
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-nocommit2-')));
+      try {
+        const home = nodePath.join(tmp, 'home');
+        const dir = nodePath.join(tmp, 'project');
+        fs.mkdirSync(dir, { recursive: true });
+
+        // Deleted, not set to '', so nothing here overrides a machine's real identity — the
+        // whole point is git having none to fall back on.
+        const env: NodeJS.ProcessEnv = { ...process.env };
+        delete env.GIT_AUTHOR_NAME;
+        delete env.GIT_AUTHOR_EMAIL;
+        delete env.GIT_COMMITTER_NAME;
+        delete env.GIT_COMMITTER_EMAIL;
+        env.AGENTIC_ARMY_HOME = home;
+        env.NODE_OPTIONS = '';
+        env.GIT_CONFIG_GLOBAL = '/dev/null';
+        env.GIT_CONFIG_SYSTEM = '/dev/null';
+
+        const res = spawnSync(process.execPath, [CLI, 'enlist'], {
+          cwd: dir,
+          encoding: 'utf8',
+          env,
+        });
+
+        assert.equal(res.status, 0, `commit failure was treated as fatal:\n${res.stderr}`);
+        assert.ok(fs.existsSync(nodePath.join(dir, '.git')), 'repository was not registered');
+        assert.match(res.stdout, /has no commits yet/);
+        assert.match(res.stdout, /fix: /);
       } finally {
         fs.rmSync(tmp, { recursive: true, force: true });
       }

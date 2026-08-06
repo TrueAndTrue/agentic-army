@@ -147,7 +147,14 @@ rung-3 heading. `src/delivery/ladder.ts` is where that gate lives.
 ```sh
 army enlist                 # ceiling 0
 army enlist --ceiling 2     # from a terminal: allow PRs on this repo
+army enlist --no-init       # refuse rather than create a repository
 ```
+
+If the current directory is not a git repository yet, `enlist` creates one — `git init` plus a
+single empty commit, because a campaign cannot lease a worktree of a repository with no HEAD, so
+initialising without committing would only move the refusal one command later. It will not do this
+in your home directory or at a filesystem root; both are a wrong `cd` rather than a new project,
+and it says so instead. Nothing already in the directory is added to that commit.
 
 "Your repo untouched" at rung 0 means *nothing is pushed anywhere and no branch you use is
 moved* — that is what the mirror is for. It does not mean the repository is bit-for-bit
