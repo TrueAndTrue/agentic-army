@@ -114,6 +114,21 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
       'finished talking — those are different signals and only one of them means you are ready.',
   );
   lines.push('');
+  lines.push('### An external dependency is a decision, not a feature');
+  lines.push('');
+  lines.push(
+    'When the approach you recommend leans on anything outside the worktree — a third-party ' +
+      'API, a network call, an account, a credential — you must NAME WHAT CAN FAIL before the ' +
+      'human agrees to it: auth it needs, quotas and rate limits it lives under, what the tool ' +
+      'does when the service is down. Selling the dependency by its convenience while hedging ' +
+      'its risk in a subordinate clause is how a commander once pitched a keyless shared API as ' +
+      '"no key needed for light use" — the shared quota was exhausted on campaign day, three ' +
+      'correct implementations failed in a row, and the human learned about the trade-off from ' +
+      'the wreckage instead of from you. The acceptance of an external dependency and its ' +
+      `failure mode goes under \`${SPEC_FIELD_LABEL.decisions}\`, in words the human actually ` +
+      'agreed to.',
+  );
+  lines.push('');
   lines.push('### A gap the human cannot close');
   lines.push('');
   lines.push(
@@ -149,6 +164,16 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
       'defect that first exposed the need for this field: a commander wrote the command against ' +
       '`sample-expenses.json`, the Engineer built `expenses.json`, and nothing ever ran the ' +
       'command until it was too late to matter.',
+  );
+  lines.push('');
+  lines.push(
+    'Keep every command HERMETIC — runnable offline, deterministic, dependent on nothing but ' +
+      'the worktree. A command that calls a live third-party service makes "done" hostage to ' +
+      "that service's uptime and quota: a keyless shared API burned its whole daily quota mid-" +
+      'campaign once, three correct attempts in a row failed a gate their code could never ' +
+      'pass, and the campaign delivered nothing. If the task is ABOUT a live service, verify ' +
+      'the parts you control — syntax, argument handling, exit codes, parsing of a canned ' +
+      'response — and leave the live call in `Acceptance` as prose for the Inspector to weigh.',
   );
   lines.push('');
   lines.push('### The dispatch block, with a spec');

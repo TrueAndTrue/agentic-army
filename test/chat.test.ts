@@ -24,9 +24,11 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { emitKeypressEvents } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -43,8 +45,18 @@ import { PROTECTED_CONFIG_GLOBS } from '../src/setup/init.ts';
 import { ROLES, WRITES_FILES } from '../src/contracts/ranks.ts';
 import { buildSoldierSpec } from '../src/command/campaign.ts';
 import { parseChatArgs, CHAT_HELP, chatCommand } from '../src/command/chat.ts';
-import { createScriptedIo } from '../src/chat/io.ts';
-import type { ChatIo, ScriptedIo } from '../src/chat/io.ts';
+import {
+  createScriptedIo,
+  createTerminalIo,
+  applyKey,
+  historyInit,
+  historySubmit,
+  historyUp,
+  historyDown,
+  renderComposerFrame,
+  splitPromptLead,
+} from '../src/chat/io.ts';
+import type { ChatIo, ComposerView, ScriptedIo, EditorState, EditorAction, Key, EditorHistory } from '../src/chat/io.ts';
 import { guardedProgress } from '../src/chat/dispatch.ts';
 import { renderProgressEvent } from '../src/view/progress.ts';
 import { formatUnit } from '../src/contracts/ranks.ts';
@@ -64,8 +76,9 @@ import type { TechnicalSpec } from '../src/contracts/spec.ts';
 import { ChatSession } from '../src/chat/session.ts';
 import { createClaudeAdapter } from '../src/harness/claude.ts';
 import type { HarnessAdapter, SoldierSpec } from '../src/contracts/harness.ts';
-import { isApproval, runChat } from '../src/chat/run.ts';
+import { CONFIRM_PROMPT, PROMPT, isApproval, renderDispatchOutcome, runChat } from '../src/chat/run.ts';
 import type { ChatOptions, ChatResult } from '../src/chat/run.ts';
+import type { CampaignResult } from '../src/command/campaign.ts';
 import { rebuildCampaign } from '../src/archive/rebuild.ts';
 import { runView } from '../src/view/index.ts';
 
@@ -523,6 +536,8 @@ function epipeOn(io: ScriptedIo, pattern: RegExp, swallowed: string[]): ChatIo {
     abortLine: () => io.abortLine(),
     onInterrupt: (handler) => io.onInterrupt(handler),
     close: () => io.close(),
+    setBusy: (label) => io.setBusy(label),
+    setIdle: () => io.setIdle(),
   };
 }
 
@@ -547,6 +562,8 @@ function snapshotOn(io: ScriptedIo, pattern: RegExp, snapshots: string[]): ChatI
     abortLine: () => io.abortLine(),
     onInterrupt: (handler) => io.onInterrupt(handler),
     close: () => io.close(),
+    setBusy: (label) => io.setBusy(label),
+    setIdle: () => io.setIdle(),
   };
 }
 
@@ -1076,6 +1093,50 @@ describe('the standing orders name every spec field and the fenced shape to carr
     assert.match(orders, /seven fields/i);
   });
 
+  it('makes an external dependency a named decision, not a feature to be sold', () => {
+    // The webvitals campaign's other lesson: the commander pitched a keyless shared API by its
+    // convenience ("no key needed for light use") and never made the human decide about its
+    // quota. The orders must force the failure modes into the open BEFORE agreement, and the
+    // acceptance into `Decisions already made`.
+    const orders = renderStandingOrders({
+      project: '/tmp/some-project',
+      ceiling: 2,
+      requestedRung: 2,
+      maxAttempts: 3,
+    });
+    assert.match(
+      orders,
+      /external dependency is a decision/i,
+      'the standing orders never make external dependencies a decision',
+    );
+    assert.match(orders, /NAME WHAT CAN FAIL/, 'the orders never demand the failure modes up front');
+    assert.match(orders, /quota|rate limit/i, 'quota is not named among the failure modes');
+    assert.ok(
+      orders.includes(`goes under \`${SPEC_FIELD_LABEL.decisions}\``),
+      'the orders never say where the accepted dependency is recorded',
+    );
+  });
+
+  it('demands hermetic verify commands, naming the quota incident that made it matter', () => {
+    // Three correct webvitals.js attempts in a row failed the acceptance gate because the spec's
+    // verify commands called the keyless shared PageSpeed Insights API, whose daily quota was
+    // exhausted mid-campaign. The commander must be told: verify what the worktree controls;
+    // live-service checks belong in Acceptance as prose for the Inspector.
+    const orders = renderStandingOrders({
+      project: '/tmp/some-project',
+      ceiling: 2,
+      requestedRung: 2,
+      maxAttempts: 3,
+    });
+    assert.match(orders, /HERMETIC/, 'the standing orders never demand hermetic verify commands');
+    assert.match(orders, /quota/i, 'the incident that justifies the rule is not named');
+    assert.match(
+      orders,
+      /leave the live call in `Acceptance`/i,
+      'the orders forbid live calls in verify without saying where they go instead',
+    );
+  });
+
   it('warns that `verify` must stay consistent with `filesInScope`, naming the incident that made it matter', () => {
     const orders = renderStandingOrders({
       project: '/tmp/some-project',
@@ -1500,6 +1561,80 @@ describe('a dispatch narrates itself, in the campaign\'s own vocabulary', () => 
     assert.throws(() => boom(), /EPIPE/, 'the unguarded listener does not actually throw');
     assert.doesNotThrow(() =>
       guardedProgress(boom)({ kind: 'note', level: 'warn', message: 'the reader has gone' }),
+    );
+  });
+});
+
+// ===============================================================================================
+// 6b. THE CLOSE-OUT DOES NOT RE-PRINT WHAT THE NARRATION ALREADY SAID
+//
+// The field transcript showed `✗ cpt-01 returned no valid report…` and `✗ durability failed…`
+// each printed twice: once live, once by the close-out's deliberate re-statement — which is
+// deliberate ONLY for notes raised before the campaign opened, the ones the live stream never
+// carries.
+// ===============================================================================================
+
+describe('an error the narration showed is not shown again by the close-out', () => {
+  /** The smallest honest `CampaignResult` these tests need. */
+  function resultWithNotes(notes: CampaignResult['notes']): CampaignResult {
+    return {
+      campaignId: 'c-1',
+      campaignRoot: '/tmp/army-c-1',
+      project: '/tmp/repo',
+      taskId: 't-1',
+      branch: 'army/t-1',
+      status: 'failed',
+      outcome: 'engineer-failed',
+      attempts: [],
+      report: null,
+      verdict: null,
+      requestedRung: 0,
+      ceiling: 0,
+      deliveredRung: null,
+      retriesExhausted: false,
+      delivery: null,
+      lease: { state: 'released', path: null, leaseId: null, reason: 'test fixture' },
+      notes,
+      acceptance: null,
+      unverifiedBehaviours: [],
+      exitCode: 1,
+    } as CampaignResult;
+  }
+
+  it('renderDispatchOutcome skips narrated error notes and keeps the never-narrated ones', () => {
+    const narratedMessage = 'cpt-01 returned no valid report (adapter status timeout)';
+    const preOpenMessage = 'raised before the campaign opened, so the stream never carried it';
+    const out = renderDispatchOutcome(
+      resultWithNotes([
+        { level: 'error', code: 'engineer', message: narratedMessage },
+        { level: 'error', code: 'aborted', message: preOpenMessage },
+      ]),
+      { self: 'ARMY', charset: 'unicode' },
+      new Set([narratedMessage]),
+    );
+    assert.ok(!out.includes(narratedMessage), `a narrated error was re-printed:\n${out}`);
+    assert.ok(out.includes(preOpenMessage), `an error the narration never showed was dropped:\n${out}`);
+    // The outcome and archive lines are the close-out's own job and always print.
+    assert.ok(out.includes('engineer-failed — branch army/t-1'), out);
+  });
+
+  it('END TO END: a scripted chat prints a narrated campaign error exactly once', async () => {
+    // One attempt, a failing Inspector: the campaign emits its retry-budget note at level error
+    // DURING narration, and the close-out used to print the same sentence a second time.
+    const rig = makeRig(
+      'dup-error',
+      ['at your orders.', `on it.\n\n${dispatchBlock('add a multiply function to calc.js')}`, 'understood.'],
+      { verdicts: ['fail'] },
+    );
+    const io = createScriptedIo(['we need multiply', 'y']);
+    const result = await chat(rig, io, { maxAttempts: 1 });
+    assert.equal(result.dispatches[0]?.outcome, 'inspector-failed');
+
+    const budgetLines = io.transcript.split('\n').filter((line) => line.includes('retry budget'));
+    assert.equal(
+      budgetLines.length,
+      1,
+      `the retry-budget error is printed ${String(budgetLines.length)} times:\n${budgetLines.join('\n')}`,
     );
   });
 });
@@ -2323,6 +2458,717 @@ describe('the suite is hermetic (a chat never reads the real ~/.agentic-army)', 
       'a chat session touched the developer\'s real home. Each line is the fs API that did it ' +
         'and the path it was given:\n  ' +
         audit.hits.join('\n  '),
+    );
+  });
+});
+
+// ===============================================================================================
+// 12. THE LINE EDITOR — pure, so tested without a stream in sight
+// ===============================================================================================
+
+describe('applyKey — the pure line-editor core', () => {
+  const st = (buffer: string, cursor: number): EditorState => ({ buffer, cursor });
+  const submit = (line: string): EditorAction => ({ kind: 'submit', line });
+  const state = (buffer: string, cursor: number): EditorAction => ({ kind: 'state', state: st(buffer, cursor) });
+  const ignore: EditorAction = { kind: 'ignore' };
+
+  it('a printable character inserts at the cursor and advances it', () => {
+    assert.deepEqual(applyKey(st('helo', 3), { sequence: 'l' }), state('hello', 4));
+  });
+
+  it('a printable character inserts in the middle of the buffer, not just at the end', () => {
+    assert.deepEqual(applyKey(st('ac', 1), { sequence: 'b' }), state('abc', 2));
+  });
+
+  it('a multi-character sequence with no name — a paste burst — inserts as text, C0 controls stripped', () => {
+    assert.deepEqual(applyKey(st('', 0), { sequence: 'ab\x07cd' }), state('abcd', 4));
+  });
+
+  it('backspace deletes left of the cursor and moves it back', () => {
+    assert.deepEqual(applyKey(st('hello', 5), { name: 'backspace' }), state('hell', 4));
+  });
+
+  it('backspace at cursor 0 is a no-op — the edge case at the start', () => {
+    assert.deepEqual(applyKey(st('hello', 0), { name: 'backspace' }), ignore);
+  });
+
+  it('delete removes the character AT the cursor; the cursor itself does not move', () => {
+    assert.deepEqual(applyKey(st('hello', 1), { name: 'delete' }), state('hllo', 1));
+  });
+
+  it('delete at the end of the buffer is a no-op — the edge case at the end', () => {
+    assert.deepEqual(applyKey(st('hello', 5), { name: 'delete' }), ignore);
+  });
+
+  it('left and right move the cursor by one, and refuse to run off either end', () => {
+    assert.deepEqual(applyKey(st('ab', 1), { name: 'left' }), state('ab', 0));
+    assert.deepEqual(applyKey(st('ab', 0), { name: 'left' }), ignore);
+    assert.deepEqual(applyKey(st('ab', 1), { name: 'right' }), state('ab', 2));
+    assert.deepEqual(applyKey(st('ab', 2), { name: 'right' }), ignore);
+  });
+
+  it('home/end and Ctrl-A/Ctrl-E land the cursor at the same two places', () => {
+    assert.deepEqual(applyKey(st('hello', 3), { name: 'home' }), state('hello', 0));
+    assert.deepEqual(applyKey(st('hello', 3), { name: 'a', ctrl: true }), state('hello', 0));
+    assert.deepEqual(applyKey(st('hello', 3), { name: 'end' }), state('hello', 5));
+    assert.deepEqual(applyKey(st('hello', 3), { name: 'e', ctrl: true }), state('hello', 5));
+    // And each is a no-op once already there.
+    assert.deepEqual(applyKey(st('hello', 0), { name: 'home' }), ignore);
+    assert.deepEqual(applyKey(st('hello', 5), { name: 'end' }), ignore);
+  });
+
+  it('Ctrl-U kills to the start of the buffer', () => {
+    assert.deepEqual(applyKey(st('hello world', 5), { name: 'u', ctrl: true }), state(' world', 0));
+  });
+
+  it('Ctrl-K kills to the end of the buffer; the cursor does not move', () => {
+    assert.deepEqual(applyKey(st('hello world', 5), { name: 'k', ctrl: true }), state('hello', 5));
+  });
+
+  it('Ctrl-W deletes the word behind the cursor, including its trailing space', () => {
+    assert.deepEqual(applyKey(st('fix the tests', 13), { name: 'w', ctrl: true }), state('fix the ', 8));
+  });
+
+  it('Ctrl-W at cursor 0 is a no-op', () => {
+    assert.deepEqual(applyKey(st('hello', 0), { name: 'w', ctrl: true }), ignore);
+  });
+
+  it('Ctrl-D on an empty buffer is eof; on a non-empty buffer it deletes right', () => {
+    assert.deepEqual(applyKey(st('', 0), { name: 'd', ctrl: true }), { kind: 'eof' });
+    assert.deepEqual(applyKey(st('hello', 1), { name: 'd', ctrl: true }), state('hllo', 1));
+  });
+
+  it('Enter always submits the buffer as-is, whatever the cursor position — both spellings of Enter', () => {
+    assert.deepEqual(applyKey(st('hello', 2), { name: 'return' }), submit('hello'));
+    assert.deepEqual(applyKey(st('hello', 2), { name: 'enter' }), submit('hello'));
+  });
+
+  it('Ctrl-C always interrupts and never inserts, even with the buffer non-empty', () => {
+    assert.deepEqual(applyKey(st('hello', 2), { name: 'c', ctrl: true }), { kind: 'interrupt' });
+    // The strongest form of "never inserts": the sequence LOOKS like it could be typed text too,
+    // and it still does not touch the buffer.
+    assert.deepEqual(applyKey(st('hello', 2), { name: 'c', ctrl: true, sequence: '\x03' }), { kind: 'interrupt' });
+  });
+
+  it('Up/Down are ignored here — history belongs to the terminal glue, not this function', () => {
+    assert.deepEqual(applyKey(st('hi', 2), { name: 'up' }), ignore);
+    assert.deepEqual(applyKey(st('hi', 2), { name: 'down' }), ignore);
+  });
+
+  it('a meta-modified key is ignored outright, even one that would otherwise insert text', () => {
+    assert.deepEqual(applyKey(st('hi', 2), { sequence: 'x', meta: true }), ignore);
+  });
+
+  it('an unassigned Ctrl combination is ignored, not inserted', () => {
+    assert.deepEqual(applyKey(st('hi', 2), { name: 'l', ctrl: true }), ignore);
+  });
+
+  it('a bare escape (or any pure-control sequence) strips to nothing and is ignored', () => {
+    assert.deepEqual(applyKey(st('hi', 2), { name: 'escape', sequence: '\x1b' }), ignore);
+  });
+});
+
+describe('editor history — pure, and separate from applyKey', () => {
+  it('starts empty, viewing the live draft', () => {
+    assert.deepEqual(historyInit(), { lines: [], index: 0, draft: '' });
+  });
+
+  it('Up on an empty history is a no-op', () => {
+    const h = historyInit();
+    const result = historyUp(h, 'typing');
+    assert.equal(result.buffer, 'typing');
+    assert.deepEqual(result.history, h);
+  });
+
+  it('Up recalls the most recently submitted line first, and stops at the oldest', () => {
+    let h = historyInit();
+    h = historySubmit(h, 'first');
+    h = historySubmit(h, 'second');
+    const up1 = historyUp(h, 'in progress');
+    assert.equal(up1.buffer, 'second');
+    const up2 = historyUp(up1.history, up1.buffer);
+    assert.equal(up2.buffer, 'first');
+    const up3 = historyUp(up2.history, up2.buffer);
+    assert.equal(up3.buffer, 'first', 'Up past the oldest entry must be a no-op, not wrap or clear');
+  });
+
+  it('Down moves back toward the live draft, and restores it exactly once there', () => {
+    let h = historyInit();
+    h = historySubmit(h, 'first');
+    h = historySubmit(h, 'second');
+    const up = historyUp(h, 'in progress');
+    const down = historyDown(up.history, up.buffer);
+    assert.equal(down.buffer, 'in progress');
+  });
+
+  it('editing a recalled line and then submitting stores the EDITED version, not the original', () => {
+    let h = historyInit();
+    h = historySubmit(h, 'fix the bug');
+    const up = historyUp(h, '');
+    assert.equal(up.buffer, 'fix the bug');
+    h = historySubmit(up.history, 'fix the bug quickly');
+    assert.deepEqual(h.lines, ['fix the bug', 'fix the bug quickly']);
+  });
+});
+
+// ===============================================================================================
+// 13. THE RAW TERMINAL — a fake TTY standing in for a real one
+//
+// No `process.stdout` reassignment anywhere below, for the reason this file's own header gives:
+// `node:test` runs suites concurrently, and a patched global swallows the runner's own output
+// along with the test's. Every fake here is a plain object injected through `TerminalIoOptions`.
+// ===============================================================================================
+
+interface FakeTtyInput extends EventEmitter {
+  isTTY: true;
+  setRawMode(mode: boolean): void;
+  readonly rawModeCalls: boolean[];
+}
+
+function fakeTtyInput(): FakeTtyInput {
+  const emitter = new EventEmitter() as FakeTtyInput;
+  const rawModeCalls: boolean[] = [];
+  Object.assign(emitter, {
+    isTTY: true as const,
+    rawModeCalls,
+    setRawMode(mode: boolean): void {
+      rawModeCalls.push(mode);
+    },
+  });
+  return emitter;
+}
+
+interface FakeTtyOutput {
+  readonly isTTY: true;
+  columns: number;
+  data: string;
+  write(text: string): boolean;
+}
+
+function fakeTtyOutput(columns = 80): FakeTtyOutput {
+  return {
+    isTTY: true,
+    columns,
+    data: '',
+    write(text: string): boolean {
+      this.data += text;
+      return true;
+    },
+  };
+}
+
+function rawIo(columns = 80): { io: ChatIo; input: FakeTtyInput; output: FakeTtyOutput } {
+  const input = fakeTtyInput();
+  const output = fakeTtyOutput(columns);
+  const io = createTerminalIo({
+    input: input as unknown as NodeJS.ReadableStream & { isTTY?: boolean; setRawMode?: (mode: boolean) => void },
+    output: output as unknown as NodeJS.WritableStream & { isTTY?: boolean; columns?: number },
+  });
+  return { io, input, output };
+}
+
+/** Fire a keypress the way `readline.emitKeypressEvents` would, without going through real parsing. */
+function press(input: EventEmitter, key: Key): void {
+  input.emit('keypress', key.sequence, key);
+}
+
+function type(input: EventEmitter, text: string): void {
+  for (const ch of text) press(input, { sequence: ch });
+}
+
+function stripColour(text: string): string {
+  return text.replace(/\[[0-9;]*m/g, '');
+}
+
+/**
+ * A dumb terminal, just enough of one: `\r[2K` clears the current line, a bare `\r` returns
+ * the column to 0 so the NEXT characters overwrite in place (this file's own cursor-positioning
+ * trick relies on that), and `\n` starts a new one. Good enough to ask "what does the current line
+ * say", which is everything these tests need to know.
+ */
+function renderScreen(raw: string): string[] {
+  const plain = stripColour(raw);
+  const lines: string[] = [''];
+  let col = 0;
+  let i = 0;
+  while (i < plain.length) {
+    const erase = '\r[2K';
+    if (plain.startsWith(erase, i)) {
+      lines[lines.length - 1] = '';
+      col = 0;
+      i += erase.length;
+      continue;
+    }
+    const ch = plain[i] as string;
+    if (ch === '\n') {
+      lines.push('');
+      col = 0;
+      i += 1;
+      continue;
+    }
+    if (ch === '\r') {
+      col = 0;
+      i += 1;
+      continue;
+    }
+    const current = lines[lines.length - 1] as string;
+    const padded = current.length < col ? current + ' '.repeat(col - current.length) : current;
+    lines[lines.length - 1] = padded.slice(0, col) + ch + padded.slice(col + 1);
+    col += 1;
+    i += 1;
+  }
+  return lines;
+}
+
+function lastLine(raw: string): string {
+  const lines = renderScreen(raw);
+  return lines[lines.length - 1] ?? '';
+}
+
+describe('createTerminalIo — the raw-mode TTY path', () => {
+  it('behaviour 1: keystrokes typed while busy produce no output, and appear at the next prompt', async () => {
+    const { io, input, output } = rawIo();
+    io.write('◆ ');
+    io.setBusy('commander');
+    const before = output.data;
+    type(input, 'hello');
+    assert.equal(output.data, before, 'a keystroke while busy must not reach the stream at all');
+    io.setIdle();
+    io.write('thinking about it.\n');
+
+    const pending = io.nextLine('you › ');
+    assert.ok(
+      lastLine(output.data).includes('hello'),
+      `typed-ahead text never appeared at the next prompt: ${JSON.stringify(lastLine(output.data))}`,
+    );
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'hello');
+    io.close();
+  });
+
+  it('behaviour 2: keystrokes typed during dispatch narration are silent the same way', () => {
+    // No dispatch machinery needed to prove this — the invariant this file implements is that
+    // ANY moment without a pending `nextLine` buffers silently, dispatch narration included. The
+    // narration case is `write()` calls with no `setBusy` at all, which this already covers.
+    const { io, input, output } = rawIo();
+    io.write('  ◇ dispatching — Engineer, then an independent Inspector.\n');
+    const before = output.data;
+    type(input, 'am I still here?');
+    assert.equal(output.data, before, 'a keystroke during narration must not reach the stream');
+    io.close();
+  });
+
+  it('behaviour 3: Enter erases the live line and writes exactly one permanent echo', async () => {
+    const { io, input, output } = rawIo();
+    const pending = io.nextLine('you › ');
+    type(input, 'fix the tests');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'fix the tests');
+    const plain = stripColour(output.data);
+    const matches = plain.match(/you › fix the tests\n/g) ?? [];
+    assert.equal(matches.length, 1, `expected exactly one permanent echo, got:\n${JSON.stringify(plain)}`);
+    // And the live input line is gone — the last thing on screen is the echoed transcript line,
+    // not a redrawn (now pointless) prompt.
+    assert.equal(lastLine(output.data), '');
+    io.close();
+  });
+
+  it('behaviour 4: setBusy paints spinner + label after the marker, and the first write erases it cleanly', () => {
+    const { io, output } = rawIo();
+    io.write('◆ ');
+    io.setBusy('commander');
+    // Frame, label, trailing mark — `◆ ⠋ commander …` — so the reader knows WHOSE silence this
+    // is. Both charsets accepted: the io detects from the real environment, which this suite
+    // refuses to patch.
+    assert.match(
+      lastLine(output.data),
+      /^◆ . commander (…|\.\.\.)$/,
+      `expected spinner + label appended after the marker, got ${JSON.stringify(lastLine(output.data))}`,
+    );
+    io.write('hello');
+    assert.equal(
+      lastLine(output.data),
+      '◆ hello',
+      'the chunk did not land where it would have without a spinner',
+    );
+    io.setIdle();
+    io.close();
+  });
+
+  it('behaviour 5: setIdle with no intervening write erases the frame and restores the bare tail', () => {
+    const { io, output } = rawIo();
+    io.write('◆ ');
+    io.setBusy('commander');
+    assert.notEqual(lastLine(output.data), '◆ ', 'the spinner never painted a frame to erase');
+    io.setIdle();
+    assert.equal(lastLine(output.data), '◆ ');
+    io.close();
+  });
+
+  it('behaviour 6: Ctrl-C fires the interrupt handler and never touches the buffer', async () => {
+    const { io, input } = rawIo();
+    let fired = 0;
+    io.onInterrupt(() => {
+      fired += 1;
+    });
+    const pending = io.nextLine('you › ');
+    type(input, 'ab');
+    press(input, { name: 'c', ctrl: true, sequence: '\x03' });
+    assert.equal(fired, 1);
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'ab', 'Ctrl-C must not have been inserted into the buffer');
+    io.close();
+  });
+
+  it('behaviour 7a: Ctrl-D on an empty buffer resolves the PENDING nextLine with null', async () => {
+    const { io, input } = rawIo();
+    const pending = io.nextLine('you › ');
+    press(input, { name: 'd', ctrl: true, sequence: '\x04' });
+    assert.equal(await pending, null);
+    io.close();
+  });
+
+  it('behaviour 7a-continued: …or the NEXT one, if none is pending yet', async () => {
+    const { io, input } = rawIo();
+    io.write('◆ ');
+    io.setBusy('commander'); // nobody is reading — Ctrl-D here must be remembered, not lost
+    press(input, { name: 'd', ctrl: true, sequence: '\x04' });
+    io.setIdle();
+    io.write('\n');
+    assert.equal(await io.nextLine('you › '), null);
+    io.close();
+  });
+
+  it('behaviour 7b: Ctrl-D on a non-empty buffer deletes right instead of ending the read', async () => {
+    const { io, input } = rawIo();
+    const pending = io.nextLine('you › ');
+    type(input, 'abc');
+    press(input, { name: 'left', sequence: '' });
+    press(input, { name: 'left', sequence: '' });
+    press(input, { name: 'd', ctrl: true, sequence: '\x04' });
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'ac');
+    io.close();
+  });
+
+  it('behaviour 9: a pasted CRLF block submits each line, with no phantom empty line between them', async () => {
+    const { io, input } = rawIo();
+    emitKeypressEvents(input as unknown as NodeJS.ReadableStream);
+    const submitted: (string | null)[] = [];
+    const first = io.nextLine('you › ');
+    // The paste lands as ONE chunk, the way a fast terminal delivers it — both `\r\n` line endings
+    // included, exercising the real `readline` keypress parser this file builds on rather than a
+    // hand-built `Key`.
+    input.emit('data', 'line one\r\nline two\r\n');
+    submitted.push(await first);
+    submitted.push(await io.nextLine('you › '));
+    assert.deepEqual(submitted, ['line one', 'line two']);
+    io.close();
+  });
+
+  it('behaviour 9b: a pasted LF-only block (Unix line endings) submits each line the same way', async () => {
+    const { io, input } = rawIo();
+    emitKeypressEvents(input as unknown as NodeJS.ReadableStream);
+    const first = io.nextLine('you › ');
+    input.emit('data', 'alpha\nbeta\n');
+    const one = await first;
+    const two = await io.nextLine('you › ');
+    assert.deepEqual([one, two], ['alpha', 'beta']);
+    io.close();
+  });
+
+  it('behaviour 11: close restores raw mode, lands the cursor on a clean line, and is idempotent', () => {
+    const { io, input, output } = rawIo();
+    io.write('◆ ');
+    io.setBusy('commander');
+    io.close();
+    assert.deepEqual(input.rawModeCalls, [true, false]);
+    assert.equal(lastLine(output.data), '', 'the cursor was not left on a clean line');
+    io.close(); // must not throw, and must not toggle raw mode a second time
+    assert.deepEqual(input.rawModeCalls, [true, false]);
+  });
+
+  it('a pending nextLine at close time is settled with null, not left hanging', async () => {
+    const { io } = rawIo();
+    const pending = io.nextLine('you › ');
+    io.close();
+    assert.equal(await pending, null);
+  });
+});
+
+// ===============================================================================================
+// 13B. THE COMPOSER, DRIVEN WITH THE REAL PROMPT BYTES
+//
+// The bug these tests exist to hold down shipped because every io test above spelled its own
+// prompt — `'you › '` — while `runChat` passes `PROMPT = '\nyou › '`, with a leading newline. The
+// repaint primitive erases ONE physical row, so a prompt whose repaint carries a `\n` walks the
+// cursor down the screen one row per keystroke and leaves a stale partial prompt on every row it
+// abandons. Nothing below invents a prompt: every read uses the exported constants from run.ts.
+// ===============================================================================================
+
+describe('the composer repaints in place, driven with runChat\'s real prompt bytes', () => {
+  it('typing repaints one physical row — no newline per keystroke, no screen growth', async () => {
+    const { io, input, output } = rawIo();
+    io.write('◆ a streamed reply.\n');
+    const pending = io.nextLine(PROMPT);
+    const rowsAtPaint = renderScreen(output.data).length;
+    const paintedUpTo = output.data.length;
+    type(input, 'I am building a calculator');
+    assert.ok(
+      !output.data.slice(paintedUpTo).includes('\n'),
+      'a keystroke repaint emitted a newline — the cursor walks down the screen, one row per key',
+    );
+    assert.equal(renderScreen(output.data).length, rowsAtPaint, 'typing grew the screen');
+    assert.equal(lastLine(output.data), 'you › I am building a calculator');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'I am building a calculator');
+    const plain = stripColour(output.data);
+    assert.equal(
+      (plain.match(/you › I am building a calculator\n/g) ?? []).length,
+      1,
+      'exactly one permanent transcript line must land on submit',
+    );
+    io.close();
+  });
+
+  it('the prompt\'s separator line prints once per read, not once per keystroke', async () => {
+    const { io, input, output } = rawIo();
+    io.write('◆ a streamed reply.\n');
+    const pending = io.nextLine(PROMPT);
+    type(input, 'hello');
+    // The whole screen, top to bottom: reply, ONE blank separator (PROMPT's leading newline),
+    // then the live composer. Nothing stale above it.
+    assert.deepEqual(renderScreen(output.data), ['◆ a streamed reply.', '', 'you › hello']);
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'hello');
+    io.close();
+  });
+
+  it('mid-line edits repaint in place: arrows and insert fix a typo without adding a row', async () => {
+    const { io, input, output } = rawIo();
+    const pending = io.nextLine(PROMPT);
+    type(input, 'helo world');
+    const rowsBefore = renderScreen(output.data).length;
+    // Walk back to the typo and fix it in place, the way a human actually would.
+    for (let i = 0; i < 7; i += 1) press(input, { name: 'left', sequence: '' });
+    press(input, { sequence: 'l' });
+    assert.equal(lastLine(output.data), 'you › hello world');
+    assert.equal(renderScreen(output.data).length, rowsBefore, 'an in-place edit grew the screen');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'hello world');
+    io.close();
+  });
+
+  it('the dispatch confirm prompt edits in place the same way', async () => {
+    const { io, input, output } = rawIo();
+    io.write('  ◇ proposed objective\n     add a multiply function\n');
+    const pending = io.nextLine(CONFIRM_PROMPT);
+    const paintedUpTo = output.data.length;
+    type(input, 'y');
+    assert.ok(
+      !output.data.slice(paintedUpTo).includes('\n'),
+      'the confirm prompt walked down the screen',
+    );
+    assert.equal(lastLine(output.data), '  ◇ dispatch this? [y/N] y');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'y');
+    io.close();
+  });
+
+  it('a terminal that reports ZERO columns still paints what you type', async () => {
+    // `script(1)`-style PTYs (and some SSH/CI terminals) have no window size: `columns` is 0,
+    // which is not nullish, so a `?? 80` fallback keeps it. With a 0-column width the buffer
+    // window is empty and every keystroke paints an unchanged bare prompt — typing is invisible.
+    // Found by the real-PTY smoke run, not by any fake that pinned `columns: 80`.
+    const { io, input, output } = rawIo(0);
+    const pending = io.nextLine(PROMPT);
+    type(input, 'hello');
+    assert.equal(
+      lastLine(output.data),
+      'you › hello',
+      'a zero-column terminal swallowed the typed text',
+    );
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'hello');
+    io.close();
+  });
+
+  it('a queued type-ahead line echoes exactly once under the real prompt, separator intact', async () => {
+    const { io, input, output } = rawIo();
+    io.write('◆ ');
+    io.setBusy('commander');
+    type(input, 'and then add tests');
+    press(input, { name: 'return', sequence: '\r' });
+    io.setIdle();
+    io.write('the reply.\n');
+    assert.equal(await io.nextLine(PROMPT), 'and then add tests');
+    const plain = stripColour(output.data);
+    assert.equal((plain.match(/you › and then add tests\n/g) ?? []).length, 1);
+    assert.deepEqual(renderScreen(output.data).slice(-3), ['', 'you › and then add tests', '']);
+    io.close();
+  });
+});
+
+// ===============================================================================================
+// 13C. THE PURE COMPOSER CORE — (prompt, buffer, cursor, width) → one frame, no stream in sight
+// ===============================================================================================
+
+describe('splitPromptLead and renderComposerFrame — the pure composer core', () => {
+  it('splitPromptLead: the lead is everything through the last newline; the line is the rest', () => {
+    assert.deepEqual(splitPromptLead('you › '), { lead: '', line: 'you › ' });
+    assert.deepEqual(splitPromptLead('\nyou › '), { lead: '\n', line: 'you › ' });
+    assert.deepEqual(splitPromptLead('a\nb\nc '), { lead: 'a\nb\n', line: 'c ' });
+    assert.deepEqual(splitPromptLead(''), { lead: '', line: '' });
+    // The real constants, so the live line can never smuggle a newline into a repaint again.
+    assert.equal(splitPromptLead(PROMPT).line.includes('\n'), false);
+    assert.equal(splitPromptLead(CONFIRM_PROMPT).line, CONFIRM_PROMPT);
+  });
+
+  const frame = (over: Partial<ComposerView> = {}): string =>
+    renderComposerFrame({
+      prompt: 'you › ',
+      colouredPrompt: 'you › ',
+      buffer: '',
+      cursor: 0,
+      width: 80,
+      ellipsis: '…',
+      ...over,
+    });
+
+  it('a frame never contains a newline — the walking-cursor bug, stated as an invariant', () => {
+    for (const view of [
+      {},
+      { buffer: 'hello', cursor: 5 },
+      { buffer: 'x'.repeat(500), cursor: 250, width: 20 },
+      { buffer: 'hello', cursor: 5, width: 3 },
+      { buffer: 'hello', cursor: 5, width: 0 },
+    ]) {
+      assert.ok(!frame(view).includes('\n'), `a newline in the frame for ${JSON.stringify(view)}`);
+    }
+  });
+
+  it('draws the full line, returns to column 0, and re-draws exactly up to the cursor', () => {
+    assert.equal(frame({ buffer: 'hello', cursor: 2 }), 'you › hello\ryou › he');
+    assert.equal(frame({ buffer: 'hello', cursor: 5 }), 'you › hello\ryou › hello');
+    assert.equal(frame({ buffer: 'hello', cursor: 0 }), 'you › hello\ryou › ');
+  });
+
+  it('SGR in the coloured prompt is painted but never charged against the width', () => {
+    const coloured = '[1m[32myou › [0m';
+    // Width 9 leaves exactly 2 columns for the buffer (one is held back from the right margin) —
+    // if the escape bytes were charged, nothing of the buffer would fit at all.
+    const out = frame({ colouredPrompt: coloured, buffer: 'hi', cursor: 2, width: 9 });
+    assert.equal(out, `${coloured}hi\r${coloured}hi`);
+  });
+
+  it('a long buffer slides a window around the cursor and marks both cut edges', () => {
+    const buffer = 'abcdefghijklmnopqrstuvwxyz'.repeat(4);
+    const out = frame({ buffer, cursor: 52, width: 24 });
+    const [full, left] = out.split('\r') as [string, string];
+    assert.ok([...full].length <= 24, `the frame overflows the width: ${JSON.stringify(full)}`);
+    assert.ok(full.startsWith('you › …'), 'the left cut is not marked');
+    assert.ok(full.endsWith('…'), 'the right cut is not marked');
+    assert.ok(!full.includes('abcdefgh'), 'the window did not slide — it still shows the start');
+    assert.ok(left.length < full.length, 'the cursor pass re-drew past the cursor');
+  });
+
+  it('a width narrower than the prompt paints the prompt alone rather than a sliver of buffer', () => {
+    assert.equal(frame({ buffer: 'hello', cursor: 5, width: 4 }), 'you › \ryou › ');
+  });
+});
+
+// ===============================================================================================
+// 14. COLOUR — decided once, from the real environment, so it has to run in a real process
+//
+// `createTerminalIo` reads `process.env` directly (decision this file implements), which is
+// exactly the global state the rest of this suite refuses to patch — a mutated `NO_COLOR` in the
+// test runner's own process would leak into every OTHER concurrently running test. So this one
+// property runs in a child process instead, the same way `test/command.test.ts` and the hermetic
+// test above already do for a different piece of ambient state.
+// ===============================================================================================
+
+const COLOUR_RUNNER = String.raw`
+import { EventEmitter } from 'node:events';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const outFile = process.argv[2];
+
+const { createTerminalIo } = await import(process.env.ARMY_CHAT_IO_MODULE);
+
+const input = new EventEmitter();
+input.isTTY = true;
+input.setRawMode = () => {};
+
+const output = { isTTY: true, columns: 80, data: '', write(text) { this.data += text; return true; } };
+
+const io = createTerminalIo({ input, output });
+io.write('hello ');
+io.setBusy('commander');
+await new Promise((resolve) => setTimeout(resolve, 150));
+io.setIdle();
+io.nextLine('you \u203a ');
+io.close();
+require('node:fs').writeFileSync(outFile, output.data);
+`;
+
+function envWithout(keys: string[], overrides: Record<string, string>): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of keys) delete base[key];
+  return { ...base, ...overrides };
+}
+
+async function runColourChild(env: NodeJS.ProcessEnv): Promise<string> {
+  const dir = mkTmp('colour');
+  const runner = path.join(dir, 'colour-runner.mjs');
+  fs.writeFileSync(runner, COLOUR_RUNNER, 'utf8');
+  const out = path.join(dir, 'out.txt');
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, [runner, out], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...env, ARMY_CHAT_IO_MODULE: pathToFileURL(path.resolve('src/chat/io.ts')).href },
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')));
+    child.on('error', reject);
+    child.on('close', (code) =>
+      code === 0 ? resolve() : reject(new Error(`colour runner exited ${String(code)}: ${stderr}`)),
+    );
+  });
+  return fs.readFileSync(out, 'utf8');
+}
+
+describe('behaviour 13: colour follows NO_COLOR / TERM=dumb, decided once by createTerminalIo', () => {
+  it('emits no SGR colour codes when NO_COLOR is set', async () => {
+    const data = await runColourChild(envWithout(['FORCE_COLOR'], { NO_COLOR: '1', TERM: 'xterm-256color' }));
+    assert.doesNotMatch(data, /\[(1|2|32|36)m/, `colour codes leaked under NO_COLOR:\n${JSON.stringify(data)}`);
+    // Cursor control is not colour, and stays — decision 13 is explicit about the distinction.
+    assert.match(data, /\[2K/, 'cursor control disappeared along with colour, which it must not');
+  });
+
+  it('emits no SGR colour codes when TERM=dumb', async () => {
+    const data = await runColourChild(envWithout(['NO_COLOR', 'FORCE_COLOR'], { TERM: 'dumb' }));
+    assert.doesNotMatch(data, /\[(1|2|32|36)m/, `colour codes leaked under TERM=dumb:\n${JSON.stringify(data)}`);
+  });
+
+  it('DOES emit colour otherwise — proving the two tests above are not vacuous', async () => {
+    const data = await runColourChild(envWithout(['NO_COLOR'], { FORCE_COLOR: '1', TERM: 'xterm-256color' }));
+    assert.match(data, /\[1m\[32m/, `expected a bold-green prompt somewhere; got:\n${JSON.stringify(data)}`);
+  });
+});
+
+// ===============================================================================================
+// 15. `runChat` brackets every commander turn in matched busy/idle pairs
+// ===============================================================================================
+
+describe('behaviour 14: setBusy/setIdle bracket every commander turn', () => {
+  it('one matched pair for the opening turn, and one more per human turn — never unmatched', async () => {
+    const rig = makeRig('states', ['ready.', 'on it.', 'noted.']);
+    const io = createScriptedIo(['first', 'second']);
+    await chat(rig, io);
+    assert.deepEqual(
+      io.states,
+      ['busy:commander', 'idle', 'busy:commander', 'idle', 'busy:commander', 'idle'],
+      `states: ${JSON.stringify(io.states)}`,
     );
   });
 });

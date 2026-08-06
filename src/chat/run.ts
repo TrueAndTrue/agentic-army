@@ -196,8 +196,15 @@ function uniqueCampaignId(archiveRoot: string, title: string): string {
   return `${base}-${String(Date.now())}`;
 }
 
-const PROMPT = '\nyou › ';
-const CONFIRM_PROMPT = '  ◇ dispatch this? [y/N] ';
+/**
+ * Exported so tests can drive the terminal with the REAL bytes. The last shipped terminal bug —
+ * the composer walking down the screen one row per keystroke — lived precisely in the gap between
+ * these constants and the `'you › '` every io test hand-rolled: the leading `\n` here never met
+ * the repaint code until a human did. `ChatIo.nextLine` documents the multi-line contract; a test
+ * that spells its own prompt is a test of a prompt nobody uses.
+ */
+export const PROMPT = '\nyou › ';
+export const CONFIRM_PROMPT = '  ◇ dispatch this? [y/N] ';
 
 /** `y` / `yes`, and nothing else. Anything ambiguous is a no — the default must be the safe one. */
 export function isApproval(line: string): boolean {
@@ -233,13 +240,21 @@ export function chatBanner(self: string, project: string, ceiling: Rung, rung: R
  * - `result.branch`, which is `armyBranch(taskId)` — the supervisor's own name for the work. The
  *   only branch a reader saw during narration came out of the Engineer's model-written summary.
  * - the archive path, which is where the whole thing can be read back.
- * - error notes, which are re-stated deliberately. Notes raised BEFORE the campaign opened are
- *   never narrated at all, and the ones that were are ten lines up by now.
+ * - error notes that were NEVER narrated. The re-statement here is deliberate only for notes
+ *   raised BEFORE the campaign opened, which the live stream never carries — the field
+ *   transcript showed every narrated error printed twice, once live and once here, so `narrated`
+ *   is the set of note messages the live stream already showed and those are skipped. PURE: the
+ *   set is passed in; this function watches nothing itself. Exported for the test that pins both
+ *   halves — a narrated error appears once, an un-narrated one still appears.
  */
-function renderDispatchOutcome(result: CampaignResult, style: ProgressStyle): string {
+export function renderDispatchOutcome(
+  result: CampaignResult,
+  style: ProgressStyle,
+  narrated: ReadonlySet<string>,
+): string {
   const lines: string[] = [];
   for (const note of result.notes) {
-    if (note.level === 'error') {
+    if (note.level === 'error' && !narrated.has(note.message)) {
       lines.push(renderProgressEvent({ kind: 'note', level: 'error', message: note.message }, style));
     }
   }
@@ -544,7 +559,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     await session.open();
 
     io.write('◆ ');
+    io.setBusy('commander');
     const opening = await session.openingTurn(standingOrders);
+    io.setIdle();
     io.write('\n');
     recordCommanderTurn(opening.text, opening.refusals);
 
@@ -575,7 +592,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       });
 
       io.write('\n◆ ');
+      io.setBusy('commander');
       const turn = await session.humanTurn(text);
+      io.setIdle();
       io.write('\n');
       recordCommanderTurn(turn.text, turn.refusals);
       if (turn.status === 'error' && turn.errors.length > 0) {
@@ -648,7 +667,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           deliveredRung: null,
         });
         io.write('\n◆ ');
+        io.setBusy('commander');
         const reaction = await session.dispatchDeclinedTurn(proposal.objective, reason);
+        io.setIdle();
         io.write('\n');
         recordCommanderTurn(reaction.text, reaction.refusals);
         continue;
@@ -671,7 +692,15 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         // escape bytes in a saved transcript are a corruption, not a feature.
         live: io.isTTY,
       });
-      narrate = guardedProgress(sink.emit);
+      // Every note message the live narration forwards, so the close-out below can re-state only
+      // the errors a reader has NOT already seen. Rebuilt per dispatch with the sink it records
+      // for; recorded before the emit, inside the guard, because a message the set holds is one
+      // this wrapper handed to the terminal — not a claim about what a dead pipe displayed.
+      const narratedNotes = new Set<string>();
+      narrate = guardedProgress((event) => {
+        if (event.kind === 'note') narratedNotes.add(event.message);
+        sink.emit(event);
+      });
       dispatchInFlight = true;
       let result: CampaignResult | null = null;
       let failure: string | null = null;
@@ -728,6 +757,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           deliveredRung: null,
         });
         io.write('\n◆ ');
+        io.setBusy('commander');
         // A failure to START is not a subordinate's account of anything — it is this process
         // reporting on itself, so it goes back as the declined envelope, whose only strings are
         // the objective the human approved and a message this file wrote.
@@ -735,12 +765,13 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           proposal.objective,
           `the dispatch could not be started: ${cap(message, 200)}`,
         );
+        io.setIdle();
         io.write('\n');
         recordCommanderTurn(reaction.text, reaction.refusals);
         continue;
       }
 
-      io.write(renderDispatchOutcome(result, progressStyle));
+      io.write(renderDispatchOutcome(result, progressStyle, narratedNotes));
       const facts = factsFrom(result, proposal.objective);
       dispatches.push({
         objective: proposal.objective,
@@ -762,7 +793,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       });
 
       io.write('\n◆ ');
+      io.setBusy('commander');
       const reaction = await session.dispatchResultTurn(facts);
+      io.setIdle();
       io.write('\n');
       recordCommanderTurn(reaction.text, reaction.refusals);
     }
