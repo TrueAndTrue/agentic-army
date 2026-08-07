@@ -583,6 +583,42 @@ export interface CampaignSummary {
   status: string;
   project: string;
   createdAt: string;
+  /**
+   * When anything in this campaign's directory last moved (newest mtime across `campaign.json`,
+   * `tasks.jsonl`, `signals.jsonl` and every agent's `stream.jsonl`), ISO-8601. Computed only
+   * for `status: "active"` — the one status a SIGKILLed supervisor leaves behind as a lie — so
+   * the list can flag a row nothing has touched in hours instead of presenting it as live.
+   * Null when the status is terminal or no file yielded a time.
+   */
+  lastActivityAt: string | null;
+}
+
+/**
+ * Newest mtime under one campaign directory, or null. mtimes, not stream contents, because the
+ * list view must stay cheap over a large archive — and "when did the file last grow" is exactly
+ * the question. Every read is guarded: a torn directory yields null, never a throw.
+ */
+function lastActivityAt(campaignRoot: string): string | null {
+  let latest = -Infinity;
+  const consider = (file: string): void => {
+    try {
+      const ms = fs.statSync(file).mtimeMs;
+      if (ms > latest) latest = ms;
+    } catch {
+      /* absent files simply do not testify */
+    }
+  };
+  consider(campaignJsonPath(campaignRoot));
+  consider(path.join(campaignRoot, 'tasks.jsonl'));
+  consider(path.join(campaignRoot, 'signals.jsonl'));
+  try {
+    for (const entry of fs.readdirSync(path.join(campaignRoot, 'agents'), { withFileTypes: true })) {
+      if (entry.isDirectory()) consider(path.join(campaignRoot, 'agents', entry.name, 'stream.jsonl'));
+    }
+  } catch {
+    /* no agents directory yet — the campaign died in its setup window */
+  }
+  return Number.isFinite(latest) ? new Date(latest).toISOString() : null;
 }
 
 /** Newest first, by `created_at` then id. A directory without `campaign.json` is not a campaign. */
@@ -598,14 +634,17 @@ export function listCampaigns(archiveRoot: string): CampaignSummary[] {
   const out: CampaignSummary[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !isSafeSegment(entry.name)) continue;
-    const row = readJsonFile(campaignJsonPath(path.join(root, entry.name)));
+    const dir = path.join(root, entry.name);
+    const row = readJsonFile(campaignJsonPath(dir));
     if (row === undefined || typeof row.id !== 'string') continue;
+    const status = typeof row.status === 'string' ? row.status : 'unknown';
     out.push({
       id: row.id,
       title: typeof row.title === 'string' ? row.title : row.id,
-      status: typeof row.status === 'string' ? row.status : 'unknown',
+      status,
       project: typeof row.project === 'string' ? row.project : '',
       createdAt: typeof row.created_at === 'string' ? row.created_at : '',
+      lastActivityAt: status === 'active' ? lastActivityAt(dir) : null,
     });
   }
   out.sort((a, b) => cmp(b.createdAt, a.createdAt) || cmp(b.id, a.id));

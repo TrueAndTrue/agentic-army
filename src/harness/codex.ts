@@ -48,8 +48,10 @@ import type {
   SoldierStatus,
   TokenUsage,
 } from '../contracts/harness.ts';
+import { killProcessTree } from '../setup/checks.ts';
 import type { JsonlLine } from './jsonl.ts';
 import { createAsyncQueue, createJsonlFramer } from './jsonl.ts';
+import type { KillableSoldier } from './kill.ts';
 
 // ---------------------------------------------------------------------------------------------
 // argv / env
@@ -725,7 +727,7 @@ export function createCodexNormalizer(options?: CodexNormalizerOptions): CodexNo
  * the Codex-minted thread id (the foreign key for `codex exec resume`) and the raw text of the
  * `-o` file (the schema-capped return path).
  */
-export interface CodexSoldier extends Soldier {
+export interface CodexSoldier extends KillableSoldier {
   /** `thread.started.thread_id`, or null before the first line / if the run never started. */
   readonly codexThreadId: string | null;
   /** Raw contents of `--output-last-message`, or null when the run failed and never wrote it. */
@@ -803,11 +805,24 @@ function makeCodexSoldier(
   let child: ChildProcess | null = null;
   let started = false;
   let processExited = false;
+  /**
+   * `exit` has fired — the PROCESS is gone, whatever its pipes are doing. Distinct from
+   * `processExited`, which this file keys on `close` (exit + stdio EOF): a grandchild holding an
+   * inherited write end delays `close` indefinitely, and a `close`-only wait registered after
+   * the child already died waits for an event that fired before anyone listened.
+   */
+  let processGone = false;
   let stdoutEnded = false;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
   let timedOut = false;
   let hardKilled = false;
+  /**
+   * Set by `killTree()`. Codex launches its child in `send()`, not `spawn()`, so an abort can
+   * land in the window where the soldier exists and its process does not — without this flag a
+   * killed-before-launch soldier would go on to start the very process the kill was for.
+   */
+  let treeKilled = false;
   let stderrTail = '';
   let outputText: string | null = null;
   let resultCount = 0;
@@ -954,6 +969,16 @@ function makeCodexSoldier(
 
   function launch(prompt: string): void {
     started = true;
+    // The abort landed before the process existed. Refuse to start one: a kill that is answered
+    // by a fresh spawn is not a kill, and the caller reaching for `killTree` is a supervisor
+    // that has already promised its user nothing outlives it.
+    if (treeKilled) {
+      emitSynthetic('soldier was killed before its process launched', 'agentic-army/codex-adapter');
+      processExited = true;
+      stdoutEnded = true;
+      finish();
+      return;
+    }
     announceConfinement();
     try {
       tempDir = mkdtempSync(join(tmpdir(), 'army-codex-'));
@@ -993,6 +1018,9 @@ function makeCodexSoldier(
         // EOF that never arrives: 0 bytes of output, no error, forever.
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        // Own process group on POSIX, so `killTree()` reaches everything codex spawned and the
+        // terminal's Ctrl-C reaches only the supervisor. See `./kill.ts`.
+        detached: process.platform !== 'win32',
       });
     } catch (err) {
       emitSynthetic(
@@ -1030,6 +1058,14 @@ function makeCodexSoldier(
       stdoutEnded = true;
       finish();
     });
+    proc.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      // Recorded HERE, not only on `close`, because `close` can be held hostage by a pipe some
+      // grandchild inherited — and the exit code must survive that. Registered at launch so a
+      // `close()` that starts after a fast child died still knows the process is gone.
+      processGone = true;
+      if (exitCode === null) exitCode = code;
+      if (exitSignal === null) exitSignal = signal;
+    });
     proc.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       exitCode = code;
       exitSignal = signal;
@@ -1046,7 +1082,10 @@ function makeCodexSoldier(
       proc.kill('SIGTERM');
       const hard = setTimeout(() => {
         hardKilled = true;
-        proc.kill('SIGKILL');
+        // The group, not the direct child — same reasoning as the claude adapter's escalation:
+        // a grandchild that inherited the stdout write end keeps `close` from ever firing after
+        // the child alone is killed, and `codex exec` runs real tools that spawn real processes.
+        killProcessTree(proc);
       }, killGraceMs);
       hard.unref?.();
     }, timeoutMs);
@@ -1084,6 +1123,19 @@ function makeCodexSoldier(
     },
     get outputText(): string | null {
       return outputText;
+    },
+
+    /**
+     * The abort seam — see `./kill.ts`. `hardKilled` makes `close()` report `killed` even on the
+     * pre-launch path, and the flag stops a not-yet-launched soldier from starting a process
+     * AFTER its own kill.
+     */
+    killTree(): void {
+      treeKilled = true;
+      if (child !== null && !processExited) {
+        hardKilled = true;
+        killProcessTree(child);
+      }
     },
 
     /**
@@ -1147,10 +1199,49 @@ function makeCodexSoldier(
         }
         const proc = child;
         if (!processExited) {
+          // Anchored on `exit`, bounded on `close`. `close` is the event the rest of this file
+          // keys on, but it fires only once the child's stdio pipes reach EOF — and a process
+          // the child spawned with inherited stdio holds those write ends open after the child
+          // itself is gone, so a `close`-only wait here is unbounded. `exit` fires the moment
+          // the process dies regardless of pipes; after it, the streams get one kill-grace to
+          // drain normally and then this stops waiting for an EOF that cannot come.
+          let reaped = false;
           await new Promise<void>((resolve) => {
-            if (processExited) resolve();
-            else proc.once('close', () => resolve());
+            if (processExited) {
+              reaped = true;
+              resolve();
+              return;
+            }
+            proc.once('close', () => {
+              reaped = true;
+              resolve();
+            });
+            const afterExit = (): void => {
+              const drain = setTimeout(resolve, killGraceMs);
+              drain.unref?.();
+            };
+            // `processGone`, not a fresh `once('exit')` alone: a fast child dies before close()
+            // is ever called, and a listener registered after the event waits forever.
+            if (processGone) afterExit();
+            else proc.once('exit', afterExit);
           });
+          if (!reaped) {
+            // Same backstop as the claude adapter and `runResolved`: a survivor still holding
+            // our pipe ends would keep the CALLER's event loop alive forever, so our ends are
+            // destroyed and the child unreferenced. The `-o` output file is unaffected — it is
+            // a file, not a pipe, and was read (or found absent) by the stream handlers.
+            try {
+              proc.stdout?.destroy();
+            } catch {
+              /* already gone */
+            }
+            try {
+              proc.stderr?.destroy();
+            } catch {
+              /* already gone */
+            }
+            proc.unref();
+          }
         }
         stdoutEnded = true;
         processExited = true;

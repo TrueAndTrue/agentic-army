@@ -44,6 +44,12 @@ import {
   samePath,
   worktreesRootFor,
 } from '../config/paths.ts';
+// The pool's OWN parser and its OWN liveness rule, imported rather than re-implemented: two
+// readers of one on-disk lease format is how doctor and the acquire path end up disagreeing
+// about whether a slot is held. `cold.ts` pulls in nothing heavier than `delivery/git`, which
+// this module's probes conceptually sit beside anyway.
+import { leaseLiveness, readLeaseRecord } from '../worktree/cold.ts';
+import type { ColdLeaseRecord, LeaseLivenessVerdict } from '../worktree/cold.ts';
 
 import { quoteArg } from './shell.ts';
 
@@ -63,6 +69,7 @@ export type CheckId =
   | 'gh'
   | 'worktree-pool'
   | 'stale-worktree-pool'
+  | 'worktree-leases'
   | 'home'
   | 'config'
   | 'sqlite';
@@ -1008,6 +1015,124 @@ export function classifyStaleWorktreePool(state: LegacyPoolState): CheckResult {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Worktree leases — is the pool holding slots for processes that no longer exist?
+// ---------------------------------------------------------------------------
+
+/** One lease record, judged. `holder` is the agent id; the pid is inside `record`. */
+export type JudgedLease = {
+  file: string;
+  holder: string;
+  path: string;
+  verdict: LeaseLivenessVerdict;
+  reason: string;
+};
+
+export type WorktreeLeasesState = {
+  /** `<pool>/leases` — where the records live. */
+  dir: string;
+  exists: boolean;
+  leases: JudgedLease[];
+  /** `.json` files present that did not parse as lease records. They hold slots forever. */
+  unreadable: number;
+};
+
+/**
+ * Read every lease record in the pool and judge each one with the pool's own liveness rule.
+ *
+ * READ-ONLY, like every doctor probe. Reclaiming is the acquire path's job (`cold.ts` releases a
+ * stale lease through the real release gate on the next acquire); this check exists because until
+ * that acquire happens the pool is a directory of opaque JSON, and "why is the pool exhausted"
+ * was unanswerable without reading it by hand.
+ */
+export async function inspectWorktreeLeases(
+  poolRoot: string = worktreePoolDir(),
+): Promise<WorktreeLeasesState> {
+  const dir = path.join(poolRoot, 'leases');
+  let names: string[];
+  try {
+    names = (await fs.readdir(dir)).filter((name) => name.endsWith('.json')).sort();
+  } catch {
+    return { dir, exists: false, leases: [], unreadable: 0 };
+  }
+  const leases: JudgedLease[] = [];
+  let unreadable = 0;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    const record: ColdLeaseRecord | null = readLeaseRecord(file);
+    if (record === null) {
+      unreadable += 1;
+      continue;
+    }
+    const liveness = leaseLiveness(record);
+    leases.push({
+      file,
+      holder: record.leaseHolder,
+      path: record.path,
+      verdict: liveness.verdict,
+      reason: liveness.reason,
+    });
+  }
+  return { dir, exists: true, leases, unreadable };
+}
+
+/**
+ * `ok` when the pool holds nothing, or only leases whose processes are alive. Anything else is
+ * `degraded` — never blocking, because nothing is PREVENTED (the pool still hands out every free
+ * slot, and stale leases are reclaimed by the next acquire) — but a slot held by the dead is
+ * capacity a reader deserves to see before `PoolExhaustedError` makes them come looking.
+ */
+export function classifyWorktreeLeases(state: WorktreeLeasesState): CheckResult {
+  const base = { id: 'worktree-leases' as const, title: 'worktree pool leases' };
+  const counts: Record<LeaseLivenessVerdict, number> = { live: 0, stale: 0, foreign: 0, unknown: 0 };
+  for (const lease of state.leases) counts[lease.verdict] += 1;
+  const total = state.leases.length + state.unreadable;
+
+  if (!state.exists || total === 0) {
+    return { ...base, outcome: 'ok', found: `${state.dir} (no leases)` };
+  }
+  const parts = [`${counts.live} live`];
+  if (counts.stale > 0) parts.push(`${counts.stale} stale`);
+  if (counts.foreign > 0) parts.push(`${counts.foreign} foreign-host`);
+  if (counts.unknown > 0) parts.push(`${counts.unknown} without a pid`);
+  if (state.unreadable > 0) parts.push(`${state.unreadable} unreadable`);
+  const found = `${state.dir} — ${total} lease(s): ${parts.join(', ')}`;
+
+  if (counts.live === state.leases.length && state.unreadable === 0) {
+    return { ...base, outcome: 'ok', found };
+  }
+
+  const dead = state.leases.filter((lease) => lease.verdict === 'stale');
+  const held = dead.map((lease) => `${lease.holder} (${lease.path})`).join(', ');
+  const impactParts: string[] = [];
+  if (dead.length > 0) {
+    impactParts.push(
+      `${dead.length} pool slot(s) are held by processes that no longer exist${held === '' ? '' : `: ${held}`}. ` +
+        'They are unavailable until the next campaign acquires a tree of the same repository, ' +
+        'which reclaims them automatically through the release gate.',
+    );
+  }
+  if (counts.foreign > 0 || counts.unknown > 0 || state.unreadable > 0) {
+    impactParts.push(
+      `${counts.foreign + counts.unknown + state.unreadable} lease(s) cannot be judged from ` +
+        'this machine (taken on another host, no recorded pid, or unreadable) and are NEVER ' +
+        'reclaimed automatically — each permanently holds a slot until dealt with by hand.',
+    );
+  }
+  return {
+    ...base,
+    outcome: 'degraded',
+    found,
+    impact: impactParts.join(' '),
+    note:
+      'A lease record outliving its process is what a SIGKILLed campaign leaves behind. ' +
+      'Reclamation goes through the real release path, so a dead holder\'s unlanded work still ' +
+      'blocks its slot — that lease will keep showing here, and the record file names the tree ' +
+      'holding the work. Only delete a record by hand once you are certain its holder is gone ' +
+      'and its tree holds nothing you want.',
+  };
+}
+
 export function classifySqlite(
   ok: boolean,
   error?: string | null,
@@ -1674,6 +1799,9 @@ export async function runChecks(
   const staleWorktreePoolCheck = async (): Promise<CheckResult> =>
     classifyStaleWorktreePool(await inspectLegacyWorktreePool(legacyWorktreePoolDir(home)));
 
+  const worktreeLeasesCheck = async (): Promise<CheckResult> =>
+    classifyWorktreeLeases(await inspectWorktreeLeases(worktreePoolDir(home)));
+
   const sqliteCheck = async (): Promise<CheckResult> => {
     const r = await canImportSqlite();
     return classifySqlite(r.ok, r.error);
@@ -1690,6 +1818,7 @@ export async function runChecks(
     configCheck(),
     worktreePoolCheck(),
     staleWorktreePoolCheck(),
+    worktreeLeasesCheck(),
     sqliteCheck(),
   ]);
 

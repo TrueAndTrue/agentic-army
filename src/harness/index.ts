@@ -40,6 +40,9 @@ export function spawnSoldier(spec: SoldierSpec): Promise<Soldier> {
   return getAdapter(spec.harness).spawn(spec);
 }
 
+export { isKillableSoldier, killSoldierTree } from './kill.ts';
+export type { KillableSoldier } from './kill.ts';
+
 export {
   createJsonlFramer,
   framedLines,

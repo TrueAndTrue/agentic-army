@@ -522,6 +522,10 @@ export async function campaignCommand(
   const options: CampaignOptions = {
     objective: args.objective,
     onProgress: sink.emit,
+    // The CLI owns this process and its terminal, so Ctrl-C here must settle the campaign —
+    // kill the soldier tree, mark the archive, release the lease — rather than orphan a
+    // `dontAsk` worker. Embedders (chat) drive `runCampaign` directly and keep the default off.
+    handleSignals: true,
     ...(spec === undefined ? {} : { spec }),
     ...(args.cwd === undefined ? {} : { cwd: args.cwd }),
     ...(args.requestedRung === undefined ? {} : { requestedRung: args.requestedRung }),

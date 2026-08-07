@@ -23,9 +23,14 @@ import { doThis, renderFix, runThis } from '../setup/fixes.ts';
 import type { Fix } from '../setup/fixes.ts';
 
 import type { BuildTreeOptions, CampaignSnapshot, TreeModel } from './tree.ts';
-import { DEFAULT_BUSY_WITHIN_MS, DEFAULT_STALE_AFTER_MS, buildTree } from './tree.ts';
+import {
+  DEFAULT_BUSY_WITHIN_MS,
+  DEFAULT_PRESUMED_DEAD_AFTER_MS,
+  DEFAULT_STALE_AFTER_MS,
+  buildTree,
+} from './tree.ts';
 import type { Charset } from './render.ts';
-import { renderJson, renderTree } from './render.ts';
+import { formatDuration, renderJson, renderTree } from './render.ts';
 import type { CampaignReader, SnapshotSource } from './live.ts';
 import { DEFAULT_POLL_MS, followCampaign, listCampaigns, openCampaignReader } from './live.ts';
 
@@ -410,6 +415,21 @@ function unknownCampaignHelp(
   return { lines, fix: runThis(`${self} view ${campaigns[0]?.id ?? ''}`) };
 }
 
+/**
+ * Milliseconds an `active` campaign's directory has sat untouched, or null when the row is not
+ * `active` or offered no timestamp. mtime-based (`CampaignSummary.lastActivityAt`), because the
+ * list must stay cheap; the single-campaign view answers the same question from the stream
+ * contents through `buildTree`.
+ */
+function listSilence(
+  campaign: { status: string; lastActivityAt: string | null },
+  nowMs: number,
+): number | null {
+  if (campaign.status !== 'active' || campaign.lastActivityAt === null) return null;
+  const last = Date.parse(campaign.lastActivityAt);
+  return Number.isNaN(last) ? null : nowMs - last;
+}
+
 /** `<self> view: <what happened>` + optional context + one `fix:` line. One spelling, five sites. */
 function refuse(
   stderr: WriteStream,
@@ -495,7 +515,16 @@ export async function runView(argv: readonly string[], deps: ViewDeps = {}): Pro
     // title would otherwise carry the status padding as trailing whitespace.
     const idWidth = Math.max(...campaigns.map((c) => c.id.length));
     for (const campaign of campaigns) {
-      const row = `${campaign.id.padEnd(idWidth)}  ${campaign.status.padEnd(8)}  ${campaign.title}`;
+      // A SIGKILLed campaign stays `active` in campaign.json forever — nothing that could have
+      // written the terminal status survived. The list keeps the recorded status (files are
+      // truth) and appends what the directory's own mtimes testify, so three dead rows no
+      // longer read as three live campaigns. Same threshold as the single-campaign header.
+      const silence = listSilence(campaign, now().getTime());
+      const flag =
+        silence !== null && silence > DEFAULT_PRESUMED_DEAD_AFTER_MS
+          ? ` — stream silent ${formatDuration(silence)}, probably interrupted`
+          : '';
+      const row = `${campaign.id.padEnd(idWidth)}  ${campaign.status.padEnd(8)}  ${campaign.title}${flag}`;
       stdout.write(`${row.trimEnd()}\n`);
     }
     return 0;

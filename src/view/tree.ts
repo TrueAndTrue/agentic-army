@@ -277,6 +277,23 @@ export function digestStream(
 /** An event this recent is proof of work. */
 export const DEFAULT_BUSY_WITHIN_MS = 30_000;
 /**
+ * An `active` campaign whose newest evidence — any stream event, any agent or task row movement —
+ * is older than this is presented as PROBABLY INTERRUPTED rather than as live.
+ *
+ * The condition it names is real and was field-reproduced three times: SIGKILL cannot be caught,
+ * so a killed supervisor leaves `campaign.json` frozen at `status: "active"` forever, and `view`
+ * showed three permanently-"active" rows for campaigns whose every process had been dead for
+ * days. Nothing here *marks* the campaign dead — reconciliation is a write and this command is
+ * read-only — it stops the presentation VOUCHING for a status the evidence contradicts.
+ *
+ * Two hours, an order of magnitude past the longest legitimate silence: a single soldier's
+ * wall-clock ceiling is 30 minutes (`DEFAULT_SOLDIER_TIMEOUT_MS`), and every soldier that ends —
+ * even by timeout — moves its rows. A claim of "probably interrupted" is only worth making where
+ * it is overwhelmingly true; anything shorter belongs to the per-unit `stale`/`unknown` ladder
+ * above, which already answers honestly at ten minutes.
+ */
+export const DEFAULT_PRESUMED_DEAD_AFTER_MS = 2 * 60 * 60_000;
+/**
  * Silence longer than this is not proof of anything. Ten minutes rather than one because a single
  * `Bash` running a test suite legitimately emits nothing for a long time, and calling that `dead`
  * would be exactly the confident-looking lie this module refuses to tell.
@@ -516,6 +533,20 @@ export interface TreeSummary {
   anomalies: Anomaly[];
 }
 
+/**
+ * How long an `active` campaign has been silent, and whether that silence has crossed the line
+ * where presenting it as live would be a lie. Computed only for `status: "active"` — a campaign
+ * that ended carries its own truth. `lastEvidenceTs` is the newest timestamp anywhere in the
+ * snapshot (stream events, agent rows, task rows, campaign creation), so a campaign killed
+ * before its first soldier still ages from the one timestamp it has.
+ */
+export interface CampaignLiveness {
+  silentMs: number;
+  lastEvidenceTs: string | null;
+  /** True once `silentMs` exceeds the presumed-dead threshold. The flag the renderer draws. */
+  presumedDead: boolean;
+}
+
 export interface TreeModel {
   /** Schema version of this JSON. Bumped when the shape changes; `--json` consumers pin on it. */
   v: 1;
@@ -530,6 +561,8 @@ export interface TreeModel {
     createdAt: string;
     endedAt: string | null;
     rootDir: string;
+    /** Null for any campaign not `active`. See `CampaignLiveness`. */
+    liveness: CampaignLiveness | null;
   };
   /** Units bound to no task — a campaign-level General, a synthesist. Rendered first. */
   unattached: UnitNode[];
@@ -541,6 +574,8 @@ export interface TreeModel {
 export interface BuildTreeOptions extends StateOptions {
   /** The clock. Injected, never read from the environment — see the file header. */
   now: Date | string | number;
+  /** Override for `DEFAULT_PRESUMED_DEAD_AFTER_MS`. Tests hold it still; the CLI leaves it. */
+  presumedDeadAfterMs?: number;
 }
 
 function toMs(now: Date | string | number): number {
@@ -744,6 +779,40 @@ export function buildTree(snapshot: CampaignSnapshot, options: BuildTreeOptions)
   let queuedTasks = 0;
   for (const task of snapshot.tasks) if (task.status === 'queued') queuedTasks += 1;
 
+  // -- campaign liveness ------------------------------------------------------------------------
+  //
+  // Only for `active`, because that is the one status that can be a stale claim: it is written at
+  // open and REMOVED at close, so a supervisor that was SIGKILLed leaves it behind as the record
+  // of an intention rather than of a state. The newest timestamp anywhere in the snapshot is the
+  // last moment anything demonstrably happened; past the threshold the header stops presenting
+  // the status bare. See `DEFAULT_PRESUMED_DEAD_AFTER_MS` for the threshold's reasoning.
+  const presumedDeadAfterMs = options.presumedDeadAfterMs ?? DEFAULT_PRESUMED_DEAD_AFTER_MS;
+  const liveness = ((): CampaignLiveness | null => {
+    if (snapshot.campaign.status !== 'active') return null;
+    let latestMs: number | null = null;
+    let latestTs: string | null = null;
+    const consider = (ts: string | null | undefined): void => {
+      const ms = parseTs(ts ?? null);
+      if (ms !== null && (latestMs === null || ms > latestMs)) {
+        latestMs = ms;
+        latestTs = ts as string;
+      }
+    };
+    consider(snapshot.campaign.created_at);
+    for (const task of snapshot.tasks) {
+      consider(task.created_at);
+      consider(task.updated_at);
+    }
+    for (const agent of snapshot.agents) {
+      consider(agent.started_at);
+      consider(agent.ended_at);
+    }
+    for (const digest of Object.values(streams)) consider(digest.lastTs);
+    if (latestMs === null) return null;
+    const silentMs = nowMs - latestMs;
+    return { silentMs, lastEvidenceTs: latestTs, presumedDead: silentMs > presumedDeadAfterMs };
+  })();
+
   return {
     v: 1,
     generatedAt: toIso(nowMs),
@@ -756,6 +825,7 @@ export function buildTree(snapshot: CampaignSnapshot, options: BuildTreeOptions)
       createdAt: snapshot.campaign.created_at,
       endedAt: snapshot.campaign.ended_at,
       rootDir: snapshot.campaign.root_dir,
+      liveness,
     },
     unattached,
     tasks: rootTasks,

@@ -50,6 +50,7 @@ import {
   classifyNode,
   classifySqlite,
   classifyStaleWorktreePool,
+  classifyWorktreeLeases,
   classifyWorktreePool,
   compareVersions,
   countOutcomes,
@@ -59,6 +60,7 @@ import {
   formatVersion,
   inspectConfig,
   inspectLegacyWorktreePool,
+  inspectWorktreeLeases,
   inspectWritableDir,
   installHint,
   homeDir,
@@ -676,6 +678,112 @@ describe('the pool left at the old location is not silently orphaned', () => {
     // An `ok` result never prints a fix line, whatever it carries.
     const fine = classifyStaleWorktreePool({ dir: '/x/worktrees', exists: false, trees: [], repos: [] });
     assert.doesNotMatch(renderCheck(fine, false, 100).join('\n'), /fix:/);
+  });
+});
+
+describe('the worktree lease check — the pool is inspectable, not a black box', () => {
+  // A crashed campaign leaves its lease record behind forever (SIGKILL releases nothing), and
+  // before this check the only way to learn why the pool was exhausted was to read the JSON by
+  // hand. The check surfaces live vs stale counts using the POOL'S OWN liveness rule — imported
+  // from cold.ts, never re-implemented — so doctor and the acquire path cannot disagree.
+
+  /** A pid that no longer exists: a real child, already exited. */
+  function deadPid(): number {
+    const child = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    assert.ok(typeof child.pid === 'number' && child.pid > 0);
+    return child.pid;
+  }
+
+  /** A pool root whose leases/ directory holds exactly the given records. */
+  function poolWith(label: string, records: Array<Record<string, unknown> | string>): string {
+    const pool = scratchHome(`lease-pool-${label}`);
+    const dir = nodePath.join(pool, 'leases');
+    fs.mkdirSync(dir, { recursive: true });
+    records.forEach((record, i) => {
+      const file = nodePath.join(dir, `repo-0000000${i}-0${i}.json`);
+      fs.writeFileSync(file, typeof record === 'string' ? record : `${JSON.stringify(record, null, 2)}\n`);
+    });
+    return pool;
+  }
+
+  function record(over: Record<string, unknown>): Record<string, unknown> {
+    return {
+      leaseId: '00000000-0000-4000-8000-000000000000',
+      leaseHolder: 'cpt-01',
+      leasedAt: new Date().toISOString(),
+      path: '/pool/trees/repo/wt-01',
+      repoRoot: '/repo',
+      slot: 1,
+      base: 'abc123',
+      pid: process.pid,
+      host: os.hostname(),
+      ...over,
+    };
+  }
+
+  it('is ok when there is no leases directory at all — the pre-first-campaign state', async () => {
+    const state = await inspectWorktreeLeases(scratchHome('lease-none'));
+    assert.equal(state.exists, false);
+    const r = classifyWorktreeLeases(state);
+    assert.equal(r.id, 'worktree-leases');
+    assert.equal(r.outcome, 'ok');
+    assert.match(r.found, /no leases/);
+  });
+
+  it('is ok when every lease is held by a live process, and says how many', async () => {
+    const pool = poolWith('live', [record({ leaseHolder: 'cpt-01' }), record({ leaseHolder: 'cpt-02' })]);
+    const state = await inspectWorktreeLeases(pool);
+    assert.equal(state.leases.length, 2);
+    assert.ok(state.leases.every((lease) => lease.verdict === 'live'));
+    const r = classifyWorktreeLeases(state);
+    assert.equal(r.outcome, 'ok');
+    assert.match(r.found, /2 lease\(s\): 2 live/);
+  });
+
+  it('DEGRADES on a stale lease, with live vs stale counts and the auto-reclaim story', async () => {
+    const pool = poolWith('stale', [
+      record({ leaseHolder: 'cpt-01' }),
+      record({ leaseHolder: 'cpt-09', pid: deadPid(), path: '/pool/trees/repo/wt-02' }),
+    ]);
+    const state = await inspectWorktreeLeases(pool);
+    const r = classifyWorktreeLeases(state);
+    assert.equal(r.outcome, 'degraded');
+    assert.match(r.found, /1 live, 1 stale/, 'the counts are the point of the check');
+    assert.match(r.impact ?? '', /no longer exist/);
+    assert.match(r.impact ?? '', /cpt-09/, 'the dead holder is named');
+    assert.match(r.impact ?? '', /reclaim/i, 'and the reader learns it self-heals on the next acquire');
+    assert.match(r.note ?? '', /unlanded work/, 'the one case that will NOT clear is named too');
+  });
+
+  it('DEGRADES on leases it cannot judge — foreign host, no pid, unreadable — and says they never self-heal', async () => {
+    const pool = poolWith('unjudgeable', [
+      record({ host: 'build-box-17', pid: deadPid() }),
+      record({ pid: undefined, host: undefined, path: '/pool/trees/repo/wt-02' }),
+      'not json{{{',
+    ]);
+    const state = await inspectWorktreeLeases(pool);
+    assert.equal(state.unreadable, 1);
+    const r = classifyWorktreeLeases(state);
+    assert.equal(r.outcome, 'degraded');
+    assert.match(r.found, /1 foreign-host/);
+    assert.match(r.found, /1 without a pid/);
+    assert.match(r.found, /1 unreadable/);
+    assert.match(r.impact ?? '', /NEVER reclaimed automatically/);
+  });
+
+  it('inspecting is read-only: the records are byte-identical afterwards', async () => {
+    const pool = poolWith('readonly', [record({ pid: deadPid() })]);
+    const dir = nodePath.join(pool, 'leases');
+    const before = fs.readdirSync(dir).map((name) => fs.readFileSync(nodePath.join(dir, name), 'utf8'));
+    await inspectWorktreeLeases(pool);
+    const after = fs.readdirSync(dir).map((name) => fs.readFileSync(nodePath.join(dir, name), 'utf8'));
+    assert.deepEqual(after, before, 'doctor must surface stale leases, never reclaim them itself');
+  });
+
+  it('runChecks reports the check by id', async () => {
+    const { runChecks } = await import('../src/setup/checks.ts');
+    const report = await runChecks(2000, scratchHome('lease-check'));
+    assert.ok(report.checks.some((c) => c.id === 'worktree-leases'));
   });
 });
 

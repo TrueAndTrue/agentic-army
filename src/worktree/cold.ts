@@ -68,6 +68,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -116,6 +117,21 @@ export interface ColdLeaseRecord {
    * stash sitting there all along".
    */
   stashBase?: string | null;
+  /**
+   * The SUPERVISOR process that took the lease — `process.pid` at acquire, not the soldier. The
+   * soldier's death is an attempt failing; the supervisor's death is what orphans the lease, so
+   * the supervisor's pid is the one whose liveness decides whether this record is stale. Optional
+   * because records written before this field existed are still valid leases; see
+   * `leaseLiveness` for how a record without it is (conservatively) treated.
+   */
+  pid?: number;
+  /**
+   * `os.hostname()` at acquire. A pid is only meaningful on the machine that minted it — a pool
+   * root on a shared filesystem can hold leases from several hosts, and `process.kill(pid, 0)`
+   * over here says nothing about a process over there. Written alongside `pid`, read by
+   * `leaseLiveness`, which refuses to judge a record from another host.
+   */
+  host?: string;
 }
 
 export interface ColdWorktreeProviderOptions {
@@ -182,7 +198,14 @@ export class PoolExhaustedError extends ColdWorktreeError {
     super(
       `all ${maxTrees} worktree slots for ${repoRoot} are leased. The pool fails fast rather than ` +
         'queueing, so this is backpressure the scheduler can see: release a lease, or raise ' +
-        '`max_trees` in [worktree] (or in that project\'s entry) in the global config.',
+        '`max_trees` in [worktree] (or in that project\'s entry) in the global config. ' +
+        // The crash case, named, because the old text misdiagnosed it: a SIGKILLed campaign
+        // leaves its lease file behind, and a reader whose pool is full of the dead was being
+        // told to wait for campaigns that no longer exist.
+'A lease whose owning process has died on this machine is reclaimed automatically by ' +
+        'the next acquire, so the slots counted here are held by live processes, or by records ' +
+        'this machine cannot judge (no recorded pid, or taken on another host) — the doctor\'s ' +
+        'lease check lists each one with its verdict.',
     );
     this.name = 'PoolExhaustedError';
     this.maxTrees = maxTrees;
@@ -302,6 +325,87 @@ function readRecord(file: string): ColdLeaseRecord | null {
   }
 }
 
+/**
+ * `readRecord`, exported under a name a caller outside this file can make sense of. `army
+ * doctor`'s lease check reads the same files this provider writes, and two parsers for one
+ * on-disk format is how the doctor and the pool end up disagreeing about what a lease says.
+ */
+export function readLeaseRecord(file: string): ColdLeaseRecord | null {
+  return readRecord(file);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lease liveness — is the process that took this lease still alive to hold it?
+// ---------------------------------------------------------------------------------------------
+
+/**
+ *   `live`     the recorded pid exists on this machine right now.
+ *   `stale`    the recorded pid is gone. The lease survives only as a file; the slot is
+ *              reclaimable (subject to the release gate — a dead holder's unlanded work is
+ *              still work).
+ *   `foreign`  the record was minted on a different host, so pid liveness is unknowable from
+ *              here. Treated as held.
+ *   `unknown`  the record carries no pid (written before pid tracking, or by hand). Treated as
+ *              held, because destroying a lease on a guess is the one mistake this module never
+ *              makes.
+ */
+export const LEASE_LIVENESS_VERDICTS = ['live', 'stale', 'foreign', 'unknown'] as const;
+export type LeaseLivenessVerdict = (typeof LEASE_LIVENESS_VERDICTS)[number];
+
+export interface LeaseLiveness {
+  verdict: LeaseLivenessVerdict;
+  /** One sentence a doctor line or an error message can carry verbatim. */
+  reason: string;
+}
+
+/**
+ * `process.kill(pid, 0)` semantics: signal 0 delivers nothing and only asks the kernel whether
+ * it COULD. No throw means the pid exists; EPERM means it exists and belongs to somebody this
+ * user may not signal — which is still alive, and the direction that matters, because reading
+ * EPERM as dead would reclaim (and eventually reset) a tree whose holder is running as another
+ * user. Anything else (ESRCH above all) means no such process.
+ *
+ * KNOWN CONSERVATISM, stated rather than hidden: pids are recycled, and a record has no boot id
+ * to tell one boot's 4242 from the next boot's. A recycled pid therefore reads `live` and the
+ * lease is NOT reclaimed — the pool under-frees rather than over-frees. That is the chosen
+ * direction everywhere in this file: a leaked slot is an inconvenience the doctor can display;
+ * a destroyed tree is somebody's night.
+ */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true; // an unusable pid proves nothing — hold
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Judge one lease record. Pure but for `process.kill(pid, 0)`; `host` injectable for tests. */
+export function leaseLiveness(
+  record: Pick<ColdLeaseRecord, 'pid' | 'host' | 'leaseHolder'>,
+  host: string = hostname(),
+): LeaseLiveness {
+  if (typeof record.pid !== 'number') {
+    return {
+      verdict: 'unknown',
+      reason: `the record carries no owning pid, so its holder (${record.leaseHolder}) cannot be checked; treated as held`,
+    };
+  }
+  if (typeof record.host !== 'string' || record.host !== host) {
+    return {
+      verdict: 'foreign',
+      reason: `the lease was taken on ${record.host ?? 'an unrecorded host'}, not ${host}; pid ${String(record.pid)} cannot be checked from here, so it is treated as held`,
+    };
+  }
+  return pidAlive(record.pid)
+    ? { verdict: 'live', reason: `pid ${String(record.pid)} is running on this machine` }
+    : {
+        verdict: 'stale',
+        reason: `pid ${String(record.pid)} no longer exists on this machine; the process that took the lease is gone`,
+      };
+}
+
 export class ColdWorktreeProvider implements WorktreeProvider {
   readonly id: WorktreeProviderId = 'cold';
 
@@ -417,13 +521,21 @@ export class ColdWorktreeProvider implements WorktreeProvider {
         slot,
         base,
         stashBase,
+        // The SUPERVISOR's identity, so a later acquire can tell a held slot from one whose
+        // holder was SIGKILLed. See `leaseLiveness`.
+        pid: process.pid,
+        host: hostname(),
       };
-      // `wx` makes claiming a slot atomic against another process racing for the same one.
-      try {
-        writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue;
-        throw error;
+      // `wx` makes claiming a slot atomic against another process racing for the same one. A
+      // slot that refuses is either genuinely held or held by a record whose owning process
+      // died — SIGKILL leaves the file behind forever, and before this reclamation every crash
+      // permanently drained one slot until the pool could not field anyone. The stale case is
+      // settled through the REAL release path (`#reclaimStaleLease`), so the ABA guard and the
+      // unlanded-work gate both apply, and then the claim is retried exactly once — a lost race
+      // against another acquirer is an ordinary `continue`, not an error.
+      if (!this.#claimSlot(file, record)) {
+        if (!(await this.#reclaimStaleLease(file))) continue;
+        if (!this.#claimSlot(file, record)) continue;
       }
 
       let warm = false;
@@ -682,6 +794,58 @@ export class ColdWorktreeProvider implements WorktreeProvider {
 
   #leaseFile(slug: string, slot: number): string {
     return join(this.leasesDir, `${slug}-${String(slot).padStart(2, '0')}.json`);
+  }
+
+  /** Atomically claim a slot. False means the record file already exists — the slot is taken. */
+  #claimSlot(file: string, record: ColdLeaseRecord): boolean {
+    try {
+      writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      throw error;
+    }
+  }
+
+  /**
+   * If the record in `file` belongs to a process that is provably gone, release it — through
+   * `release`, never around it. True means the record is gone and the slot may be re-claimed.
+   *
+   * Everything conservative about this method is deliberate:
+   *
+   *  - Only a `stale` verdict is acted on. `live` is held; `foreign` and `unknown` are held too,
+   *    because a pid from another machine (or no pid at all) cannot be checked from here and a
+   *    reclaim on a guess is a destructive release of a tree somebody may be sitting in. Those
+   *    records never self-heal — `army doctor`'s lease check is what makes them visible.
+   *  - The release is the REAL one, so the ABA guard compares against the file and the
+   *    unlanded-work gate still refuses to destroy a dead holder's commits. A crashed campaign
+   *    whose Engineer had committed keeps its tree AND its lease; recovering that work is a
+   *    human decision, and the doctor names the record.
+   *  - `missing-tree` counts as reclaimed — that outcome unlinks the record itself — and every
+   *    throw (unlanded work included) is answered by leaving the slot alone.
+   */
+  async #reclaimStaleLease(file: string): Promise<boolean> {
+    const record = readRecord(file);
+    // An unreadable record still holds its slot: deleting a file this code cannot even parse is
+    // exactly the guess-based destruction the ABA guard exists to prevent.
+    if (record === null) return false;
+    if (leaseLiveness(record).verdict !== 'stale') return false;
+
+    const lease: Lease = {
+      path: record.path,
+      leaseId: record.leaseId,
+      leaseHolder: record.leaseHolder,
+      leasedAt: record.leasedAt,
+      provider: this.id,
+    };
+    try {
+      const result = await this.release(lease);
+      return result.released || result.outcome === 'missing-tree' || result.outcome === 'no-record';
+    } catch {
+      // UnlandedWorkError above all: the dead holder's work is real and stays protected. Any
+      // other failure also fails toward "held" — the acquire simply moves to the next slot.
+      return false;
+    }
   }
 
   #findLeaseFile(path: string): string | null {

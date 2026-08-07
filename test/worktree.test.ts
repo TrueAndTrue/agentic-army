@@ -17,7 +17,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -28,7 +28,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,10 +49,14 @@ import {
   DEFAULT_PRESERVED_DEPS,
   PoolExhaustedError,
   isSupportedPreservePattern,
+  leaseLiveness,
   normalizePreservePattern,
+  pidAlive,
+  readLeaseRecord,
   UnlandedWorkError,
   selectWorktreeProvider,
 } from '../src/worktree/index.ts';
+import type { ColdLeaseRecord } from '../src/worktree/index.ts';
 import { DEFAULT_EXPENDABLE_IGNORED, inspectUnlandedWork } from '../src/delivery/durability.ts';
 import { ensureDurable, durableRef } from '../src/delivery/durability.ts';
 
@@ -1792,3 +1796,168 @@ test(
     await provider.release(lease, { force: true });
   },
 );
+
+// ---------------------------------------------------------------------------------------------
+// STALE LEASES — a crash must not drain the pool forever
+//
+// Field-reproduced: SIGKILL a campaign mid-flight and its lease record file survives in
+// <root>/leases/ with nothing left alive to release it. Before acquire-time reclamation every
+// crash permanently consumed a slot, `--id` re-attachment was refused (cpt-01 already recorded),
+// and the pool ran dry one death at a time. The tests below hold the whole policy still: a
+// provably dead holder is reclaimed THROUGH the real release path, and everything the machine
+// cannot judge — a live pid, another host, a record with no pid, an unreadable file, unlanded
+// work — is conservatively left exactly where it is.
+// ---------------------------------------------------------------------------------------------
+
+/** A pid that demonstrably exists no longer: a real child, already exited when we return. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  assert.ok(typeof child.pid === 'number' && child.pid > 0, 'spawnSync must yield a pid');
+  return child.pid;
+}
+
+/** The record file behind a lease, found the same way `release` finds it — by tree path. */
+function leaseFileFor(provider: ColdWorktreeProvider, treePath: string): string {
+  for (const name of readdirSync(provider.leasesDir)) {
+    const file = join(provider.leasesDir, name);
+    if (readLeaseRecord(file)?.path === treePath) return file;
+  }
+  throw new Error(`no lease record found for ${treePath}`);
+}
+
+/** Rewrite a lease record in place, keeping every field the patch does not name. */
+function patchLease(file: string, patch: Partial<ColdLeaseRecord>): void {
+  const record = readLeaseRecord(file);
+  assert.ok(record !== null, `${file} must hold a readable record`);
+  writeFileSync(file, `${JSON.stringify({ ...record, ...patch }, null, 2)}\n`);
+}
+
+test('a lease record carries the supervisor pid and host, and leaseLiveness judges each shape', async () => {
+  const dir = caseDir('lease-pid');
+  const repo = repoWithCommit(join(dir, 'repo'));
+  const provider = new ColdWorktreeProvider({ root: join(dir, 'pool'), home: join(dir, 'home') });
+
+  const lease = await provider.acquire('cpt-01', repo);
+  const record = readLeaseRecord(leaseFileFor(provider, lease.path));
+  assert.ok(record !== null);
+  // The SUPERVISOR's pid — the process whose death orphans the lease — not the soldier's.
+  assert.equal(record.pid, process.pid);
+  assert.equal(record.host, hostname());
+
+  // The four verdicts, each from the record shape that produces it.
+  assert.equal(leaseLiveness(record).verdict, 'live');
+  assert.equal(leaseLiveness({ ...record, pid: deadPid() }).verdict, 'stale');
+  assert.equal(leaseLiveness({ ...record, host: 'somewhere-else' }).verdict, 'foreign');
+  assert.equal(leaseLiveness({ leaseHolder: 'cpt-01' }).verdict, 'unknown');
+
+  // pidAlive is `process.kill(pid, 0)` semantics: a live pid answers true, a dead one false,
+  // and pid 1 — EPERM for a normal user, deliverable for root — answers true either way,
+  // because EPERM proves existence and reading it as death would reclaim a live lease.
+  assert.equal(pidAlive(process.pid), true);
+  assert.equal(pidAlive(deadPid()), false);
+  assert.equal(pidAlive(1), true);
+
+  await provider.release(lease);
+});
+
+test('acquire reclaims a dead-pid lease through the real release path — a crash no longer drains the pool', async () => {
+  const dir = caseDir('lease-reclaim');
+  const repo = repoWithCommit(join(dir, 'repo'));
+  const provider = new ColdWorktreeProvider({
+    root: join(dir, 'pool'),
+    maxSlots: 1,
+    home: join(dir, 'home'),
+  });
+
+  // A campaign takes the only slot and is SIGKILLed: nothing releases, the record survives.
+  const crashed = await provider.acquire('cpt-01', repo);
+  const file = leaseFileFor(provider, crashed.path);
+  patchLease(file, { pid: deadPid() });
+
+  // The next campaign's acquire reclaims the slot instead of failing the pool dry.
+  const next = await provider.acquire('cpt-01', repo);
+  assert.equal(next.path, crashed.path, 'the reclaimed slot is the one the crash was holding');
+  assert.notEqual(next.leaseId, crashed.leaseId, 'a reclaim mints a fresh lease, never revives one');
+  assert.equal(provider.listLeases().length, 1, 'exactly one lease exists afterwards');
+  assert.equal(readLeaseRecord(file)?.leaseId, next.leaseId);
+
+  // The dead run's lease is now stale by the ABA guard: replaying it must be a no-op.
+  const replay = await provider.release(crashed);
+  assert.equal(replay.outcome, 'stale-lease');
+  assert.equal(replay.released, false);
+  assert.ok(existsSync(next.path), "the new holder's tree survives the dead run's replayed release");
+
+  await provider.release(next);
+});
+
+test('acquire never reclaims a lease it cannot judge: live pid, foreign host, missing pid, unreadable record', async () => {
+  const dir = caseDir('lease-conservative');
+  const repo = repoWithCommit(join(dir, 'repo'));
+  const provider = new ColdWorktreeProvider({
+    root: join(dir, 'pool'),
+    maxSlots: 1,
+    home: join(dir, 'home'),
+  });
+
+  const held = await provider.acquire('cpt-01', repo);
+  const file = leaseFileFor(provider, held.path);
+  const original = readFileSync(file, 'utf8');
+
+  const shapes: Array<[string, () => void]> = [
+    // A live pid IS the normal held case — reclaiming it would destroy a running campaign's tree.
+    ['live pid', () => patchLease(file, { pid: process.pid })],
+    // A dead-here pid from another machine proves nothing about that machine.
+    ['foreign host', () => patchLease(file, { pid: deadPid(), host: 'build-box-17' })],
+    // A record from before pid tracking cannot be judged at all.
+    ['missing pid', () => {
+      const record = JSON.parse(original) as Record<string, unknown>;
+      delete record['pid'];
+      delete record['host'];
+      writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+    }],
+    // An unreadable record still holds its slot — deleting what cannot be parsed is guesswork.
+    ['unreadable record', () => writeFileSync(file, 'not json{{{\n')],
+  ];
+
+  for (const [label, mutate] of shapes) {
+    mutate();
+    await assert.rejects(
+      () => provider.acquire('cpt-02', repo),
+      (error: unknown) => {
+        assert.ok(error instanceof PoolExhaustedError, `${label}: still exhausted, never reclaimed`);
+        // The fix text names the crash case honestly instead of misdiagnosing it.
+        assert.match(error.message, /reclaimed automatically/, `${label}: the message explains reclamation`);
+        assert.match(error.message, /doctor/, `${label}: and points at the lease check`);
+        return true;
+      },
+    );
+  }
+
+  writeFileSync(file, original);
+  await provider.release(held);
+});
+
+test("a dead holder's unlanded work still blocks reclamation — the release gate applies to the dead too", async () => {
+  const dir = caseDir('lease-reclaim-unlanded');
+  const repo = repoWithCommit(join(dir, 'repo'));
+  const provider = new ColdWorktreeProvider({
+    root: join(dir, 'pool'),
+    maxSlots: 1,
+    home: join(dir, 'home'),
+  });
+
+  const crashed = await provider.acquire('cpt-01', repo);
+  // The crashed Engineer left uncommitted work in the tree. Reclaiming would reset it away.
+  writeFileSync(join(crashed.path, 'night-of-work.txt'), 'not yet durable\n');
+  const file = leaseFileFor(provider, crashed.path);
+  patchLease(file, { pid: deadPid() });
+
+  await assert.rejects(() => provider.acquire('cpt-02', repo), PoolExhaustedError);
+
+  // Nothing was destroyed and nothing was unlinked: the slot is still held FOR the dead run,
+  // which is the fail-closed answer — a leaked slot is recoverable, a night of work is not.
+  assert.ok(existsSync(join(crashed.path, 'night-of-work.txt')), 'the unlanded work survives');
+  assert.equal(readLeaseRecord(file)?.leaseId, crashed.leaseId, 'the record survives too');
+
+  await provider.release(crashed, { force: true });
+});

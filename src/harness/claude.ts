@@ -38,8 +38,10 @@ import type {
 } from '../contracts/harness.ts';
 import type { Rank } from '../contracts/ranks.ts';
 import { maxSubagentDepth } from '../contracts/ranks.ts';
+import { killProcessTree } from '../setup/checks.ts';
 import type { JsonlLine } from './jsonl.ts';
 import { createAsyncQueue, createJsonlFramer } from './jsonl.ts';
+import type { KillableSoldier } from './kill.ts';
 
 // ---------------------------------------------------------------------------------------------
 // argv
@@ -874,7 +876,7 @@ interface SpawnSettings {
   partialMessages: boolean;
 }
 
-function spawnClaude(spec: SoldierSpec, settings: SpawnSettings): Soldier {
+function spawnClaude(spec: SoldierSpec, settings: SpawnSettings): KillableSoldier {
   const { bin, closeGraceMs, killGraceMs, interruptTimeoutMs, partialMessages } = settings;
   const args = buildClaudeArgs(spec, { partialMessages });
   const queue = createAsyncQueue<SoldierEvent>();
@@ -905,6 +907,11 @@ function spawnClaude(spec: SoldierSpec, settings: SpawnSettings): Soldier {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      // Own process group on POSIX — same pattern as `spawnProbeChild` and `src/verify/exec.ts`.
+      // Two properties, both load-bearing for a supervisor answering Ctrl-C: `killTree()` can
+      // reach the soldier's grandchildren (`process.kill(-pid)`), and the terminal's own SIGINT
+      // goes to the supervisor alone instead of racing it to kill a `dontAsk` worker mid-write.
+      detached: process.platform !== 'win32',
     });
   } catch (err) {
     spawnError = err instanceof Error ? err : new Error(String(err));
@@ -1094,9 +1101,21 @@ function spawnClaude(spec: SoldierSpec, settings: SpawnSettings): Soldier {
     return 'error';
   }
 
-  const soldier: Soldier = {
+  const soldier: KillableSoldier = {
     id: spec.agentId,
     spec,
+
+    /**
+     * The abort seam — see `./kill.ts`. SIGKILL to the whole group, because the caller reaching
+     * for this is a supervisor answering a signal, and the one thing it owes its user is that no
+     * `dontAsk` worker outlives it. `escalation` is set so `close()` reports `killed` even when
+     * the group was already empty by the time the kernel looked.
+     */
+    killTree(): void {
+      if (child === null || processExited) return;
+      escalation = 'kill';
+      killProcessTree(child);
+    },
 
     send(text: string): Promise<void> {
       if (closed) return Promise.reject(new Error(`soldier ${spec.agentId} is closed`));
@@ -1211,8 +1230,43 @@ function spawnClaude(spec: SoldierSpec, settings: SpawnSettings): Soldier {
             const hard = await raceTimeout(exited, killGraceMs);
             if (!hard) {
               escalation = 'kill';
-              proc.kill('SIGKILL');
-              await exited;
+              // THE WHOLE GROUP, and then a BOUNDED wait — this used to be `proc.kill('SIGKILL')`
+              // followed by an unbounded `await exited`, and that pair wedges: Node's `close`
+              // event fires only after the child's stdio pipes reach EOF, and a grandchild that
+              // inherited the stdout write end keeps them open FOREVER after the direct child is
+              // dead. Demonstrated with a fake whose grandchild was spawned `stdio: 'inherit'`:
+              // close() never settled. The group kill (possible because soldiers spawn detached,
+              // as group leaders) takes the pipe-holders with the soldier; the backstop below is
+              // for whatever it still cannot reach.
+              killProcessTree(proc);
+              const reaped = await raceTimeout(exited, killGraceMs);
+              if (!reaped) {
+                // The hard backstop, same pattern as `runResolved` (setup/checks.ts) and
+                // `src/verify/exec.ts`, for the same reason those have one: settling alone is
+                // not enough when something outlives the kill, because a survivor holds this
+                // process's event loop open through the still-referenced pipe sockets. Our ends
+                // are destroyed and the child unreferenced, so the guarantee is about the
+                // CALLER's process — a campaign holding a lease, a test runner holding a file —
+                // never merely about this promise. The status below is already `killed`; what
+                // could not be collected is the exit code, and `exitCode: null` is the honest
+                // answer for a child the kernel never let us reap.
+                try {
+                  proc.stdout.destroy();
+                } catch {
+                  /* already gone */
+                }
+                try {
+                  proc.stderr.destroy();
+                } catch {
+                  /* already gone */
+                }
+                try {
+                  proc.stdin.destroy();
+                } catch {
+                  /* already gone */
+                }
+                proc.unref();
+              }
             }
           }
         }

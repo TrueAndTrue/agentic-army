@@ -40,7 +40,14 @@ import type {
   UnitNode,
   UnitState,
 } from '../src/view/tree.ts';
-import { STATE_SOURCES, buildTree, computeUnitState, digestStream, walkTree } from '../src/view/tree.ts';
+import {
+  DEFAULT_PRESUMED_DEAD_AFTER_MS,
+  STATE_SOURCES,
+  buildTree,
+  computeUnitState,
+  digestStream,
+  walkTree,
+} from '../src/view/tree.ts';
 import { ASCII_GLYPHS, asciiFold, chooseColumns, formatAge, renderJson, renderTree } from '../src/view/render.ts';
 import {
   createJsonlReader,
@@ -1605,6 +1612,135 @@ test('END TO END: both of `live.ts`’s lines come out of the same `self` as eve
         `a hardcoded \`army …\` survived ${what}:\n${text}`,
       );
     }
+  } finally {
+    fs.rmSync(archiveRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// A KILLED CAMPAIGN MUST NOT READ AS LIVE FOREVER
+//
+// SIGKILL cannot be caught, so a supervisor killed mid-flight leaves `campaign.json` frozen at
+// `status: "active"` — field-reproduced three times, three permanently-"active" rows. The view
+// never edits truth (this command is read-only), so the fix is presentation: an `active` whose
+// newest evidence is hours old is flagged `probably interrupted` instead of being vouched for.
+// ---------------------------------------------------------------------------------------------
+
+/** Three hours after the campaign opened — safely past the two-hour presumed-dead line. */
+const HOURS_LATER = T0 + 3 * 60 * 60_000;
+
+test('an active campaign silent past the threshold is flagged, in the model and on the screen', () => {
+  const built = buildTree(
+    snapshot({
+      agents: [agentRow('cpt-07', 'CAPTAIN', 1, { status: 'running' })],
+      streams: {
+        'cpt-07': digestStream('cpt-07', [
+          event('ready', 11),
+          event('tool_use', 30, { name: 'Bash', toolUseId: 'tu-1' }),
+        ]),
+      },
+    }),
+    { now: HOURS_LATER },
+  );
+
+  const liveness = built.campaign.liveness;
+  assert.ok(liveness !== null, 'an active campaign always carries a liveness verdict');
+  assert.equal(liveness.presumedDead, true);
+  assert.equal(liveness.lastEvidenceTs, at(30), 'anchored to the newest evidence in the snapshot');
+  assert.equal(liveness.silentMs, HOURS_LATER - Date.parse(at(30)));
+  assert.ok(liveness.silentMs > DEFAULT_PRESUMED_DEAD_AFTER_MS);
+
+  // The header keeps the recorded status AND refuses to let it stand alone.
+  const text = renderTree(built, { width: 120, charset: 'ascii' });
+  assert.match(text, /active/);
+  assert.match(text, /! active - stream silent 2h, probably interrupted/, text);
+
+  // `--json` carries the same verdict, so a script is not left re-deriving it from mtimes.
+  const parsed = JSON.parse(renderJson(built)) as TreeModel;
+  assert.equal(parsed.campaign.liveness?.presumedDead, true);
+});
+
+test('an active campaign with recent evidence is NOT flagged — silence is the claim, not activity', () => {
+  const built = buildTree(
+    snapshot({
+      agents: [agentRow('cpt-07', 'CAPTAIN', 1, { status: 'running' })],
+      streams: { 'cpt-07': digestStream('cpt-07', [event('tool_use', 590, { name: 'Bash', toolUseId: 'tu' })]) },
+    }),
+    { now: NOW },
+  );
+  assert.ok(built.campaign.liveness !== null);
+  assert.equal(built.campaign.liveness.presumedDead, false);
+  assert.doesNotMatch(renderTree(built, { width: 120, charset: 'ascii' }), /probably interrupted/);
+});
+
+test('a campaign that ENDED is never flagged, however long ago — its status is already the truth', () => {
+  const built = buildTree(
+    snapshot({ campaign: campaignRow({ status: 'done', ended_at: at(600) }) }),
+    { now: HOURS_LATER },
+  );
+  assert.equal(built.campaign.liveness, null, 'liveness is an `active`-only question');
+  assert.doesNotMatch(renderTree(built, { width: 120, charset: 'ascii' }), /probably interrupted/);
+});
+
+test('a campaign killed before its first soldier still ages, from the one timestamp it has', () => {
+  // The setup-window death: no agents, no streams, no tasks — only campaign.json exists.
+  const built = buildTree(snapshot(), { now: HOURS_LATER });
+  assert.ok(built.campaign.liveness !== null);
+  assert.equal(built.campaign.liveness.presumedDead, true);
+  assert.equal(built.campaign.liveness.lastEvidenceTs, at(0), 'created_at is the last evidence');
+});
+
+test('--list flags an active campaign whose directory has not moved in hours, and only that one', async () => {
+  const archiveRoot = tempDir();
+  try {
+    const campaignRootDir = buildFixtureArchive(archiveRoot);
+
+    // A terminal campaign of the same age must NOT be flagged: done is done, however old.
+    const doneDir = path.join(archiveRoot, 'campaigns', 'finished-long-ago');
+    fs.mkdirSync(doneDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(doneDir, 'campaign.json'),
+      JSON.stringify({ id: 'finished-long-ago', title: 'Done Deal', status: 'done', project: '/p', created_at: at(0) }),
+    );
+
+    // Nothing in the killed campaign's directory has moved for three hours: age every file's
+    // mtime, which is exactly the evidence `--list` reads (it must stay too cheap for streams).
+    const old = new Date(T0);
+    const age = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) age(full);
+        else fs.utimesSync(full, old, old);
+      }
+    };
+    age(campaignRootDir);
+    age(doneDir);
+
+    const summaries = listCampaigns(archiveRoot);
+    const active = summaries.find((c) => c.id === CAMPAIGN_ID);
+    assert.ok(active !== undefined);
+    assert.equal(active.status, 'active');
+    assert.equal(active.lastActivityAt, new Date(T0).toISOString());
+    assert.equal(
+      summaries.find((c) => c.id === 'finished-long-ago')?.lastActivityAt,
+      null,
+      'a terminal campaign is not even measured',
+    );
+
+    const out = collect();
+    const code = await runView(['--archive', archiveRoot, '--list'], {
+      stdout: out.stream,
+      stderr: out.stream,
+      now: () => new Date(HOURS_LATER),
+      env: CLEAN_ENV,
+      homeDir: archiveRoot,
+    });
+    assert.equal(code, 0, out.text());
+    const activeRow = out.text().split('\n').find((line) => line.includes(CAMPAIGN_ID)) ?? '';
+    assert.match(activeRow, /active/);
+    assert.match(activeRow, /stream silent 3h, probably interrupted/, out.text());
+    const doneRow = out.text().split('\n').find((line) => line.includes('finished-long-ago')) ?? '';
+    assert.doesNotMatch(doneRow, /probably interrupted/, out.text());
   } finally {
     fs.rmSync(archiveRoot, { recursive: true, force: true });
   }

@@ -127,6 +127,7 @@ import { createClaudeAdapter } from '../harness/claude.ts';
 import type { ClaudeAdapterOptions } from '../harness/claude.ts';
 import { createCodexAdapter, isCodexSoldier } from '../harness/codex.ts';
 import type { CodexAdapterOptions } from '../harness/codex.ts';
+import { killSoldierTree } from '../harness/kill.ts';
 import { installHint, invokedAs } from '../setup/checks.ts';
 import { autoInitRepo, decideAutoInit, mainRootFromCommonDir } from '../setup/enlist.ts';
 import type { Fix } from '../setup/fixes.ts';
@@ -439,6 +440,23 @@ export interface CampaignOptions {
    * listener writing to a closed pipe must not be able to end a campaign that is holding a lease.
    */
   onProgress?: ProgressListener;
+  /**
+   * Answer SIGINT/SIGTERM by aborting the campaign CLEANLY: kill the in-flight soldier's whole
+   * process tree, settle the archive (`aborted` / task `blocked`), run durability and the lease
+   * release through the normal `finally`, and exit `128 + signal` (130 for Ctrl-C).
+   *
+   * OPT-IN, and `campaignCommand` is the caller that opts in. Default-off because `runCampaign`
+   * is also driven from inside `army chat`, which owns its own terminal and its own signal
+   * story — a library function quietly installing `process.on('SIGINT')` under a host that
+   * already has one is how two handlers fight over one keypress.
+   *
+   * The field failure this exists for: Ctrl-C on a running campaign killed the supervisor in
+   * milliseconds — exit 130, no message, no abort record, lease file left forever — while the
+   * claude soldier, running with `--permission-mode dontAsk`, kept working until it noticed
+   * stdin EOF. An agent with dontAsk permissions outliving its supervisor is the worst version
+   * of an orphaned process, so the FIRST thing the handler does is kill the soldier's tree.
+   */
+  handleSignals?: boolean;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -695,10 +713,21 @@ export interface SoldierRun {
   errors: string[];
 }
 
+export interface RunSoldierHooks {
+  /**
+   * Handed the live soldier the moment it exists, BEFORE any orders are sent. This is how the
+   * campaign's signal handler knows whose process tree to kill — a handler that only learns
+   * about a soldier after `runSoldier` returns learns about it after the wait it needed to
+   * interrupt.
+   */
+  onSpawn?: (soldier: Soldier) => void;
+}
+
 export async function runSoldier(
   adapter: HarnessAdapter,
   spec: SoldierSpec,
   archive: CampaignArchive,
+  hooks?: RunSoldierHooks,
 ): Promise<SoldierRun> {
   const events: SoldierEvent[] = [];
   const errors: string[] = [];
@@ -706,6 +735,7 @@ export async function runSoldier(
   let costUsd: number | null = null;
 
   const soldier: Soldier = await adapter.spawn(spec);
+  hooks?.onSpawn?.(soldier);
 
   // Tee the stream to `stream.jsonl` LOSSLESSLY. An archive write that throws must not kill
   // a live soldier — the run is the expensive thing; the index is rebuildable from the file, and
@@ -1205,6 +1235,79 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   /** The status this campaign intends to record, then what the archive says it recorded. */
   let intendedStatus: CampaignStatus = 'aborted';
 
+  // ---- signals — Ctrl-C is an order, not an outage --------------------------------------------
+  //
+  // The handler does exactly two things, both safe in a signal context: it kills the in-flight
+  // soldier's process tree (a `dontAsk` worker must never outlive its supervisor), and it records
+  // which signal arrived. Everything else — the abort note, `aborted`/`blocked` in the archive,
+  // durability, the lease release — happens by TRANSLATING the signal into the campaign's own
+  // control flow: `throwIfInterrupted` throws through the main try into the one `finally` that
+  // already knows how to settle a campaign. A `process.exit` in the handler would skip all of it,
+  // which is precisely the field failure being fixed.
+  let interruptedBy: NodeJS.Signals | null = null;
+  /** The soldier whose tree the handler kills. Set by `runSoldier`'s onSpawn, cleared after. */
+  let liveSoldier: Soldier | null = null;
+  /** Named so the abort note can say WHOSE tree was killed, after `liveSoldier` is cleared. */
+  let killedSoldierId: string | null = null;
+  const handledSignals: readonly NodeJS.Signals[] =
+    options.handleSignals === true ? (['SIGINT', 'SIGTERM'] as const) : [];
+  const exitCodeForSignal = (signal: NodeJS.Signals): number =>
+    128 + (signal === 'SIGTERM' ? 15 : 2);
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (interruptedBy !== null) {
+      // The SECOND signal. The user is insisting, and a graceful path that cannot be escaped is
+      // a hang with better manners — so this one exits now, cleanup unfinished, with the
+      // conventional code. The soldier tree is already dead from the first signal.
+      process.exit(exitCodeForSignal(interruptedBy));
+    }
+    interruptedBy = signal;
+    if (liveSoldier !== null) {
+      killedSoldierId = liveSoldier.id;
+      killSoldierTree(liveSoldier);
+    }
+    progress({
+      kind: 'note',
+      level: 'warn',
+      message:
+        `${signal} received — ` +
+        (killedSoldierId === null
+          ? 'no soldier is in flight; '
+          : `killing ${killedSoldierId}'s process tree; `) +
+        'aborting the campaign and settling the archive and the lease (press again to exit immediately)',
+    });
+  };
+  const onSigint = (): void => onSignal('SIGINT');
+  const onSigterm = (): void => onSignal('SIGTERM');
+  /**
+   * The signal, translated into the campaign's own abort path. Called at every point the attempt
+   * loop comes back from an await long enough for a human to have pressed Ctrl-C during it.
+   */
+  const throwIfInterrupted = (during: string): void => {
+    if (interruptedBy === null) return;
+    const line =
+      `interrupted by ${interruptedBy} during ${during}: ` +
+      (killedSoldierId === null
+        ? 'no soldier was in flight'
+        : `${killedSoldierId}'s process tree was killed`) +
+      '. The campaign is aborted; anything committed is made durable and the lease is settled below.';
+    note(
+      'error',
+      'aborted',
+      line,
+      noFix(
+        'nothing is broken — the campaign stopped because you asked it to. The worktree line ' +
+          'below says what happened to the work.',
+      ),
+    );
+    try {
+      archive.appendSignal({ fromAgent: GENERAL_AGENT_ID, kind: 'status', body: cap(line) });
+    } catch {
+      /* the abort is the report; a failed signal row must not replace it */
+    }
+    outcome = 'aborted';
+    throw new CampaignAborted(line);
+  };
+
   const recordNoteSignals = (from: string, list: readonly { level: string; message: string }[]): void => {
     for (const item of list) {
       archive.appendSignal({
@@ -1217,6 +1320,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   };
 
   try {
+    // Installed INSIDE the try so the finally below is what uninstalls them, whatever happens.
+    // One listener per signal, removed by reference; a campaign that crashes out of setup a line
+    // later still cleans them up.
+    if (handledSignals.includes('SIGINT')) process.on('SIGINT', onSigint);
+    if (handledSignals.includes('SIGTERM')) process.on('SIGTERM', onSigterm);
+
     // ---- worktree ---------------------------------------------------------------------
     // `home` and `env` are threaded EXPLICITLY, and that is the whole point of these two lines.
     //
@@ -1298,6 +1407,9 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     let previousFailure: string | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      // A signal that landed between attempts (or before the first) must not dispatch a fresh
+      // soldier into a campaign the user has already ended.
+      throwIfInterrupted(`the gap before attempt ${String(attempt)}`);
       const engineerId = nextAgentId();
       const engineerOrders = renderEngineerOrders({
         orders,
@@ -1378,7 +1490,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         adapterFor(options, engineerSpec.harness),
         engineerSpec,
         archive,
+        // The signal handler above kills whatever this points at. Set before orders are sent,
+        // cleared as soon as the soldier is down — a handler must never kill a tree from a
+        // PREVIOUS attempt.
+        { onSpawn: (soldier) => (liveSoldier = soldier) },
       );
+      liveSoldier = null;
       recordDenials(archive, engineerId, engineerRun.denials, note);
 
       const reportResult = validateReport(engineerRun.structured);
@@ -1413,7 +1530,16 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       }
       await writeDiffFor(archive, engineerId, worktree, branch, baseCommit);
       archive.finishAgent(engineerId, {
-        status: engineerRun.status === 'ok' ? 'exited' : 'failed',
+        // `interrupted`, not `failed`, when the supervisor's own signal handler is what killed
+        // it: a failure gets retried and diagnosed, an interruption was ordered. Same rule the
+        // claude adapter applies on the wire (`claudeResultStatus` step 1) — our own knowledge
+        // that we stopped it outranks how the process happened to die.
+        status:
+          interruptedBy !== null
+            ? 'interrupted'
+            : engineerRun.status === 'ok'
+              ? 'exited'
+              : 'failed',
         exitCode: engineerRun.exitCode,
         costUsd: engineerRun.costUsd,
         durationMs: engineerRun.durationMs,
@@ -1436,6 +1562,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         // that decides what a terminal is allowed to receive.
         summary: report?.summary ?? null,
       });
+
+      // AFTER the bookkeeping above, deliberately: the killed attempt's agent row, report.md,
+      // diff and signals are all real evidence and all written before the abort unwinds. BEFORE
+      // the retry branch below, equally deliberately: a soldier this campaign killed on the
+      // user's order must not be diagnosed as a failure and retried with a fresh one.
+      throwIfInterrupted(`attempt ${String(attempt)} (${engineerId})`);
 
       if (report === null || engineerRun.status !== 'ok' || report.status !== 'done') {
         const why =
@@ -1543,6 +1675,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         onProgress: (line) => progress({ kind: 'note', level: 'info', message: line }),
       });
       record.acceptance = acceptance;
+
+      // The gate runs real `spec.verify` processes and can take as long as a test suite does —
+      // long enough to be the thing a human interrupts.
+      throwIfInterrupted(`the acceptance gate for attempt ${String(attempt)}`);
 
       if (acceptance.ran && !acceptance.passed) {
         const failedCommands = acceptance.outcomes
@@ -1676,7 +1812,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         adapterFor(options, inspectorSpec.harness),
         inspectorSpec,
         archive,
+        // Same seam as the Engineer's: the signal handler kills whatever is in flight.
+        { onSpawn: (soldier) => (liveSoldier = soldier) },
       );
+      liveSoldier = null;
       recordDenials(archive, inspectorId, inspectorRun.denials, note);
 
       const verdictResult = validateVerdict(inspectorRun.structured);
@@ -1704,7 +1843,13 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         );
       }
       archive.finishAgent(inspectorId, {
-        status: inspectorRun.status === 'ok' ? 'exited' : 'failed',
+        // Same rule as the Engineer's row above: an interruption was ordered, not suffered.
+        status:
+          interruptedBy !== null
+            ? 'interrupted'
+            : inspectorRun.status === 'ok'
+              ? 'exited'
+              : 'failed',
         exitCode: inspectorRun.exitCode,
         costUsd: inspectorRun.costUsd,
         durationMs: inspectorRun.durationMs,
@@ -1735,6 +1880,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       // A reviewer that returned nothing is narrated by the error note below, not by a `verdict`
       // event: the review gate fails CLOSED, and printing a verdict line for a verdict that does
       // not exist is the one shape of this stream that could mislead.
+
+      // Same placement rule as the Engineer's check: after the review's own bookkeeping, before
+      // a killed reviewer can be misread as `inspector-unavailable` and fail the gate closed.
+      throwIfInterrupted(`the review of attempt ${String(attempt)} (${inspectorId})`);
 
       if (verdict === null) {
         // A reviewer that produced nothing usable is NOT a pass. The Inspector runs on a
@@ -2027,6 +2176,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       intendedStatus = archive.getCampaign().status;
     });
     guard('closing the archive', () => archive.close());
+    // LAST, so a second Ctrl-C during the settlement above still has its escape hatch. After
+    // this line the process is back to Node's default signal behaviour.
+    if (handledSignals.includes('SIGINT')) process.removeListener('SIGINT', onSigint);
+    if (handledSignals.includes('SIGTERM')) process.removeListener('SIGTERM', onSigterm);
   }
 
   const campaignRoot = archive.root;
@@ -2045,7 +2198,16 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   // would tell a script everything is fine while the note on screen says it is not, which is the
   // safe-sounding half of "I could not do X so I did Y".
   const deliveryFailedLoudly = notes.some((n) => n.level === 'error' && n.code === 'delivery');
-  const exitCode = outcome === 'delivered' && !deliveryFailedLoudly ? 0 : 1;
+  // A signal-aborted campaign exits `128 + signal` — 130 for Ctrl-C — because that is the code
+  // every shell and CI system already reads as "interrupted", and the cleanup this run now does
+  // must not change what a wrapper script observes. Only when the signal is what ENDED it: a
+  // signal that arrived during delivery and let the merge finish is still a delivery.
+  const exitCode =
+    interruptedBy !== null && outcome === 'aborted'
+      ? exitCodeForSignal(interruptedBy)
+      : outcome === 'delivered' && !deliveryFailedLoudly
+        ? 0
+        : 1;
   return {
     campaignId,
     campaignRoot,
@@ -2198,8 +2360,10 @@ async function diagnoseAcquireFailure(error: unknown, project: string, home: str
   }
   if (error instanceof PoolExhaustedError) {
     return doThis(
-      `wait for a campaign on ${project} to finish and release its tree, or raise \`max_trees\` ` +
-        `under \`[worktree]\` in ${configPath(home)}.`,
+      `run \`${invokedAs()} doctor\` — its lease check says who holds each slot and whether any ` +
+        'holder is dead (a crashed run\'s lease is reclaimed automatically on the next acquire). ' +
+        `Then wait for a campaign on ${project} to finish and release its tree, or raise ` +
+        `\`max_trees\` under \`[worktree]\` in ${configPath(home)}.`,
     );
   }
   // Anything else here is git or the filesystem refusing — `worktree add` failing, the pool root

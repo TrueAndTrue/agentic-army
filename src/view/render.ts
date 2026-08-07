@@ -461,6 +461,27 @@ function renderHeader(ctx: Ctx, model: TreeModel): string[] {
   lines.push(paint(ctx, 'bold', titleShown) + paint(ctx, 'grey', idShown));
   lines.push(paint(ctx, 'grey', clip(ctx, fold(ctx, `  ${model.campaign.project}`), ctx.width)));
 
+  // An `active` that nothing has backed up for hours is a claim, not a state — SIGKILL cannot be
+  // caught, so a killed supervisor freezes `campaign.json` at `active` forever. The header keeps
+  // the recorded status (this command never edits truth) and refuses to let it stand alone.
+  const liveness = model.campaign.liveness;
+  if (liveness !== null && liveness.presumedDead) {
+    lines.push(
+      paint(
+        ctx,
+        'yellow',
+        clip(
+          ctx,
+          fold(
+            ctx,
+            `  ${g.warn} ${model.campaign.status} ${g.dash} stream silent ${formatDuration(liveness.silentMs)}, probably interrupted`,
+          ),
+          ctx.width,
+        ),
+      ),
+    );
+  }
+
   const s = model.summary;
   const ranks = s.ranks.length === 0 ? g.none : s.ranks.map((rank) => RANK_ABBREV[rank]).join(`${g.arrow}`);
   const depth =
