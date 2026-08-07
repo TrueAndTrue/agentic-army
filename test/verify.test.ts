@@ -13,6 +13,7 @@
 
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -80,6 +81,44 @@ describe('runCommand', () => {
     );
     assert.equal(result.timedOut, true);
   });
+
+  // `&` is POSIX shell syntax — cmd.exe reads it as "then", so this repro means nothing there.
+  test(
+    'a command that backgrounds a survivor still settles at the timeout, and the survivor dies',
+    { skip: process.platform === 'win32' },
+    async () => {
+      // A unique sleep duration doubles as a pgrep-able marker for the orphan check below.
+      const marker = String(3600 + Math.floor(Math.random() * 1000));
+
+      // Race against a wall clock, because the failure mode under test is `runCommand` never
+      // settling at all: the backgrounded child inherits the stdio pipes, killing only the shell
+      // leaves them open, and 'close' waits on them forever. A test that just awaited would hang
+      // with the bug instead of reporting it.
+      const deadline = new Promise<never>((_, reject) => {
+        const t = setTimeout(() => {
+          reject(new Error('runCommand did not settle within 4s of a 500ms timeout'));
+        }, 4000);
+        t.unref();
+      });
+      const result = await Promise.race([
+        runCommand(`sleep ${marker} & sleep ${marker}`, mkTmp('bg'), 500),
+        deadline,
+      ]);
+      assert.equal(result.timedOut, true);
+      assert.notEqual(result.exitCode, 0);
+
+      // Settling is not enough — the kill must reach the backgrounded grandchild, or every timed-out
+      // verify command leaks a live process into the machine. Brief pause so the kill lands before
+      // we look.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const survivors = spawnSync('pgrep', ['-f', `sleep ${marker}`], { encoding: 'utf8' });
+      assert.equal(
+        survivors.stdout.trim(),
+        '',
+        `backgrounded process survived the timeout kill: pids ${survivors.stdout.trim()}`,
+      );
+    },
+  );
 
   test('cwd is honoured', async () => {
     const dir = mkTmp('cwd');
