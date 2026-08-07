@@ -446,12 +446,27 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     options.commanderAdapter ??
     createClaudeAdapter({
       partialMessages: true,
+      // The adapter's default close grace (300s) exists for campaign soldiers that may be
+      // mid-write when stdin closes. A commander writes nothing — its whole loadout is TodoWrite
+      // — so there is nothing to wait for, and the long grace has a real cost here: an armed
+      // Ctrl-C during a wedged turn leaves through `session.close()`, and 300s of grace would
+      // turn "again to leave" into a five-minute goodbye.
+      closeGraceMs: 2_000,
       ...(options.commanderBin === undefined ? {} : { bin: options.commanderBin }),
     });
 
   const appendEvent = (event: SoldierEvent): void => {
     archive.appendEvent(COMMANDER_AGENT_ID, event);
   };
+
+  // ---- session state the interrupt handler and the death callback read ---------------------
+  let exitRequested = false;
+  let exitReason: ChatExitReason = 'eof';
+  let exitCode = 0;
+  /** The commander's process died — set by `onEnded`, never by a close this process asked for. */
+  let commanderGone = false;
+  /** The armed second Ctrl-C is leaving; further presses must not re-run the close. */
+  let exitLeaving = false;
 
   const session = new ChatSession({
     adapter: commanderAdapter,
@@ -460,11 +475,15 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       io.write(chunk);
     },
     onEvent: appendEvent,
+    onEnded: () => {
+      // The QA field shape this exists for: a commander binary that exits shortly after start.
+      // The loop is parked on `nextLine` with nothing to wake it, so the prompt just sits there
+      // looking healthy while the next input goes to a corpse. The flag is what the loop reads;
+      // the abort is what gets the loop back to reading it.
+      commanderGone = true;
+      io.abortLine();
+    },
   });
-
-  // ---- session state the interrupt handler reads ------------------------------------------
-  let exitRequested = false;
-  let exitReason: ChatExitReason = 'eof';
   /** True while a dispatch campaign is running. A campaign holds a lease; only it may settle one. */
   let dispatchInFlight = false;
   /** Armed by the first Ctrl-C; the second one leaves. Reset whenever the human speaks again. */
@@ -521,63 +540,88 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   };
 
   const onInterrupt = (): void => {
-    if (interruptBusy) return;
-    interruptBusy = true;
     void (async (): Promise<void> => {
-      try {
-        if (dispatchInFlight) {
-          // Killing here leaks a worktree lease: the pool slot is held by a process that is no
-          // longer coming back, and the branch inside it has not been made durable yet. The
-          // campaign's own cleanup is the only thing that settles a lease, so it is allowed to
-          // finish. Leaking a tree is recoverable; a half-torn-down one is not.
-          //
-          // Through the narration sink, not `io.write`: this line lands in the middle of the
-          // dispatch's own lifecycle lines and is a warning about it, so it is marked the way
-          // every other warning in that stretch is marked — and, on a terminal, it stops the
-          // elapsed ticker rather than being painted over by the next frame.
-          narrate({
-            kind: 'note',
-            level: 'warn',
-            message:
-              'a dispatch is in flight and holds a worktree lease. Letting it settle — ' +
-              'interrupting here would strand the tree and the branch inside it.',
-          });
-          return;
-        }
+      if (dispatchInFlight) {
+        // Killing here leaks a worktree lease: the pool slot is held by a process that is no
+        // longer coming back, and the branch inside it has not been made durable yet. The
+        // campaign's own cleanup is the only thing that settles a lease, so it is allowed to
+        // finish. Leaking a tree is recoverable; a half-torn-down one is not.
+        //
+        // Through the narration sink, not `io.write`: this line lands in the middle of the
+        // dispatch's own lifecycle lines and is a warning about it, so it is marked the way
+        // every other warning in that stretch is marked — and, on a terminal, it stops the
+        // elapsed ticker rather than being painted over by the next frame.
+        narrate({
+          kind: 'note',
+          level: 'warn',
+          message:
+            'a dispatch is in flight and holds a worktree lease. Letting it settle — ' +
+            'interrupting here would strand the tree and the branch inside it.',
+        });
+        return;
+      }
+      if (exitArmed) {
+        // BEFORE the busy check, and that order is the whole fix. It used to sit after, which
+        // read sensibly — "stop the answer first, leave second" — but made the exit unreachable
+        // whenever a turn could not be stopped: an interrupt receipt that times out (30s), or a
+        // CLI that never advertised interrupt_receipt_v1, kept `session.busy` true forever, so
+        // every armed press re-entered the busy branch and the only way out was kill -9. Once
+        // armed, a press means leave, and a wedged commander is the last reason to refuse.
+        if (exitLeaving) return;
+        exitLeaving = true;
+        exitRequested = true;
+        exitReason = 'interrupt';
+        guardedWrite('\n  leaving.\n');
         if (session.busy) {
-          const stopped = await session.interrupt();
-          // Arm BEFORE emitting, so this branch is correct on its own rather than because of the
-          // line above it. With the write unguarded AND the assignment after it, a closed pipe
-          // left `exitArmed` false and the user's next Ctrl-C re-armed instead of leaving — three
-          // keystrokes to get out of a session that promises two. `guardedWrite` already stops
-          // that, since a caught write cannot skip what follows it; this is belt and braces and
-          // is not independently observable while the guard holds. It is here because state a
-          // later keystroke reads should not sit downstream of an emission at all.
+          // The turn cannot be waited out — that is why the user is leaving. `close()` is the
+          // best-effort kill: stdin ends, then SIGTERM, then SIGKILL on the short grace set at
+          // the adapter above; and the stream ending is what settles the stuck turn, so the main
+          // loop wakes and leaves through the same `finally` as /exit — archive written, io
+          // closed. A failure here changes nothing: the loop's own close would repeat it.
+          try {
+            await session.close();
+          } catch {
+            /* the commander was already gone */
+          }
+        }
+        // Unguarded on purpose: `abortLine` is the thing that actually ends the session, by
+        // unblocking the read the loop is parked on. It is a queue operation with no stream
+        // under it, and if it ever did throw, swallowing it would park the session forever on a
+        // read nobody will answer — a hang with no message, which is worse than a stack trace.
+        // What matters is that it is no longer downstream of a write that can throw.
+        io.abortLine();
+        return;
+      }
+      if (session.busy) {
+        // One interrupt per turn: a second press lands in the armed branch above, so this guard
+        // only serialises the receipt round-trip, never the way out.
+        if (interruptBusy) return;
+        interruptBusy = true;
+        try {
+          // Arm and acknowledge BEFORE awaiting the receipt. The await is a round trip to a
+          // separate process that can take 30s to time out — or never resolve at all — and both
+          // used to sit on the far side of it: the user's press was invisible for the whole
+          // wait, and the session was not yet armed, so a wedged commander swallowed every
+          // subsequent press too. State a later keystroke reads must never sit downstream of an
+          // emission, so the assignment comes first.
           exitArmed = true;
+          guardedWrite('\n  ^C  stopping this answer — Ctrl-C again to leave.\n');
+          const stopped = await session.interrupt();
+          // An armed press may have left while this was suspended; its close-out owns the
+          // terminal now.
+          if (exitRequested) return;
           guardedWrite(
             stopped
-              ? '\n  ^C  turn stopped. The session is still up — Ctrl-C again to leave.\n'
-              : '\n  ^C  the commander would not stop; waiting for this turn. Ctrl-C again to leave.\n',
+              ? '  turn stopped.\n'
+              : '  the commander would not stop; waiting for this turn. Ctrl-C again to leave.\n',
           );
-          return;
+        } finally {
+          interruptBusy = false;
         }
-        if (exitArmed) {
-          exitRequested = true;
-          exitReason = 'interrupt';
-          guardedWrite('\n  leaving.\n');
-          // Unguarded on purpose: `abortLine` is the thing that actually ends the session, by
-          // unblocking the read the loop is parked on. It is a queue operation with no stream
-          // under it, and if it ever did throw, swallowing it would park the session forever on a
-          // read nobody will answer — a hang with no message, which is worse than a stack trace.
-          // What matters is that it is no longer downstream of a write that can throw.
-          io.abortLine();
-          return;
-        }
-        exitArmed = true;
-        guardedWrite('\n  ^C  (again to leave, or /exit)\n');
-      } finally {
-        interruptBusy = false;
+        return;
       }
+      exitArmed = true;
+      guardedWrite('\n  ^C  (again to leave, or /exit)\n');
     })();
   };
   const unsubscribe = io.onInterrupt(onInterrupt);
@@ -601,6 +645,22 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     }
   };
 
+  /**
+   * The one-line account of a commander that died, and the exit it forces.
+   *
+   * Nonzero on purpose, where every other way out of a chat exits 0: an inspector FAIL is news
+   * about the work, but a commander that died is the tool breaking, and a script watching this
+   * command is owed the difference.
+   */
+  const commanderDeathCloseOut = (): void => {
+    exitReason = 'commander-ended';
+    exitCode = 1;
+    io.write(
+      `\n  ✗ the commander is gone — ${session.lastError ?? 'its stream ended without a result'}` +
+        '. Ending the session.\n',
+    );
+  };
+
   try {
     await session.open();
 
@@ -612,9 +672,21 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     recordCommanderTurn(opening.text, opening.refusals);
 
     while (!exitRequested) {
+      // Before the read, not after: a commander that died on the previous turn must not be given
+      // a fresh prompt at all — the field observation was exactly that prompt, sitting live over
+      // a corpse, with the next input going nowhere.
+      if (commanderGone) {
+        commanderDeathCloseOut();
+        break;
+      }
       const line = await io.nextLine(PROMPT);
       if (line === null) {
-        if (!exitRequested) exitReason = 'eof';
+        // `onEnded` aborts a parked read, so a null line is how a death at the prompt arrives
+        // here. An exit the human asked for keeps its own reason.
+        if (!exitRequested) {
+          if (commanderGone) commanderDeathCloseOut();
+          else exitReason = 'eof';
+        }
         break;
       }
       const text = line.trim();
@@ -643,10 +715,15 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       io.setIdle();
       io.write('\n');
       recordCommanderTurn(turn.text, turn.refusals);
-      if (turn.status === 'error' && turn.errors.length > 0) {
+      // Not when the commander died: the close-out at the top of the loop prints the same
+      // message with its consequence attached, and the same sentence twice is noise.
+      if (turn.status === 'error' && turn.errors.length > 0 && !commanderGone) {
         io.write(`\n  ✗ ${turn.errors[0] as string}\n`);
       }
       if (exitRequested) break;
+      // Back to the top, which diagnoses and leaves. A proposal parsed out of the commander's
+      // dying words must not open a confirm flow whose result nobody can be told about.
+      if (commanderGone) continue;
 
       const proposal: DispatchRequest | null = turn.proposal;
       if (proposal === null) continue;
@@ -691,7 +768,10 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           verdict: null,
           deliveredRung: null,
         });
-        if (!exitRequested) exitReason = 'eof';
+        if (!exitRequested) {
+          if (commanderGone) commanderDeathCloseOut();
+          else exitReason = 'eof';
+        }
         break;
       }
       if (!isApproval(answer)) {
@@ -712,6 +792,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           verdict: null,
           deliveredRung: null,
         });
+        // A commander that died while the human was deciding cannot be told the decision — the
+        // loop's own close-out says why the session is over. Same guard on the two turns below.
+        if (commanderGone) continue;
         io.write('\n◆ ');
         io.setBusy('commander');
         const reaction = await session.dispatchDeclinedTurn(proposal.objective, reason);
@@ -802,6 +885,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           verdict: null,
           deliveredRung: null,
         });
+        if (commanderGone) continue;
         io.write('\n◆ ');
         io.setBusy('commander');
         // A failure to START is not a subordinate's account of anything — it is this process
@@ -838,6 +922,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         artifact: result.campaignRoot,
       });
 
+      if (commanderGone) continue;
       io.write('\n◆ ');
       io.setBusy('commander');
       const reaction = await session.dispatchResultTurn(facts);
@@ -905,8 +990,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     costUsd: session.costUsd,
     // A conversation that happened is a conversation that succeeded. A dispatch that failed
     // inspection is news, not an error in the session — `army view` and the printed outcome say
-    // so, and exiting non-zero would make every honest FAIL look like a broken tool.
-    exitCode: 0,
+    // so, and exiting non-zero would make every honest FAIL look like a broken tool. The one
+    // exception is a commander that DIED: that is the tool breaking, and it exits 1.
+    exitCode,
   };
 }
 

@@ -72,6 +72,18 @@ export interface ChatSessionDeps {
   onText?: (chunk: string) => void;
   /** Every normalised event. The caller tees this to `stream.jsonl`. */
   onEvent?: (event: SoldierEvent) => void;
+  /**
+   * The commander's stream ended and this process never asked it to — the child died, or closed
+   * its own stdout. NOT fired for a `close()` this session initiated, because a deliberate
+   * shutdown is not news. Fired after any pending turn has been settled, so a caller reacting to
+   * it observes the turn's error result, not a still-busy session. Exceptions are swallowed for
+   * the same reason `onEvent`'s are: the pump must reach its end whatever a listener does.
+   *
+   * This callback is why a chat no longer sits at a live prompt over a dead commander: without
+   * it, a child that exited while the loop was parked on `nextLine` had no way to wake anyone —
+   * the field report was a session that looked healthy until the next input went nowhere.
+   */
+  onEnded?: () => void;
 }
 
 /** What one turn produced. There is no `dispatch` field here, and that absence is deliberate. */
@@ -116,6 +128,15 @@ export class ChatSession {
   private streamEnded = false;
   private closeResult: CloseResult | null = null;
   private turnCount = 0;
+  /** Set the moment `close()` is asked for, so the pump can tell a shutdown from a death. */
+  private closing = false;
+  /**
+   * The most recent adapter-level error, kept even when NO turn is pending. The per-turn `errors`
+   * array cannot hold the one that matters most here: a child that dies while the session is idle
+   * emits its `claude exited with code N` synthetic with no turn to attach it to, and dropping it
+   * left the death diagnosis with nothing to say.
+   */
+  private lastErrorMessage: string | null = null;
 
   constructor(deps: ChatSessionDeps) {
     this.deps = deps;
@@ -133,6 +154,16 @@ export class ChatSession {
 
   get costUsd(): number | null {
     return this.lastCostUsd;
+  }
+
+  /** True once the commander's stream is over — no further turn can ever run. */
+  get ended(): boolean {
+    return this.streamEnded || this.closeResult !== null;
+  }
+
+  /** The last adapter error, for the caller's one-line account of a commander that died. */
+  get lastError(): string | null {
+    return this.lastErrorMessage;
   }
 
   async open(): Promise<void> {
@@ -153,6 +184,15 @@ export class ChatSession {
       this.streamEnded = true;
       // A soldier that died mid-turn must not leave a caller parked forever.
       this.settle('error');
+      // After the settle, so the listener sees a session that is ended AND idle. Only for a death:
+      // a stream that ended because `close()` asked it to is the caller's own doing.
+      if (!this.closing) {
+        try {
+          this.deps.onEnded?.();
+        } catch {
+          /* a listener's throw must not turn the pump's end into an unhandled rejection */
+        }
+      }
     })();
   }
 
@@ -164,6 +204,7 @@ export class ChatSession {
       return;
     }
     if (event.type === 'error') {
+      this.lastErrorMessage = event.message;
       if (turn !== null) turn.errors.push(event.message);
       return;
     }
@@ -330,6 +371,9 @@ export class ChatSession {
   /** Close stdin and wait for exit. Idempotent. */
   async close(): Promise<CloseResult> {
     if (this.closeResult !== null) return this.closeResult;
+    // Before the soldier is touched, so the pump — which may end at any point after stdin closes
+    // — can already tell this shutdown was asked for and keep `onEnded` quiet.
+    this.closing = true;
     const soldier = this.soldier;
     if (soldier === null) {
       this.closeResult = { exitCode: null, status: 'error' };
