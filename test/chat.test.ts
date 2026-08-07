@@ -1137,6 +1137,31 @@ describe('the standing orders name every spec field and the fenced shape to carr
     );
   });
 
+  it('steers verify commands away from `)`, showing both the pipe and the substitution spelling', () => {
+    // Field evidence: a harness rule-grammar limit means the Engineer cannot be granted an allow
+    // rule for a verify command holding `)` — every such command was denied in a live campaign.
+    // The commander is not forbidden from writing one (the gate still runs it), but should be
+    // steered toward the paren-free spelling so the Engineer is not left reasoning blind.
+    const orders = renderStandingOrders({
+      project: '/tmp/some-project',
+      ceiling: 2,
+      requestedRung: 2,
+      maxAttempts: 3,
+    });
+    assert.match(orders, /no parentheses/i, 'the orders never steer away from `)` in a verify command');
+    // Both concrete spellings named, so the swap is a recipe rather than an abstract preference.
+    assert.ok(
+      orders.includes("sh -c 'node app.js x | grep -qx expected'"),
+      'the pipe spelling (no parens) is not shown',
+    );
+    assert.ok(
+      orders.includes('sh -c \'test "$(node app.js x)" = expected\''),
+      'the substitution spelling (with parens) is not shown for contrast',
+    );
+    // A steer, not a ban — `$()` stays legal.
+    assert.doesNotMatch(orders, /\$\(\)\s+is (forbidden|not allowed|banned)/i);
+  });
+
   it('warns that `verify` must stay consistent with `filesInScope`, naming the incident that made it matter', () => {
     const orders = renderStandingOrders({
       project: '/tmp/some-project',

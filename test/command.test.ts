@@ -47,6 +47,7 @@ import {
   permissionsFor,
   protectedGlobContaining,
   rankDeny,
+  splitVerifyCommands,
   subagentDeny,
   subagentRosterFor,
   toolNameOf,
@@ -1208,6 +1209,73 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
     assert.doesNotMatch(withoutVerify, /within your authority to run/i);
   });
 
+  it('a MIXED verify list puts the safe commands under the authority claim and the unsafe ones under a do-not-attempt passage naming the gate', () => {
+    const safe = 'node --check webvitals.js';
+    const unsafe = 'sh -c \'test "$(node webvitals.js)" = ok\'';
+    const specWithVerify: TechnicalSpec = { ...SAMPLE_SPEC, verify: [safe, unsafe] };
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: specWithVerify,
+    });
+
+    // The safe command is still rendered under the authority claim.
+    assert.match(orders, /within your authority to run/i);
+    assert.ok(orders.includes(`\`${safe}\``), 'the grantable command is not rendered verbatim');
+
+    // The unsafe command is named, marked ungrantable, and the Engineer is told not to try it.
+    assert.ok(orders.includes(`\`${unsafe}\``), 'the ungrantable command is not rendered verbatim');
+    assert.match(orders, /cannot be granted to you/i);
+    assert.match(orders, /DO NOT ATTEMPT/);
+    assert.match(orders, /denial is guaranteed/i);
+    // Names the gate as the thing that actually runs it, and tells the Engineer to satisfy it by
+    // reading rather than running.
+    assert.match(orders, /acceptance gate runs them/i);
+    assert.match(orders, /reading them.*not by running them/i);
+
+    // The blanket authority sentence must not be widened to cover the ungrantable command too —
+    // it is under the safe-list claim only, so the unsafe command is never claimed as `within
+    // your authority`.
+    const authorityLineIndex = orders.search(/within your authority to run/i);
+    const doNotAttemptIndex = orders.search(/cannot be granted to you/i);
+    assert.ok(authorityLineIndex !== -1 && doNotAttemptIndex !== -1);
+    assert.ok(doNotAttemptIndex > authorityLineIndex, 'the do-not-attempt passage should follow the authority claim');
+  });
+
+  it('an ALL-SAFE verify list renders no do-not-attempt sub-list at all', () => {
+    const specWithVerify: TechnicalSpec = {
+      ...SAMPLE_SPEC,
+      verify: ['npm test', 'node --check webvitals.js'],
+    };
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: specWithVerify,
+    });
+    assert.match(orders, /within your authority to run/i);
+    assert.doesNotMatch(orders, /cannot be granted to you/i);
+    assert.doesNotMatch(orders, /DO NOT ATTEMPT/);
+  });
+
+  it('an ALL-UNSAFE verify list renders no authority claim at all', () => {
+    const unsafe = 'sh -c \'test "$(node webvitals.js)" = ok\'';
+    const specWithVerify: TechnicalSpec = { ...SAMPLE_SPEC, verify: [unsafe] };
+    const orders = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: specWithVerify,
+    });
+    assert.doesNotMatch(orders, /within your authority to run/i);
+    assert.match(orders, /cannot be granted to you/i);
+    assert.ok(orders.includes(`\`${unsafe}\``));
+  });
+
   it("a retry after a harness-level failure carries the supervisor's one-line account of it", () => {
     const line = 'attempt 1 ended with adapter status timeout and produced no report';
     const orders = renderEngineerOrders({
@@ -1449,9 +1517,62 @@ describe('permissions', () => {
     for (const rule of verifyAllowRules(commands)) {
       assert.ok(!rule.includes(':*'), `verify rule is a prefix, not an exact match: ${rule}`);
     }
-    // The known limitation, pinned rather than solved: a command containing `)` still travels
-    // verbatim — whatever claude's parser makes of the rule, OUR emitted string is the human's.
-    assert.deepEqual(verifyAllowRules(['test $(echo 1) -eq 1']), ['Bash(test $(echo 1) -eq 1)']);
+  });
+
+  it('verifyAllowRules emits NO rule for a `)`-carrying command — field-confirmed, every one was denied', () => {
+    // Measured on a live campaign: every verify command containing `)` was denied by claude's
+    // permission engine, every one without it was allowed. Granting a rule that can never match
+    // is worse than granting none — it tells the Engineer's orders it holds an authority it does
+    // not.
+    assert.deepEqual(verifyAllowRules(['test $(echo 1) -eq 1']), []);
+    // Mixed: the paren-free command still gets its exact rule; the paren-carrying one is dropped,
+    // not mangled or truncated.
+    assert.deepEqual(
+      verifyAllowRules(['npm test', 'test $(echo 1) -eq 1', 'node --check webvitals.js']),
+      ['Bash(npm test)', 'Bash(node --check webvitals.js)'],
+    );
+  });
+
+  it('splitVerifyCommands: `)` anywhere makes a command ungrantable; empties are dropped from both lists', () => {
+    // The exact field commands from the incident: a spec granted these as `verifyAllowRules`
+    // rules and every one carrying `)` was denied in the field.
+    const fieldGrantable = 'node slugify.js "Hello, World!" | grep -qx hello-world';
+    const fieldUngrantable = 'sh -c \'test "$(node slugify.js "Hello, World!")" = hello-world\'';
+    assert.deepEqual(splitVerifyCommands([fieldGrantable, fieldUngrantable]), {
+      grantable: [fieldGrantable],
+      ungrantable: [fieldUngrantable],
+    });
+
+    // Paren command alone -> wholly ungrantable.
+    assert.deepEqual(splitVerifyCommands(['test $(echo 1) -eq 1']), {
+      grantable: [],
+      ungrantable: ['test $(echo 1) -eq 1'],
+    });
+    // Paren-free command alone -> wholly grantable.
+    assert.deepEqual(splitVerifyCommands(['node --check webvitals.js']), {
+      grantable: ['node --check webvitals.js'],
+      ungrantable: [],
+    });
+    // A closing paren need not come from `$()` — the classifier is "contains `)`", not "contains
+    // a substitution", because the rule grammar has no notion of a paren that is fine.
+    assert.deepEqual(splitVerifyCommands(['echo ")"']), {
+      grantable: [],
+      ungrantable: ['echo ")"'],
+    });
+    // Mixed, in order, each landing in exactly one list.
+    assert.deepEqual(
+      splitVerifyCommands(['npm test', 'test $(echo 1) -eq 1', 'node --check webvitals.js']),
+      {
+        grantable: ['npm test', 'node --check webvitals.js'],
+        ungrantable: ['test $(echo 1) -eq 1'],
+      },
+    );
+    // Empty and whitespace-only entries are dropped from BOTH lists, matching what
+    // `verifyAllowRules` already did before the split — trimmed, not just filtered raw.
+    assert.deepEqual(splitVerifyCommands(['', '   ', '  node --check webvitals.js  ']), {
+      grantable: ['node --check webvitals.js'],
+      ungrantable: [],
+    });
   });
 
   it('buildSoldierSpec threads verify commands into the ENGINEER allow-list, and refuses every other role', () => {

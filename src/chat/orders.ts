@@ -176,6 +176,19 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
       'response — and leave the live call in `Acceptance` as prose for the Inspector to weigh.',
   );
   lines.push('');
+  lines.push(
+    'Prefer a command whose text contains no parentheses. A harness rule-grammar limit means the ' +
+      'Engineer cannot be granted an allow rule for a command holding a `)` — measured on a live ' +
+      'campaign, every such command was denied — so the gate still runs it after the Engineer ' +
+      'reports done, but the Engineer has to make it pass by reading, blind, instead of running ' +
+      'it and seeing the result. Spell an output-equality check as a pipe rather than a ' +
+      "substitution: `sh -c 'node app.js x | grep -qx expected'` instead of `sh -c 'test " +
+      '"$(node app.js x)" = expected\'` — both are HERMETIC, and the pipe form carries no ' +
+      'paren for the grammar to trip on. This is a steer, not a ban: `$()` is not forbidden, and ' +
+      'a criterion that genuinely needs one still belongs in `verify` — the gate runs it either ' +
+      'way.',
+  );
+  lines.push('');
   lines.push('### The dispatch block, with a spec');
   lines.push('');
   lines.push('A filled spec rides inside the same block, alongside `objective`, like this:');

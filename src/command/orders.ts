@@ -42,6 +42,7 @@ import { renderTechnicalSpec, SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../cont
 import type { TechnicalSpec } from '../contracts/spec.ts';
 import type { AcceptanceResult } from '../contracts/verify.ts';
 import { renderAcceptanceFailure } from '../verify/index.ts';
+import { splitVerifyCommands } from './permissions.ts';
 
 // ---------------------------------------------------------------------------------------------
 // The original orders — the campaign's own words, held verbatim
@@ -163,27 +164,51 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
     lines.push('');
     // The mechanical half of acceptance. See `src/contracts/spec.ts`'s incident note: a
     // criterion left in prose was never executed by anything. These ARE executed, against your
-    // branch, after you report done — running them yourself first means you find out about a
-    // failure before the gate does, instead of costing a whole retry to learn it.
+    // branch, after you report done — running the grantable ones yourself first means you find
+    // out about a failure before the gate does, instead of costing a whole retry to learn it.
     if (input.spec.verify !== undefined) {
       lines.push(
         `The \`${SPEC_FIELD_LABEL.verify}\` below are run against your branch mechanically ` +
-          'after you report done, and each must exit 0. Run them yourself, in this worktree, ' +
-          'before you report done:',
+          'after you report done, and each must exit 0.',
       );
       lines.push('');
-      for (const command of input.spec.verify) lines.push(`- \`${command}\``);
-      lines.push('');
-      // True since Fix A: `verifyAllowRules` turns each approved verify command into an exact
-      // Bash allow rule on this Engineer's own loadout. Without this sentence the field failure
-      // repeats in miniature — a worker that has just read the loadout section believes bare
-      // `node` is off-limits and skips the one check its orders told it to run.
-      lines.push(
-        'These exact commands are within your authority to run: each one was approved by a human ' +
-          'with the spec and is on your Bash allow-list VERBATIM. Run them exactly as written — ' +
-          'a variation (an added flag, a different path) is a different command and is not.',
-      );
-      lines.push('');
+      // ONE classifier, shared with `verifyAllowRules` (`./permissions.ts`) — a command
+      // containing `)` cannot be carried as an exact Bash allow rule, field-confirmed on a live
+      // campaign where every such command was denied. Telling the Engineer this split, rather
+      // than letting it discover a rule that can never fire by being refused, is the whole point:
+      // a worker that believes a listed command is within its authority will retry the denial
+      // instead of reading its way to the fix, which is exactly the fifteen-denial flail this
+      // section exists to close.
+      const { grantable, ungrantable } = splitVerifyCommands(input.spec.verify);
+      if (grantable.length > 0) {
+        lines.push('Run them yourself, in this worktree, before you report done:');
+        lines.push('');
+        for (const command of grantable) lines.push(`- \`${command}\``);
+        lines.push('');
+        // True since Fix A: `verifyAllowRules` turns each approved verify command into an exact
+        // Bash allow rule on this Engineer's own loadout. Without this sentence the field failure
+        // repeats in miniature — a worker that has just read the loadout section believes bare
+        // `node` is off-limits and skips the one check its orders told it to run.
+        lines.push(
+          'These exact commands are within your authority to run: each one was approved by a ' +
+            'human with the spec and is on your Bash allow-list VERBATIM. Run them exactly as ' +
+            'written — a variation (an added flag, a different path) is a different command and ' +
+            'is not.',
+        );
+        lines.push('');
+      }
+      if (ungrantable.length > 0) {
+        lines.push(
+          'These cannot be granted to you — a harness rule-grammar limit on `)` inside a Bash ' +
+            'rule means no allow rule for one of these can ever be written, on this or any spec. ' +
+            'DO NOT ATTEMPT THEM: a denial is guaranteed, not a risk to weigh. The acceptance ' +
+            'gate runs them, mechanically, after you report done — make them pass by reading ' +
+            'them and fixing what they check, not by running them yourself:',
+        );
+        lines.push('');
+        for (const command of ungrantable) lines.push(`- \`${command}\``);
+        lines.push('');
+      }
     }
   } else {
     lines.push('## NO SPEC WAS PROVIDED');

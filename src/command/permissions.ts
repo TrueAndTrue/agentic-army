@@ -150,6 +150,43 @@ function bashRules(prefixes: readonly string[]): string[] {
 }
 
 /**
+ * A verify command, sorted into what this harness's rule grammar can and cannot carry as an
+ * exact-match Bash allow rule.
+ *
+ * ## Field-confirmed, not hypothetical
+ *
+ * `verifyAllowRules` used to carry a "known limitation, stated rather than solved" comment about
+ * `)` inside a `Bash(<specifier>)` rule. A live campaign settled the question: EVERY verify
+ * command containing `)` was denied by claude's permission engine, every one without `)` was
+ * allowed — fifteen denial notes on one Engineer before it finished despite them, because the
+ * acceptance gate runs the commands outside the permission layer regardless. The rule grammar
+ * cannot carry a closing paren inside the specifier. It is broken on arrival, not sometimes
+ * broken, so granting a rule for one is granting a denial.
+ *
+ * `)` anywhere in the trimmed command is ungrantable — not just inside `$(...)`, because the
+ * grammar has no notion of "this paren is fine" and neither does this classifier. Empty and
+ * whitespace-only entries are dropped from both lists, matching what `verifyAllowRules` already
+ * did before splitting.
+ *
+ * Exported so `verifyAllowRules` and `renderEngineerOrders` share ONE classifier: two copies of
+ * the `)` test is two places for the mitigation to drift out of step with the grammar it works
+ * around.
+ */
+export function splitVerifyCommands(commands: readonly string[]): {
+  grantable: string[];
+  ungrantable: string[];
+} {
+  const grantable: string[] = [];
+  const ungrantable: string[] = [];
+  for (const command of commands) {
+    const trimmed = command.trim();
+    if (trimmed === '') continue;
+    (trimmed.includes(')') ? ungrantable : grantable).push(trimmed);
+  }
+  return { grantable, ungrantable };
+}
+
+/**
  * The spec's own `verify` commands as EXACT-match Bash allow rules, for the ENGINEER that has to
  * run them.
  *
@@ -173,18 +210,17 @@ function bashRules(prefixes: readonly string[]): string[] {
  * unchanged and deny wins over allow in claude's engine, so a hostile verify command that collides
  * with a denied prefix stays dead — and `validateTechnicalSpec` refuses it earlier, with a reason.
  *
- * Known limitation, stated rather than solved: a command containing `)` may interact badly with
- * the `Tool(specifier)` rule grammar — the campaign cannot verify claude's parser from here, so
- * the command travels verbatim and the rule carries whatever the human approved.
+ * ## Only the grantable half
+ *
+ * `splitVerifyCommands` sorts out the commands whose rule can never fire — see that function for
+ * the field evidence. Emitting a rule for one anyway would not widen anything (the command still
+ * carries whatever the human approved, and deny still wins over allow), but it would be a promise
+ * this permission set cannot keep: a rule on the wire that is denied every single time it matches
+ * is worse than no rule, because it tells the Engineer's orders (`renderEngineerOrders`) it may
+ * claim an authority it does not have.
  */
 export function verifyAllowRules(commands: readonly string[]): string[] {
-  const out: string[] = [];
-  for (const command of commands) {
-    const trimmed = command.trim();
-    if (trimmed === '') continue;
-    out.push(`Bash(${trimmed})`);
-  }
-  return out;
+  return splitVerifyCommands(commands).grantable.map((command) => `Bash(${command})`);
 }
 
 /**
