@@ -2245,7 +2245,7 @@ test('the worktree contract describes one shared writable lease, not an attenuat
   );
   assert.match(campaign, /const worktree = lease\.path;/, 'the shared cwd must be the leased path');
 
-  const specs = [...campaign.matchAll(/buildSoldierSpec\(\{[\s\S]{0,900}?\}\);/g)].map((m) => m[0]);
+  const specs = [...campaign.matchAll(/buildSoldierSpec\(\{[\s\S]{0,1600}?\}\);/g)].map((m) => m[0]);
   assert.equal(specs.length, 2, 'today exactly two spawns build a spec: the Engineer and the Inspector');
   assert.ok(specs.some((s) => s.includes("role: 'ENGINEER'")), 'one of them is the Engineer');
   assert.ok(specs.some((s) => s.includes("role: 'INSPECTOR'")), 'the other is the Inspector');

@@ -42,7 +42,7 @@ import { renderTechnicalSpec, SPEC_FIELD_LABEL, SPEC_LIST_FIELDS } from '../cont
 import type { TechnicalSpec } from '../contracts/spec.ts';
 import type { AcceptanceResult } from '../contracts/verify.ts';
 import { renderAcceptanceFailure } from '../verify/index.ts';
-import { splitVerifyCommands } from './permissions.ts';
+import { fileRunRules, splitVerifyCommands } from './permissions.ts';
 
 // ---------------------------------------------------------------------------------------------
 // The original orders — the campaign's own words, held verbatim
@@ -319,6 +319,17 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
       'file contents. `Bash` is restricted to an allow-list: `git`, and the project\'s test, ' +
       'build, lint and typecheck commands. Nothing else.',
   );
+  // One exception, and it is granted rather than discovered by refusal: the field failure this
+  // sentence closes is an Engineer denied every ad-hoc run of a file its own approved spec named
+  // — see `fileRunRules` in `./permissions.ts` for the rule this describes and why it is safe to
+  // grant. Present only when the spec actually put a runnable file in scope; a sentence claiming
+  // an authority the loadout does not hold is worse than no sentence.
+  if (input.spec !== undefined && fileRunRules(input.spec.filesInScope).length > 0) {
+    lines.push(
+      'One exception: the files named in scope above with a runnable extension may be executed ' +
+        'directly — `node <file>`, any arguments — which is granted, unlike arbitrary commands.',
+    );
+  }
   lines.push('');
   lines.push(
     '- `cat`, `ls`, `sed`, `grep`, `mkdir`, `rm` and friends are NOT available. `Read`, `Glob` ' +

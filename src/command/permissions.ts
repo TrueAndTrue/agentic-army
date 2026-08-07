@@ -4,7 +4,8 @@
  *
  * ```
  * ALLOW  ENGINEER   Read Grep Glob, Edit Write, Bash(git*|test|build|lint)
- *                   + the spec's approved `verify` commands, as EXACT Bash rules
+ *                   + spec-derived authority: the approved `verify` commands as EXACT Bash rules,
+ *                   and a run rule for each runnable `filesInScope` entry as a PREFIX Bash rule
  *        INSPECTOR  Read Grep Glob, Bash(test|lint)
  *
  * NARROW (by rank, subtracted from whatever the role asked for)
@@ -221,6 +222,73 @@ export function splitVerifyCommands(commands: readonly string[]): {
  */
 export function verifyAllowRules(commands: readonly string[]): string[] {
   return splitVerifyCommands(commands).grantable.map((command) => `Bash(${command})`);
+}
+
+/**
+ * The interpreter a `Bash(<interpreter> <file>:*)` rule needs, keyed by the file's extension.
+ * Anything else — `.ts`, `.md`, `.json`, `.css`, extensionless — is not this codebase's to run: a
+ * rule for a file nothing can execute is noise, and `.ts` in particular is edited and type-checked,
+ * never run directly by a bare interpreter.
+ */
+const FILE_RUN_INTERPRETERS: Readonly<Record<string, string>> = Object.freeze({
+  '.js': 'node',
+  '.mjs': 'node',
+  '.cjs': 'node',
+  '.py': 'python3',
+  '.sh': 'sh',
+});
+
+/**
+ * The spec's `filesInScope`, as PREFIX Bash allow rules — one per file the Engineer can actually
+ * run, arguments unrestricted.
+ *
+ * ## Why this exists — the same shape of field failure `verifyAllowRules` closes
+ *
+ * A spec ordered a Captain-Engineer to write `slugify.js`, then debug it by running
+ * `node slugify.js "Hello, World!"`. `ENGINEER_BASH_PREFIXES` allows `node --test` and nothing
+ * else bare-`node`-shaped, so every ad-hoc run of the file it had just written — with its own
+ * arguments, exploring its own bug — was denied. The Engineer already holds `Write` on the
+ * worktree; denying it a run of a file the spec itself named restricts debugging without
+ * restricting anything an adversary could not already do through the tools it holds. Authority
+ * derives from what the human approved, and the spec names these files before dispatch — so their
+ * runnable half carries authority the same way `verify` does.
+ *
+ * ## PREFIX, not exact — the one place this deliberately differs from `verifyAllowRules`
+ *
+ * `verify` commands are a fixed, human-approved command line, so `verifyAllowRules` grants an
+ * EXACT match and nothing wider. A file being debugged is run with DIFFERENT arguments on every
+ * attempt — that is the whole point of ad-hoc execution — so an exact rule would have to be
+ * re-derived per invocation and would grant nothing on the second run. `Bash(node slugify.js:*)`
+ * fixes the interpreter and the file and leaves the argument tail open, which is the same shape
+ * `ENGINEER_BASH_PREFIXES` already uses for every other prefix rule on this loadout.
+ *
+ * ## What is deliberately NOT granted
+ *
+ * No bare `node`, no `node -e`, no `sh -c` prefix, and no rule at all for a file the spec did not
+ * name — each of those is authority over more than the spec approved. An entry with no runnable
+ * extension (`.ts`, `.md`, `.json`, `.css`, extensionless) emits nothing: those files are edited,
+ * not executed, by this codebase's own toolchain, and a rule nothing can run is noise on the wire.
+ *
+ * An entry containing `)` emits nothing — the same rule-grammar limit `splitVerifyCommands`
+ * documents field evidence for; a granted-but-ungrantable rule is worse than no rule because it
+ * tells the Engineer it holds an authority it does not.
+ *
+ * Entries are the spec's own spelling, worktree-relative, verbatim — no `./`-stripping, no
+ * separator normalisation. The Engineer's orders name the file the same way the spec did, and a
+ * rule spelled differently from the orders would not match the command the Engineer actually runs.
+ */
+export function fileRunRules(filesInScope: readonly string[]): string[] {
+  const rules: string[] = [];
+  for (const entry of filesInScope) {
+    const trimmed = entry.trim();
+    if (trimmed === '' || trimmed.includes(')')) continue;
+    const dot = trimmed.lastIndexOf('.');
+    const ext = dot === -1 ? '' : trimmed.slice(dot);
+    const interpreter = FILE_RUN_INTERPRETERS[ext];
+    if (interpreter === undefined) continue;
+    rules.push(`Bash(${interpreter} ${trimmed}:*)`);
+  }
+  return rules;
 }
 
 /**

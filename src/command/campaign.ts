@@ -155,6 +155,7 @@ import {
   assertNoFlagLikeRules,
   assertSubagentRosterSafe,
   assertWorktreeRootOutsideProtected,
+  fileRunRules,
   permissionsFor,
   subagentDeny,
   subagentRosterFor,
@@ -518,6 +519,17 @@ export interface BuildSpecInput {
    */
   verifyCommands?: readonly string[];
   /**
+   * The spec's `filesInScope`, for an ENGINEER whose orders now say it may run the runnable ones.
+   *
+   * Each runnable entry (`.js`/`.mjs`/`.cjs`/`.py`/`.sh`) becomes a PREFIX `Bash(<interpreter>
+   * <file>:*)` allow rule via `fileRunRules` — see that function for the field failure this closes
+   * (an Engineer denied every ad-hoc run of the file its own approved spec named) and why a spec
+   * approved at dispatch is authorization for the files it names. ENGINEER only, same guard as
+   * `verifyCommands`: the Inspector never runs anything the spec named, and the codex harness has
+   * no per-tool rules to carry a prefix rule with anyway.
+   */
+  filesInScope?: readonly string[];
+  /**
    * Issue this worker a roster of subordinates it may field as native subagents.
    *
    * OPT-IN, and default-off, which is the conservative direction: a worker with no roster is
@@ -568,7 +580,26 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
       if (!allow.includes(rule)) allow.push(rule);
     }
   }
-  assertNoFlagLikeRules(allow, `${input.role} allow-list (with verify rules)`);
+
+  // ---- the spec's own filesInScope, as run rules for the ones the Engineer may execute ----
+  //
+  // Same guard, same reasoning, as the verify-command block above: appended AFTER `permissionsFor`
+  // so `assertCommanderLoadout` and rank narrowing never see these rules, and refused for any role
+  // but ENGINEER rather than widened past those guards. `fileRunRules` already drops every entry
+  // that has no runnable extension, so a spec's `.ts`/`.md`/`.json` files add nothing here.
+  if (input.filesInScope !== undefined) {
+    if (input.role !== 'ENGINEER') {
+      throw new Error(
+        `refusing to spawn ${who}: file-run allow rules are the ENGINEER's alone. No other role ` +
+          'holds a shell to run a file with — widening another loadout here would bypass the ' +
+          'guards inside permissionsFor.',
+      );
+    }
+    for (const rule of fileRunRules(input.filesInScope)) {
+      if (!allow.includes(rule)) allow.push(rule);
+    }
+  }
+  assertNoFlagLikeRules(allow, `${input.role} allow-list (with verify and file-run rules)`);
 
   // ---- the lower half of the org chart ---------------------------------------------------
   //
@@ -1155,6 +1186,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         home,
         // Approved with the spec; see `BuildSpecInput.verifyCommands`.
         ...(options.spec?.verify === undefined ? {} : { verifyCommands: options.spec.verify }),
+        // Approved with the spec; see `BuildSpecInput.filesInScope`.
+        ...(options.spec?.filesInScope === undefined ? {} : { filesInScope: options.spec.filesInScope }),
         // The one unit here that decomposes: it holds the worktree, the branch and the report;
         // its subordinates read and answer. Claude-only; `buildSoldierSpec` refuses otherwise.
         fanOut: engineerTarget.harness === 'claude',

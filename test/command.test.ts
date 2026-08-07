@@ -42,6 +42,7 @@ import {
   assertWorktreeRootOutsideProtected,
   BUILTIN_AGENT_TYPES,
   DENIED_COMMAND_RULES,
+  fileRunRules,
   missingProtectedGlobs,
   narrowToRank,
   permissionsFor,
@@ -1276,6 +1277,40 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
     assert.ok(orders.includes(`\`${unsafe}\``));
   });
 
+  it('the orders grant a direct run of a runnable filesInScope entry, and stay silent when none is runnable', () => {
+    // SAMPLE_SPEC.filesInScope is ['calc.js', 'calc.test.js'] — both runnable.
+    const withRunnable = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: SAMPLE_SPEC,
+    });
+    assert.match(withRunnable, /may be executed directly/i);
+    assert.match(withRunnable, /`node <file>`/);
+    assert.match(withRunnable, /granted, unlike arbitrary commands/i);
+
+    // No spec at all — nothing to grant, nothing claimed.
+    const withoutSpec = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+    });
+    assert.doesNotMatch(withoutSpec, /may be executed directly/i);
+
+    // A spec whose filesInScope has no runnable extension — same silence.
+    const noRunnable: TechnicalSpec = { ...SAMPLE_SPEC, filesInScope: ['README.md', 'notes.txt'] };
+    const withoutRunnable = renderEngineerOrders({
+      orders: ORDERS,
+      branch: 'army/t-abc123',
+      worktree: '/tmp/wt-01',
+      attempt: 1,
+      spec: noRunnable,
+    });
+    assert.doesNotMatch(withoutRunnable, /may be executed directly/i);
+  });
+
   it("a retry after a harness-level failure carries the supervisor's one-line account of it", () => {
     const line = 'attempt 1 ended with adapter status timeout and produced no report';
     const orders = renderEngineerOrders({
@@ -1575,6 +1610,40 @@ describe('permissions', () => {
     });
   });
 
+  it('fileRunRules emits a PREFIX Bash rule per runnable extension, and nothing for the rest', () => {
+    // The field incident this closes: a spec ordered `slugify.js` written, then debugging it with
+    // `node slugify.js "Hello, World!"` was denied every time — the Engineer held Write on the
+    // worktree but no authority to run the file its own approved spec named.
+    assert.deepEqual(fileRunRules(['slugify.js']), ['Bash(node slugify.js:*)']);
+    assert.deepEqual(fileRunRules(['tools/build.py']), ['Bash(python3 tools/build.py:*)']);
+    assert.deepEqual(fileRunRules(['scripts/deploy.sh']), ['Bash(sh scripts/deploy.sh:*)']);
+    assert.deepEqual(fileRunRules(['worker.mjs']), ['Bash(node worker.mjs:*)']);
+    assert.deepEqual(fileRunRules(['worker.cjs']), ['Bash(node worker.cjs:*)']);
+
+    // `.ts`, `.md`, and extensionless entries are edited, not executed — no rule for a file
+    // nothing can run.
+    assert.deepEqual(fileRunRules(['index.ts']), []);
+    assert.deepEqual(fileRunRules(['README.md']), []);
+    assert.deepEqual(fileRunRules(['Makefile']), []);
+
+    // A `)`-carrying entry — same rule-grammar limit `splitVerifyCommands` field-confirmed.
+    assert.deepEqual(fileRunRules(['weird)name.js']), []);
+
+    // Empties are skipped; entries are trimmed but otherwise emitted with their EXACT spelling —
+    // no `./`-stripping, no separator normalisation, because the Engineer's orders name the file
+    // the same way the spec did.
+    assert.deepEqual(
+      fileRunRules(['', '   ', '  ./tools/x.mjs  ']),
+      ['Bash(node ./tools/x.mjs:*)'],
+    );
+
+    // Mixed list, order preserved, only the runnable ones surviving.
+    assert.deepEqual(
+      fileRunRules(['slugify.js', 'README.md']),
+      ['Bash(node slugify.js:*)'],
+    );
+  });
+
   it('buildSoldierSpec threads verify commands into the ENGINEER allow-list, and refuses every other role', () => {
     const verify = ['node --check webvitals.js', 'node webvitals.js https://example.com --detail'];
     const spec = buildSoldierSpec({
@@ -1609,6 +1678,45 @@ describe('permissions', () => {
           orders: 'review it',
           home: '/tmp/army-home',
           verifyCommands: verify,
+        }),
+      /ENGINEER/,
+    );
+  });
+
+  it('buildSoldierSpec threads filesInScope into the ENGINEER allow-list as file-run rules, and refuses every other role', () => {
+    const filesInScope = ['slugify.js', 'README.md'];
+    const spec = buildSoldierSpec({
+      agentId: 'cpt-01',
+      rank: 'CAPTAIN',
+      role: 'ENGINEER',
+      harness: 'claude',
+      cwd: '/tmp/wt-01',
+      orders: 'do the thing',
+      home: '/tmp/army-home',
+      filesInScope,
+    });
+    // The role loadout is intact, the runnable file gets its rule…
+    for (const rule of ROLE_ALLOW.ENGINEER) assert.ok(spec.allow.includes(rule), `lost ${rule}`);
+    assert.ok(spec.allow.includes('Bash(node slugify.js:*)'), 'missing run rule for slugify.js');
+    // …and the non-runnable one contributes nothing to the wire.
+    assert.ok(
+      !spec.allow.some((rule) => rule.includes('README.md')),
+      'a rule was emitted for README.md, which nothing can run',
+    );
+    for (const rule of DENIED_COMMAND_RULES) assert.ok(spec.deny.includes(rule), `deny lost ${rule}`);
+
+    // Non-ENGINEER roles never receive file-run rules — mirrors the verify-rules role guard above.
+    assert.throws(
+      () =>
+        buildSoldierSpec({
+          agentId: 'cpt-02',
+          rank: 'CAPTAIN',
+          role: 'INSPECTOR',
+          harness: 'codex',
+          cwd: '/tmp/wt-01',
+          orders: 'review it',
+          home: '/tmp/army-home',
+          filesInScope,
         }),
       /ENGINEER/,
     );
@@ -2877,6 +2985,48 @@ describe("the spec's approved verify commands reach the Engineer as exact allow 
     for (const rule of ROLE_ALLOW.ENGINEER) assert.ok(allowed.includes(rule), `lost ${rule}`);
     for (const rule of DENIED_COMMAND_RULES) {
       assert.ok(argv.includes(rule), `the deny-list lost ${rule} when verify rules were added`);
+    }
+  });
+
+  it('ON THE WIRE: a campaign with spec.filesInScope spawns its Engineer with a run rule for the runnable file, and none for the rest', async () => {
+    // The `slugify.js` incident itself: the Engineer was denied every ad-hoc run of the file the
+    // approved spec had named, including `node slugify.js "Hello, World!"`.
+    const repo = makeRepo('file-run-authority');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('file-run-authority', 'ok', ['pass']);
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], filesInScope: ['slugify.js', 'README.md'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+
+    const argv = JSON.parse(
+      fs.readFileSync(bins.claudeArgvLog, 'utf8').split('\n')[0] ?? '[]',
+    ) as string[];
+    const at = argv.indexOf('--allowedTools');
+    assert.notEqual(at, -1, `--allowedTools never reached execve:\n${argv.join(' ')}`);
+    const allowed: string[] = [];
+    for (let i = at + 1; i < argv.length && !(argv[i] as string).startsWith('--'); i += 1) {
+      allowed.push(argv[i] as string);
+    }
+    assert.ok(
+      allowed.includes('Bash(node slugify.js:*)'),
+      `the Engineer has no run rule for slugify.js:\n${allowed.join('\n')}`,
+    );
+    assert.ok(
+      !allowed.some((rule) => rule.includes('README.md')),
+      'a rule was emitted for README.md, which nothing can run',
+    );
+    // The role loadout is still there, and the global deny-list is emitted unchanged beside it.
+    for (const rule of ROLE_ALLOW.ENGINEER) assert.ok(allowed.includes(rule), `lost ${rule}`);
+    for (const rule of DENIED_COMMAND_RULES) {
+      assert.ok(argv.includes(rule), `the deny-list lost ${rule} when file-run rules were added`);
     }
   });
 });
