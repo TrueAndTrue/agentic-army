@@ -5,12 +5,13 @@
   "type": "module",
   "license": "MIT",
   "bin": {
-    "army": "./dist/cli.js"
+    "army": "./bin/army.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "files": [
+    "bin",
     "dist",
     "schemas",
     "README.md"
