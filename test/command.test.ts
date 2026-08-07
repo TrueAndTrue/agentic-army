@@ -88,6 +88,7 @@ import {
 } from '../src/command/orders.ts';
 import type { OriginalOrders } from '../src/command/orders.ts';
 import {
+  DEFAULT_SOLDIER_TIMEOUT_MS,
   LEASE_STATES,
   UNSPECIFIED_BRIEF_EFFORT,
   behaviourCoverage,
@@ -98,6 +99,7 @@ import {
   recordDenials,
   resolveProjectRoot,
   runCampaign,
+  soldierAdapterSettings,
 } from '../src/command/campaign.ts';
 import type { CampaignNote, CampaignNoteCode, CampaignOptions, CampaignResult, CoverageReport } from '../src/command/campaign.ts';
 import {
@@ -2140,6 +2142,21 @@ describe('parsing', () => {
     assert.throws(() => parseCampaignArgs(['a', '--rung', '9']), /--rung expects/);
     assert.throws(() => parseCampaignArgs(['a', '--nope']), /unknown option/);
     assert.equal(parseCampaignArgs(['--help']).help, true);
+  });
+
+  it('an objective that is empty or whitespace-only is refused exactly like a missing one', () => {
+    // Field-reproduced: `army campaign ""` sailed past the missing-objective refusal (an empty
+    // string is still a positional), archived a nameless campaign, and — no objective meaning no
+    // spec — dispatched the Engineer at `UNSPECIFIED_BRIEF_EFFORT`. Same message, same exit path
+    // as no argument at all.
+    assert.throws(() => parseCampaignArgs(['']), /objective is required/);
+    assert.throws(() => parseCampaignArgs(['   ']), /objective is required/);
+    assert.throws(() => parseCampaignArgs(['\t \t']), /objective is required/);
+    // With `--spec` a blank positional is dropped exactly like an absent one — the spec carries
+    // its own objective, and a whitespace string must not reach the mismatch comparison.
+    const specOnly = parseCampaignArgs(['   ', '--spec', '/tmp/spec.json']);
+    assert.equal(specOnly.objective, '');
+    assert.equal(specOnly.specPath, '/tmp/spec.json');
   });
 
   it('parseCampaignArgs handles --spec, and a missing path is a usage error', () => {
@@ -5033,6 +5050,22 @@ describe('army campaign --spec', () => {
     assert.match(err, /spec\.filesInScope must be an array of strings/);
   });
 
+  it('a --spec path that does not exist is a clean refusal, not raw errno text', async () => {
+    const missing = path.join(mkTmp('spec-enoent'), 'nope.json');
+    let err = '';
+    const code = await campaignCommand(['--spec', missing], {
+      stdout: { write: () => undefined },
+      stderr: { write: (t) => void (err += t) },
+    });
+    assert.equal(code, 1);
+    assert.match(err, /no such file: /);
+    assert.ok(err.includes(missing), 'the refusal does not name the path');
+    // The old message forwarded `readFileSync`'s own sentence — "ENOENT: no such file or
+    // directory, open '…'" — a syscall's account of the problem on a screen where every other
+    // refusal speaks in the command's voice.
+    assert.doesNotMatch(err, /ENOENT/, `raw errno text reached the user:\n${err}`);
+  });
+
   it('invalid JSON in the spec file is refused the same way — no silent fallback', async () => {
     const dir = mkTmp('spec-badjson');
     const specPath = path.join(dir, 'spec.json');
@@ -5828,6 +5861,33 @@ describe('the progress renderer respects a stream that is not a terminal', () =>
     assert.equal(timers.running(), 0, 'close() left a ticker running');
   });
 
+  it('a ticker frame against a dead TTY stops the ticker instead of throwing uncaught', () => {
+    // Every OTHER emission reaches the stream through a caller's guard — `runCampaign`'s
+    // `progress`, chat's `guardedProgress` — but the elapsed ticker fires from a timer callback
+    // with no caller on the stack, so before the guard an EPIPE here was an uncaughtException
+    // in the middle of a campaign holding a worktree lease, skipping every `finally`.
+    const timers = fakeTimers();
+    const written: string[] = [];
+    const stream = {
+      isTTY: true,
+      write: (t: string): void => {
+        if (/working/.test(t)) {
+          const error: NodeJS.ErrnoException = new Error('write EPIPE');
+          error.code = 'EPIPE';
+          throw error;
+        }
+        written.push(t);
+      },
+    };
+    const sink = createProgressSink({ stream, self: 'ARMY', timers, live: true });
+    sink.emit(DISPATCH);
+    assert.equal(timers.running(), 1, 'no ticker started — the scenario never armed');
+    assert.doesNotThrow(() => timers.tick(1), 'a narration frame became an uncaught exception');
+    assert.equal(timers.running(), 0, 'the ticker kept firing against a stream that is gone');
+    // And the close-out must not try to erase a frame that never landed on the dead stream.
+    assert.doesNotThrow(() => sink.close());
+  });
+
   it('a hostile summary cannot move the reader’s cursor', () => {
     // Model-controlled text on a human's terminal. A summary that clears the screen or returns to
     // column zero would let a subordinate overwrite the line naming which unit produced it.
@@ -5942,5 +6002,273 @@ describe('the view layer and the campaign cannot drift apart', () => {
     // `src/view` deliberately does not import `src/command`, so the union is written twice. This
     // is the pin that makes the second copy safe: add a state to one and this goes red.
     assert.deepEqual([...PROGRESS_LEASE_STATES], [...LEASE_STATES]);
+  });
+});
+
+// ===============================================================================================
+// 10. A blank objective never dispatches — at any entry point
+// ===============================================================================================
+
+describe('an empty objective is refused at every door', () => {
+  it('`campaign ""` at the CLI gets the SAME refusal as no objective at all', async () => {
+    let err = '';
+    let called = false;
+    // The stub is not decoration: with the refusal regressed, a bare `campaignCommand([''])`
+    // would run a REAL campaign in the developer's own repository and home. A hermetic red is
+    // "runCampaign was reached at all".
+    const code = await campaignCommand([''], {
+      stdout: { write: () => undefined },
+      stderr: { write: (t) => void (err += t) },
+      runCampaignFn: async () => {
+        called = true;
+        return stubCampaignResult();
+      },
+    });
+    assert.equal(code, 1);
+    assert.ok(!called, 'a blank objective reached runCampaign');
+    assert.match(err, /an objective is required/);
+    assert.match(err, /campaign "add a multiply function/, 'diagnosis with no example');
+  });
+
+  it('runCampaign itself refuses a whitespace objective before anything is archived', async () => {
+    // Defence in depth for programmatic callers: the CLI parse already refuses, but `runCampaign`
+    // is the choke point chat's `runDispatch` and any future caller go through, and a blank
+    // objective past this line becomes a nameless archive row plus an `UNSPECIFIED_BRIEF_EFFORT`
+    // Engineer with nothing to do. Fake binaries are supplied EVEN THOUGH the refusal fires
+    // before any adapter exists — with the guard regressed, this test dispatches, and it must
+    // dispatch a fake rather than a real model.
+    const repo = makeRepo('blank-objective');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('blank-objective', 'ok', ['pass']);
+    await assert.rejects(
+      campaign({
+        objective: ' \t ',
+        cwd: repo,
+        home,
+        requestedRung: 0,
+        claudeBin: bins.claudeBin,
+        codexBin: bins.codexBin,
+      }),
+      /objective is required/,
+    );
+    assert.equal(
+      fs.readdirSync(path.join(home, 'campaigns')).length,
+      0,
+      'a nameless campaign reached the archive',
+    );
+  });
+});
+
+// ===============================================================================================
+// 11. The soldier wall-clock ceiling reaches every adapter branch — claude included
+// ===============================================================================================
+
+describe('timeoutMs governs claude soldiers, not only codex', () => {
+  it('threads the ceiling, and its 30-minute default, onto all four factory branches', () => {
+    // The bug lived in the asymmetry: `timeoutMs` reached codex-with-an-injected-bin and died on
+    // the way to every claude branch and both no-bin defaults, so every claude Engineer inherited
+    // the adapter's silent 300s `closeGraceMs`.
+    const claudeInjected = soldierAdapterSettings({ claudeBin: '/tmp/fake-claude' }, 'claude');
+    assert.ok('claude' in claudeInjected);
+    assert.equal(claudeInjected.claude.bin, '/tmp/fake-claude');
+    assert.equal(claudeInjected.claude.closeGraceMs, DEFAULT_SOLDIER_TIMEOUT_MS);
+
+    // The production branch — no injected bin — is where the field failure actually lived.
+    const claudeDefault = soldierAdapterSettings({}, 'claude');
+    assert.ok('claude' in claudeDefault);
+    assert.equal(claudeDefault.claude.bin, undefined, 'a bin was invented for the default branch');
+    assert.equal(claudeDefault.claude.closeGraceMs, DEFAULT_SOLDIER_TIMEOUT_MS);
+
+    const claudeOverride = soldierAdapterSettings({ timeoutMs: 1234 }, 'claude');
+    assert.ok('claude' in claudeOverride && claudeOverride.claude.closeGraceMs === 1234);
+
+    const codexInjected = soldierAdapterSettings({ codexBin: '/tmp/fake-codex', timeoutMs: 1234 }, 'codex');
+    assert.ok('codex' in codexInjected);
+    assert.equal(codexInjected.codex.bin, '/tmp/fake-codex');
+    assert.equal(codexInjected.codex.timeoutMs, 1234);
+
+    const codexDefault = soldierAdapterSettings({}, 'codex');
+    assert.ok('codex' in codexDefault && codexDefault.codex.timeoutMs === DEFAULT_SOLDIER_TIMEOUT_MS);
+
+    // codex's own default scale, adopted, and it must keep fitting the measured worst case: the
+    // trial clocked a spec-less `xhigh` Engineer — what `UNSPECIFIED_BRIEF_EFFORT` dispatches —
+    // at 9m42s (582s). The old 300s wall GUARANTEED those campaigns died.
+    assert.equal(DEFAULT_SOLDIER_TIMEOUT_MS, 30 * 60_000);
+    assert.ok(DEFAULT_SOLDIER_TIMEOUT_MS >= 3 * 582_000, 'the default no longer fits the measured 9m42s worst case with headroom');
+  });
+
+  it('a claude Engineer still working at the ceiling is cut off — the ceiling is real', async () => {
+    // End-to-end through a real spawned process: a fake claude that needs 3s gets a 500ms
+    // ceiling. Before the fix the ceiling never reached the claude adapter, the fake finished at
+    // its leisure and this campaign DELIVERED — five minutes of silent grace, scaled down.
+    const repo = makeRepo('timeout-claude');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('timeout-claude', 'ok', ['pass']);
+    const slowBin = writeSlowClaude(mkTmp('slow-claude'), 3_000);
+
+    const result = await campaign({
+      objective: 'Add a multiply function',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: slowBin,
+      codexBin: bins.codexBin,
+      maxAttempts: 1,
+      timeoutMs: 500,
+    });
+
+    assert.equal(
+      result.attempts[0]?.engineerStatus,
+      'timeout',
+      `the soldier was not cut off at the ceiling:\n${renderCampaignResult(result)}`,
+    );
+    assert.equal(result.outcome, 'engineer-failed', renderCampaignResult(result));
+    assertReadableArchive(result);
+  });
+});
+
+/**
+ * A fake claude that takes `delayMs` to do the work — the scale a real Engineer works at, which
+ * is what the silent-ceiling bug needed to bite. Survives stdin closing mid-delay, the same
+ * pattern as chat's delayed fake: the runner closes the pipe right after the orders, so an
+ * exit-on-close fake would make the delay a way to die rather than a way to be slow.
+ */
+function writeSlowClaude(dir: string, delayMs: number): string {
+  const source = `#!/usr/bin/env node
+import { createInterface } from 'node:readline';
+import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const DELAY_MS = ${JSON.stringify(delayMs)};
+const argv = process.argv.slice(2);
+const i = argv.indexOf('--session-id');
+const sid = i === -1 ? '00000000-0000-4000-8000-000000000000' : argv[i + 1];
+const say = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+say({ type: 'system', subtype: 'init', session_id: sid, cwd: process.cwd(),
+      capabilities: ['interrupt_receipt_v1'] });
+let pending = 0;
+let closed = false;
+const maybeExit = () => { if (closed && pending === 0) process.exit(0); };
+const rl = createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (line.trim() === '') return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (msg.type !== 'user') return;
+  pending += 1;
+  const orders = msg.message?.content?.[0]?.text ?? '';
+  const m = /\`(army\\/[A-Za-z0-9._\\/-]+)\`/.exec(orders);
+  const branch = m === null ? 'army/unknown' : m[1];
+  setTimeout(() => {
+    const g = (...a) => execFileSync('git', a, { cwd: process.cwd(), stdio: 'pipe' });
+    let report;
+    try {
+      g('checkout', '-B', branch);
+      writeFileSync(join(process.cwd(), 'ENGINEER.md'), 'slow attempt pid ' + process.pid + '\\n');
+      g('add', '-A');
+      g('commit', '--quiet', '-m', 'army: slow attempt');
+      report = { status: 'done', summary: 'cut ' + branch + ' after a long think',
+                 findings: [], artifacts: [{ kind: 'branch', ref: branch, note: null }],
+                 branch, costUsd: null };
+    } catch (err) {
+      report = { status: 'failed', summary: 'git failed: ' + String(err.message).slice(0, 120),
+                 findings: [], artifacts: [], branch: null, costUsd: null };
+    }
+    const payload = JSON.stringify(report);
+    say({ type: 'assistant', session_id: sid, parent_tool_use_id: null,
+          message: { role: 'assistant', content: [{ type: 'text', text: payload }] } });
+    say({ type: 'result', subtype: 'success', is_error: false, terminal_reason: 'completed',
+          session_id: sid, duration_ms: DELAY_MS, total_cost_usd: 0.25, result: payload,
+          permission_denials: [], usage: { input_tokens: 1, output_tokens: 2 } });
+    pending -= 1;
+    maybeExit();
+  }, DELAY_MS);
+});
+rl.on('close', () => { closed = true; maybeExit(); });
+`;
+  return writeExecutable(path.join(dir, 'slow-claude.mjs'), source);
+}
+
+// ===============================================================================================
+// 12. A throw in the setup window cannot leave a phantom live campaign
+// ===============================================================================================
+
+describe('a setup throw settles the archive before it escapes', () => {
+  /** A driver that fails exactly one statement, the way the cleanup-path test above does. */
+  async function driverFailingOn(
+    pattern: RegExp,
+  ): Promise<NonNullable<CampaignOptions['dbFactory']>> {
+    const { openDb } = await import('../src/archive/db.ts');
+    return (file, options) => {
+      const db = openDb(file, options);
+      return {
+        exec: (sql: string) => db.exec(sql),
+        transaction: <T,>(fn: () => T): T => db.transaction(fn),
+        close: () => db.close(),
+        prepare: (sql: string) => {
+          if (pattern.test(sql)) throw new Error(`simulated driver failure on ${String(pattern)}`);
+          return db.prepare(sql);
+        },
+      };
+    };
+  }
+
+  it('a createTask that throws still closes campaign.json as aborted', async () => {
+    // Before the fix a throw between `createCampaign` and the main `try` exited with the archive
+    // OPEN and `campaign.json` frozen at `status: "active"` — `view` then showed a live campaign
+    // no process was fighting, forever.
+    const repo = makeRepo('setup-throw-task');
+    const home = makeHome({ [repo]: 0 });
+
+    await assert.rejects(
+      campaign({
+        objective: 'Add a multiply function',
+        cwd: repo,
+        home,
+        campaignId: 'setup-throw-task',
+        dbFactory: await driverFailingOn(/^INSERT INTO tasks/),
+      }),
+      // The ORIGINAL error — a cleanup that masks the cause with its own failure is the exact
+      // shape the guarded steps exist to prevent.
+      /simulated driver failure/,
+    );
+
+    const row = JSON.parse(
+      fs.readFileSync(path.join(home, 'campaigns', 'setup-throw-task', 'campaign.json'), 'utf8'),
+    ) as { status: string; ended_at: string | null };
+    assert.equal(row.status, 'aborted', 'campaign.json is frozen at active — a phantom live campaign');
+    assert.notEqual(row.ended_at, null, 'the campaign ended without an ended_at');
+  });
+
+  it('an appendSignal that throws also closes the task it had already opened', async () => {
+    const repo = makeRepo('setup-throw-signal');
+    const home = makeHome({ [repo]: 0 });
+    const root = path.join(home, 'campaigns', 'setup-throw-signal');
+
+    await assert.rejects(
+      campaign({
+        objective: 'Add a multiply function',
+        cwd: repo,
+        home,
+        campaignId: 'setup-throw-signal',
+        dbFactory: await driverFailingOn(/^INSERT INTO signals/),
+      }),
+      /simulated driver failure/,
+    );
+
+    const row = JSON.parse(fs.readFileSync(path.join(root, 'campaign.json'), 'utf8')) as {
+      status: string;
+    };
+    assert.equal(row.status, 'aborted');
+    // The task the window opened before the throw. `blocked`, matching the cleanup convention for
+    // outcome `aborted` — nothing ran, so `failed` would claim a fight that never happened. Last
+    // line for an id wins in tasks.jsonl.
+    const lines = fs
+      .readFileSync(path.join(root, 'tasks.jsonl'), 'utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '');
+    const task = JSON.parse(lines[lines.length - 1] as string) as { status: string };
+    assert.equal(task.status, 'blocked', 'the task is in_flight forever');
   });
 });

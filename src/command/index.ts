@@ -206,22 +206,29 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
   if (!args.help) {
     // Both of these are the FIRST thing a new user can get wrong, and both used to answer with a
     // diagnosis and no example. The shape of the thing being asked for is the fix.
-    //
-    // A spec carries its own objective (`spec.objective`), so `--spec` alone is a complete
-    // campaign with zero positional arguments — the "objective is required" refusal only fires
-    // when there is neither a positional objective nor a spec to take one from.
-    if (positional.length === 0 && args.specPath === undefined) {
-      throw new UsageError(
-        `an objective is required, e.g. ${invokedAs()} campaign "add a multiply function to calc.js"`,
-      );
-    }
     if (positional.length > 1) {
       throw new UsageError(
         `expected one objective, got ${String(positional.length)}. Quote it: ` +
           `${invokedAs()} campaign "…"`,
       );
     }
-    if (positional.length === 1) args.objective = positional[0] as string;
+    // A spec carries its own objective (`spec.objective`), so `--spec` alone is a complete
+    // campaign with zero positional arguments — the "objective is required" refusal only fires
+    // when there is neither a positional objective nor a spec to take one from.
+    //
+    // WHITESPACE-ONLY IS MISSING. `army campaign ""` used to sail past this check — `""` is a
+    // positional — and the cost was not cosmetic: a nameless row in the archive, and no objective
+    // means no spec, so the Engineer was dispatched at `UNSPECIFIED_BRIEF_EFFORT`, the most
+    // expensive possible way to do nothing. Same refusal, same message, same exit code as no
+    // argument at all; with `--spec` a blank positional is simply dropped, exactly as an absent
+    // one is, and the spec's own objective carries the campaign.
+    const objective = positional[0];
+    if ((objective === undefined || objective.trim() === '') && args.specPath === undefined) {
+      throw new UsageError(
+        `an objective is required, e.g. ${invokedAs()} campaign "add a multiply function to calc.js"`,
+      );
+    }
+    if (objective !== undefined && objective.trim() !== '') args.objective = objective;
   }
   return args;
 }
@@ -466,9 +473,16 @@ export async function campaignCommand(
     try {
       raw = fs.readFileSync(args.specPath, 'utf8');
     } catch (error) {
+      // ENOENT gets its own sentence: the raw errno text ("ENOENT: no such file or directory,
+      // open '…'") is a syscall's account of the problem, and every other refusal on this path
+      // speaks in the command's own voice. Anything else (permissions, a directory) keeps the
+      // system message — there the errno detail IS the diagnosis.
+      const missing = (error as NodeJS.ErrnoException).code === 'ENOENT';
       stderr.write(
-        `${self} campaign: could not read --spec ${args.specPath}: ` +
-          `${error instanceof Error ? error.message : String(error)}\n`,
+        missing
+          ? `${self} campaign: no such file: ${args.specPath}\n`
+          : `${self} campaign: could not read --spec ${args.specPath}: ` +
+              `${error instanceof Error ? error.message : String(error)}\n`,
       );
       return 1;
     }

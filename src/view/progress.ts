@@ -357,8 +357,23 @@ export function createProgressSink(options: ProgressSinkOptions): ProgressSink {
       const seconds = Math.max(0, Math.round((now() - startedAt) / 1000));
       const mark = frames[frame % frames.length] as string;
       frame += 1;
-      painted = true;
-      options.stream.write(`${CLEAR_LINE}${INDENT}${mark} ${label} ${String(seconds)}s`);
+      try {
+        options.stream.write(`${CLEAR_LINE}${INDENT}${mark} ${label} ${String(seconds)}s`);
+        // Only after the write LANDED: `painted` is a promise that there is a frame on screen to
+        // erase, and `stopTicker` honours it with another write to the same stream.
+        painted = true;
+      } catch {
+        // A dead TTY must not turn a narration frame into an uncaught exception — every other
+        // emission here is reached through a caller's guard (`runCampaign`'s `progress`, chat's
+        // `guardedProgress`), but a timer callback has no caller to catch it, and this one fires
+        // while a campaign may be holding a worktree lease. Cleared directly rather than via
+        // `stopTicker`, which would write the line-erase to the stream that just refused a write.
+        if (handle !== null) {
+          timers.clear(handle);
+          handle = null;
+        }
+        painted = false;
+      }
     }, tickMs);
   };
 

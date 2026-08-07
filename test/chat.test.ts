@@ -3342,3 +3342,76 @@ describe('behaviour 14: setBusy/setIdle bracket every commander turn', () => {
     );
   });
 });
+
+// ===============================================================================================
+// 16. A setup throw cannot leave a phantom live session
+// ===============================================================================================
+
+describe('a throw before the first turn settles the archive', () => {
+  // Before the fix, everything between `createCampaign` and the main `try` was unprotected: a
+  // throw exited `runChat` with the archive OPEN, `campaign.json` frozen at `status: "active"`
+  // and the task `in_flight` forever — `army view` then listed a live session no process was
+  // running. The main `finally` cannot cover that window; the window has to settle itself.
+
+  function readState(home: string): { campaign: string; task: string } {
+    const root = path.join(home, 'campaigns', 'chat-under-test');
+    const campaign = (
+      JSON.parse(fs.readFileSync(path.join(root, 'campaign.json'), 'utf8')) as { status: string }
+    ).status;
+    const lines = fs
+      .readFileSync(path.join(root, 'tasks.jsonl'), 'utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '');
+    // Last line for an id wins — tasks.jsonl is an append-only journal.
+    const task = (JSON.parse(lines[lines.length - 1] as string) as { status: string }).status;
+    return { campaign, task };
+  }
+
+  it('an archive write that throws during setup closes campaign.json as aborted', async () => {
+    const rig = makeRig('setup-throw', ['at your orders.']);
+    const { openDb } = await import('../src/archive/db.ts');
+    const failingDriver: NonNullable<ChatOptions['dbFactory']> = (file, options) => {
+      const db = openDb(file, options);
+      return {
+        exec: (sql: string) => db.exec(sql),
+        transaction: <T,>(fn: () => T): T => db.transaction(fn),
+        close: () => db.close(),
+        prepare: (sql: string) => {
+          // The first signal of the session is the `chat opened` order — by then the task
+          // exists, so BOTH cleanup obligations are exercised.
+          if (/^INSERT INTO signals/.test(sql)) {
+            throw new Error('simulated driver failure on the signal insert');
+          }
+          return db.prepare(sql);
+        },
+      };
+    };
+
+    // The ORIGINAL error reaches the caller — a cleanup step that fails must not replace it.
+    await assert.rejects(
+      chat(rig, createScriptedIo([]), { dbFactory: failingDriver }),
+      /simulated driver failure/,
+    );
+
+    const state = readState(rig.home);
+    assert.equal(state.campaign, 'aborted', 'campaign.json is frozen at active — a phantom live session');
+    // `blocked`, matching runCampaign's convention for a run that ended before anything ran —
+    // `failed` would claim a conversation that never happened, `done` one that finished.
+    assert.equal(state.task, 'blocked', 'the conversation task is in_flight forever');
+  });
+
+  it('a banner write to a dead pipe settles the archive before the EPIPE escapes', async () => {
+    // `army chat < script | head` is enough to close the pipe before the banner lands. The
+    // session cannot continue — its terminal is gone — but the archive must not stay `active`.
+    const rig = makeRig('setup-epipe', ['at your orders.']);
+    const swallowed: string[] = [];
+    const io = epipeOn(createScriptedIo([]), /COL·COMMANDER/, swallowed);
+
+    await assert.rejects(chat(rig, io), /EPIPE/);
+    assert.equal(swallowed.length, 1, 'the banner never reached the dead pipe scenario');
+
+    const state = readState(rig.home);
+    assert.equal(state.campaign, 'aborted', 'campaign.json is frozen at active — a phantom live session');
+    assert.equal(state.task, 'blocked', 'the conversation task is in_flight forever');
+  });
+});

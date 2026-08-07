@@ -69,7 +69,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import type { CampaignStatus } from '../contracts/archive.ts';
+import type { CampaignStatus, TaskRow } from '../contracts/archive.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import { RUNG_LABEL } from '../contracts/delivery.ts';
 import type {
@@ -124,8 +124,9 @@ import type {
 import { RungNotImplementedError, projectCeiling, runLadder } from '../delivery/ladder.ts';
 import { runAcceptanceGate } from '../verify/index.ts';
 import { createClaudeAdapter } from '../harness/claude.ts';
+import type { ClaudeAdapterOptions } from '../harness/claude.ts';
 import { createCodexAdapter, isCodexSoldier } from '../harness/codex.ts';
-import { getAdapter } from '../harness/index.ts';
+import type { CodexAdapterOptions } from '../harness/codex.ts';
 import { installHint, invokedAs } from '../setup/checks.ts';
 import { autoInitRepo, decideAutoInit, mainRootFromCommonDir } from '../setup/enlist.ts';
 import type { Fix } from '../setup/fixes.ts';
@@ -422,7 +423,8 @@ export interface CampaignOptions {
   stdout?: WriteStream;
   stderr?: WriteStream;
   now?: () => string;
-  /** Per-soldier wall-clock ceiling. */
+  /** Per-soldier wall-clock ceiling. Defaults to `DEFAULT_SOLDIER_TIMEOUT_MS`, on EVERY branch
+   *  of `adapterFor` — see that constant for the field failure a claude-only gap caused. */
   timeoutMs?: number;
   /**
    * Narration, as it happens.
@@ -941,6 +943,19 @@ export function behaviourCoverage(
 // ---------------------------------------------------------------------------------------------
 
 export async function runCampaign(options: CampaignOptions): Promise<CampaignResult> {
+  // The command layer refuses a blank objective at parse time; this is the same refusal for every
+  // OTHER route in — programmatic callers most of all. Field-reproduced: `army campaign ""`
+  // slipped past the missing-objective check (it counts positionals, and `""` is one), archived a
+  // campaign with no title, and — because no objective means no spec — escalated the Engineer to
+  // `UNSPECIFIED_BRIEF_EFFORT`, the most expensive possible way to do nothing. Refused HERE,
+  // before the archive exists, because there is no campaign to hang a note on: same class as the
+  // not-a-git-repository refusal below, thrown with its own `fix`.
+  if (options.objective.trim() === '') {
+    throw new CampaignSetupError(
+      'an objective is required — the one given is empty or whitespace-only',
+      doThis(`pass a real objective: ${invokedAs()} campaign "add a multiply function to calc.js"`),
+    );
+  }
   const env: Env = options.env ?? process.env;
   const cwd = path.resolve(options.cwd ?? process.cwd());
   const home = options.home ?? armyHome(env);
@@ -1051,8 +1066,22 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
    * `AgentIdInUseError` carries the id, the campaign and the time the first attempt started, and
    * `src/command/index.ts` and `src/command/chat.ts` both key on that type for the `fix:` line, so
    * the reader loses nothing by the diagnosis moving.
+   *
+   * On refusal the archive handle is CLOSED — it used to leak — but the campaign's status is left
+   * exactly as found: a collision here means the record belongs to some other run (finished, or
+   * crashed mid-flight, or live right now under the same `--id`), and a run that wrote nothing has
+   * no standing to end it. `close()` writes no rows, so the record stays byte-identical.
    */
-  archive.assertAgentIdAvailable(agentIdFor(1));
+  try {
+    archive.assertAgentIdAvailable(agentIdFor(1));
+  } catch (error) {
+    try {
+      archive.close();
+    } catch {
+      /* the refusal is the report; closing is hygiene */
+    }
+    throw error;
+  }
 
   /**
    * Whether THIS run is the one entitled to write this campaign's terminal status.
@@ -1082,25 +1111,64 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
    */
   const settledBeforeThisRun = archive.getCampaign().status !== 'active';
 
-  const task = archive.createTask({ title: options.objective, status: 'in_flight' });
+  // ---- the setup window ------------------------------------------------------------------
+  //
+  // Everything between the archive opening and the main `try` used to be unprotected: a throw
+  // from `createTask` or `appendSignal` exited `runCampaign` with the archive OPEN, `campaign.json`
+  // frozen at `status: "active"` and the task `in_flight` forever — `view` then showed a phantom
+  // live campaign nobody could end. The main `finally` cannot cover this window (it needs `task`
+  // to exist), so the window closes itself: on a throw the campaign is marked and the archive
+  // closed, then the original error is rethrown for the command layer to report.
+  //
+  // `aborted`, not `failed`, by the campaign's own convention: the cleanup `finally` below maps
+  // outcome `aborted` — nothing was dispatched — to status `aborted` and the task to `blocked`;
+  // `failed` claims soldiers ran and lost, which would be a lie here.
+  const task = ((): TaskRow => {
+    let created: TaskRow | null = null;
+    try {
+      created = archive.createTask({ title: options.objective, status: 'in_flight' });
+      archive.appendSignal({
+        fromAgent: GENERAL_AGENT_ID,
+        toSelector: 'chain',
+        kind: 'broadcast',
+        body: cap(`campaign opened: ${options.objective}`),
+      });
+      opened = true;
+      progress({ kind: 'campaign-opened', campaignId, title: options.objective });
+      for (const warning of loaded.warnings) {
+        archive.appendSignal({
+          fromAgent: GENERAL_AGENT_ID,
+          kind: 'status',
+          body: cap(`config: ${warning}`),
+        });
+      }
+      return created;
+    } catch (error) {
+      // Per-step guards, same rule as the main cleanup: a cleanup failure must not replace the
+      // error the caller is owed. The status write keys on what the archive says NOW rather than
+      // on `settledBeforeThisRun` alone, so a campaign another run already closed keeps its
+      // record — same property the main `finally` protects.
+      const guard = (fn: () => void): void => {
+        try {
+          fn();
+        } catch {
+          /* the setup error is the report; cleanup must not mask it */
+        }
+      };
+      guard(() => {
+        if (created !== null && archive.getTask(created.id)?.status === 'in_flight') {
+          archive.updateTask(created.id, { status: 'blocked' });
+        }
+      });
+      guard(() => {
+        if (archive.getCampaign().status === 'active') archive.setCampaignStatus('aborted');
+      });
+      guard(() => archive.close());
+      throw error;
+    }
+  })();
   const branch = armyBranch(task.id);
   const orders: OriginalOrders = { objective: options.objective, project, taskId: task.id };
-
-  archive.appendSignal({
-    fromAgent: GENERAL_AGENT_ID,
-    toSelector: 'chain',
-    kind: 'broadcast',
-    body: cap(`campaign opened: ${options.objective}`),
-  });
-  opened = true;
-  progress({ kind: 'campaign-opened', campaignId, title: options.objective });
-  for (const warning of loaded.warnings) {
-    archive.appendSignal({
-      fromAgent: GENERAL_AGENT_ID,
-      kind: 'status',
-      body: cap(`config: ${warning}`),
-    });
-  }
 
   // Mutable campaign state, so the `finally` block can settle the lease whatever happened.
   let lease: Lease | null = null;
@@ -2624,18 +2692,66 @@ export function dispatchFor(
   return target;
 }
 
+/**
+ * Wall-clock ceiling for one campaign soldier when the caller sets no `timeoutMs`.
+ *
+ * The claude adapter's own `closeGraceMs` default is 300s — a fine backstop for the short
+ * sessions it was written for, and a silent hard wall for a campaign Engineer: `timeoutMs` was
+ * only ever forwarded to codex, so every claude soldier still working at 300s was SIGTERMed
+ * mid-task, burned an attempt, and ended the campaign `engineer-failed` with nothing to review.
+ * The repo's own trial data (`TrialSpec.armTimeoutMs` in `src/contracts/trial.ts`) measured a
+ * spec-less `xhigh` Engineer — the exact configuration `UNSPECIFIED_BRIEF_EFFORT` dispatches —
+ * at 9m42s, so the 300s default GUARANTEED those campaigns died.
+ *
+ * 30 minutes is codex's own `CODEX_DEFAULTS.timeoutMs`, adopted rather than invented: it fits
+ * the measured 9m42s worst case three times over, and one scale for both harnesses means an
+ * Engineer's budget does not depend on which vendor the dispatch table picked. Threaded from
+ * HERE, not changed in the adapters, whose defaults other consumers (chat's commander session,
+ * the trial runner) still rely on.
+ */
+export const DEFAULT_SOLDIER_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * The options `adapterFor` hands the harness factory — every branch, one place.
+ *
+ * Split out and exported for the unit test that pins the ceiling onto ALL FOUR branches
+ * (claude/codex, injected bin or not) without spawning anything. The bug this answers lived in
+ * exactly the gap a spawning test cannot cover cheaply: `timeoutMs` reached codex-with-a-bin and
+ * silently died on the way to every claude branch and the no-bin defaults.
+ */
+export function soldierAdapterSettings(
+  options: Pick<CampaignOptions, 'timeoutMs' | 'claudeBin' | 'codexBin'>,
+  harness: HarnessId,
+): { claude: ClaudeAdapterOptions } | { codex: CodexAdapterOptions } {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SOLDIER_TIMEOUT_MS;
+  if (harness === 'claude') {
+    // `closeGraceMs` is the claude spelling of a work ceiling: `runSoldier` closes stdin right
+    // after the orders, so the grace-before-SIGTERM window IS the soldier's whole working time.
+    return {
+      claude: {
+        ...(options.claudeBin === undefined ? {} : { bin: options.claudeBin }),
+        closeGraceMs: timeoutMs,
+      },
+    };
+  }
+  return {
+    codex: {
+      ...(options.codexBin === undefined ? {} : { bin: options.codexBin }),
+      timeoutMs,
+    },
+  };
+}
+
 function adapterFor(options: CampaignOptions, harness: HarnessId): HarnessAdapter {
   const injected = options.adapters?.[harness];
   if (injected !== undefined) return injected;
-  if (harness === 'claude' && options.claudeBin !== undefined) {
-    return createClaudeAdapter({ bin: options.claudeBin });
-  }
-  if (harness === 'codex' && options.codexBin !== undefined) {
-    const codexOptions: { bin: string; timeoutMs?: number } = { bin: options.codexBin };
-    if (options.timeoutMs !== undefined) codexOptions.timeoutMs = options.timeoutMs;
-    return createCodexAdapter(codexOptions);
-  }
-  return getAdapter(harness);
+  // Built per campaign rather than read from the adapter registry: the registry entries carry
+  // the adapters' own defaults, and the campaign's soldier ceiling must ride along on every
+  // branch. `ARMY_CLAUDE_BIN` / `ARMY_CODEX_BIN` are still honoured — the factories read them.
+  const settings = soldierAdapterSettings(options, harness);
+  return 'claude' in settings
+    ? createClaudeAdapter(settings.claude)
+    : createCodexAdapter(settings.codex);
 }
 
 /**

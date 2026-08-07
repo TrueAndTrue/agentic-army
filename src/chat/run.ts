@@ -74,7 +74,8 @@ import { armyHome } from '../config/paths.ts';
 import type { Env } from '../config/paths.ts';
 import { RUNG_LABEL, effectiveRung } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
-import type { HarnessAdapter, HarnessId, SoldierEvent } from '../contracts/harness.ts';
+import type { TaskRow } from '../contracts/archive.ts';
+import type { HarnessAdapter, HarnessId, SoldierEvent, SoldierSpec } from '../contracts/harness.ts';
 import { codePointLength } from '../contracts/report.ts';
 import { renderTechnicalSpec } from '../contracts/spec.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
@@ -324,57 +325,100 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     project,
     title: `chat in ${path.basename(project)}`,
   });
-  // Before the first append, for the reason spelled out at the same call in `runCampaign`: a
-  // session refused for colliding on `col-01` used to open a task and append signals into somebody
-  // else's conversation first, and `tasks.jsonl` and `signals.jsonl` are append-only, so those rows
-  // stayed. `chatCommand` renders the `fix:` line off the thrown type.
-  archive.assertAgentIdAvailable(COMMANDER_AGENT_ID);
-
-  const task = archive.createTask({ title: 'the conversation', status: 'in_flight' });
-
   const standingOrders = renderStandingOrders({ project, ceiling, requestedRung, maxAttempts });
 
-  // The same choke point every campaign worker goes through. `assertGlobalDenyIntact` and
-  // `assertCommanderLoadout` both run in here, so a commander with a widened loadout does not
-  // start — it throws, before a process exists.
-  const spec = buildSoldierSpec({
-    agentId: COMMANDER_AGENT_ID,
-    rank: 'COLONEL',
-    role: 'COMMANDER',
-    harness: 'claude',
-    ...(options.model === undefined ? {} : { model: options.model }),
-    cwd: project,
-    orders: standingOrders,
-    home,
-  });
+  // ---- the setup window --------------------------------------------------------------------
+  //
+  // Everything between the archive opening and the main `try` used to be unprotected: a throw
+  // from any call in here — the `col-01` collision, a refused commander loadout, a banner write
+  // to a pipe whose reader is gone — exited `runChat` with the archive OPEN, `campaign.json`
+  // frozen at `status: "active"` and the task `in_flight` forever, so `view` showed a phantom
+  // live session. The main `finally` cannot cover this window (it needs `task` and `session` to
+  // exist), so the window closes itself and rethrows for `chatCommand` to report.
+  //
+  // Status `aborted`, not `done` (what the finally writes) and not `failed`: nothing was ever
+  // said, and `runCampaign`'s own setup convention for "ended before anything ran" is `aborted`,
+  // with the task `blocked`. The status write keys on the archive still saying `active`, so a
+  // collision with a campaign some other run already settled leaves that run's record untouched.
+  const { task, spec } = ((): { task: TaskRow; spec: SoldierSpec } => {
+    let created: TaskRow | null = null;
+    try {
+      // Before the first append, for the reason spelled out at the same call in `runCampaign`: a
+      // session refused for colliding on `col-01` used to open a task and append signals into
+      // somebody else's conversation first, and `tasks.jsonl` and `signals.jsonl` are
+      // append-only, so those rows stayed. `chatCommand` renders the `fix:` line off the type.
+      archive.assertAgentIdAvailable(COMMANDER_AGENT_ID);
 
-  archive.recordAgentAttempt({
-    id: COMMANDER_AGENT_ID,
-    taskId: task.id,
-    parentAgentId: null,
-    rank: 'COLONEL',
-    role: 'COMMANDER',
-    harness: 'claude',
-    model: spec.model ?? null,
-    effort: spec.effort ?? null,
-    sessionId: spec.sessionId,
-    depth: 1,
-    status: 'running',
-    worktreePath: null,
-    leaseId: null,
-    orders: standingOrders,
-    attempt: 1,
-  });
-  archive.appendSignal({
-    fromAgent: GENERAL_AGENT_ID,
-    toAgent: COMMANDER_AGENT_ID,
-    kind: 'order',
-    body: cap(`chat opened in ${project}`),
-    artifact: `agents/${COMMANDER_AGENT_ID}/orders.md`,
-  });
-  for (const warning of loaded.warnings) {
-    archive.appendSignal({ fromAgent: GENERAL_AGENT_ID, kind: 'status', body: cap(`config: ${warning}`) });
-  }
+      created = archive.createTask({ title: 'the conversation', status: 'in_flight' });
+
+      // The same choke point every campaign worker goes through. `assertGlobalDenyIntact` and
+      // `assertCommanderLoadout` both run in here, so a commander with a widened loadout does
+      // not start — it throws, before a process exists.
+      const commanderSpec = buildSoldierSpec({
+        agentId: COMMANDER_AGENT_ID,
+        rank: 'COLONEL',
+        role: 'COMMANDER',
+        harness: 'claude',
+        ...(options.model === undefined ? {} : { model: options.model }),
+        cwd: project,
+        orders: standingOrders,
+        home,
+      });
+
+      archive.recordAgentAttempt({
+        id: COMMANDER_AGENT_ID,
+        taskId: created.id,
+        parentAgentId: null,
+        rank: 'COLONEL',
+        role: 'COMMANDER',
+        harness: 'claude',
+        model: commanderSpec.model ?? null,
+        effort: commanderSpec.effort ?? null,
+        sessionId: commanderSpec.sessionId,
+        depth: 1,
+        status: 'running',
+        worktreePath: null,
+        leaseId: null,
+        orders: standingOrders,
+        attempt: 1,
+      });
+      archive.appendSignal({
+        fromAgent: GENERAL_AGENT_ID,
+        toAgent: COMMANDER_AGENT_ID,
+        kind: 'order',
+        body: cap(`chat opened in ${project}`),
+        artifact: `agents/${COMMANDER_AGENT_ID}/orders.md`,
+      });
+      for (const warning of loaded.warnings) {
+        archive.appendSignal({ fromAgent: GENERAL_AGENT_ID, kind: 'status', body: cap(`config: ${warning}`) });
+      }
+      // Inside the window on purpose: this is the first write to the human's terminal, EPIPE is
+      // one `army chat < script | head` away, and a banner that cannot land must not strand the
+      // rows above as a live session. Nothing else prints between here and the old call site.
+      io.write(chatBanner(self, project, ceiling, requestedRung));
+      return { task: created, spec: commanderSpec };
+    } catch (error) {
+      // Per-step guards, the same rule as the closing `finally`: a cleanup failure must not
+      // replace the error the caller is owed.
+      const guard = (fn: () => void): void => {
+        try {
+          fn();
+        } catch {
+          /* the setup error is the report; cleanup must not mask it */
+        }
+      };
+      guard(() => {
+        if (created !== null && archive.getTask(created.id)?.status === 'in_flight') {
+          archive.updateTask(created.id, { status: 'blocked' });
+        }
+      });
+      guard(() => {
+        if (archive.getCampaign().status === 'active') archive.setCampaignStatus('aborted');
+      });
+      guard(() => archive.close());
+      throw error;
+    }
+  })();
 
   /**
    * The commander streams at TOKEN level. This is the one caller in the tree that opts in.
@@ -556,8 +600,6 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       io.write(`\n  ⚠ ${refusal}\n`);
     }
   };
-
-  io.write(chatBanner(self, project, ceiling, requestedRung));
 
   try {
     await session.open();
