@@ -165,10 +165,18 @@ OPTIONS
 army enlist — register the current repository
 
 USAGE
-  ${self} enlist [--ceiling 0|1|2|3]
+  ${self} enlist [--ceiling 0|1|2|3] [--no-init]
 
   Records the repository's absolute path and its delivery ceiling in the GLOBAL
   config at ~/.agentic-army/config.toml. Nothing is written into the repo.
+
+OPTIONS
+  --ceiling <0|1|2|3>  Delivery ceiling to record for this repository — the
+                       ladder below. Raising needs a real terminal; lowering
+                       never does.
+  --no-init            Outside a repository, refuse instead of running the
+                       auto-init: git init plus one empty commit, never in your
+                       home directory or a filesystem root.
 
 THE DELIVERY LADDER
   0  commit         Durable in the army mirror. Your repo is untouched. Default.

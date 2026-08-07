@@ -245,6 +245,25 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * A spec file that could not be read, as a sentence rather than a raw errno.
+ *
+ * `ENOENT: no such file or directory, open '…'` is a debugging artefact, and this is the CLI's
+ * most typo-prone argument — the reader's mistake is the path, so the message leads with it. The
+ * two codes a typo actually produces get their own sentences; anything rarer keeps the OS's own
+ * words with the errno prefix and the `, open '…'` tail stripped, since the path is already in
+ * the sentence.
+ */
+function describeSpecReadFailure(file: string, error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'ENOENT') return `no such file: ${file}`;
+  if (code === 'EISDIR') return `${file} is a directory, not a spec file`;
+  const sentence = errorMessage(error)
+    .replace(/^[A-Z][A-Z0-9]+: /, '')
+    .replace(/, (?:open|read) '.*'$/, '');
+  return `cannot read ${file}: ${sentence}`;
+}
+
 export async function trialCommand(
   argv: readonly string[],
   deps: TrialCommandDeps = {},
@@ -261,9 +280,18 @@ export async function trialCommand(
     return 1;
   }
 
+  // Read and parse are caught separately: a parse error's message is the parser's own sentence
+  // and stays verbatim, while a read failure used to escape as a raw errno (F9).
+  let text: string;
+  try {
+    text = await fs.readFile(args.specPath, 'utf8');
+  } catch (error) {
+    stderr.write(`${self} trial: ${describeSpecReadFailure(args.specPath, error)}\n`);
+    return 1;
+  }
+
   let spec: TrialSpec;
   try {
-    const text = await fs.readFile(args.specPath, 'utf8');
     const parsed = parseTrialSpec(text, args.specPath, args.outDir);
     for (const warning of parsed.warnings) stderr.write(`${self} trial: warning: ${warning}\n`);
     spec = args.mode === undefined ? parsed.spec : { ...parsed.spec, mode: args.mode };

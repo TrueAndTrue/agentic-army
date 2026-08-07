@@ -43,6 +43,7 @@ import {
   classifyApiKey,
   classifyClaude,
   classifyCodex,
+  classifyConfig,
   classifyGh,
   classifyGit,
   classifyHome,
@@ -56,6 +57,7 @@ import {
   invokedAs,
   exitCodeFor,
   formatVersion,
+  inspectConfig,
   inspectLegacyWorktreePool,
   inspectWritableDir,
   installHint,
@@ -71,7 +73,7 @@ import {
 } from '../src/setup/checks.ts';
 
 import { parseDoctorArgs, wrap } from '../src/setup/doctor.ts';
-import { PROTECTED_CONFIG_GLOBS, defaultConfigToml, protectedConfigGlobs } from '../src/setup/init.ts';
+import { PROTECTED_CONFIG_GLOBS, defaultConfigToml, parseInitArgs, protectedConfigGlobs } from '../src/setup/init.ts';
 import { DEFAULT_CEILING, parseCeiling, parseEnlistArgs, type Rung } from '../src/setup/enlist.ts';
 
 /**
@@ -290,17 +292,122 @@ describe('classifyCodex', () => {
     assert.equal(r.version, '0.142.5');
     assert.match(r.found, /Logged in using ChatGPT/);
   });
-  it('degrades when present but not logged in', () => {
+  it('degrades when codex itself SAID not logged in', () => {
     const r = classifyCodex(
       versionProbe('codex-cli 0.142.5'),
       stubProbe({ found: true, code: 1, stdout: 'Not logged in' }),
     );
     assert.equal(r.outcome, 'degraded');
+    assert.match(r.found, /not logged in/i);
     assert.match(r.note ?? '', /codex login/);
   });
-  it('stays ok when login status could not be determined', () => {
+  it('stays ok when there was no login probe to read', () => {
     assert.equal(classifyCodex(versionProbe('codex-cli 0.142.5'), null).outcome, 'ok');
-    assert.equal(classifyCodex(versionProbe('codex-cli 0.142.5'), timedOut()).outcome, 'ok');
+  });
+
+  // The flap seen in the field (F12): `codex login status` failing for a reason that is not
+  // "you are logged out" — a timeout on a slow machine, a fork that transiently failed under
+  // load, a kill signal — was reported with the same words as a genuine logged-out session, so
+  // the check flip-flopped while nothing about the machine's auth changed. A probe that did not
+  // answer must say "could not determine", never "not logged in".
+  it('a timed-out login probe is reported as a timeout, never as logged out', () => {
+    const r = classifyCodex(versionProbe('codex-cli 0.142.5'), timedOut());
+    assert.equal(r.outcome, 'degraded');
+    assert.match(r.found, /timed out/);
+    assert.doesNotMatch(r.found, /not logged in/i);
+    assert.match(r.impact ?? '', /uncertain|unknown|could not/i);
+  });
+  it('a login probe killed by a signal is "could not determine", never "not logged in"', () => {
+    const killed = stubProbe({ found: true, code: null, error: 'terminated by SIGKILL' });
+    const r = classifyCodex(versionProbe('codex-cli 0.142.5'), killed);
+    assert.equal(r.outcome, 'degraded');
+    assert.doesNotMatch(r.found, /not logged in/i);
+    assert.match(r.found, /could not be determined/);
+  });
+  it('a non-zero exit that never said "not logged in" is not read as one', () => {
+    const flaky = stubProbe({ found: true, code: 1, stderr: 'error: unexpected end of stream' });
+    const r = classifyCodex(versionProbe('codex-cli 0.142.5'), flaky);
+    assert.equal(r.outcome, 'degraded');
+    assert.doesNotMatch(r.found, /not logged in/i);
+    assert.match(r.found, /could not be determined/);
+    // The honest next step is asking codex directly, not `codex login` — nothing here proved
+    // the session is gone.
+    assert.match(r.note ?? '', /codex login status/);
+  });
+});
+
+describe('classifyConfig', () => {
+  it('is ok when the config does not exist yet — that is the pre-init state', () => {
+    const r = classifyConfig({ file: '/x/.army/config.toml', present: false, error: null });
+    assert.equal(r.outcome, 'ok');
+    assert.match(r.found, /absent/);
+    assert.match(r.note ?? '', /init/);
+  });
+  it('is ok when the config parses', () => {
+    const r = classifyConfig({ file: '/x/.army/config.toml', present: true, error: null });
+    assert.equal(r.outcome, 'ok');
+  });
+  it('BLOCKS on a config that does not parse, with the shared fix-by-hand text', () => {
+    const r = classifyConfig({
+      file: '/x/.army/config.toml',
+      present: true,
+      error:
+        '/x/.army/config.toml is not valid TOML: Invalid TOML document: invalid comment character\n\n' +
+        '1:  GARBAGE not toml %% [[[\n' +
+        'Fix the file by hand.',
+    });
+    assert.equal(r.outcome, 'blocking');
+    // The first line of the parse error is the diagnosis; the caret junk stays in --json only.
+    assert.match(r.found, /not valid TOML/);
+    assert.ok(!r.found.includes('\n'), 'found must be a single line');
+    assert.match(r.fix ?? '', /Fix the file by hand/);
+  });
+  it('BLOCKS on a config that exists but cannot be read', () => {
+    const r = classifyConfig({
+      file: '/x/.army/config.toml',
+      present: true,
+      error: 'cannot read /x/.army/config.toml: EACCES: permission denied',
+    });
+    assert.equal(r.outcome, 'blocking');
+    assert.match(r.found, /cannot read/);
+  });
+
+  it('inspectConfig reads the real states off a real directory', async () => {
+    const home = scratchHome('config-inspect');
+    assert.equal((await inspectConfig(home)).present, false);
+    fs.writeFileSync(nodePath.join(home, 'config.toml'), defaultConfigToml(), 'utf8');
+    assert.deepEqual(await inspectConfig(home), {
+      file: nodePath.join(home, 'config.toml'),
+      present: true,
+      error: null,
+    });
+    fs.writeFileSync(nodePath.join(home, 'config.toml'), 'GARBAGE not toml %% [[[', 'utf8');
+    const corrupt = await inspectConfig(home);
+    assert.equal(corrupt.present, true);
+    assert.match(corrupt.error ?? '', /not valid TOML/);
+  });
+
+  // The field reproduction of F4: a config `enlist` and `campaign` both refuse to run against
+  // was green-lit by the one command whose help calls itself "the first thing to run when
+  // anything looks wrong".
+  it('runChecks reports a corrupt config as blocking, and the report exits 1', async () => {
+    const { runChecks } = await import('../src/setup/checks.ts');
+    const home = scratchHome('config-corrupt');
+    fs.writeFileSync(nodePath.join(home, 'config.toml'), 'GARBAGE not toml %% [[[', 'utf8');
+    const report = await runChecks(2000, home);
+    const check = report.checks.find((c) => c.id === 'config');
+    assert.ok(check !== undefined, 'doctor has no config check');
+    assert.equal(check.outcome, 'blocking');
+    assert.equal(report.ok, false, 'a corrupt config still reported Ready');
+  });
+
+  it('runChecks stays quiet about a config that merely does not exist yet', async () => {
+    const { runChecks } = await import('../src/setup/checks.ts');
+    const home = scratchHome('config-absent');
+    const report = await runChecks(2000, home);
+    const check = report.checks.find((c) => c.id === 'config');
+    assert.ok(check !== undefined);
+    assert.equal(check.outcome, 'ok');
   });
 });
 
@@ -683,6 +790,12 @@ describe('outcome contract', () => {
     classifyApiKey('sk-ant-whatever-1234'),
     classifyCodex(absent(), null),
     classifyCodex(versionProbe('codex-cli 0.142.5'), versionProbe('Logged in')),
+    classifyCodex(versionProbe('codex-cli 0.142.5'), timedOut()),
+    classifyCodex(versionProbe('codex-cli 0.142.5'), stubProbe({ found: true, code: 1, stdout: 'Not logged in' })),
+    classifyCodex(versionProbe('codex-cli 0.142.5'), stubProbe({ found: true, code: null, error: 'terminated by SIGKILL' })),
+    classifyConfig({ file: '/x/config.toml', present: false, error: null }),
+    classifyConfig({ file: '/x/config.toml', present: true, error: null }),
+    classifyConfig({ file: '/x/config.toml', present: true, error: '/x/config.toml is not valid TOML: bad' }),
     classifyGh(absent(), null),
     classifyGh(versionProbe('gh version 2.96.0'), stubProbe({ found: true, code: 0 })),
     classifyHome({ dir: '/x', exists: false, writable: false, creatable: false, error: null }),
@@ -832,16 +945,53 @@ describe('installHint', () => {
 
 describe('doctor arg parsing', () => {
   it('defaults to human output', () => {
-    assert.deepEqual(parseDoctorArgs([]), { json: false, timeoutMs: 5000 });
+    assert.deepEqual(parseDoctorArgs([]), { ok: true, options: { json: false, timeoutMs: 5000 } });
   });
   it('accepts --json and both --timeout spellings', () => {
-    assert.equal(parseDoctorArgs(['--json']).json, true);
-    assert.equal(parseDoctorArgs(['--timeout', '250']).timeoutMs, 250);
-    assert.equal(parseDoctorArgs(['--timeout=250']).timeoutMs, 250);
+    const opt = (argv: string[]) => {
+      const parsed = parseDoctorArgs(argv);
+      assert.ok(parsed.ok, `refused: ${JSON.stringify(argv)}`);
+      return parsed.options;
+    };
+    assert.equal(opt(['--json']).json, true);
+    assert.equal(opt(['--timeout', '250']).timeoutMs, 250);
+    assert.equal(opt(['--timeout=250']).timeoutMs, 250);
   });
-  it('ignores nonsense timeouts rather than spawning with timeout NaN', () => {
-    assert.equal(parseDoctorArgs(['--timeout', 'soon']).timeoutMs, 5000);
-    assert.equal(parseDoctorArgs(['--timeout=-5']).timeoutMs, 5000);
+  // F5: `doctor --timeut` ran the checks with defaults and exited 0, which is how a typo hides.
+  it('refuses unknown options instead of running without them', () => {
+    const r = parseDoctorArgs(['--bogus']);
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? '' : r.error, /unknown option --bogus/);
+  });
+  it('refuses a nonsense timeout rather than silently using the default', () => {
+    for (const argv of [['--timeout', 'banana'], ['--timeout=-5'], ['--timeout'], ['--timeout=0']]) {
+      const r = parseDoctorArgs(argv);
+      assert.equal(r.ok, false, `accepted: ${JSON.stringify(argv)}`);
+      assert.match(r.ok ? '' : r.error, /--timeout expects/);
+    }
+  });
+  it('refuses positional arguments — doctor takes none', () => {
+    const r = parseDoctorArgs(['now']);
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? '' : r.error, /unexpected argument "now"/);
+  });
+});
+
+describe('init arg parsing', () => {
+  it('accepts --skip-doctor and nothing else', () => {
+    assert.deepEqual(parseInitArgs([]), { ok: true, skipDoctor: false });
+    assert.deepEqual(parseInitArgs(['--skip-doctor']), { ok: true, skipDoctor: true });
+  });
+  // F5's other half: `init --bogus` created the archive as if nothing was wrong.
+  it('refuses unknown options and positionals', () => {
+    for (const [argv, expected] of [
+      [['--bogus'], /unknown option --bogus/],
+      [['here'], /unexpected argument "here"/],
+    ] as Array<[string[], RegExp]>) {
+      const r = parseInitArgs(argv);
+      assert.equal(r.ok, false, `accepted: ${JSON.stringify(argv)}`);
+      assert.match(r.ok ? '' : r.error, expected);
+    }
   });
 });
 
@@ -883,6 +1033,21 @@ describe('parseCeiling', () => {
     const r = parseCeiling('  2 ');
     assert.ok(r.ok);
     assert.equal(r.value, 2);
+  });
+
+  // F8: out-of-range said "must be between 0 and 3" while non-numeric said "must be an integer
+  // 0..3" — two spellings for one rule read as two rules. One refusal, one sentence.
+  it('rejects every bad value with the one spelling', () => {
+    for (const [bad, quoted] of [
+      ['9', '"9"'],
+      ['-1', '"-1"'],
+      ['banana', '"banana"'],
+      ['2.5', '"2.5"'],
+    ] as Array<[string, string]>) {
+      const r = parseCeiling(bad);
+      assert.equal(r.ok, false);
+      assert.equal(r.ok ? '' : r.error, `--ceiling must be an integer 0..3, got ${quoted}`);
+    }
   });
 });
 
@@ -3592,6 +3757,104 @@ describe(
     });
   },
 );
+
+// ===========================================================================
+// Refusal format — every subcommand refuses an unknown option the same way.
+//
+// F5/F8 from the black-box sweep: `doctor --bogus` and `init --bogus` ran to
+// completion at exit 0, and the commands that did refuse each did it in a
+// different shape (a Usage dump, a `fix:` line, a `Try …` line). The dominant
+// convention — `<self> <cmd>: <error>` + `Try \`<self> <cmd> --help\`.` — is
+// what campaign, trial, chat and rebuild already print, so doctor, init and
+// enlist are held to it here, as real child processes, because exit codes and
+// stderr are the whole surface a script sees.
+// ===========================================================================
+
+describe('doctor and init refuse bad arguments like their siblings', () => {
+  const tryLine = (cmd: string) => new RegExp(`Try \`.+ ${cmd} --help\`\\.`);
+
+  it('`doctor --bogus` refuses instead of checking', () => {
+    const r = runCli(['doctor', '--bogus'], os.tmpdir(), scratchHome('args-doctor'));
+    assert.equal(r.code, 1, `exit ${String(r.code)}:\n${r.out}${r.err}`);
+    assert.match(r.err, /doctor: unknown option --bogus/);
+    assert.match(r.err, tryLine('doctor'));
+    assert.ok(!r.out.includes('environment check'), 'the checks ran anyway');
+  });
+
+  it('`doctor --timeout banana` refuses instead of silently using the default', () => {
+    const r = runCli(['doctor', '--timeout', 'banana'], os.tmpdir(), scratchHome('args-timeout'));
+    assert.equal(r.code, 1);
+    assert.match(r.err, /--timeout expects/);
+    assert.match(r.err, tryLine('doctor'));
+  });
+
+  it('`init --bogus` refuses instead of creating the archive', () => {
+    const home = scratchHome('args-init');
+    const r = runCli(['init', '--bogus'], os.tmpdir(), home);
+    assert.equal(r.code, 1, `exit ${String(r.code)}:\n${r.out}${r.err}`);
+    assert.match(r.err, /init: unknown option --bogus/);
+    assert.match(r.err, tryLine('init'));
+    assert.ok(!fs.existsSync(nodePath.join(home, 'config.toml')), 'init wrote the config anyway');
+  });
+});
+
+describe('enlist refuses in the shared Try-form, not with a Usage dump', () => {
+  it('an unknown option routes to enlist --help', async () => {
+    let err = '';
+    const code = await enlistCommand(['--bogus'], {
+      out: () => {},
+      err: (s) => {
+        err += s;
+      },
+    });
+    assert.equal(code, 1);
+    assert.match(err, /enlist: unknown option --bogus/);
+    assert.match(err, /Try `.+ enlist --help`\./);
+    assert.doesNotMatch(err, /Usage:/);
+  });
+});
+
+// F7: the unknown-option error revealed `[--no-init]` but the help never documented it, and the
+// usage line disagreed with the parser about what the command takes.
+describe('enlist --help documents every flag the parser accepts', () => {
+  it('has an OPTIONS section naming --ceiling and --no-init, and a usage line that agrees', () => {
+    const r = runCli(['enlist', '--help'], os.tmpdir(), scratchHome('enlist-help'));
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /^OPTIONS$/m, `no OPTIONS section:\n${r.out}`);
+    assert.match(r.out, /--ceiling/);
+    assert.match(r.out, /--no-init/);
+    assert.match(r.out, /enlist \[--ceiling 0\|1\|2\|3\] \[--no-init\]/, 'usage omits --no-init');
+    // The same clause chat's help uses for the same flag, so the two cannot drift apart in
+    // meaning: the flag refuses the auto-init, and the auto-init is git init + one empty commit.
+    assert.match(r.out, /git init plus one empty commit/);
+  });
+});
+
+// F4 at the CLI surface: the same corrupt config that makes enlist and campaign refuse must not
+// leave doctor saying "Ready. Full capability." — and init, which runs doctor first, must stop.
+describe('doctor refuses to green-light a corrupt config', () => {
+  it('`doctor` exits 1 and prints the parse failure with its fix', () => {
+    const home = scratchHome('cli-corrupt');
+    fs.writeFileSync(nodePath.join(home, 'config.toml'), 'GARBAGE not toml %% [[[', 'utf8');
+    const r = runCli(['doctor'], os.tmpdir(), home);
+    assert.equal(r.code, 1, `doctor exited ${String(r.code)}:\n${r.out}`);
+    assert.match(r.out, /not valid TOML/);
+    assert.match(r.out, /Fix the file by hand/);
+    assert.match(r.out, /Not ready/);
+  });
+
+  it('`doctor --json` carries the config check', () => {
+    const home = scratchHome('cli-corrupt-json');
+    fs.writeFileSync(nodePath.join(home, 'config.toml'), 'GARBAGE not toml %% [[[', 'utf8');
+    const r = runCli(['doctor', '--json'], os.tmpdir(), home);
+    assert.equal(r.code, 1);
+    const report = JSON.parse(r.out) as { checks: Array<{ id: string; outcome: string; fix?: string }> };
+    const check = report.checks.find((c) => c.id === 'config');
+    assert.ok(check !== undefined, 'no config check in --json');
+    assert.equal(check.outcome, 'blocking');
+    assert.match(check.fix ?? '', /Fix the file by hand/);
+  });
+});
 
 // ===========================================================================
 // The claim audit.

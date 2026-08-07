@@ -146,30 +146,50 @@ export function renderReport(report: DoctorReport, colored: boolean = useColor()
 
 export type DoctorOptions = { json: boolean; timeoutMs: number };
 
-export function parseDoctorArgs(argv: readonly string[]): DoctorOptions {
+/** Same refusing shape as `parseEnlistArgs`: a diagnosis to print, never a guessed run. */
+export type DoctorArgs = { ok: true; options: DoctorOptions } | { ok: false; error: string };
+
+export function parseDoctorArgs(argv: readonly string[]): DoctorArgs {
   const options: DoctorOptions = { json: false, timeoutMs: 5000 };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] ?? '';
     if (arg === '--json') {
       options.json = true;
-    } else if (arg.startsWith('--timeout=')) {
-      const value = Number(arg.slice('--timeout='.length));
-      if (Number.isFinite(value) && value > 0) options.timeoutMs = value;
-    } else if (arg === '--timeout') {
-      const value = Number(argv[i + 1]);
-      if (Number.isFinite(value) && value > 0) options.timeoutMs = value;
-      i += 1;
+    } else if (arg === '--timeout' || arg.startsWith('--timeout=')) {
+      const raw = arg === '--timeout' ? argv[++i] : arg.slice('--timeout='.length);
+      // Digits only, same screen as `--rung`: `Number('')` is 0 and `Number('5e3')` is 5000, and
+      // a flag whose value silently differs from what was typed is the failure mode this parser
+      // used to have in a worse form — an unparseable timeout silently became the default, so
+      // `--timeout banana` checked with a budget nobody chose.
+      const value = raw !== undefined && /^[0-9]+$/.test(raw.trim()) ? Number(raw.trim()) : Number.NaN;
+      if (!Number.isFinite(value) || value <= 0) {
+        return {
+          ok: false,
+          error: `--timeout expects a positive number of milliseconds, got ${JSON.stringify(raw ?? '')}`,
+        };
+      }
+      options.timeoutMs = value;
+    } else if (arg.startsWith('-')) {
+      // A typo'd flag that runs anyway is a typo that hides; every sibling command refuses.
+      return { ok: false, error: `unknown option ${arg}` };
+    } else {
+      return { ok: false, error: `unexpected argument ${JSON.stringify(arg)} — doctor takes no positional arguments` };
     }
   }
-  return options;
+  return { ok: true, options };
 }
 
 /** Runs the checks and prints them. Returns the process exit code. */
 export async function doctorCommand(argv: readonly string[]): Promise<number> {
-  const options = parseDoctorArgs(argv);
-  const report = await runChecks(options.timeoutMs);
+  const self = invokedAs();
+  const parsed = parseDoctorArgs(argv);
+  if (!parsed.ok) {
+    process.stderr.write(`${self} doctor: ${parsed.error}\nTry \`${self} doctor --help\`.\n`);
+    return 1;
+  }
+  const report = await runChecks(parsed.options.timeoutMs);
 
-  if (options.json) {
+  if (parsed.options.json) {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
     process.stdout.write(renderReport(report));

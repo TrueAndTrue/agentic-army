@@ -1069,6 +1069,53 @@ test('--list names the campaigns and writes nothing', async () => {
   }
 });
 
+// F11: rows were `<id>  <status>  <title>` with the id unpadded, so the status and title columns
+// started wherever each id happened to end. `listCampaigns` only reads `campaign.json`, so the
+// rows are written by hand here — that is also the only way to hold an empty title still, which
+// is the case that leaves padding as trailing whitespace.
+test('--list pads by the widest id, and no row carries trailing whitespace', async () => {
+  const archiveRoot = tempDir();
+  const rows: Array<{ id: string; title: string; status: string; created_at: string }> = [
+    { id: 'campaign-with-a-much-longer-id', title: 'Take Hill 4', status: 'running', created_at: '2026-08-06T00:00:00Z' },
+    { id: 'c-1', title: 'Short one', status: 'done', created_at: '2026-08-05T00:00:00Z' },
+    { id: 'c-2', title: '', status: 'done', created_at: '2026-08-04T00:00:00Z' },
+  ];
+  try {
+    for (const row of rows) {
+      const dir = path.join(archiveRoot, 'campaigns', row.id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'campaign.json'), JSON.stringify({ ...row, project: '/p' }), 'utf8');
+    }
+    const out = collect();
+    const code = await runView(['--archive', archiveRoot, '--list'], {
+      stdout: out.stream,
+      stderr: out.stream,
+      now: NOW_DATE,
+      env: CLEAN_ENV,
+      homeDir: archiveRoot,
+    });
+    assert.equal(code, 0, out.text());
+    const printed = out.text().split('\n').filter((line) => line !== '');
+    assert.equal(printed.length, 3, out.text());
+
+    for (const line of printed) {
+      assert.equal(line, line.trimEnd(), `trailing whitespace on ${JSON.stringify(line)}`);
+    }
+
+    const width = Math.max(...rows.map((r) => r.id.length));
+    const long = printed.find((l) => l.startsWith('campaign-with-a-much-longer-id'));
+    const short = printed.find((l) => l.startsWith('c-1'));
+    assert.ok(long !== undefined && short !== undefined, out.text());
+    // The status column starts at the same offset on every row: widest id + two-space gutter.
+    assert.equal(short.slice(0, width).trimEnd(), 'c-1', `id field is not padded:\n${out.text()}`);
+    assert.equal(short.slice(width, width + 2), '  ');
+    // And the titles land in one column too, which is the visible symptom the finding named.
+    assert.equal(long.indexOf('Take Hill 4'), short.indexOf('Short one'), `misaligned:\n${out.text()}`);
+  } finally {
+    fs.rmSync(archiveRoot, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------------------------
 // Follow mode
 // ---------------------------------------------------------------------------------------------
@@ -1281,13 +1328,11 @@ test('every way `view` can refuse names a next step, and never a command this re
     buildFixtureArchive(archiveRoot);
 
     const refusals = [
-      // 1. a usage error
-      await refusal(['--archive', archiveRoot, '--nope'], { homeDir: archiveRoot }),
-      // 2. no campaigns anywhere
+      // 1. no campaigns anywhere
       await refusal(['--archive', empty], { homeDir: empty }),
-      // 3. an id that is not in this archive — the headline case
+      // 2. an id that is not in this archive — the headline case
       await refusal(['--archive', archiveRoot, 'no-such-campaign'], { homeDir: archiveRoot }),
-      // 4. an id that is not in an archive with nothing in it either
+      // 3. an id that is not in an archive with nothing in it either
       await refusal(['--archive', empty, 'no-such-campaign'], { homeDir: empty }),
     ];
 
@@ -1307,6 +1352,18 @@ test('every way `view` can refuse names a next step, and never a command this re
     fs.rmSync(archiveRoot, { recursive: true, force: true });
     fs.rmSync(empty, { recursive: true, force: true });
   }
+});
+
+// F8: view's unknown-option refusal printed a `fix:` line while campaign, trial, chat and
+// rebuild all print `Try \`… --help\`.` — one CLI, two grammars for the same mistake. Usage
+// errors now speak the majority form; the fix: contract stays for the refusals that diagnose
+// a real condition.
+test('a usage error routes to `view --help` in the shared Try-form', async () => {
+  const { code, text } = await refusal(['--nope']);
+  assert.equal(code, 1);
+  assert.match(text, /^node src\/cli\.ts view: unknown option --nope$/m);
+  assert.match(text, /Try `node src\/cli\.ts view --help`\./);
+  assert.equal(fixLines(text).length, 0, `usage errors use the Try-form, not a fix: line:\n${text}`);
 });
 
 test('a wrong campaign id answers with the ids that DO exist', async () => {

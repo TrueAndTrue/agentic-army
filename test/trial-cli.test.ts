@@ -644,6 +644,59 @@ describe('trialCommand', () => {
     assert.ok(fs.existsSync(path.join(outDir, 'result.json')));
   });
 
+  // F9: a mistyped spec path answered with `ENOENT: no such file or directory, open '…'` — a raw
+  // errno where every other refusal in this CLI speaks a sentence. The errno is a debugging
+  // artefact; the reader's mistake is the path, so the message leads with that.
+  it('a missing spec file is a sentence, not a raw ENOENT', async () => {
+    const missing = path.join(scratchDir('missing-spec'), 'missing.toml');
+    const { deps, err } = baseDeps({
+      runTrial: async () => {
+        throw new Error('must not be called — there was no spec to run');
+      },
+    });
+    const code = await trialCommand([missing], deps);
+    assert.equal(code, 1);
+    assert.match(err.text(), new RegExp(`no such file: ${missing.replace(/[/.]/g, '\\$&')}`));
+    assert.doesNotMatch(err.text(), /ENOENT/);
+  });
+
+  it('a directory handed as the spec path is named as one, not as an errno', async () => {
+    const dir = scratchDir('dir-as-spec');
+    const { deps, err } = baseDeps({
+      runTrial: async () => {
+        throw new Error('must not be called');
+      },
+    });
+    const code = await trialCommand([dir], deps);
+    assert.equal(code, 1);
+    assert.match(err.text(), /is a directory, not a spec file/);
+    assert.doesNotMatch(err.text(), /EISDIR/);
+  });
+
+  it(
+    'an unreadable spec file reports the OS sentence without the errno prefix',
+    { skip: process.platform === 'win32' || process.getuid?.() === 0 ? 'chmod 0 is not a denial here' : false },
+    async () => {
+      const dir = scratchDir('unreadable-spec');
+      const specPath = path.join(dir, 'spec.toml');
+      fs.writeFileSync(specPath, 'title = "t"\n', 'utf8');
+      fs.chmodSync(specPath, 0);
+      try {
+        const { deps, err } = baseDeps({
+          runTrial: async () => {
+            throw new Error('must not be called');
+          },
+        });
+        const code = await trialCommand([specPath], deps);
+        assert.equal(code, 1);
+        assert.match(err.text(), /cannot read .*spec\.toml: permission denied/);
+        assert.doesNotMatch(err.text(), /EACCES/);
+      } finally {
+        fs.chmodSync(specPath, 0o600);
+      }
+    },
+  );
+
   it('a parse error is caught and reported on one line, returning 1', async () => {
     const dir = scratchDir('bad-spec');
     const specPath = path.join(dir, 'spec.toml');

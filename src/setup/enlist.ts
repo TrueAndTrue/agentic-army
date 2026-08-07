@@ -87,12 +87,13 @@ export function parseCeiling(raw: string | undefined): CeilingParse {
   if (raw === undefined || raw.trim() === '') {
     return { ok: false, error: '--ceiling needs a value: 0, 1, 2, or 3' };
   }
-  if (!/^-?\d+$/.test(raw.trim())) {
-    return { ok: false, error: `--ceiling must be an integer 0..3, got ${JSON.stringify(raw)}` };
-  }
-  const n = Number(raw.trim());
-  if (n < 0 || n > 3) {
-    return { ok: false, error: `--ceiling must be between 0 and 3, got ${n}` };
+  const trimmed = raw.trim();
+  // ONE refusal sentence for every bad value. `9` used to get "must be between 0 and 3" while
+  // `banana` got "must be an integer 0..3" — two spellings for one rule read as two rules, and
+  // the pair could drift apart because they were two sites.
+  const n = /^-?\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+  if (!Number.isInteger(n) || n < 0 || n > 3) {
+    return { ok: false, error: `--ceiling must be an integer 0..3, got ${JSON.stringify(trimmed)}` };
   }
   return { ok: true, value: n as Rung };
 }
@@ -383,9 +384,10 @@ export async function enlistCommand(
   const self = invokedAs();
   const args = parseEnlistArgs(argv);
   if (!args.ok) {
-    err(
-      `${self} enlist: ${args.error}\n\nUsage: ${self} enlist [--ceiling 0|1|2|3] [--no-init]\n`,
-    );
+    // The Try-form every other subcommand refuses with — a Usage dump here was the one place in
+    // the CLI where the same mistake earned a different grammar, and `--help` documents the
+    // flags the old one-line usage omitted.
+    err(`${self} enlist: ${args.error}\nTry \`${self} enlist --help\`.\n`);
     return 1;
   }
 

@@ -430,10 +430,35 @@ export async function ensureConfig(home: string = armyHome()): Promise<InitResul
 // Entry point
 // ---------------------------------------------------------------------------
 
+/** Same refusing shape as `parseDoctorArgs`: a typo'd flag must never init with defaults. */
+export type InitArgs = { ok: true; skipDoctor: boolean } | { ok: false; error: string };
+
+export function parseInitArgs(argv: readonly string[]): InitArgs {
+  let skipDoctor = false;
+  for (const arg of argv) {
+    if (arg === '--skip-doctor') {
+      skipDoctor = true;
+    } else if (arg.startsWith('-')) {
+      // `argv.includes('--skip-doctor')` was the whole parser, so `init --bogus` ran to
+      // completion at exit 0 while every sibling command refused. Refusing is the only way a
+      // typo'd `--skip-doctr` gets noticed before the checks it meant to skip have already run.
+      return { ok: false, error: `unknown option ${arg}` };
+    } else {
+      return { ok: false, error: `unexpected argument ${JSON.stringify(arg)} — init takes no positional arguments` };
+    }
+  }
+  return { ok: true, skipDoctor };
+}
+
 export async function initCommand(argv: readonly string[]): Promise<number> {
-  const skipDoctor = argv.includes('--skip-doctor');
-  const home = armyHome();
   const self = invokedAs();
+  const parsed = parseInitArgs(argv);
+  if (!parsed.ok) {
+    process.stderr.write(`${self} init: ${parsed.error}\nTry \`${self} init --help\`.\n`);
+    return 1;
+  }
+  const skipDoctor = parsed.skipDoctor;
+  const home = armyHome();
 
   // Checks run exactly once — they are ~8 concurrent subprocess spawns, and running them twice
   // to satisfy the print order would be paying real time for a cosmetic property.

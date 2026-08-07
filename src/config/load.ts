@@ -384,6 +384,16 @@ function parseProjects(raw: unknown, warnings: string[]): Record<string, Project
  * ceiling the user set down to 0 without saying so, and they would find out by watching a
  * campaign refuse to open a PR.
  */
+/**
+ * The one sentence every reader of an unparseable config gets, exported so `army doctor`'s
+ * config check prints the SAME fix text `enlist` and `campaign` already print through the throw
+ * below. Doctor green-lit a config the other commands refused to run against precisely because
+ * it had no shared definition of this condition to reach for.
+ */
+export const CONFIG_FIX_BY_HAND =
+  'Fix the file by hand. Nothing will run against a config that cannot be read, because ' +
+  'guessing would mean guessing about delivery ceilings.';
+
 export function parseConfig(toml: string, configFilePath: string): ParsedConfig {
   const warnings: string[] = [];
 
@@ -393,9 +403,7 @@ export function parseConfig(toml: string, configFilePath: string): ParsedConfig 
     data = parseToml(splitBom(toml).body) as Record<string, unknown>;
   } catch (e) {
     throw new Error(
-      `${configFilePath} is not valid TOML: ${(e as Error).message}\n` +
-        'Fix the file by hand. Nothing will run against a config that cannot be read, because ' +
-        'guessing would mean guessing about delivery ceilings.',
+      `${configFilePath} is not valid TOML: ${(e as Error).message}\n${CONFIG_FIX_BY_HAND}`,
     );
   }
 

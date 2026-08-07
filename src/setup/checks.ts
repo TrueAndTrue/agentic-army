@@ -33,8 +33,12 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { installWarningFilter } from '../archive/db.ts';
+// Static rather than lazy, and deliberately so: `src/cli.ts` already pulls `config/load.ts` in
+// through `enlist.ts` before any command runs, so this import adds nothing to doctor's startup.
+import { CONFIG_FIX_BY_HAND, parseConfig } from '../config/load.ts';
 import {
   armyHome,
+  configPath,
   normalizePathForCompare as normalizePath,
   realpathOrResolve,
   samePath,
@@ -60,6 +64,7 @@ export type CheckId =
   | 'worktree-pool'
   | 'stale-worktree-pool'
   | 'home'
+  | 'config'
   | 'sqlite';
 
 export type CheckResult = {
@@ -662,9 +667,18 @@ export function classifyCodex(
   const v = parseVersion(raw);
   const version = v === null ? raw.split('\n')[0] ?? 'present' : formatVersion(v);
 
-  if (login !== null && !login.timedOut && login.found) {
+  if (login !== null && login.found) {
     const loginOut = output(login);
-    if (login.code === 0) {
+    // ---------------------------------------------------------------------------------------
+    // "not logged in" is only ever reported when codex actually SAID it. This check used to
+    // read EVERY non-zero login probe as a logged-out session — a probe killed by the timeout's
+    // SIGKILL, a fork that transiently failed under load, a network hiccup inside
+    // `codex login status` — and so it flip-flopped between "Logged in" and "not logged in" on
+    // machines whose auth never changed. A probe that did not answer is uncertainty, and
+    // uncertainty gets its own words; dressing it as a definitive verdict is what trains a user
+    // to ignore this line on the day the session really has expired.
+    // ---------------------------------------------------------------------------------------
+    if (!login.timedOut && login.code === 0) {
       const first = loginOut.split('\n').find((l) => l.trim() !== '') ?? 'logged in';
       return {
         ...base,
@@ -673,15 +687,32 @@ export function classifyCodex(
         version: v === null ? undefined : formatVersion(v),
       };
     }
+    if (!login.timedOut && /not logged in|logged out/i.test(loginOut)) {
+      return {
+        ...base,
+        outcome: 'degraded',
+        found: `${version} — not logged in`,
+        version: v === null ? undefined : formatVersion(v),
+        impact:
+          'Inspectors cannot run. codex is installed but unauthenticated, so cross-vendor review ' +
+          ' will fail at spawn time rather than at doctor time.',
+        note: 'Fix: `codex login`',
+      };
+    }
+    const how = login.timedOut
+      ? 'login status check timed out'
+      : `login status could not be determined${login.code === null ? '' : ` (exit ${String(login.code)})`}`;
     return {
       ...base,
       outcome: 'degraded',
-      found: `${version} — not logged in`,
+      found: `${version} — ${how}`,
       version: v === null ? undefined : formatVersion(v),
       impact:
-        'Inspectors cannot run. codex is installed but unauthenticated, so cross-vendor review ' +
-        ' will fail at spawn time rather than at doctor time.',
-      note: 'Fix: `codex login`',
+        'Uncertainty, not a verdict: `codex login status` did not answer, so whether Inspectors ' +
+        'can dispatch is unknown. Nothing here says your session expired.',
+      note:
+        'Run `codex login status` yourself; if this machine is just slow, raise the probe budget ' +
+        'with `--timeout <ms>`.',
     };
   }
 
@@ -814,6 +845,53 @@ export function classifyHome(state: DirState): CheckResult {
     found: `${state.dir} — ${reason}${detail}`,
     fix: mkdirFix(state),
     note: 'The war archive lives here so reports never pollute your repos.',
+  };
+}
+
+/** What `inspectConfig` found at `<home>/config.toml`. */
+export type ConfigState = {
+  file: string;
+  /** False when there is no config yet — the pre-`init` state, which is fine. */
+  present: boolean;
+  /** The read or parse failure, verbatim. null when the file is absent or parses. */
+  error: string | null;
+};
+
+/**
+ * `config.toml` must parse when it exists.
+ *
+ * This check exists because doctor said "Ready. Full capability." over a config that `enlist`
+ * and `campaign` both refused to run against — and a corrupt config is exactly the state a user
+ * runs doctor to diagnose. A missing file stays ok: that is the pre-`init` state, not a defect.
+ *
+ * Blocking, not degraded: every delivery ceiling lives in this file, so nothing that reads one
+ * will run until it parses. The fix is `CONFIG_FIX_BY_HAND` — the same sentence the refusing
+ * commands print — rather than a pasteable command, because no command repairs hand-broken TOML
+ * and inventing one would be worse than saying so.
+ */
+export function classifyConfig(state: ConfigState): CheckResult {
+  const base = { id: 'config' as const, title: 'config.toml parses' };
+  if (!state.present) {
+    return {
+      ...base,
+      outcome: 'ok',
+      found: `${state.file} (absent)`,
+      note: `Will be created by \`${invokedAs()} init\`.`,
+    };
+  }
+  if (state.error === null) {
+    return { ...base, outcome: 'ok', found: `${state.file} (parses)` };
+  }
+  return {
+    ...base,
+    outcome: 'blocking',
+    // The first line carries the diagnosis; a parser's multi-line caret excerpt belongs in
+    // `--json`, not wrapped to a terminal column.
+    found: state.error.split('\n')[0] ?? state.error,
+    fix: CONFIG_FIX_BY_HAND,
+    note:
+      'Every delivery ceiling and dispatch rule lives in this file, so enlist and campaign ' +
+      'refuse to run against it in this state for the same reason.',
   };
 }
 
@@ -1407,6 +1485,32 @@ export async function inspectHome(dir: string = homeDir()): Promise<DirState> {
   return inspectWritableDir(dir);
 }
 
+/**
+ * Read and parse `<home>/config.toml`, reporting rather than throwing.
+ *
+ * READ-ONLY like every other probe here, and it deliberately reuses `parseConfig` — the same
+ * parser every refusing command goes through — so doctor and `enlist` can never disagree about
+ * whether a given file parses.
+ */
+export async function inspectConfig(home: string = homeDir()): Promise<ConfigState> {
+  const file = configPath(home);
+  let text: string;
+  try {
+    text = await fs.readFile(file, 'utf8');
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') return { file, present: false, error: null };
+    // Exists but unreadable — as blocking as unparseable, and for the same reason.
+    return { file, present: true, error: `cannot read ${file}: ${err.message}` };
+  }
+  try {
+    parseConfig(text, file);
+    return { file, present: true, error: null };
+  } catch (e) {
+    return { file, present: true, error: (e as Error).message };
+  }
+}
+
 /** What is left behind at the old pool location, if anything. */
 export type LegacyPoolState = {
   dir: string;
@@ -1562,6 +1666,8 @@ export async function runChecks(
 
   const homeCheck = async (): Promise<CheckResult> => classifyHome(await inspectHome(home));
 
+  const configCheck = async (): Promise<CheckResult> => classifyConfig(await inspectConfig(home));
+
   const worktreePoolCheck = async (): Promise<CheckResult> =>
     classifyWorktreePool(await inspectWritableDir(worktreePoolDir(home)));
 
@@ -1581,6 +1687,7 @@ export async function runChecks(
     codexCheck(),
     ghCheck(),
     homeCheck(),
+    configCheck(),
     worktreePoolCheck(),
     staleWorktreePoolCheck(),
     sqliteCheck(),

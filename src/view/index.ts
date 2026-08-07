@@ -400,9 +400,11 @@ function unknownCampaignHelp(
       fix: runThis(`${self} view --list`),
     };
   }
+  // Same column rule as `--list`: pad by the widest id, never leave padding as trailing space.
+  const idWidth = Math.max(...campaigns.map((c) => c.id.length));
   const lines = [
     `  ${campaigns.length === 1 ? 'the one campaign' : `the ${campaigns.length} campaigns`} in this archive:`,
-    ...campaigns.map((c) => `    ${c.id}  ${c.status.padEnd(8)}  ${c.title}`),
+    ...campaigns.map((c) => `    ${`${c.id.padEnd(idWidth)}  ${c.status.padEnd(8)}  ${c.title}`.trimEnd()}`),
   ];
   // A paste-and-run command, and the id in it is real: it came off the disk a moment ago.
   return { lines, fix: runThis(`${self} view ${campaigns[0]?.id ?? ''}`) };
@@ -440,7 +442,10 @@ export async function runView(argv: readonly string[], deps: ViewDeps = {}): Pro
   try {
     options = parseViewArgs(argv);
   } catch (error) {
-    return refuse(stderr, self, (error as Error).message, runThis(`${self} view --help`));
+    // The Try-form the other subcommands refuse usage errors with, not a `fix:` line: a mistyped
+    // flag is not a diagnosed condition, and one CLI must not keep two grammars for one mistake.
+    stderr.write(`${self} view: ${(error as Error).message}\nTry \`${self} view --help\`.\n`);
+    return 1;
   }
 
   if (options.help) {
@@ -484,8 +489,14 @@ export async function runView(argv: readonly string[], deps: ViewDeps = {}): Pro
       stdout.write(`no campaigns in ${archiveRoot}\n`);
       return 0;
     }
+    // Padded by the widest id in THIS archive — ids are user-choosable (`--id`), so a fixed
+    // width would be wrong the first time someone named a campaign, and unpadded ids put the
+    // status column wherever each id happened to end. `trimEnd` because a row with an empty
+    // title would otherwise carry the status padding as trailing whitespace.
+    const idWidth = Math.max(...campaigns.map((c) => c.id.length));
     for (const campaign of campaigns) {
-      stdout.write(`${campaign.id}  ${campaign.status.padEnd(8)}  ${campaign.title}\n`);
+      const row = `${campaign.id.padEnd(idWidth)}  ${campaign.status.padEnd(8)}  ${campaign.title}`;
+      stdout.write(`${row.trimEnd()}\n`);
     }
     return 0;
   }
