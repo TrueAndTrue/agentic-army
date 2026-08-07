@@ -66,6 +66,7 @@
 
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type { CampaignStatus } from '../contracts/archive.ts';
@@ -126,7 +127,7 @@ import { createClaudeAdapter } from '../harness/claude.ts';
 import { createCodexAdapter, isCodexSoldier } from '../harness/codex.ts';
 import { getAdapter } from '../harness/index.ts';
 import { installHint, invokedAs } from '../setup/checks.ts';
-import { mainRootFromCommonDir } from '../setup/enlist.ts';
+import { autoInitRepo, decideAutoInit, mainRootFromCommonDir } from '../setup/enlist.ts';
 import type { Fix } from '../setup/fixes.ts';
 import {
   doThis,
@@ -227,7 +228,13 @@ export type CampaignNoteCode =
    */
   | 'coverage'
   | 'retry'
-  | 'aborted';
+  | 'aborted'
+  /**
+   * The campaign turned a bare directory into a repository before starting, the same way
+   * `enlist` does. Recorded so `--json` and the final report say a repository now exists that
+   * did not when the command was typed.
+   */
+  | 'auto-init';
 
 export interface CampaignNote {
   level: 'info' | 'warn' | 'error';
@@ -355,6 +362,11 @@ export interface CampaignOptions {
   spec?: TechnicalSpec;
   /** Where the campaign was launched. Defaults to `process.cwd()`. */
   cwd?: string;
+  /**
+   * Turn a bare directory into a repository before refusing it, exactly as `enlist` does.
+   * Default true; `--no-init` is the opt-out. See `resolveProjectRootOrInit` for the guards.
+   */
+  init?: boolean;
   /** Highest rung to attempt, before the project ceiling clamps it. Defaults to 2. */
   requestedRung?: Rung;
   /**
@@ -793,6 +805,61 @@ export async function resolveProjectRoot(cwd: string): Promise<string | null> {
   }
 }
 
+/**
+ * `resolveProjectRoot`, with `enlist`'s auto-init in front of the refusal.
+ *
+ * The field transcript this exists for: `enlist` learned to turn a bare directory into a
+ * repository, and then the very next thing the Commander typed — `army chat` in that same fresh
+ * directory — refused with the sentence `enlist` had just been taught not to say. One CLI, one
+ * policy: any command a user can point at a bare directory runs the same decide → init →
+ * re-resolve sequence, built from the same two functions `enlist` uses, so the guards (never the
+ * home directory, never a filesystem root) cannot drift between commands.
+ *
+ * `needs` finishes the refusal sentence — chat and campaign each name what they need a repository
+ * FOR — and `onCreated` is where the `created a git repository in <dir>` line goes, because chat
+ * owns a terminal and campaign owns a narration stream and this function must own neither.
+ */
+export async function resolveProjectRootOrInit(options: {
+  cwd: string;
+  /** `--no-init` turns this off; the refusal is then exactly the pre-auto-init one. */
+  init: boolean;
+  needs: string;
+  onCreated: (dir: string) => void;
+}): Promise<string> {
+  const { cwd, init, needs, onCreated } = options;
+  let project = await resolveProjectRoot(cwd);
+  if (project === null && init) {
+    const decision = decideAutoInit(cwd, os.homedir());
+    if (decision.kind === 'refuse') {
+      // The reason already carries its own instruction ("cd into the project directory…"), so
+      // the fix restates the action rather than offering `git init` — a runnable command HERE
+      // would be a command that initialises the exact directory the guard just protected.
+      throw new CampaignSetupError(
+        `${cwd} is not inside a git repository, and one will not be created here: ${decision.reason}`,
+        doThis('cd into the project directory and run this again'),
+      );
+    }
+    const outcome = await autoInitRepo(decision.dir);
+    if (!outcome.ok) {
+      throw new CampaignSetupError(
+        `${cwd} is not inside a git repository, and creating one failed: ${outcome.error}`,
+        initRepoFix(cwd),
+      );
+    }
+    onCreated(decision.dir);
+    // Re-derive rather than trust `decision.dir` — the real root goes through
+    // `mainRootFromCommonDir` and realpath, and shortcutting that here is how this route would
+    // silently diverge from every other route to a project root in this file.
+    project = await resolveProjectRoot(cwd);
+  }
+  if (project === null) {
+    // Both halves of the fix, on purpose. `git init` alone lands the reader on the NEXT refusal
+    // — a repository with no commit cannot be leased from.
+    throw new CampaignSetupError(`${cwd} is not inside a git repository. ${needs}`, initRepoFix(cwd));
+  }
+  return project;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Behaviour coverage — is the verdict answering the same numbered list the spec asked?
 // ---------------------------------------------------------------------------------------------
@@ -919,15 +986,19 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   const loaded = await loadConfig({ home, env });
   const config = loaded.config;
 
-  const project = await resolveProjectRoot(cwd);
-  if (project === null) {
-    // Both halves of the fix, on purpose. `git init` alone lands you on the NEXT refusal — the
-    // one this whole change exists because the Commander hit it ninety seconds later.
-    throw new CampaignSetupError(
-      `${cwd} is not inside a git repository. A campaign needs a repository to lease a worktree of.`,
-      initRepoFix(cwd),
-    );
-  }
+  const project = await resolveProjectRootOrInit({
+    cwd,
+    init: options.init ?? true,
+    needs: 'A campaign needs a repository to lease a worktree of.',
+    onCreated: (dir) => {
+      const message = `created a git repository in ${dir}`;
+      // Streamed directly rather than through `note`, which holds `info` back from the live
+      // stream — but a repository now exists that did not when the command was typed, and that
+      // must not wait for the final report to be said.
+      progress({ kind: 'note', level: 'info', message });
+      note('info', 'auto-init', message);
+    },
+  });
 
   const ceilingLookup = projectCeiling(config as DeliveryConfig, project);
   const ceiling = ceilingLookup.ceiling;

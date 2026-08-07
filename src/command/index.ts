@@ -72,6 +72,9 @@ OPTIONS
                        the seam is what lets a devcontainer or a snapshotting
                        filesystem take over later. Default: the pool.
   --id <campaign-id>   Override the generated campaign id.
+  --no-init            Outside a repository, refuse instead of running the
+                       auto-init \`${invokedAs()} enlist\` runs: git init plus one empty
+                       commit, never in your home directory or a filesystem root.
   --json               Emit the result as JSON on stdout.
   -h, --help           This.
 
@@ -105,6 +108,8 @@ export interface CampaignArgs {
   campaignId?: string;
   /** Raw `--spec` path, unread and unvalidated. `campaignCommand` does the I/O. */
   specPath?: string;
+  /** False when `--no-init` was passed — mirrors `enlist`, which grew the flag first. */
+  init: boolean;
   json: boolean;
   help: boolean;
 }
@@ -131,7 +136,7 @@ function asRung(raw: string | undefined): Rung {
 }
 
 export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
-  const args: CampaignArgs = { objective: '', json: false, help: false };
+  const args: CampaignArgs = { objective: '', init: true, json: false, help: false };
   const positional: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -188,6 +193,9 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
         args.specPath = value;
         break;
       }
+      case '--no-init':
+        args.init = false;
+        break;
       default:
         if (arg.startsWith('-')) throw new UsageError(`unknown option ${arg}`);
         positional.push(arg);
@@ -506,6 +514,7 @@ export async function campaignCommand(
     ...(args.maxAttempts === undefined ? {} : { maxAttempts: args.maxAttempts }),
     ...(args.provider === undefined ? {} : { worktreeProvider: args.provider }),
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
+    ...(args.init ? {} : { init: false }),
     // Spread LAST, so a caller that wants its own listener — or none — wins over the default.
     ...deps.overrides,
   };

@@ -236,13 +236,18 @@ export function decideAutoInit(dir: string, home: string): AutoInitDecision {
  */
 export type AutoInitOutcome = { ok: true; committed: boolean } | { ok: false; error: string };
 
-export async function autoInitRepo(): Promise<AutoInitOutcome> {
-  const init = await probe('git', ['init', '-q'], 5000);
+export async function autoInitRepo(dir?: string): Promise<AutoInitOutcome> {
+  // `dir` exists for `chat` and `campaign`, whose `--cwd` need not be this process's working
+  // directory. Without `-C`, their auto-init would land the repository wherever the CLI happened
+  // to be launched from — a directory the user never pointed the command at. `enlist` keeps
+  // calling with no argument, so its behaviour is byte-for-byte what it was.
+  const at = dir === undefined ? [] : ['-C', dir];
+  const init = await probe('git', [...at, 'init', '-q'], 5000);
   if (!init.found || init.timedOut || init.code !== 0) {
     const detail = init.stderr.trim();
     return { ok: false, error: `git init failed${detail === '' ? '' : `: ${detail}`}` };
   }
-  const commit = await probe('git', ['commit', '--allow-empty', '-m', 'init'], 5000);
+  const commit = await probe('git', [...at, 'commit', '--allow-empty', '-m', 'init'], 5000);
   return { ok: true, committed: !commit.timedOut && commit.code === 0 };
 }
 

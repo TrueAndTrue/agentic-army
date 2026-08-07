@@ -58,6 +58,9 @@ OPTIONS
                        the top; the units below it are dispatched by role.
   --provider <id>      Worktree provider for anything dispatched.
   --id <campaign-id>   Override the generated archive id for the conversation.
+  --no-init            Outside a repository, refuse instead of running the
+                       auto-init \`${invokedAs()} enlist\` runs: git init plus one empty
+                       commit, never in your home directory or a filesystem root.
   -h, --help           This.
 
 IN THE SESSION
@@ -106,6 +109,8 @@ export interface ChatArgs {
   model?: string;
   provider?: WorktreeProviderId;
   campaignId?: string;
+  /** False when `--no-init` was passed — mirrors `enlist`, which grew the flag first. */
+  init: boolean;
   help: boolean;
 }
 
@@ -118,7 +123,7 @@ function asRung(raw: string | undefined): Rung {
 }
 
 export function parseChatArgs(argv: readonly string[]): ChatArgs {
-  const args: ChatArgs = { help: false };
+  const args: ChatArgs = { init: true, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] as string;
     const next = (): string | undefined => argv[++i];
@@ -170,6 +175,9 @@ export function parseChatArgs(argv: readonly string[]): ChatArgs {
         args.campaignId = value;
         break;
       }
+      case '--no-init':
+        args.init = false;
+        break;
       default:
         if (arg.startsWith('-')) throw new UsageError(`unknown option ${arg}`);
         // A chat takes no objective — that is the difference between it and a campaign, and a
@@ -222,6 +230,7 @@ export async function chatCommand(
     ...(args.provider === undefined ? {} : { worktreeProvider: args.provider }),
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
     ...(args.model === undefined ? {} : { model: args.model }),
+    ...(args.init ? {} : { init: false }),
     ...overrides,
     io,
   };

@@ -703,6 +703,13 @@ function createRawTerminalIo(
         /* best effort — a dead stream cannot un-raw itself, and that is not this call's problem */
       }
       input.removeListener('keypress', onKeypress as (chunk: string, key: unknown) => void);
+      // The mirror of the `resume()` at construction, and the line the process's exit hangs on:
+      // a resumed stdin holds a ref that keeps the event loop alive, so without this a session
+      // that failed preflight printed its refusal and then sat until Ctrl-C. Guarded the same
+      // way the resume is, because the seam only promises a readable stream.
+      if (typeof (input as { pause?: () => void }).pause === 'function') {
+        (input as { pause: () => void }).pause();
+      }
       process.removeListener('SIGINT', hub.fire);
       hub.clear();
       settlePending(null);
@@ -781,6 +788,10 @@ function createPipedTerminalIo(
       closed = true;
       process.removeListener('SIGINT', hub.fire);
       hub.clear();
+      // Also what releases stdin: `rl.close()` pauses the input it put into flowing mode, so a
+      // still-open writer on the other end of the pipe cannot keep the event loop alive after a
+      // refusal. The raw path shipped exactly that hang, so the property is pinned by a test
+      // here rather than trusted to stay a readline detail.
       rl.close();
     },
     // No cursor to animate for, and nothing reading a spinner frame in a redirected file — same

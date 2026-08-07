@@ -29,6 +29,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
+import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -2226,10 +2227,11 @@ describe('the conversation is in the archive, and army view reads it back', () =
 
 describe('army chat — the command', () => {
   it('parses its options and refuses an objective with the command that takes one', () => {
-    assert.deepEqual(parseChatArgs([]), { help: false });
+    assert.deepEqual(parseChatArgs([]), { init: true, help: false });
     assert.equal(parseChatArgs(['--rung', '1']).requestedRung, 1);
     assert.equal(parseChatArgs(['--attempts', '5']).maxAttempts, 5);
     assert.equal(parseChatArgs(['--model', 'claude-sonnet-5']).model, 'claude-sonnet-5');
+    assert.equal(parseChatArgs(['--no-init']).init, false, 'the auto-init opt-out did not parse');
     assert.equal(parseChatArgs(['-h']).help, true);
     assert.throws(() => parseChatArgs(['--rung', '9']), /--rung expects/);
     assert.throws(() => parseChatArgs(['--attempts', '0']), /positive integer/);
@@ -2268,11 +2270,13 @@ describe('army chat — the command', () => {
     assert.match(err, /Try `.*chat --help`/);
   });
 
-  it('outside a git repository it refuses with the fix, before it creates anything', async () => {
+  // `--no-init` on the argv rather than `init: false` in overrides, so this exercises the flag's
+  // whole route through `parseChatArgs` — the wiring that did not exist when auto-init landed.
+  it('outside a git repository, --no-init refuses with the fix, before it creates anything', async () => {
     const nowhere = mkTmp('nogit');
     const home = makeHome();
     let err = '';
-    const code = await chatCommand([], {
+    const code = await chatCommand(['--no-init'], {
       stdout: { write: () => undefined },
       stderr: { write: (text: string) => void (err += text) },
       overrides: { io: createScriptedIo([]), cwd: nowhere, home, env: {} },
@@ -2282,7 +2286,99 @@ describe('army chat — the command', () => {
     // The refusal owes the exact command, and `git init` alone lands the reader on the NEXT
     // refusal — a repository with no commit cannot be leased from.
     assert.match(err, /fix: git -C .* init && git -C .* commit --allow-empty/);
+    assert.equal(fs.existsSync(path.join(nowhere, '.git')), false, 'a repository was created despite --no-init');
     assert.equal(fs.existsSync(path.join(home, 'campaigns', 'chat')), false);
+  });
+
+  // ===========================================================================================
+  // AUTO-INIT — `army chat` in a bare directory initialises it the way `enlist` learned to,
+  // through the same two functions, instead of refusing with the sentence `enlist` stopped
+  // saying. The field repro: the product owner ran `army chat` in a fresh empty directory and
+  // was refused by the very tool that had just been taught to stop refusing.
+  // ===========================================================================================
+
+  it('a bare directory is auto-initialised like enlist, and the session proceeds inside it', async () => {
+    const bare = mkTmp('autoinit');
+    const home = makeHome();
+    const bins = mkTmp('bins-autoinit');
+    const commanderBin = writeFakeCommander(bins, 'fake-commander.mjs', {
+      replies: ['at your orders.'],
+    });
+    const io = createScriptedIo(['/exit']);
+    const result = await runChat({
+      io,
+      cwd: bare,
+      env: {},
+      home,
+      commanderBin,
+      campaignId: 'chat-autoinit',
+      charset: 'unicode',
+    });
+
+    assert.ok(fs.existsSync(path.join(bare, '.git')), 'no repository was created');
+    assert.equal(result.project, fs.realpathSync(bare), 'the session did not adopt the new repository');
+    const created = io.transcript.indexOf('created a git repository in');
+    const banner = io.transcript.indexOf('COL·COMMANDER');
+    assert.notEqual(created, -1, `no "created a git repository" line:\n${io.transcript}`);
+    assert.notEqual(banner, -1, `the session never reached its banner:\n${io.transcript}`);
+    assert.ok(created < banner, 'the creation notice did not come before the session started');
+    assert.equal(result.exitReason, 'command');
+  });
+
+  it('init: false restores the exact former refusal and creates nothing', async () => {
+    const bare = mkTmp('noinit-run');
+    const home = makeHome();
+    await assert.rejects(
+      runChat({ io: createScriptedIo([]), cwd: bare, env: {}, home, init: false }),
+      /is not inside a git repository\. A commander needs a repository to send anyone into\./,
+    );
+    assert.equal(fs.existsSync(path.join(bare, '.git')), false, 'a repository was created despite init: false');
+  });
+
+  it('refuses to initialise a filesystem root, through the same guard enlist uses', async () => {
+    const root = path.parse(os.tmpdir()).root;
+    // Refused BEFORE any git command runs, so this is safe to ask even on a machine where the
+    // root is writable — the assertion on the message is the assertion that the guard fired.
+    await assert.rejects(
+      runChat({ io: createScriptedIo([]), cwd: root, env: {}, home: makeHome() }),
+      /one will not be created here: .*filesystem root/,
+    );
+  });
+
+  it('refuses to initialise the home directory, and the refused process EXITS', async () => {
+    // A subprocess, not `runChat`: `decideAutoInit` reads the real `os.homedir()`, which only a
+    // child's environment can point somewhere disposable without racing the other suites.
+    const tmp = mkTmp('homerefuse');
+    const fakeHome = path.join(tmp, 'fakehome');
+    fs.mkdirSync(fakeHome, { recursive: true });
+    const cli = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'src', 'cli.ts');
+    const child = spawn(process.execPath, [cli, 'chat'], {
+      cwd: fakeHome,
+      // stdin is deliberately a pipe held OPEN for the child's whole life. This is the second
+      // field bug: a refused session printed its message and then sat until Ctrl-C, because
+      // `close()` never paused the stream it had resumed. With stdin closed instead, the old
+      // code exited by luck and this test could not fail.
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        AGENTIC_ARMY_HOME: path.join(tmp, 'armyhome'),
+        NODE_OPTIONS: '',
+        HOME: fakeHome,
+        USERPROFILE: fakeHome,
+      },
+    });
+    let err = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      err += chunk;
+    });
+    // A hang comes back as a SIGKILLed child with a null exit code, not a green test.
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
+    const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
+    clearTimeout(timer);
+    assert.equal(code, 1, `expected a prompt refusal exit, got ${String(code)}:\n${err}`);
+    assert.match(err, /home directory/);
+    assert.equal(fs.existsSync(path.join(fakeHome, '.git')), false, 'a repository was created at the fake home');
   });
 
   /**
@@ -2648,16 +2744,28 @@ interface FakeTtyInput extends EventEmitter {
   isTTY: true;
   setRawMode(mode: boolean): void;
   readonly rawModeCalls: boolean[];
+  resume(): void;
+  pause(): void;
+  /** `'resume'` / `'pause'` in call order — the flow-control ledger the exit bug lives in. */
+  readonly flowCalls: string[];
 }
 
 function fakeTtyInput(): FakeTtyInput {
   const emitter = new EventEmitter() as FakeTtyInput;
   const rawModeCalls: boolean[] = [];
+  const flowCalls: string[] = [];
   Object.assign(emitter, {
     isTTY: true as const,
     rawModeCalls,
+    flowCalls,
     setRawMode(mode: boolean): void {
       rawModeCalls.push(mode);
+    },
+    resume(): void {
+      flowCalls.push('resume');
+    },
+    pause(): void {
+      flowCalls.push('pause');
     },
   });
   return emitter;
@@ -2918,6 +3026,43 @@ describe('createTerminalIo — the raw-mode TTY path', () => {
     const pending = io.nextLine('you › ');
     io.close();
     assert.equal(await pending, null);
+  });
+
+  it('close() pauses the stdin it resumed — the resumed ref is what kept a refused session alive', () => {
+    // The second field bug: `army chat` printed its preflight refusal and then sat until Ctrl-C.
+    // Construction resumes the input stream (and raw mode needs that), but a resumed stdin holds
+    // a ref that keeps the event loop alive, so a close() that never paused it left the process
+    // with nothing to do and no way to exit.
+    const { io, input } = rawIo();
+    assert.deepEqual(input.flowCalls, ['resume'], 'construction did not resume the input exactly once');
+    io.close();
+    assert.deepEqual(input.flowCalls, ['resume', 'pause'], 'close() did not pause the input it resumed');
+    io.close(); // idempotent: a second close must not pause a stream it no longer owns
+    assert.deepEqual(input.flowCalls, ['resume', 'pause']);
+  });
+});
+
+describe('createTerminalIo — the piped path releases stdin on close', () => {
+  it('close() leaves the input paused, so a still-open writer cannot hold the loop', () => {
+    // The raw path shipped exactly this hang: a preflight refusal printed and the process sat on
+    // a resumed stdin until Ctrl-C. The piped path escapes it only because `rl.close()` happens
+    // to pause the input it put into flowing mode — a readline detail this file leans on, so it
+    // is pinned here rather than trusted. Verified against a fifo with an open writer: the
+    // process exits 1 today, and would sit until the alarm without the pause.
+    const input = new PassThrough();
+    let paused = 0;
+    const realPause = input.pause.bind(input);
+    input.pause = (): PassThrough => {
+      paused += 1;
+      return realPause();
+    };
+    const output = { isTTY: false, write: () => true } as unknown as NonNullable<
+      Parameters<typeof createTerminalIo>[0]
+    >['output'];
+    const io = createTerminalIo({ input, output });
+    assert.equal(io.isTTY, false, 'a PassThrough input must select the piped path');
+    io.close();
+    assert.ok(paused >= 1, 'close() left the piped input flowing');
   });
 });
 

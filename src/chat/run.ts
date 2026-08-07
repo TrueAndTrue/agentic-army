@@ -67,8 +67,7 @@ import * as path from 'node:path';
 
 import { CampaignArchive, campaignIdFor, createCampaign, listCampaignIds } from '../archive/archive.ts';
 import type { ArchiveConfig } from '../archive/archive.ts';
-import { GENERAL_AGENT_ID, buildSoldierSpec, resolveProjectRoot } from '../command/campaign.ts';
-import { CampaignSetupError } from '../command/campaign.ts';
+import { GENERAL_AGENT_ID, buildSoldierSpec, resolveProjectRootOrInit } from '../command/campaign.ts';
 import type { CampaignResult } from '../command/campaign.ts';
 import { loadConfig } from '../config/load.ts';
 import { armyHome } from '../config/paths.ts';
@@ -84,7 +83,6 @@ import { projectCeiling } from '../delivery/ladder.ts';
 import type { GhStatus } from '../delivery/git.ts';
 import { createClaudeAdapter } from '../harness/claude.ts';
 import { invokedAs } from '../setup/checks.ts';
-import { initRepoFix } from '../setup/fixes.ts';
 import { detectCharset } from '../view/index.ts';
 import type { Charset } from '../view/render.ts';
 import { createProgressSink, renderProgressEvent } from '../view/progress.ts';
@@ -108,6 +106,11 @@ export interface ChatOptions {
   env?: Env;
   /** Override the army home. Test seam; production reads `env`. */
   home?: string;
+  /**
+   * Turn a bare directory into a repository before refusing it, exactly as `enlist` does.
+   * Default true; `--no-init` is the opt-out. See `resolveProjectRootOrInit` for the guards.
+   */
+  init?: boolean;
   /** Highest rung any dispatch may attempt, before the project ceiling clamps it. Default 2. */
   requestedRung?: Rung;
   /** Engineer attempts per dispatch, including the first. Default 3. */
@@ -291,13 +294,14 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   /** Shared by the live narration and the close-out, so the two cannot spell a unit differently. */
   const progressStyle: ProgressStyle = { self, charset };
 
-  const project = await resolveProjectRoot(cwd);
-  if (project === null) {
-    throw new CampaignSetupError(
-      `${cwd} is not inside a git repository. A commander needs a repository to send anyone into.`,
-      initRepoFix(cwd),
-    );
-  }
+  const project = await resolveProjectRootOrInit({
+    cwd,
+    init: options.init ?? true,
+    needs: 'A commander needs a repository to send anyone into.',
+    // The same line `enlist` prints, before the banner: the reader is owed the fact that a
+    // repository now exists that did not when they typed the command.
+    onCreated: (dir) => io.write(`\n  created a git repository in ${dir}\n`),
+  });
 
   const loaded = await loadConfig({ home, env });
   const config = loaded.config;

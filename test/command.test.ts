@@ -2133,6 +2133,8 @@ describe('parsing', () => {
     assert.equal(args.objective, 'do the thing');
     assert.equal(args.requestedRung, 1);
     assert.equal(args.maxAttempts, 2);
+    assert.equal(args.init, true, 'auto-init must be the default');
+    assert.equal(parseCampaignArgs(['x', '--no-init']).init, false, 'the auto-init opt-out did not parse');
     assert.throws(() => parseCampaignArgs([]), /objective is required/);
     assert.throws(() => parseCampaignArgs(['a', 'b']), /expected one objective/);
     assert.throws(() => parseCampaignArgs(['a', '--rung', '9']), /--rung expects/);
@@ -3885,13 +3887,46 @@ describe('failure paths', () => {
     assert.ok(fs.existsSync(path.join(result.campaignRoot, 'campaign.json')));
   });
 
-  it('a campaign outside a git repository refuses before it creates anything', async () => {
+  it('a campaign outside a git repository with init: false refuses before it creates anything', async () => {
     const home = makeHome();
+    const bare = mkTmp('bare-dir');
     await assert.rejects(
-      campaign({ objective: 'x', cwd: mkTmp('bare-dir'), home }),
+      campaign({ objective: 'x', cwd: bare, home, init: false }),
       /not inside a git repository/,
     );
+    assert.equal(fs.existsSync(path.join(bare, '.git')), false, 'a repository was created despite init: false');
     assert.equal(fs.readdirSync(path.join(home, 'campaigns')).length, 0);
+  });
+
+  it('a campaign in a bare directory auto-inits like enlist, says so live, and fights on', async () => {
+    const bare = mkTmp('autoinit-dir');
+    const home = makeHome();
+    const bins = makeHarnesses('autoinit', 'ok', ['pass']);
+    const events: ProgressEvent[] = [];
+    const result = await campaign({
+      objective: 'Add a multiply function to calc.js',
+      cwd: bare,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      onProgress: (event) => void events.push(event),
+    });
+
+    assert.ok(fs.existsSync(path.join(bare, '.git')), 'no repository was created');
+    assert.equal(result.project, fs.realpathSync(bare), 'the campaign did not adopt the new repository');
+    // The whole point of initialising WITH a commit: the campaign gets all the way to a leased
+    // worktree and a delivery, not to the no-commits refusal one step later.
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    // Said live — the same sentence enlist prints — and recorded on the result for `--json`.
+    assert.ok(
+      events.some((e) => e.kind === 'note' && /created a git repository in /.test(e.message)),
+      'the creation notice never reached the live stream',
+    );
+    assert.ok(
+      result.notes.some((n) => n.code === 'auto-init' && /created a git repository in /.test(n.message)),
+      'the creation was not recorded as a note',
+    );
   });
 
   /**
@@ -5307,7 +5342,9 @@ describe('every way a campaign can fail says what to do about it', () => {
     const home = makeHome();
     const bins = makeHarnesses('fixrun-norepo', 'ok', ['pass']);
     let err = '';
-    const code = await campaignCommand(['Add a multiply function', '--rung', '0'], {
+    // `--no-init` — with the auto-init on, the refusal whose fix line this test exists to run
+    // never fires. The flag rides through parseCampaignArgs, so its wiring is pinned here too.
+    const code = await campaignCommand(['Add a multiply function', '--rung', '0', '--no-init'], {
       stderr: { write: (t) => void (err += t) },
       stdout: { write: () => undefined },
       overrides: { cwd: bare, home, env: {}, worktreeProvider: 'cold', ...bins },
