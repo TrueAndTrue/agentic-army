@@ -42,6 +42,12 @@ import type {
   DispatchRule,
   DispatchTarget,
   GlobalConfig,
+  PermissionPosture,
+  PermissionsConfig,
+} from '../contracts/config.ts';
+import {
+  DEFAULT_PERMISSION_POSTURE,
+  PERMISSION_POSTURES,
 } from '../contracts/config.ts';
 import type { ProjectPolicy, Rung } from '../contracts/delivery.ts';
 import { RUNG_LABEL } from '../contracts/delivery.ts';
@@ -189,7 +195,120 @@ export function defaultConfig(configFilePath: string): GlobalConfig {
     delivery: { defaultCeiling: 0 },
     projects: {},
     dispatch: DEFAULT_DISPATCH,
+    permissions: { mode: DEFAULT_PERMISSION_POSTURE },
   };
+}
+
+/**
+ * `[permissions] mode = "guarded" | "unguarded"`.
+ *
+ * Warns ONLY about a malformed value, and deliberately says nothing about a well-formed
+ * `unguarded`.
+ *
+ * THE FIRST VERSION OF THIS WARNED UNCONDITIONALLY, and fourteen tests failed — every one of them
+ * a case asserting the warnings array for some unrelated reason. That is not fourteen stale
+ * assertions; it is the codebase stating what `warnings` means. This array is "something about
+ * YOUR CONFIG is questionable", it is read by `doctor`, by `view`, by every command that loads a
+ * file, and the effort-drift warning next door already argues that one warning is worth more than
+ * a wall of them. Since `DEFAULT_PERMISSION_POSTURE` is `unguarded`, an unconditional warning here
+ * fires on every load for every reader including ones with no `[permissions]` block at all —
+ * which is the exact shape of a warning people learn to scroll past, taking the effort-drift line
+ * with it.
+ *
+ * The posture still gets announced, louder than a warning would have: `runCampaign` raises it as a
+ * `permissions` NOTE, so it prints once per campaign next to the delivery ceiling, which is the
+ * channel for "here is the authority this run is operating under". Config problems go here;
+ * run-scoped posture goes there.
+ */
+function parsePermissions(raw: unknown, warnings: string[]): PermissionsConfig {
+  let mode: PermissionPosture = DEFAULT_PERMISSION_POSTURE;
+
+  if (isTable(raw)) {
+    const rawMode = raw['mode'];
+    if (typeof rawMode === 'string' && (PERMISSION_POSTURES as readonly string[]).includes(rawMode)) {
+      mode = rawMode as PermissionPosture;
+    } else if (rawMode !== undefined) {
+      warnings.push(
+        `permissions.mode: expected one of ${PERMISSION_POSTURES.map((p) => `"${p}"`).join(', ')}, ` +
+          `got ${JSON.stringify(rawMode)}; using "${DEFAULT_PERMISSION_POSTURE}"`,
+      );
+    }
+  } else if (raw !== undefined) {
+    warnings.push(
+      `permissions: expected a table; using mode = "${DEFAULT_PERMISSION_POSTURE}"`,
+    );
+  }
+
+  return { mode };
+}
+
+/**
+ * The one sentence a reader needs about the posture this run is operating under. Exported so the
+ * campaign note, the chat banner and the test that pins the wording all say the same thing.
+ */
+export function postureNotice(mode: PermissionPosture): string {
+  return mode === 'unguarded'
+    ? 'permissions: unguarded — workers hold their tools unscoped, so an Engineer runs any ' +
+        'command rather than a listed one, and the codex reviewer may open a socket to run your ' +
+        'tests. Still enforced: rank narrowing, the commander context guard, the credential and ' +
+        'archive denies, and the codex write sandbox. Set permissions.mode = "guarded" in ' +
+        'config.toml to restore per-command scoping.'
+    : 'permissions: guarded — every command a worker runs must match its allow-list verbatim, ' +
+        'and the codex reviewer cannot open a socket.';
+}
+
+/**
+ * Reasoning classes, weakest first — the order `REASONING_EFFORTS` already declares.
+ *
+ * Local rather than imported as a value so this stays a pure comparison over a config, with no
+ * opinion about what a harness does with the class it is handed.
+ */
+const EFFORT_ORDER: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+
+/**
+ * Say so when a hand-written config dispatches Engineers above the measured default.
+ *
+ * ## Why this is a warning and not a migration
+ *
+ * `army init` writes a config and never rewrites one, which is correct — a config is the user's
+ * file and this codebase refuses to repair rather than repairing behind a reader's back. The cost
+ * of that correctness is that a config written before 2026-08-05 still says `xhigh`, and the
+ * measured default became `low` on that date under the justification on `DEFAULT_DISPATCH`. A run
+ * observed in the field spent 27.1 minutes and $6.93 on one Engineer attempt for a task the same
+ * trial had measured at a quarter of both, and nothing anywhere said a word.
+ *
+ * ## Why this does not violate NEVER-DOWNGRADE-REASONING
+ *
+ * `src/contracts/harness.ts` forbids silently trading correctness for cost under pressure,
+ * absolutely. This is neither silent nor a reaction to a bill: it reports a divergence from a
+ * default that was chosen on MEASURED OUTCOME under a guaranteed-complete spec, it changes
+ * nothing, and the escalation for a brief with no spec is untouched. A reader who wants `xhigh`
+ * keeps `xhigh` and now knows what it costs.
+ */
+function warnEffortDrift(rules: readonly DispatchRule[], warnings: string[]): void {
+  const baseline = DEFAULT_DISPATCH.rules[0]?.use[0]?.effort;
+  if (baseline === undefined) return;
+  const floor = EFFORT_ORDER.indexOf(baseline);
+  if (floor === -1) return;
+
+  for (const [i, rule] of rules.entries()) {
+    for (const [j, target] of rule.use.entries()) {
+      // The ENGINEER rule only. A reviewer at `high` is a deliberate, separate choice — it must
+      // not share the builder's blind spots — and warning about it would be noise that teaches a
+      // reader to ignore the one warning that matters.
+      if (target.harness !== 'claude' || target.effort === undefined) continue;
+      const level = EFFORT_ORDER.indexOf(target.effort);
+      if (level <= floor) continue;
+      warnings.push(
+        `dispatch.rules[${String(i)}].use[${String(j)}]: effort is "${target.effort}", above the ` +
+          `measured default "${baseline}". A trial measured a complete spec producing ` +
+          'byte-identical output at both, 4x cheaper and 4x faster at the lower class. Nothing ' +
+          'has been changed — this is your config. Lower it to reclaim that, or keep it and know ' +
+          'the cost.',
+      );
+      return; // One warning, not one per rule: the reader needs the fact, not a wall.
+    }
+  }
 }
 
 function parseDispatchTarget(raw: unknown, where: string, warnings: string[]): DispatchTarget | null {
@@ -294,6 +413,8 @@ function parseDispatch(raw: unknown, warnings: string[]): DispatchConfig {
     warnings.push('dispatch: no usable rules — using the built-in vendor split');
     return DEFAULT_DISPATCH;
   }
+
+  warnEffortDrift(rules, warnings);
 
   const config: DispatchConfig = { rules };
 
@@ -454,6 +575,7 @@ export function parseConfig(toml: string, configFilePath: string): ParsedConfig 
       delivery: { defaultCeiling },
       projects: parseProjects(data['projects'], warnings),
       dispatch: parseDispatch(data['dispatch'], warnings),
+      permissions: parsePermissions(data['permissions'], warnings),
     },
     warnings,
   };

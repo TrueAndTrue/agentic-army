@@ -164,4 +164,96 @@ export interface GlobalConfig {
   projects: Record<string, ProjectPolicy>;
 
   dispatch: DispatchConfig;
+
+  permissions: PermissionsConfig;
+}
+
+// -----------------------------------------------------------------------------------------------
+// `[permissions]` — how tightly a worker is confined while it works
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * How tightly a worker is confined. ONE switch, read by both adapters, meaning the same thing on
+ * each: does the confinement stop at the tools a role holds, or does it also police every argv
+ * and deny the network?
+ *
+ * ## Why this exists rather than a pile of individual escape hatches
+ *
+ * Measured on the campaign of 2026-08-07, which burned 65 minutes and ~$14.86 across three
+ * Engineer attempts and delivered nothing:
+ *
+ * | denial | cause |
+ * |---|---|
+ * | 6 on the spec's OWN verify commands | the Engineer appended `; echo "exit=$?"` to see the exit status, which is a different string, and `verifyAllowRules` grants EXACT matches |
+ * | `git clean -f -- seo-audit/debug-redirect.mjs` | absent from `ENGINEER_BASH_PREFIXES`; under `dontAsk`, absent from the allow-list IS denied |
+ * | 50 EPERM on `listen` 127.0.0.1 | the codex Inspector runs `-s workspace-write`, whose sandbox denies the network, and the suite under review binds a loopback socket |
+ *
+ * None of those is an attack. Each is a competent worker meeting a rule that was written to stop
+ * something else, and the last one meant the campaign's headline criterion was never executed by
+ * any of the three reviewers — while all three still returned `testsRun: true`.
+ *
+ * The lesson is not "the rules were wrong in detail". A scoped allow-list is a whitelist of
+ * SPELLINGS, and a model that reaches for a different-but-equivalent spelling is not misbehaving.
+ * Widening the list one entry at a time chases spellings forever; widening it with `:*` is worse,
+ * because `Bash(node x.js:*)` grants `node x.js; rm -rf .`.
+ *
+ * So the axis is made explicit and moved into config, where it can be turned back up in one line.
+ *
+ * ## What each value actually changes
+ *
+ * | | `guarded` | `unguarded` |
+ * |---|---|---|
+ * | tools a role holds | `ROLE_ALLOW[role]`, rank-narrowed | the same tool NAMES, rank-narrowed — identical set, no argv scoping |
+ * | argv scoping (`Bash(git add:*)`) | enforced | none — a granted tool is granted |
+ * | verify / file-run exact grants | appended per spec | not needed, not emitted |
+ * | `GLOBAL_DENY` (credentials, `~/.agentic-army/**`) | enforced | **enforced, unchanged** |
+ * | rank narrowing, `COMMANDER_FORBIDDEN_TOOLS` | enforced | **enforced, unchanged** |
+ * | codex write sandbox (`-s workspace-write`) | enforced | **enforced, unchanged** |
+ * | codex network | denied | allowed |
+ *
+ * The right-hand column is the load-bearing half, and it is why this is `unguarded` rather than
+ * `dangerous`. What is removed is the layer that polices HOW a held tool is spelled. What is kept
+ * is every layer that decides WHICH tools are held and WHERE bytes may land — the rank narrowing,
+ * the commander's context guard, the credential and archive denies, and the codex directory
+ * sandbox that is the only reason a leased worktree is an isolation boundary at all.
+ *
+ * An Engineer under `unguarded` can run any command; it still cannot write outside its lease
+ * without going through a shell, cannot read your credentials, and cannot rewrite the archive
+ * that records what it did. A Commander under `unguarded` still holds no `Read` and no `Bash`.
+ *
+ * ## The honest residual
+ *
+ * A claude worker's ONLY confinement is its permission rules — there is no directory sandbox on
+ * that harness — so `unguarded` does hand a claude ENGINEER a shell that can write anywhere the
+ * user can, `GLOBAL_DENY` notwithstanding, because a deny-list against a shell is a speed bump
+ * and this file has said so since it was written. That is the price, it is stated rather than
+ * papered over, and it is the same price the user pays running `claude --dangerously-skip-
+ * permissions` by hand, which is the posture this mode is named after.
+ */
+export type PermissionPosture = 'guarded' | 'unguarded';
+
+/** Every accepted spelling of `permissions.mode`, for parsing and for the error message. */
+export const PERMISSION_POSTURES: readonly PermissionPosture[] = Object.freeze([
+  'guarded',
+  'unguarded',
+]);
+
+/**
+ * The default, and the one place to change it back.
+ *
+ * `unguarded` while the pipeline is being made to work end-to-end. The reasoning is the user's
+ * and is recorded because a security default that drifted in unattributed is a bug: iteration is
+ * currently gated on argv spellings rather than on whether the work is right, so the boundary is
+ * costing correctness instead of buying it. Every campaign start prints a banner naming this, and
+ * `permissions.mode = "guarded"` restores the old behaviour in one line.
+ *
+ * WHAT MUST FLIP THIS BACK: a green end-to-end run against a real objective, at which point the
+ * argv scoping can be re-enabled and the denials it produces are signal rather than noise.
+ */
+export const DEFAULT_PERMISSION_POSTURE: PermissionPosture = 'unguarded';
+
+/** `[permissions]`. */
+export interface PermissionsConfig {
+  /** TOML `permissions.mode`. Anything unrecognised warns and falls back to the default. */
+  mode: PermissionPosture;
 }

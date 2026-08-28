@@ -46,6 +46,7 @@
  * orchestrator can import it rather than re-derive a rule from memory.
  */
 
+import type { Dirent } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -226,6 +227,129 @@ export function decideAutoInit(dir: string, home: string): AutoInitDecision {
 }
 
 /**
+ * Whether `dir` is a directory the enclosing repository has never heard of.
+ *
+ * ## The failure this closes
+ *
+ * `git rev-parse` walks UP. So `currentRepoRoot()` inside a brand-new `~/projects/thing/` returns
+ * whatever repository happens to be an ancestor, and the lookup succeeds — which means the
+ * `reason: 'no-repo'` branch that auto-init hangs off never fires, and the new directory is
+ * silently adopted into a project the user was not thinking about.
+ *
+ * Field transcript, 2026-08-09: `organizations/personal/` is itself a repository. A campaign run
+ * from a new folder beneath it leased a worktree of the ENTIRE personal directory and committed
+ * to a branch on it — the lease recorded `repoRoot: /Users/awestbury/organizations/personal`. The
+ * user's `mkdir` was the whole of their intent, and nothing in the output said otherwise.
+ *
+ * ## The discriminator, and why it is these two questions
+ *
+ * ```
+ * detached  :=  `git rev-parse --show-toplevel` != dir     (dir is not a worktree root)
+ *           AND `git ls-files` at the toplevel is NOT empty  (the repo has content SOMEWHERE)
+ *           AND `git ls-files -- .` IS empty                 (…and none of it is here)
+ * ```
+ *
+ * The FIRST question is what keeps every agent working. `--show-toplevel` is the WORKTREE root,
+ * not the main root, so it equals `dir` for the main checkout AND for every linked worktree —
+ * including a worktree of a repository whose only commit is empty, which tracks no files and
+ * would otherwise look exactly like a bare new directory. Every Engineer in this system works in
+ * a linked worktree; initialising a repository inside one would be catastrophic and this is the
+ * line that prevents it.
+ *
+ * The SECOND question is the one a test caught rather than a design meeting. "This directory
+ * holds nothing tracked" only MEANS anything if the repository tracks something somewhere else —
+ * in a repository with no commits at all, every subdirectory holds nothing tracked, so the
+ * discriminator fired on `packages/inner` inside a freshly `git init`-ed project and would have
+ * created a nested repository in a perfectly ordinary new codebase. An empty repository has not
+ * yet said what belongs to it, and the honest answer to "is this directory part of it?" is
+ * therefore "assume yes" — which is also exactly the behaviour that shipped before any of this.
+ *
+ * …UNLESS it holds other repositories, which is the case that made all of this visible. The
+ * repository at `~/organizations/personal/` tracks zero files and contains ten checkouts. It is
+ * not a young project that has yet to declare its content; it is a container that was
+ * initialised by mistake, and treating its children as its own is what leased a worktree of an
+ * entire home directory. See `childRepoCount`.
+ *
+ * The THIRD question separates "a new folder that happens to sit inside a repo" from "a
+ * subdirectory OF that repo". `src/` under this project holds 63 tracked files and is obviously
+ * part of it; a directory holding none, in a repo that tracks plenty elsewhere, has never been
+ * committed, never been added, and is not part of the project's content by any test git itself
+ * can apply.
+ *
+ * ## What this deliberately does NOT try to be
+ *
+ * It is not a mind-reader. An EMPTY, UNTRACKED scratch directory inside a project you meant to
+ * work on now becomes its own repository instead of resolving to the parent — `mkdir scratch &&
+ * cd scratch && army chat` changes meaning. That is the price of the fix and it is the right way
+ * round: the new behaviour is announced on the way past (`created a git repository in <dir>`, and
+ * an `auto-init` note in the campaign report), and `--no-init` turns the whole thing off. The old
+ * behaviour was silent, and a silent wrong project is worse than a loud surprising one.
+ *
+ * Answers `false` on any git failure. A repository is never created because a probe timed out.
+ */
+/**
+ * How many immediate children of `dir` are themselves git repositories.
+ *
+ * A directory holding a dozen repositories is a CONTAINER for projects, not a project. That
+ * distinction is not academic: `~/organizations/personal/` on the machine this was written for is
+ * a repository with zero tracked files whose one commit is named `init` — the exact artefact
+ * `autoInitRepo` leaves behind — sitting on top of ten sibling checkouts. Something pointed a
+ * command at a container and it became a repository, and every new folder underneath it has been
+ * inheriting that ever since.
+ *
+ * Shallow by design. A recursive walk of a home directory is slow and the answer does not improve:
+ * one repository directly below is already enough to know what kind of directory this is.
+ *
+ * Returns 0 on any error — an unreadable directory must not be reported as a project container.
+ */
+export async function childRepoCount(dir: string): Promise<number> {
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      // `.git` is a DIRECTORY in a normal checkout and a FILE in a linked worktree. Both count.
+      await fs.stat(path.join(dir, entry.name, '.git'));
+      count += 1;
+    } catch {
+      // Not a repository; keep looking.
+    }
+  }
+  return count;
+}
+
+export async function detachedFromEnclosingRepo(dir: string): Promise<boolean> {
+  const at = ['-C', dir];
+
+  const top = await probe('git', [...at, 'rev-parse', '--show-toplevel'], 5000);
+  if (!top.found || top.timedOut || top.code !== 0) return false;
+  const toplevel = top.stdout.trim().split('\n')[0] ?? '';
+  if (toplevel === '') return false;
+  // Compare physical paths: /tmp vs /private/tmp on macOS would otherwise make a worktree root
+  // look like a subdirectory of itself, and that mistake initialises a repo inside a lease.
+  if ((await physicalPath(toplevel)) === (await physicalPath(dir))) return false;
+
+  // Does the repository track anything AT ALL? If not it has not yet declared what belongs to it,
+  // and "nothing tracked here" carries no information — see the second question above. The one
+  // exception is a repository that tracks nothing but HOLDS OTHER REPOSITORIES: that is not a
+  // young project, it is a container something initialised by mistake, and it owns none of them.
+  const anywhere = await probe('git', ['-C', toplevel, 'ls-files'], 5000);
+  if (!anywhere.found || anywhere.timedOut || anywhere.code !== 0) return false;
+  if (anywhere.stdout.trim() === '' && (await childRepoCount(toplevel)) === 0) return false;
+
+  // `-- .` rather than the absolute path: with `-C dir` the pathspec is relative to `dir`, and an
+  // absolute pathspec outside the toplevel is an error rather than an empty result.
+  const here = await probe('git', [...at, 'ls-files', '--', '.'], 5000);
+  if (!here.found || here.timedOut || here.code !== 0) return false;
+  return here.stdout.trim() === '';
+}
+
+/**
  * `git init` and the empty commit `campaign` needs, run through the same `probe` seam as every
  * other git call in this file. Both steps are reported so the caller can tell "no repository" (the
  * init failed, fatal) from "repository exists but nothing to detach a lease to" (the commit
@@ -354,6 +478,40 @@ export function decideCeiling(
 }
 
 /**
+ * Register a project at the fail-closed ceiling, and only where no registration exists.
+ *
+ * The one ceiling write outside `enlistCommand`, and it lives in this module because the
+ * layering guard in `test/contracts.test.ts` is right: `writeProjectCeiling` carries no raise
+ * policy of its own, so every caller must sit where the policy does. This caller's policy is
+ * that it has no raising to police. It writes only when the project is absent from the config,
+ * and only the value an absent project already answers (`projectCeiling` fails closed to 0), so
+ * there is no input, TTY or otherwise, on which it records more authority than doing nothing
+ * records. The decision still goes through `decideCeiling`, deliberately passed
+ * `interactive: false`, so a future change to the register path breaks here and not in a
+ * session.
+ *
+ * `runChat` calls this on the way into a session, which is what makes a first run one command
+ * instead of three. It throws what the write throws; the caller decides what that costs, and
+ * for a session the answer is a note, never the conversation, because the ceiling is the same
+ * 0 whether or not the write landed.
+ */
+export async function registerProjectIfAbsent(
+  project: string,
+  home: string,
+): Promise<{ registered: boolean }> {
+  const loaded = await loadConfig({ home });
+  if (loaded.config.projects[project] !== undefined) return { registered: false };
+  const decision = decideCeiling(null, null, false);
+  if (decision.kind !== 'register' || decision.target !== DEFAULT_CEILING) {
+    throw new Error(
+      `registerProjectIfAbsent expected register-at-${String(DEFAULT_CEILING)}, got ${decision.kind}`,
+    );
+  }
+  await writeProjectCeiling(project, decision.target, { home });
+  return { registered: true };
+}
+
+/**
  * Where this command's output goes, and whether a human is at the keyboard.
  *
  * An injection seam rather than a test-only convenience, and it replaced something actively
@@ -392,7 +550,11 @@ export async function enlistCommand(
   }
 
   let repo = await currentRepoRoot();
-  if (!repo.ok && repo.reason === 'no-repo' && args.init) {
+  // Two routes to the same init, because "there is no repository here" has two spellings: git
+  // found nothing, or git found one upstairs that has never tracked this directory. The second is
+  // the common one on a machine where projects are nested — see `detachedFromEnclosingRepo`.
+  const detached = repo.ok && args.init && (await detachedFromEnclosingRepo(process.cwd()));
+  if (args.init && ((!repo.ok && repo.reason === 'no-repo') || detached)) {
     const decision = decideAutoInit(process.cwd(), os.homedir());
     if (decision.kind === 'refuse') {
       err(`${self} enlist: ${decision.reason}\n`);

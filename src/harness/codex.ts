@@ -127,7 +127,11 @@ export interface CodexArgsOptions {
  *   `exclude_tmpdir_env_var`, but ONLY when a protected path actually lives there — excluding
  *   `$TMPDIR` unconditionally would break most test runners, and an Inspector is leased a writable
  *   tree precisely so it can run them.
- * - Pins `network_access=false` explicitly, so a user's `config.toml` cannot quietly widen it.
+ * - Pins `network_access` explicitly — to `false` under the `guarded` posture and `true` under
+ *   `unguarded` — so a user's `config.toml` decides neither. Under `guarded` the sandbox denies
+ *   `listen`, which is a real boundary and also the reason a socket-bound test suite cannot be
+ *   reviewed; `PermissionPosture` in `src/contracts/config.ts` records the campaign that made the
+ *   trade explicit.
  * - **REFUSES TO SPAWN** when a rooted write-deny still lands inside the writable region. A
  *   boundary that is silently absent is worse than one that is explicitly unavailable.
  * - Reports everything it cannot enforce as a structured limitation, on the event stream and via
@@ -138,6 +142,12 @@ export interface CodexConfinement {
   args: string[];
   /** Absolute roots the worker can write to, after the overrides above. */
   writableRoots: string[];
+  /**
+   * Whether the sandbox will let this worker open a socket. Reported rather than inferred from
+   * `args`, so a caller — and the test that proves the Inspector can bind 127.0.0.1 again — reads
+   * the decision instead of grepping a `-c` string for a substring.
+   */
+  networkAccess: boolean;
   /** Deny rules the sandbox genuinely enforces. */
   enforced: string[];
   /** Deny rules codex cannot express. Recorded intent, NOT enforcement. */
@@ -308,10 +318,22 @@ export function codexConfinement(
     enforced.push(rule);
   }
 
+  // THE INSPECTOR'S BLINDNESS, and why this is a switch rather than a constant.
+  //
+  // `-s workspace-write` denies `listen`, so a suite that binds 127.0.0.1 dies with
+  // `EPERM ... syscall: 'listen'` before it asserts anything. Measured on the campaign of
+  // 2026-08-07: 50 such failures in one Inspector's stream, on all three review attempts, which
+  // meant the campaign's headline end-to-end criterion was never executed by any reviewer — while
+  // all three still returned `testsRun: true`. A reviewer that cannot run the tests is not a
+  // reviewer, and one that cannot run them but says it did is worse than none.
+  //
+  // Still PINNED either way, which is the part worth keeping: the value is whatever this posture
+  // decided, so a user's `config.toml` cannot widen it under `guarded` and cannot narrow it under
+  // `unguarded`. What changed is that the pin has a reason on both settings instead of one.
+  const networkAccess = spec.posture === 'unguarded';
   const args: string[] = [
-    // Pinned explicitly so a user's config.toml cannot widen it behind our back.
     '-c',
-    'sandbox_workspace_write.network_access=false',
+    `sandbox_workspace_write.network_access=${String(networkAccess)}`,
   ];
   if (excludeSlashTmp) args.push('-c', 'sandbox_workspace_write.exclude_slash_tmp=true');
   if (excludeTmpDir) args.push('-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true');
@@ -320,7 +342,7 @@ export function codexConfinement(
   if (!excludeSlashTmp) writableRoots.push(slashTmp);
   if (!excludeTmpDir && tmpDir !== null) writableRoots.push(tmpDir);
 
-  return { args, writableRoots, enforced, unenforceable, breaches };
+  return { args, writableRoots, networkAccess, enforced, unenforceable, breaches };
 }
 
 /** The message used both by the refusal and by the test that proves the refusal fires. */

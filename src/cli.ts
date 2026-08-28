@@ -62,10 +62,13 @@ function alignedSteps(steps: ReadonlyArray<readonly [string, string]>): string {
 
 function topLevelHelp(self: string): string {
   const firstRun = alignedSteps([
-    [`${self} doctor`, 'find out what is missing before anything else'],
-    [`${self} init`, 'create the war archive in ~/.agentic-army'],
     ['cd ~/code/some-repo', ''],
-    [`${self} enlist`, 'register it — ceiling 0, commit only'],
+    [`${self} chat`, 'the whole setup: archive, config, enlist, session'],
+  ]);
+  const pieces = alignedSteps([
+    [`${self} doctor`, 'check the machine without changing anything'],
+    [`${self} init`, 'create the war archive in ~/.agentic-army'],
+    [`${self} enlist`, 'register a repo by hand, or raise its ceiling'],
   ]);
   return `
 army — a war-hierarchy multi-agent orchestrator
@@ -77,6 +80,8 @@ army — a war-hierarchy multi-agent orchestrator
 
 USAGE
   ${self} <command> [options]
+
+  With no command at all, on a terminal, it opens a chat session.
 
 SETUP
   doctor            Check this machine's environment. Safe to run at any time.
@@ -104,6 +109,12 @@ GLOBAL OPTIONS
 FIRST RUN
 
 ${firstRun}
+
+  Chat creates ~/.agentic-army and its config where they are missing, turns a
+  bare directory into a repository, and registers the project at ceiling 0.
+  Each piece is also its own command, for when you want one alone:
+
+${pieces}
 
   The delivery ceiling is worth understanding before your first campaign:
   it decides whether an agent may open a pull request or merge one. Raising it
@@ -336,7 +347,22 @@ export async function run(argv: readonly string[]): Promise<number> {
   // screen can never report one form and suggest another.
   const self = invokedAs();
 
-  if (first === undefined || first === '--help' || first === '-h' || first === 'help') {
+  if (first === undefined) {
+    // No command, on a terminal, is the front door: a chat session, which does its own setup
+    // (archive, config, repository, enlistment) on the way in. Both streams must be terminals,
+    // not just one: `army | less` and `army < answers.txt` each have half a terminal, and an
+    // interactive session needs the keyboard AND the screen. Piped or redirected this stays the
+    // help it has always been, because a script that ran `army` expecting text must never find
+    // itself holding a live commander.
+    if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
+      const { chatCommand } = await import('./command/chat.ts');
+      return chatCommand([]);
+    }
+    process.stdout.write(topLevelHelp(self));
+    return 0;
+  }
+
+  if (first === '--help' || first === '-h' || first === 'help') {
     const topic = first === 'help' ? rest[0] : undefined;
     const topicHelp = topic === undefined ? undefined : COMMAND_HELP[topic];
     if (topicHelp !== undefined) {

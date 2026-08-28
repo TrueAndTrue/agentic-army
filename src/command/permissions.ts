@@ -69,6 +69,7 @@
  * "enforced" column is trusted there.
  */
 
+import type { PermissionPosture } from '../contracts/config.ts';
 import type { SubagentDefinition } from '../contracts/harness.ts';
 import type { Rank, Role } from '../contracts/ranks.ts';
 import {
@@ -637,6 +638,18 @@ export interface PermissionSet {
 }
 
 /**
+ * `['Bash(git add:*)', 'Bash(npm test:*)', 'Read']` -> `['Bash', 'Read']`.
+ *
+ * The `unguarded` posture in one function: keep every tool the role was granted, drop the argv
+ * scoping, dedupe. It is a projection, never a widening — `unscoped(x)` and `x` name the same
+ * tools, which is what lets `assertDeclaredWritesMatchLoadout` and `assertCommanderLoadout` run
+ * unchanged over either. See `PermissionPosture` in `src/contracts/config.ts` for why.
+ */
+export function unscoped(rules: readonly string[]): string[] {
+  return toolNamesOf(rules);
+}
+
+/**
  * The allow/deny pair for one worker. The only supported way to build one.
  *
  * ## The intersection rule
@@ -656,8 +669,17 @@ export interface PermissionSet {
  * `rank` is a required positional argument and deliberately has no default. A rank that a call
  * site may omit is a mechanism that the next call site will omit, and this whole function exists
  * because a map declared as the single source of truth had no reader for the length of a build.
+ *
+ * `posture` DOES have a default, and it is the tight one — see `SoldierSpec.posture` for why the
+ * polarity matters. It changes the allow half only, and only by dropping argv scoping; the deny
+ * half below is byte-identical under both postures.
  */
-export function permissionsFor(rank: Rank, role: Role, home?: string): PermissionSet {
+export function permissionsFor(
+  rank: Rank,
+  role: Role,
+  home?: string,
+  posture: PermissionPosture = 'guarded',
+): PermissionSet {
   const who = `a ${formatUnit(rank, role)}`;
   // Before anything is subtracted, check that the bottom of the rank order is still a floor. Every
   // loadout below depends on the recursion terminating somewhere, and the place it terminates is a
@@ -665,7 +687,17 @@ export function permissionsFor(rank: Rank, role: Role, home?: string): Permissio
   assertRankFloorContiguous();
   assertDeclaredWritesMatchLoadout(ROLE_ALLOW[role], ROLE_WRITES_FILES[role], `${who} (its role loadout)`);
 
-  const allow = narrowToRank(rank, ROLE_ALLOW[role]);
+  // THE ONE LINE THE POSTURE CHANGES. `unscoped` maps the role's rules to their tool NAMES, so the
+  // SET OF TOOLS is bit-for-bit the set `guarded` would grant — `Bash(git add:*)` and
+  // `Bash(npm test:*)` collapse to one `Bash`, `Read` stays `Read` — and only the argv scoping is
+  // dropped. Everything downstream is unchanged and still runs: the rank narrowing below, the
+  // commander's context guard, the write-declaration check, and the whole deny half.
+  //
+  // Deliberately NOT a wider list. A posture that added a tool would make `ROLE_ALLOW` stop being
+  // the single source of truth for who holds what, and `assertDeclaredWritesMatchLoadout` would be
+  // checking a list nobody declared.
+  const requested = posture === 'unguarded' ? unscoped(ROLE_ALLOW[role]) : ROLE_ALLOW[role];
+  const allow = narrowToRank(rank, requested);
   if (role === 'COMMANDER') assertCommanderLoadout(allow, who);
   assertDeclaredWritesMatchLoadout(allow, writesFiles(rank, role), who);
   assertAllowListNonEmpty(allow, who);

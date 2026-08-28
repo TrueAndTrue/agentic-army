@@ -22,6 +22,7 @@
  * subscription auth.
  */
 
+import type { PermissionPosture } from './config.ts';
 import type { Rank, Role } from './ranks.ts';
 
 export const HARNESS_IDS = ['claude', 'codex'] as const;
@@ -132,6 +133,21 @@ export interface SoldierSpec {
   allow: string[];
   /** Global deny-list. No override, at any rank. A denial writes a signal row (ceiling breach). */
   deny: string[];
+  /**
+   * How tightly this worker is confined — see `PermissionPosture` in `src/contracts/config.ts`
+   * for what each value changes and what it deliberately does not.
+   *
+   * OPTIONAL, DEFAULTING TO `guarded`, and the polarity is the whole point: a call site that
+   * forgets this field builds a TIGHT spec, not a loose one. The opposite default would make
+   * "remember to pass the posture" load-bearing, which is the class of rule this codebase keeps
+   * proving it cannot rely on.
+   *
+   * Read by BOTH adapters and it means the same thing in each, but they act on different halves:
+   * `permissionsFor` has already resolved the allow-list by the time a spec exists, so the claude
+   * adapter needs nothing further; the codex adapter reads it directly to decide
+   * `sandbox_workspace_write.network_access`, which has no representation in an allow-list.
+   */
+  posture?: PermissionPosture;
   /** Extra environment. Credentials are INHERITED, never injected — see the auth note above. */
   env?: Record<string, string>;
 

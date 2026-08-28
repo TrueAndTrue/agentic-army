@@ -185,15 +185,27 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
         lines.push('');
         for (const command of grantable) lines.push(`- \`${command}\``);
         lines.push('');
-        // True since Fix A: `verifyAllowRules` turns each approved verify command into an exact
-        // Bash allow rule on this Engineer's own loadout. Without this sentence the field failure
-        // repeats in miniature — a worker that has just read the loadout section believes bare
-        // `node` is off-limits and skips the one check its orders told it to run.
+        // `verifyAllowRules` turns each approved verify command into an exact Bash allow rule, so
+        // the grant is real and this section has to say so — without it, a worker that has just
+        // read the loadout section believes bare `node` is off-limits and skips the one check its
+        // orders told it to run.
+        //
+        // What it may NOT do is promise the grant will fire. An exact-match rule matches the
+        // command the worker TYPES, and a command that is not valid shell does not survive being
+        // typed: measured in the field, a model handed
+        // `sh -c 'grep -q \"\\\"dependencies\\\": {}\" package.json'` silently normalised the
+        // escaping on its way out, missed the rule, and was denied — then denied again on the
+        // literal form, across three attempts and eleven denial signals. The absolute guarantee
+        // is what turned that into a retry loop: it contradicted the never-retry-a-denied-command
+        // rule four lines below, and the worker believed the guarantee.
         lines.push(
-          'These exact commands are within your authority to run: each one was approved by a ' +
-            'human with the spec and is on your Bash allow-list VERBATIM. Run them exactly as ' +
-            'written — a variation (an added flag, a different path) is a different command and ' +
-            'is not.',
+          'These should be within your authority: each was approved by a human with the spec and ' +
+            'is on your Bash allow-list as an exact match. Run them exactly as written — a ' +
+            'variation (an added flag, a different path) is a different command and will not ' +
+            'match. If one is DENIED anyway, that is a defect in the spec, not something for you ' +
+            'to work around: do NOT retry it, do NOT re-escape it, and do NOT substitute your own ' +
+            'spelling. The acceptance gate runs it for you regardless. Read what it checks, make ' +
+            'that true, and record the denial as a finding so the defect is visible.',
         );
         lines.push('');
       }
@@ -612,7 +624,13 @@ export function renderInspectorBrief(brief: InspectorBrief): string {
   lines.push('');
   lines.push('Specifically:');
   lines.push('1. Does the change do what the OBJECTIVE asked? Name anything it substituted.');
-  lines.push('2. Run the test suite. If you cannot, say so and set `testsRun: false`.');
+  lines.push(
+    '2. Run the test suite. **A suite that did not finish did not run.** If any test errored ' +
+      'for an environmental reason rather than a code reason — a sandbox denial, `EPERM`, a ' +
+      'missing binary, no network, a port it could not bind — then you have not run the suite, ' +
+      'however many other tests passed. Set `testsRun: false`, and name the specific failure and ' +
+      'which criteria it left unverified in your summary.',
+  );
   lines.push(
     '3. Can the new tests fail? Break the thing they guard, watch them go red, restore it. A ' +
       'test that cannot fail is worse than no test, because everything downstream inherits a ' +
@@ -628,6 +646,17 @@ export function renderInspectorBrief(brief: InspectorBrief): string {
       '`blocker`; `pass` otherwise. `testsRun` must be honest — `pass` with `testsRun: false` is ' +
       'a legitimate and distinguishable state, and claiming otherwise is the one thing you can ' +
       'do here that is worse than a wrong verdict.',
+  );
+  lines.push('');
+  lines.push(
+    '`testsRun: true` is a claim that the suite RAN TO COMPLETION under your own hand. It is ' +
+      'not a claim that you tried, and "attempted, mostly passed, some errored on the ' +
+      'environment" is `false`. This has been got wrong in the field: three reviewers in a row ' +
+      'returned `testsRun: true` for a suite in which every socket-bound test died on `EPERM` ' +
+      'before asserting anything, so the objective\'s headline criterion went unverified by ' +
+      'anyone while the report said tests had run. Reporting `false` costs you nothing and costs ' +
+      'the campaign one honest line; reporting `true` wrongly spends someone\'s trust on a ' +
+      'measurement that does not exist.',
   );
   lines.push('');
   return `${lines.join('\n')}\n`;

@@ -27,6 +27,8 @@ import { killProcessTree, probe, resolveBinary, spawnProbeChild } from '../src/s
 import {
   currentRepoRoot,
   decideAutoInit,
+  childRepoCount,
+  detachedFromEnclosingRepo,
   decideCeiling,
   enlistCommand,
   mainRootFromCommonDir,
@@ -2697,11 +2699,18 @@ describe('no command suggests a binary the reader may not have', () => {
         }
       });
 
-      it('the FIRST RUN block is three commands this reader can actually paste', () => {
+      it('the FIRST RUN block leads with chat and every command in it can be pasted', () => {
         const r = cli(world, ['--help']);
         assert.equal(r.code, 0);
         const firstRun = r.out.slice(r.out.indexOf('FIRST RUN'));
-        for (const step of ['doctor', 'init', 'enlist']) {
+        // `chat` first: it is the one command a first run needs, and the other three are listed
+        // under it as the pieces for readers who want them one at a time.
+        assert.ok(
+          firstRun.indexOf(`${world.self} chat`) !== -1 &&
+            firstRun.indexOf(`${world.self} chat`) < firstRun.indexOf(`${world.self} doctor`),
+          `FIRST RUN does not lead with a runnable \`chat\`:\n${firstRun}`,
+        );
+        for (const step of ['chat', 'doctor', 'init', 'enlist']) {
           // Runnable has two halves, and each is proved somewhere it can be proved cheaply:
           // that `step` is a command this CLI routes (the derived set), and that `world.self`
           // followed by a command actually executes (the USAGE test below runs all seven).
@@ -3680,6 +3689,176 @@ describe('decideAutoInit', () => {
   });
 });
 
+// ===========================================================================
+// `git rev-parse` WALKS UP, so "is there a repository?" is the wrong question.
+//
+// Field transcript, 2026-08-09: `~/organizations/personal/` is itself a
+// repository. `mkdir army-test-5 && cd army-test-5` then running a campaign
+// resolved the project to the ENTIRE personal directory and leased a worktree
+// of it — the lease recorded `repoRoot: /Users/awestbury/organizations/personal`.
+// Auto-init never fired because it hangs off `reason: 'no-repo'`, and git had
+// happily found a repository one level up.
+// ===========================================================================
+
+describe(
+  'detachedFromEnclosingRepo',
+  { skip: gitPath === null ? 'git not on PATH' : false },
+  () => {
+    const git = (args: string[], cwd: string): void => {
+      execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', ...args], {
+        cwd,
+        stdio: 'pipe',
+      });
+    };
+
+    /**
+     * A repo that TRACKS SOMETHING, plus somewhere to hang temp dirs off.
+     *
+     * The tracked file is load-bearing, not scenery: a repository with no tracked content
+     * anywhere is deliberately never treated as detachable, so a scaffold built on an empty
+     * commit would make every assertion below vacuously false.
+     */
+    const scaffold = (): { base: string; repo: string } => {
+      const base = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-detach-')));
+      const repo = nodePath.join(base, 'repo');
+      fs.mkdirSync(repo);
+      git(['init', '-q'], repo);
+      fs.writeFileSync(nodePath.join(repo, 'README.md'), '# project\n');
+      git(['add', 'README.md'], repo);
+      git(['commit', '-m', 'init'], repo);
+      return { base, repo };
+    };
+
+    it('a new folder inside a repo that tracks nothing under it IS detached', async () => {
+      const { repo } = scaffold();
+      const fresh = nodePath.join(repo, 'army-test-5');
+      fs.mkdirSync(fresh);
+      assert.equal(await detachedFromEnclosingRepo(fresh), true);
+
+      // Untracked CONTENT does not make it part of the project either — nothing has been added,
+      // nothing committed, and "git has never heard of this" is the whole test.
+      fs.writeFileSync(nodePath.join(fresh, 'draft.txt'), 'x');
+      assert.equal(await detachedFromEnclosingRepo(fresh), true);
+    });
+
+    it('a subdirectory holding a tracked file is NOT detached', async () => {
+      const { repo } = scaffold();
+      const sub = nodePath.join(repo, 'src');
+      fs.mkdirSync(sub);
+      fs.writeFileSync(nodePath.join(sub, 'a.ts'), 'export {};');
+      git(['add', 'src/a.ts'], repo);
+      git(['commit', '-m', 'a'], repo);
+      assert.equal(await detachedFromEnclosingRepo(sub), false);
+    });
+
+    it('a repository root is never detached from itself', async () => {
+      const { repo } = scaffold();
+      assert.equal(await detachedFromEnclosingRepo(repo), false);
+    });
+
+    /**
+     * THE CATASTROPHIC CASE. Every Engineer in this system works in a linked worktree, and a
+     * worktree of a repo whose only commit is empty tracks NO files — so a tracked-file test
+     * alone would call it detached and initialise a repository inside a live lease.
+     *
+     * `--show-toplevel` is what prevents it: it returns the WORKTREE root, so it equals the
+     * directory for a linked worktree exactly as it does for the main checkout.
+     */
+    it('a linked worktree is NOT detached, and neither is one that tracks nothing', async () => {
+      const { base, repo } = scaffold();
+      const wt = nodePath.join(base, 'wt-01');
+      git(['worktree', 'add', '-q', '-b', 'army/t-probe', wt], repo);
+      assert.equal(await detachedFromEnclosingRepo(wt), false);
+
+      // The sharper version: a worktree on an ORPHAN branch tracks no files at all, so only
+      // `--show-toplevel` stands between it and a repository initialised inside a live lease.
+      const bare = nodePath.join(base, 'wt-02');
+      git(['worktree', 'add', '-q', '--detach', bare], repo);
+      git(['checkout', '-q', '--orphan', 'army/t-empty'], bare);
+      git(['rm', '-rqf', '.'], bare);
+      assert.equal(
+        execFileSync('git', ['ls-files', '--', '.'], { cwd: bare, stdio: 'pipe' }).toString().trim(),
+        '',
+        'precondition: the worktree tracks no files',
+      );
+      assert.equal(await detachedFromEnclosingRepo(bare), false);
+    });
+
+    /**
+     * A repository with no tracked content ANYWHERE has not yet said what belongs to it, so every
+     * subdirectory of it looks bare. This is the case that shipped broken for one test run: a
+     * freshly `git init`-ed project would have got a nested repository in `packages/inner`.
+     */
+    it('a subdirectory of a repo that tracks nothing anywhere is NOT detached', async () => {
+      const base = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-detach-empty-')));
+      const repo = nodePath.join(base, 'repo');
+      fs.mkdirSync(repo);
+      git(['init', '-q'], repo);
+      git(['commit', '--allow-empty', '-m', 'init'], repo);
+      const sub = nodePath.join(repo, 'packages', 'inner');
+      fs.mkdirSync(sub, { recursive: true });
+      assert.equal(await detachedFromEnclosingRepo(sub), false);
+
+      // …and the moment the project has content, the same directory IS detached.
+      fs.writeFileSync(nodePath.join(repo, 'README.md'), '# project\n');
+      git(['add', 'README.md'], repo);
+      git(['commit', '-m', 'content'], repo);
+      assert.equal(await detachedFromEnclosingRepo(sub), true);
+    });
+
+    /**
+     * THE DIRECTORY THAT STARTED IT. `~/organizations/personal/` is a repository with ZERO tracked
+     * files whose single commit is named `init` — the artefact `autoInitRepo` leaves — sitting on
+     * top of ten sibling checkouts. Something pointed a command at a container and it became a
+     * repository.
+     *
+     * It defeats the empty-repo guard above on its own terms: no tracked content anywhere. What
+     * separates it from a young project is that it HOLDS OTHER REPOSITORIES, and a directory full
+     * of checkouts owns none of them.
+     */
+    it('an empty repo that HOLDS other repositories is a container — its children are detached', async () => {
+      const base = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-container-')));
+      const container = nodePath.join(base, 'personal');
+      fs.mkdirSync(container);
+      git(['init', '-q'], container);
+      git(['commit', '--allow-empty', '-m', 'init'], container);
+
+      const fresh = nodePath.join(container, 'army-test-5');
+      fs.mkdirSync(fresh);
+      // With no sibling checkouts it is indistinguishable from a young project — assume it owns.
+      assert.equal(await detachedFromEnclosingRepo(fresh), false);
+
+      // Give it one sibling repository and it is a container.
+      const sibling = nodePath.join(container, 'other-project');
+      fs.mkdirSync(sibling);
+      git(['init', '-q'], sibling);
+      assert.equal(await childRepoCount(container), 1);
+      assert.equal(await detachedFromEnclosingRepo(fresh), true);
+    });
+
+    it('childRepoCount is shallow, counts linked worktrees, and never throws', async () => {
+      const { base, repo } = scaffold();
+      // `repo` holds no child repositories; `base` holds `repo`.
+      assert.equal(await childRepoCount(repo), 0);
+      assert.equal(await childRepoCount(base), 1);
+
+      // A linked worktree's `.git` is a FILE, not a directory, and still counts.
+      const wt = nodePath.join(base, 'wt-01');
+      git(['worktree', 'add', '-q', '-b', 'army/t-count', wt], repo);
+      assert.ok(fs.statSync(nodePath.join(wt, '.git')).isFile(), 'precondition: .git is a file here');
+      assert.equal(await childRepoCount(base), 2);
+
+      // Unreadable or absent: 0, never a throw — this feeds a decision to CREATE a repository.
+      assert.equal(await childRepoCount(nodePath.join(base, 'does-not-exist')), 0);
+    });
+
+    it('a directory in no repository at all is NOT detached — that is the old no-repo route', async () => {
+      const loose = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-loose-')));
+      assert.equal(await detachedFromEnclosingRepo(loose), false);
+    });
+  },
+);
+
 describe(
   'enlist auto-init',
   { skip: gitPath === null ? 'git not on PATH' : false },
@@ -3825,6 +4004,56 @@ describe(
         const run = runCli(['enlist'], sub, home);
         assert.equal(run.code, 0, run.err);
         assert.doesNotMatch(run.out, /created a git repository/, 'auto-init fired inside an existing repository');
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * THE FIELD FAILURE, end to end. `~/organizations/personal/` is itself a repository, so
+     * `mkdir army-test-5 && cd army-test-5 && army <anything>` resolved the project to the whole
+     * personal directory — a campaign run that way leased a worktree of it and committed to a
+     * branch on it. `git rev-parse` walks up; nothing in the output said which repository had
+     * been chosen.
+     *
+     * The assertion that matters is the LAST one: the enlisted project must be the new directory,
+     * not its parent. Without it this passes on the banner alone.
+     */
+    it('a new folder inside a repo that has content gets its OWN repository, not its parent', () => {
+      const tmp = fs.realpathSync(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'army-adopt-')));
+      try {
+        const home = nodePath.join(tmp, 'home');
+        const parent = nodePath.join(tmp, 'personal');
+        fs.mkdirSync(parent, { recursive: true });
+        const g = (args: string[]): void => {
+          execFileSync('git', ['-c', 'user.email=a@b', '-c', 'user.name=a', ...args], {
+            cwd: parent,
+            stdio: 'ignore',
+          });
+        };
+        g(['init', '-q']);
+        fs.writeFileSync(nodePath.join(parent, 'notes.md'), '# personal\n');
+        g(['add', 'notes.md']);
+        g(['commit', '-q', '-m', 'content']);
+
+        const fresh = nodePath.join(parent, 'army-test-5');
+        fs.mkdirSync(fresh);
+
+        const run = runCli(['enlist'], fresh, home);
+        assert.equal(run.code, 0, run.err);
+        assert.match(run.out, /created a git repository/, 'the new folder was adopted silently');
+        assert.ok(
+          fs.existsSync(nodePath.join(fresh, '.git')),
+          'no repository was created in the directory the command was pointed at',
+        );
+
+        // The whole point: the ceiling is keyed to the new folder, never to the parent.
+        const cfg = fs.readFileSync(nodePath.join(home, 'config.toml'), 'utf8');
+        assert.ok(cfg.includes(fresh), `[projects] did not name ${fresh}:\n${cfg}`);
+        assert.ok(
+          !cfg.includes(`"${parent}"`),
+          `the parent repository was enlisted instead of the new folder:\n${cfg}`,
+        );
       } finally {
         fs.rmSync(tmp, { recursive: true, force: true });
       }

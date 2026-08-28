@@ -13,13 +13,22 @@
 import type {
   AcceptanceResult,
   CommandRunner,
+  VerifyBaseline,
   VerifyOutcome,
 } from '../contracts/verify.ts';
-import { DEFAULT_VERIFY_TIMEOUT_MS } from '../contracts/verify.ts';
+import { DEFAULT_VERIFY_TIMEOUT_MS, SHELL_CANNOT_EXECUTE } from '../contracts/verify.ts';
 import { runCommand } from './exec.ts';
 
 /** The tail is where the failure is — see `output` below. */
 const OUTPUT_TAIL_MAX_CHARS = 2000;
+
+/**
+ * How many distinct output lines form a command's baseline reading.
+ *
+ * Capped so a command that complains once per file cannot make the comparison depend on how many
+ * files happened to be present. Deduplicated for the same reason.
+ */
+const SIGNATURE_MAX_LINES = 40;
 
 export interface AcceptanceGateInput {
   /** The spec's `verify` commands. Absent or empty means there is no gate to run. */
@@ -32,6 +41,14 @@ export interface AcceptanceGateInput {
   timeoutMs?: number;
   /** One line per command, as it starts and as it finishes. Optional. */
   onProgress?: (line: string) => void;
+  /**
+   * What each command did against the untouched base tree, from `runVerifyBaseline`.
+   *
+   * Optional, and absence is never treated as agreement: a command with no baseline gets
+   * `unchangedFromBaseline: false`, which is the reading that keeps every existing caller's
+   * behaviour exactly as it was.
+   */
+  baseline?: readonly VerifyBaseline[];
 }
 
 function errorMessage(error: unknown): string {
@@ -62,6 +79,134 @@ function tailOutput(stdout: string, stderr: string): string {
 }
 
 /**
+ * What a command said, as a set of distinct lines two runs can be compared on.
+ *
+ * ## The whole difficulty is false EQUALITY, not false difference
+ *
+ * The comparison this feeds decides whether to tell a human their SPEC is broken instead of
+ * telling an Engineer its BRANCH is. Getting that backwards blames the wrong thing on the one
+ * screen where a person is deciding what to fix, so every judgement call here is made in the
+ * direction of failing to notice rather than accusing wrongly.
+ *
+ * Two earlier shapes failed that test by matching too eagerly, and both were caught by the tests
+ * beside this:
+ *
+ *   - The exit code alone. `node --test` exits 1 because no tests exist yet and exits 1 because
+ *     an assertion failed. Completely different events, identical key.
+ *   - The first two lines with digits masked. `tests 0 | fail 0` and `tests 9 | fail 1` both
+ *     become `tests # | fail #`, which is the same collision wearing a disguise — and the counts
+ *     were the entire content.
+ *
+ * A third failed the other way, by matching too strictly — see `saysNothingNew`, which is where
+ * the comparison actually lives. Lines rather than a single blob because the useful relation
+ * turned out to be containment, not equality.
+ */
+export function outputLines(stdout: string, stderr: string): string[] {
+  const raw = stderr.trim() !== '' ? stderr : stdout;
+  const seen = new Set(
+    raw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== ''),
+  );
+  // Deduplicated and capped. A command that prints the same complaint per file would otherwise
+  // make the set size depend on how many files happened to be there.
+  return [...seen].slice(0, SIGNATURE_MAX_LINES);
+}
+
+/**
+ * Did this run say anything the baseline had not already said?
+ *
+ * SUBSET, not equality, and that asymmetry is the whole correction. Byte-identical output was the
+ * obvious rule and it does not survive contact: the baseline runs against a tree where the work
+ * does not exist yet, so a broken command legitimately says MORE at base than it does afterwards.
+ * The field case is exactly that —
+ *
+ *     base : grep: {}": No such file or directory
+ *            grep: package.json: No such file or directory      <- the file is not there yet
+ *     after: grep: {}": No such file or directory
+ *
+ * — identical in the part that matters and different in the part that does not, so equality
+ * reported "changed" for the one command this exists to catch.
+ *
+ * Subset keeps the safe direction. A genuine failure introduces a line the baseline never had
+ * (`not ok 3 - crawl finds every heading`), so it is never a subset and is never blamed on the
+ * spec. Saying strictly LESS than a tree with no work in it, while still failing the same way, is
+ * the shape of a command that was never reading the work.
+ */
+export function saysNothingNew(before: readonly string[], after: readonly string[]): boolean {
+  const seen = new Set(before);
+  return after.every((line) => seen.has(line));
+}
+
+export interface VerifyBaselineInput {
+  commands?: readonly string[];
+  /** The leased worktree, at base — BEFORE any Engineer has touched it. */
+  cwd: string;
+  run?: CommandRunner;
+  timeoutMs?: number;
+  onProgress?: (line: string) => void;
+}
+
+/**
+ * Read what every verify command does against the untouched base tree.
+ *
+ * Run once per campaign, after the worktree is leased and before the first Engineer is dispatched.
+ * Costs one pass over the commands; buys the ability to say, later, that a command failed the
+ * same way before anybody did any work — and to say it in the seconds after a human approves a
+ * dispatch rather than twenty-seven minutes into it.
+ *
+ * Never throws, for the same reason the gate does not: this is diagnostic, and a diagnostic that
+ * can abort a campaign which has not started yet is worse than no diagnostic. A runner that throws
+ * becomes a baseline entry whose line set records the throw.
+ */
+export async function runVerifyBaseline(input: VerifyBaselineInput): Promise<VerifyBaseline[]> {
+  const commands = input.commands;
+  if (commands === undefined || commands.length === 0) return [];
+
+  const run = input.run ?? runCommand;
+  const timeoutMs = input.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+
+  const baseline: VerifyBaseline[] = [];
+  for (const command of commands) {
+    try {
+      const result = await run(command, input.cwd, timeoutMs);
+      baseline.push({
+        command,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        lines: outputLines(result.stdout, result.stderr),
+      });
+      safeProgress(
+        input.onProgress,
+        `baseline: \`${command}\` exited ${String(result.exitCode)} against the base tree`,
+      );
+    } catch (error) {
+      baseline.push({
+        command,
+        exitCode: null,
+        timedOut: false,
+        lines: outputLines('', errorMessage(error)),
+      });
+    }
+  }
+  return baseline;
+}
+
+/**
+ * Commands that could never have said anything about the work.
+ *
+ * Two ways in, and both are facts rather than judgements: the command exited 126/127 at base, so a
+ * shell could not run it at all; or it failed at base and then failed IDENTICALLY afterwards, so
+ * whatever it measures, it is not the difference the Engineer made.
+ *
+ * A command that PASSED after failing at base is the normal, healthy case and never appears here.
+ */
+export function unrunnableCommands(result: AcceptanceResult): readonly VerifyOutcome[] {
+  return result.outcomes.filter((outcome) => outcome.unchangedFromBaseline);
+}
+
+/**
  * Run every command in `input.commands`, in order, and report whether the branch earned an
  * Inspector.
  *
@@ -84,6 +229,32 @@ export async function runAcceptanceGate(input: AcceptanceGateInput): Promise<Acc
   const run = input.run ?? runCommand;
   const timeoutMs = input.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
 
+  // Keyed by command text, which is what `spec.verify` is a list of. A spec naming the same
+  // command twice gets one baseline for both — they are the same command and cannot disagree.
+  const baseline = new Map<string, VerifyBaseline>();
+  for (const entry of input.baseline ?? []) baseline.set(entry.command, entry);
+
+  /**
+   * Did this command say the same thing before anybody did the work?
+   *
+   * Only ever consulted for a FAILING command. A command that passes has plainly distinguished
+   * the work from its absence, whatever it did at base, and asking the question of it would be a
+   * way to talk a passing check into looking suspicious.
+   */
+  const wasAlreadyFailing = (
+    command: string,
+    exitCode: number | null,
+    lines: readonly string[],
+  ): boolean => {
+    const before = baseline.get(command);
+    if (before === undefined) return false;
+    // A shell that could not execute the command at base says so with 126/127, and no amount of
+    // engineering changes that — the line comparison would usually catch it too, but naming the
+    // codes makes the reason legible in a report.
+    if (before.exitCode !== null && SHELL_CANNOT_EXECUTE.includes(before.exitCode)) return true;
+    return before.exitCode === exitCode && saysNothingNew(before.lines, lines);
+  };
+
   const outcomes: VerifyOutcome[] = [];
   for (const command of commands) {
     safeProgress(input.onProgress, `verify: starting \`${command}\``);
@@ -96,6 +267,13 @@ export async function runAcceptanceGate(input: AcceptanceGateInput): Promise<Acc
         exitCode: result.exitCode,
         timedOut: result.timedOut,
         output: tailOutput(result.stdout, result.stderr),
+        unchangedFromBaseline:
+          !passed &&
+          wasAlreadyFailing(
+            command,
+            result.exitCode,
+            outputLines(result.stdout, result.stderr),
+          ),
       });
       safeProgress(input.onProgress, `verify: finished \`${command}\` — ${passed ? 'passed' : 'failed'}`);
     } catch (error) {
@@ -107,6 +285,11 @@ export async function runAcceptanceGate(input: AcceptanceGateInput): Promise<Acc
         exitCode: null,
         timedOut: false,
         output: errorMessage(error),
+        unchangedFromBaseline: wasAlreadyFailing(
+          command,
+          null,
+          outputLines('', errorMessage(error)),
+        ),
       });
       safeProgress(input.onProgress, `verify: finished \`${command}\` — failed (${errorMessage(error)})`);
     }

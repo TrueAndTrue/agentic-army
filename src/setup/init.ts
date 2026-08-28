@@ -154,6 +154,41 @@ default_ceiling = 0
 
 
 # ---------------------------------------------------------------------------
+# [permissions] — how tightly a worker is held WHILE it works
+# ---------------------------------------------------------------------------
+# [delivery] above decides how far finished work may travel. This decides what
+# a worker may do while producing it. Two settings:
+#
+#   guarded    every command must match an allow-list entry verbatim, and the
+#              codex reviewer cannot open a socket.
+#   unguarded  a worker holds its tools unscoped — an Engineer runs any
+#              command rather than a listed one — and the codex reviewer may
+#              bind a socket so it can actually run your tests.
+#
+# UNCHANGED BY EITHER SETTING, because these are the boundaries that carry the
+# weight: which tools a rank and role may hold at all, the Commander holding no
+# shell and no Read, the denies on your credentials and on this archive, and the
+# codex write sandbox that keeps a worker inside its leased worktree.
+#
+# WHY THE DEFAULT IS "unguarded". A scoped allow-list is a whitelist of command
+# SPELLINGS, and a model that reaches for an equivalent spelling is not
+# misbehaving. Measured on one campaign: six denials on the spec's OWN verify
+# commands because the Engineer appended a trailing echo to read the exit
+# status; one on "git clean" merely for being absent from the list; and fifty
+# EPERM failures because the reviewer's sandbox denies listen(2) and the suite
+# under review binds a socket — so the headline criterion was never executed by
+# any reviewer. 65 minutes, nothing delivered, no attack anywhere in it.
+#
+# Widening the list one spelling at a time chases spellings forever, and
+# widening it with a wildcard is worse: an allow rule for "node x.js:*" also
+# grants "node x.js; rm -rf ." — the wildcard covers the whole rest of the line.
+# So the axis is explicit and lives here, where one line turns it back up.
+[permissions]
+
+mode = "unguarded"
+
+
+# ---------------------------------------------------------------------------
 # [worktree] — the pool every agent works in
 # ---------------------------------------------------------------------------
 # A campaign leases ONE tree and runs its Engineer and then its Inspector in it.
@@ -506,7 +541,8 @@ export async function initCommand(argv: readonly string[]): Promise<number> {
     process.stdout.write('\n  Existing config left untouched — init never overwrites it.\n');
   }
   process.stdout.write(
-    `\n  Next: \`cd\` into a repo you want the army to work on and run \`${self} enlist\`.\n\n`,
+    `\n  Next: \`cd\` into a repo you want the army to work on and run \`${self} chat\`,\n` +
+      `  which enlists it on the way in. \`${self} enlist\` registers it by hand.\n\n`,
   );
   return 0;
 }

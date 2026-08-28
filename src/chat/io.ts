@@ -30,6 +30,25 @@
  * This matters more than it looks. The soldier's own interrupt is ALSO not a signal — it is a
  * stdin control message — so the whole path from keystroke to aborted turn contains no signal at
  * any point, and nothing in it can kill the conversation by accident.
+ *
+ * ## Two painted regions, and why they are painted separately
+ *
+ * This file used to own exactly one row: the cursor's own, repainted with `\r` + erase-line. The
+ * status block adds rows BELOW it, and the temptation is to treat the whole thing as one overlay
+ * repainted together. That would be wrong in a way that costs real bytes, because the two change
+ * at wildly different rates — the composer repaints on every keystroke and the spinner eight
+ * times a second, while the block changes when a unit starts or a clock ticks over. So:
+ *
+ * - `repaint()` draws the cursor's row and does not touch what is under it. The rows below have
+ *   not moved, and redrawing them per keystroke would be a cursor round trip per character.
+ * - `writeBelow()` draws the rows below and puts the cursor back. It compares what it would paint
+ *   against what is on screen and returns without writing a byte when they agree, which is what
+ *   makes it safe to call from a 120ms timer.
+ *
+ * Everything that moves the cursor off its row goes through `emit`, which erases the block first
+ * and paints it again afterwards. That is the whole protocol, and the two rules that keep it
+ * honest are on `statusRows` (when the block may be drawn at all) and on `submitLine` (when
+ * `currentExtra()` may be evaluated). Both are stated where they are enforced.
  */
 
 import { createInterface, emitKeypressEvents } from 'node:readline';
@@ -37,6 +56,23 @@ import type { Interface as ReadlineInterface } from 'node:readline';
 
 import { detectCharset, detectColor } from '../view/index.ts';
 import type { Charset } from '../view/render.ts';
+import { ANSI, SPINNER_FRAMES, asciiFold, displayWidth, paintInk, wrapPlain } from '../view/render.ts';
+
+/**
+ * The status block, as a pure function of the animation frame and the terminal's width.
+ *
+ * A FUNCTION rather than an array of lines, because the block animates: a spinner frame and an
+ * elapsed clock both change without anything happening in the session, and a `setStatus(lines)`
+ * taking a snapshot would need its caller to own a second timer writing to a stream this file is
+ * documented as owning alone. So the caller supplies what the block SAYS and this file decides
+ * when it is drawn, which keeps every write to `output` behind one door.
+ *
+ * `width` is handed in for the same reason `nextLine` does not take one: the terminal's width is
+ * this file's knowledge, it changes under a running session when somebody drags a window, and a
+ * caller that captured it at startup would produce rows that wrap. A wrapped status row breaks
+ * the cursor arithmetic below — see `writeBelow`.
+ */
+export type StatusRenderer = (tick: number, width: number) => readonly string[];
 
 export interface ChatIo {
   /** Write to the conversation. No trailing newline is added. */
@@ -44,7 +80,7 @@ export interface ChatIo {
   /**
    * Print `prompt`, then resolve with the next line the human types.
    *
-   * A prompt may span lines — `runChat` asks for `'\nyou › '`, a blank separator and then the
+   * A prompt may span lines — `runChat` asks for `'\n▌ '`, a blank separator and then the
    * prompt. On a TTY everything up to the last `\n` is printed once and only the FINAL line is
    * repainted while the human edits; on the piped path the whole string is written verbatim. The
    * distinction lives here, in the contract, because the caller has no way to know which physical
@@ -63,6 +99,15 @@ export interface ChatIo {
   /** True when this is a real terminal — decides whether colour and re-prompting are worth it. */
   readonly isTTY: boolean;
   /**
+   * Terminal columns, live.
+   *
+   * A getter rather than a number, because a window that is resized mid-session changes it and
+   * anything that captured it at startup starts producing rows that wrap. Off a terminal it is
+   * the conventional 80 — a width nothing is measured against, but one every renderer that asks
+   * for a width can be given.
+   */
+  readonly width: number;
+  /**
    * The session is waiting on the model, with nothing to show yet. On a TTY this animates
    * `<spinner> <label> …` appended to the current line — the label so the reader knows WHOSE
    * silence they are looking at; everywhere else it is bookkeeping only. `write` (the model's
@@ -72,6 +117,18 @@ export interface ChatIo {
   setBusy(label: string): void;
   /** The wait is over, with nothing ever written. Idempotent with an unstarted or already-ended spinner. */
   setIdle(): void;
+  /**
+   * Install, replace or clear (`null`) the status block pinned under the conversation.
+   *
+   * On a TTY this is one or more rows painted BELOW the cursor's row and repainted in place —
+   * the branch, the loadout, the cost, and a row per unit in flight. Everywhere else it is
+   * bookkeeping only: escape bytes in a redirected transcript are a corruption, not a feature,
+   * and the same reasoning gates the spinner and the campaign ticker.
+   *
+   * The block is drawn only when the current row is FINISHED — see `writeBelow`. A caller that
+   * installs one is asking for it to be visible whenever it can be, not promising a row count.
+   */
+  setStatus(render: StatusRenderer | null): void;
 }
 
 /**
@@ -319,29 +376,85 @@ export function historyDown(
 }
 
 // =================================================================================================
+// Backslash continuation: multiline input without a multi-row composer.
+//
+// A line whose Enter arrives with a single trailing backslash continues instead of submitting:
+// the backslash comes off, the segment is held, and the next line joins it with a newline. The
+// composer itself never holds a newline. Earlier segments are already echoed above, only the
+// segment being typed is live on the cursor row, so the one-row repaint model and every piece of
+// cursor arithmetic built on it stay untouched.
+// =================================================================================================
+
+export type ContinuationStep =
+  | { kind: 'continue'; segment: string }
+  | { kind: 'submit'; line: string };
+
+/**
+ * One Enter press, judged against the segments already held.
+ *
+ * Only the line's last characters are inspected, and the rule is two cases deep on purpose: a
+ * single trailing backslash continues (and comes off), a trailing double backslash submits with
+ * the pair collapsed to one literal backslash (the escape for "I really mean a backslash at the
+ * end"), and everything else submits as typed. Backslashes anywhere else in the line are never
+ * touched, so paths and regexes pass through whole. Shared by all three input paths, which is
+ * what keeps `first \` + `second` meaning the same two-line turn on a raw terminal, a pipe and a
+ * scripted test.
+ */
+export function continuationStep(segments: readonly string[], line: string): ContinuationStep {
+  if (line.endsWith('\\\\')) {
+    return { kind: 'submit', line: [...segments, `${line.slice(0, -2)}\\`].join('\n') };
+  }
+  if (line.endsWith('\\')) return { kind: 'continue', segment: line.slice(0, -1) };
+  return { kind: 'submit', line: [...segments, line].join('\n') };
+}
+
+/**
+ * Fold backslash-continued lines into whole entries, for the queue-fed paths.
+ *
+ * The raw path applies `continuationStep` keystroke by keystroke because it also owns the echo;
+ * the piped path and the scripted stand-in have no composer, so this fold is the entire feature
+ * there. An entry still open when the stream ends is dropped with the stream, the same way a
+ * half-typed line is.
+ */
+function continuationFold(push: (entry: string) => void): (line: string) => void {
+  let segments: string[] = [];
+  return (line: string): void => {
+    const step = continuationStep(segments, line);
+    if (step.kind === 'continue') {
+      segments = [...segments, step.segment];
+      return;
+    }
+    segments = [];
+    push(step.line);
+  };
+}
+
+// =================================================================================================
 // The real terminal
 // =================================================================================================
 
 export interface TerminalIoOptions {
   input?: NodeJS.ReadableStream & { isTTY?: boolean; setRawMode?: (mode: boolean) => void };
-  output?: NodeJS.WritableStream & { isTTY?: boolean; columns?: number };
+  /**
+   * `rows` is read for exactly one decision: whether there is room under the conversation for a
+   * status block at all. A terminal three rows tall that is asked to pin two of them has no
+   * screen left to hold a conversation in.
+   */
+  output?: NodeJS.WritableStream & { isTTY?: boolean; columns?: number; rows?: number };
 }
 
-/** `\r` to column zero, then erase to end of line — the only cursor control this file emits. */
+/** `\r` to column zero, then erase to end of line. With `cursorUp`, the whole cursor vocabulary. */
 const ERASE_LINE = '\r[2K';
 
-const ANSI = {
-  reset: '[0m',
-  bold: '[1m',
-  dim: '[2m',
-  green: '[32m',
-  cyan: '[36m',
-} as const;
-
-const SPINNER_FRAMES: Record<Charset, readonly string[]> = {
-  unicode: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
-  ascii: ['-', '\\', '|', '/'],
-};
+/**
+ * Move the cursor up `n` rows, staying in the same column.
+ *
+ * The second and last cursor control this file emits, and it is the whole of what makes a
+ * multi-row overlay possible. RELATIVE, never absolute: a terminal that scrolls while the block
+ * is being painted moves the conversation and the cursor together, so "up two rows" stays correct
+ * where a saved absolute position would be wrong by however far it had scrolled.
+ */
+const cursorUp = (n: number): string => `[${String(n)}A`;
 
 const ELLIPSIS: Record<Charset, string> = { unicode: '…', ascii: '~' };
 
@@ -349,9 +462,16 @@ const ELLIPSIS: Record<Charset, string> = { unicode: '…', ascii: '~' };
 const LABEL_ELLIPSIS: Record<Charset, string> = { unicode: '…', ascii: '...' };
 
 /**
+ * The composer's prompt while a backslash continuation is open. Painted dim where the main
+ * prompt is bold: this row is the tail of an entry, not a fresh question. `~ ` on ascii would
+ * read as a home-directory typo, so the fold picks `. ` instead.
+ */
+const CONTINUATION_PROMPT: Record<Charset, string> = { unicode: '… ', ascii: '. ' };
+
+/**
  * Split a prompt into the lines above the composer and the composer's own single line.
  *
- * `runChat`'s prompt is `'\nyou › '` — a blank separator line, then the prompt. The separator is
+ * `runChat`'s prompt is `'\n▌ '` — a blank separator line, then the prompt. The separator is
  * ordinary output: printed once, when the read begins. Only the FINAL line may be repainted per
  * keystroke, because the repaint primitive is `\r` + erase-line, which touches exactly one
  * physical row. Feeding the whole string to the repaint was the shipped bug: every keystroke
@@ -454,6 +574,20 @@ function createRawTerminalIo(
   let painted = false;
   let plainPrompt = '';
   let colouredPrompt = '';
+  /**
+   * Completed segments of a backslash-continued entry; empty when no continuation is open.
+   *
+   * While it is non-empty the composer paints the continuation prompt instead of the main one,
+   * and Enter keeps joining rather than submitting. It never holds the live segment; that is
+   * `editor.buffer`, on the one row the repaint owns.
+   */
+  let pendingSegments: string[] = [];
+  const contPlainPrompt = CONTINUATION_PROMPT[charset];
+  const contColouredPrompt = paintInk(colour, 'dim', contPlainPrompt);
+  const livePlainPrompt = (): string =>
+    pendingSegments.length > 0 ? contPlainPrompt : plainPrompt;
+  const liveColouredPrompt = (): string =>
+    pendingSegments.length > 0 ? contColouredPrompt : colouredPrompt;
   let editor: EditorState = { buffer: '', cursor: 0 };
   let history: EditorHistory = historyInit();
   let resolveLine: ((value: string | null) => void) | null = null;
@@ -470,6 +604,15 @@ function createRawTerminalIo(
   /** A `\r\n` paste sends two keypress events; the LF half is swallowed so no phantom line lands. */
   let pendingCrlf = false;
 
+  /** The status block's source, its animation frame, and what is currently on screen below. */
+  let statusRender: StatusRenderer | null = null;
+  let statusTick = 0;
+  let statusTimer: ReturnType<typeof setInterval> | null = null;
+  /** Rows the block occupies below the cursor's row right now. */
+  let below = 0;
+  /** What those rows say, so an unchanged block is never repainted. */
+  let belowText = '';
+
   const colourizePrompt = (prompt: string): string =>
     colour ? `${ANSI.bold}${ANSI.green}${prompt}${ANSI.reset}` : prompt;
 
@@ -478,32 +621,108 @@ function createRawTerminalIo(
     const text = busyLabel === '' ? frame : `${frame} ${busyLabel} ${LABEL_ELLIPSIS[charset]}`;
     // Dim, not coloured: the spinner is a placeholder for text that has not arrived, and it must
     // read as quieter than the text that will replace it.
-    return colour ? `${ANSI.dim}${text}${ANSI.reset}` : text;
+    return paintInk(colour, 'dim', text);
+  };
+
+  /**
+   * Terminal columns.
+   *
+   * Not `?? 80`: a PTY without a window size — `script(1)`, some SSH and CI terminals — reports
+   * columns as 0, which is not nullish. A 0-column width makes the composer's buffer window empty
+   * and everything typed INVISIBLE. Found on a real PTY; no fake with `columns: 80` could ever
+   * have seen it, which is why the guard is `> 0` rather than a nullish coalesce.
+   */
+  const widthOf = (): number => {
+    const columns = output.columns;
+    return typeof columns === 'number' && columns > 0 ? columns : 80;
   };
 
   const currentExtra = (): string => {
     if (spinnerActive) return spinnerText();
     if (painted) {
-      // Not `?? 80`: a PTY without a window size — `script(1)`, some SSH and CI terminals —
-      // reports columns as 0, which is not nullish. A 0-column width makes the buffer window
-      // empty and everything typed INVISIBLE. Found on a real PTY; no fake with `columns: 80`
-      // could ever have seen it.
-      const columns = output.columns;
-      const width = typeof columns === 'number' && columns > 0 ? columns : 80;
       return renderComposerFrame({
-        prompt: plainPrompt,
-        colouredPrompt,
+        prompt: livePlainPrompt(),
+        colouredPrompt: liveColouredPrompt(),
         buffer: editor.buffer,
         cursor: editor.cursor,
-        width,
+        width: widthOf(),
         ellipsis,
       });
     }
     return '';
   };
 
+  /**
+   * What the status block should say right now, or nothing at all.
+   *
+   * **The block is drawn only when `tail === ''`** — when the writer has finished with the row the
+   * cursor is on. That single rule is what keeps the cursor arithmetic in `writeBelow` honest, and
+   * it is worth being exact about why, because the rule looks like a stylistic choice and is not:
+   *
+   * `writeBelow` returns the cursor by re-writing `tail` after a bare `\r`. If `tail` is longer
+   * than the terminal is wide it has already WRAPPED, so `\r` lands at the start of its last
+   * physical row and the rewrite paints the whole of it again from there — the same one-row
+   * assumption the composer's repaint has always made, and the reason `nextLine` forces a fresh
+   * line before painting. Mid-answer, `tail` is a partial line of streamed model prose and grows
+   * without bound between newlines, so it is exactly the case the assumption does not survive.
+   *
+   * The visible consequence is that the block is up at the prompt and through a dispatch's
+   * line-by-line narration, and steps aside while an answer streams — where the inline spinner is
+   * already saying what it would have said. It reappears on the newline that ends the answer.
+   */
+  const statusRows = (): readonly string[] => {
+    if (statusRender === null || tail !== '' || closed) return [];
+    const width = widthOf();
+    const rows = statusRender(statusTick, width);
+    // A row carrying a newline would put the block's own row count out by one and leave the
+    // cursor a row adrift for the rest of the session. The renderer is trusted to be pure, not
+    // to be careful, and the fix has to be here rather than in a contract nobody can enforce.
+    const flat = rows.map((line) => line.replace(/[\r\n]+/gu, ' '));
+    const rowCount = output.rows;
+    // Two rows held back: one for the row the conversation is being written on, one so the
+    // terminal is not left with nowhere to scroll. A window too short for that gets no block at
+    // all rather than a block that eats the conversation.
+    if (typeof rowCount === 'number' && rowCount > 0 && flat.length + 2 > rowCount) return [];
+    return flat;
+  };
+
+  /**
+   * Paint (or erase) the rows under the cursor, and put the cursor back where it was.
+   *
+   * The span is `max(wanted, painted)`: shrinking from three rows to one still has to walk over
+   * the third and erase it, or a unit that has finished stays on screen forever. A no-op when
+   * nothing has changed, which is what makes it safe to call from the 120ms spinner tick.
+   */
+  const writeBelow = (rows: readonly string[]): void => {
+    const text = rows.join('\n');
+    if (rows.length === below && text === belowText) return;
+    const span = Math.max(rows.length, below);
+    if (span === 0) return;
+    let out = '';
+    for (let i = 0; i < span; i += 1) out += `\n${ERASE_LINE}${rows[i] ?? ''}`;
+    out += cursorUp(span);
+    // `\r` and then the row's own content again, which is how the cursor gets back to a column
+    // this file never had to count — the same trick `renderComposerFrame` uses, for the same
+    // reason: a wide glyph earlier in the line cannot desynchronise arithmetic that never ran.
+    out += `\r${tail}${currentExtra()}`;
+    below = rows.length;
+    belowText = text;
+    output.write(out);
+  };
+
+  /** Erase the block. Called before ANY write that can move the cursor off its row. */
+  const clearBelow = (): void => {
+    writeBelow([]);
+  };
+
+  const syncBelow = (): void => {
+    writeBelow(statusRows());
+  };
+
+  /** Repaint the cursor's own row. Leaves the block below alone — it has not moved. */
   const repaint = (): void => {
     output.write(`${ERASE_LINE}${tail}${currentExtra()}`);
+    syncBelow();
   };
 
   const extendTail = (text: string): void => {
@@ -524,14 +743,20 @@ function createRawTerminalIo(
   const emit = (text: string): void => {
     const needsRestore = spinnerActive || painted;
     if (spinnerActive) stopSpinnerTimer();
+    // Before anything else, and unconditionally: the block occupies rows below the one about to
+    // be written, and `text` may wrap onto them, scroll past them, or end in a newline that lands
+    // the cursor straight on top of the first of them.
+    clearBelow();
     if (needsRestore) output.write(`${ERASE_LINE}${tail}`);
     output.write(text);
     extendTail(text);
+    syncBelow();
   };
 
   const eraseInputLine = (): void => {
     output.write(`${ERASE_LINE}${tail}`);
     painted = false;
+    syncBelow();
   };
 
   const settlePending = (value: string | null): void => {
@@ -540,11 +765,53 @@ function createRawTerminalIo(
     if (resolve !== null) resolve(value);
   };
 
-  const submitLine = (line: string): void => {
-    emit(`${colouredPrompt}${line}\n`);
-    painted = false;
-    history = historySubmit(history, line);
-    editor = { buffer: '', cursor: 0 };
+  /**
+   * A submitted entry, painted as a block belonging to the human.
+   *
+   * Two things changed here after watching a real session, and both were failures of the same
+   * kind — the screen not saying who was speaking.
+   *
+   * The entry now WRAPS. It used to go out as one string, so a question longer than the window
+   * hard-broke at the terminal's right edge, mid-word, while the commander's answer beneath it
+   * wrapped properly. One speaker's paragraphs breaking and the other's not does not read as two
+   * speakers; it reads as a bug.
+   *
+   * And the prompt repeats down every wrapped row. `you › ` was a label on the first row of a
+   * turn, and a label on one row cannot mark a region — the eye had nothing to follow. A coloured
+   * rule down the left edge of every row is a region, recognisable before a word of it is read.
+   * The text itself is no longer dimmed, either: the rule carries the identity now, and dim is
+   * the weight of metadata, not of the thing the reader just said.
+   *
+   * Every row takes the READ's own prompt rather than the live one, so a backslash-continued
+   * entry lands as one block instead of a first row and a train of `… ` tails.
+   */
+  const paintEntry = (rows: readonly string[]): string => {
+    // Held off the last column for the same reason every other row here is: a row that reaches
+    // the right edge leaves the terminal in the wrap-pending state the `ESC[nA` arithmetic in
+    // `writeBelow` cannot see. The floor keeps a narrow window from producing a zero-width one.
+    const budget = Math.max(8, widthOf() - displayWidth(plainPrompt) - 1);
+    return rows
+      .flatMap((row) => wrapPlain(row, budget))
+      .map((row) => `${colouredPrompt}${row}`)
+      .join('\n');
+  };
+
+  const echoEntryLine = (line: string): void => {
+    // The composer is retired BEFORE the echo, not after it, and the order is load-bearing.
+    //
+    // `emit` ends by putting the status block back, and putting it back means returning the
+    // cursor — which it does by re-writing `tail` and `currentExtra()`. With `painted` still true
+    // at that moment, `currentExtra()` is the composer's own frame, so Enter drew the submitted
+    // line, then drew it AGAIN on the row below: one duplicate per line typed, for the whole
+    // session. Erasing first means there is no composer left for the restore to paint.
+    //
+    // The general rule, and the one to keep in mind when adding a caller: `currentExtra()` must
+    // never be evaluated after a write that consumed the row the composer was painted on. `write`
+    // does not violate it — there the composer legitimately follows the output down a row.
+    eraseInputLine();
+    // A continued row echoes AS TYPED, trailing backslash included: the transcript records
+    // keystrokes, and the join is the delivered text's business.
+    emit(`${paintEntry([line])}\n`);
   };
 
   const takeCommitted = (): string | null | undefined => {
@@ -593,9 +860,21 @@ function createRawTerminalIo(
     const action = applyKey(editor, key);
     switch (action.kind) {
       case 'interrupt':
+        // Ctrl-C with a continuation open abandons the pending entry, painted or not. It is the
+        // "throw away what I was typing" gesture, not an exit gesture, so the hub never hears
+        // it: arming exit off a discarded draft is how a later keystroke ends a session by
+        // surprise. The echoed segments stay in scrollback; nothing after them was delivered.
+        if (pendingSegments.length > 0) {
+          pendingSegments = [];
+          editor = { buffer: '', cursor: 0 };
+          if (painted) repaint();
+          return;
+        }
         hub.fire();
         return;
       case 'eof':
+        // Ctrl-D ends the read whole: a half-built continuation must not leak into a later one.
+        pendingSegments = [];
         if (painted) {
           eraseInputLine();
           settlePending(null);
@@ -603,17 +882,40 @@ function createRawTerminalIo(
           ended = true;
         }
         return;
-      case 'submit':
+      case 'submit': {
+        const step = continuationStep(pendingSegments, action.line);
         if (painted) {
-          submitLine(action.line);
-          settlePending(action.line);
-        } else {
-          // Nobody is reading yet — queue the whole line and start the next one fresh, exactly
-          // the multi-message type-ahead the old `LineQueue` gave the piped path.
-          committed.push(action.line);
+          echoEntryLine(action.line);
           editor = { buffer: '', cursor: 0 };
+          if (step.kind === 'continue') {
+            // The entry is still open: hold the segment, repaint a fresh continuation row, and
+            // leave the pending `nextLine` exactly where it is.
+            pendingSegments.push(step.segment);
+            painted = true;
+            repaint();
+            return;
+          }
+          pendingSegments = [];
+          // History stores the DELIVERED text with newlines flattened to spaces: the composer
+          // is one row, so a recalled entry must be a line, and flattening at store time means
+          // recall, edit and resubmit all handle the same honest string. Stated behaviour, and
+          // pinned by a test, rather than a silent mangling at recall time.
+          history = historySubmit(history, step.line.replace(/\n/gu, ' '));
+          settlePending(step.line);
+          return;
         }
+        // Nobody is reading yet: the same state machine, minus the echo nobody would see. A
+        // completed entry queues whole and is echoed at pickup, exactly the multi-message
+        // type-ahead the old `LineQueue` gave the piped path.
+        editor = { buffer: '', cursor: 0 };
+        if (step.kind === 'continue') {
+          pendingSegments.push(step.segment);
+          return;
+        }
+        pendingSegments = [];
+        committed.push(step.line);
         return;
+      }
       case 'state':
         editor = action.state;
         if (painted) repaint();
@@ -633,6 +935,9 @@ function createRawTerminalIo(
 
   return {
     isTTY: true,
+    get width(): number {
+      return widthOf();
+    },
 
     write(text: string): void {
       emit(text);
@@ -651,8 +956,11 @@ function createRawTerminalIo(
     nextLine(prompt: string): Promise<string | null> {
       // Only the final line of the prompt is live — see `splitPromptLead` for the bug this kills.
       const { lead, line } = splitPromptLead(prompt);
-      plainPrompt = line;
-      colouredPrompt = colourizePrompt(line);
+      // Folded HERE rather than at every call site. A prompt is decoration like any other row,
+      // and `runChat` spells its two in unicode; a cp437 console was getting the raw code points
+      // and drawing whatever its own table said they were.
+      plainPrompt = charset === 'ascii' ? asciiFold(line) : line;
+      colouredPrompt = colourizePrompt(plainPrompt);
       // The lead (usually one blank separator line) is ordinary output, printed once per read.
       // Then the composer takes a fresh physical line: if something is still sitting on the
       // current one — narration that never got a trailing `\n`, say — start below it rather than
@@ -665,7 +973,9 @@ function createRawTerminalIo(
       if (queued !== undefined) {
         if (queued !== null) {
           freshLine();
-          emit(`${colouredPrompt}${queued}\n`);
+          // A queued entry may be multiline (typed with backslash continuations while a turn
+          // streamed). It echoes as the same block a live entry does, wrap and all.
+          emit(`${paintEntry(queued.split('\n'))}\n`);
         }
         return Promise.resolve(queued);
       }
@@ -679,18 +989,61 @@ function createRawTerminalIo(
 
     abortLine(): void {
       committed.length = 0;
+      pendingSegments = [];
       editor = { buffer: '', cursor: 0 };
       if (spinnerActive) stopSpinnerTimer();
       if (painted) eraseInputLine();
       settlePending(null);
     },
 
+    setStatus(render: StatusRenderer | null): void {
+      statusRender = render;
+      statusTick = 0;
+      if (statusTimer !== null) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+      }
+      if (render !== null && !closed) {
+        // The same 120ms the composer's spinner runs at, deliberately: two animations on one
+        // screen at two rates read as one of them stuttering, and nothing here needs a rate of
+        // its own. The tick is cheap when nothing has changed — `writeBelow` compares the block
+        // it would paint against the one on screen and returns without writing a byte.
+        statusTimer = setInterval(() => {
+          statusTick += 1;
+          try {
+            syncBelow();
+          } catch {
+            // Same rule as the spinner tick below: a timer callback has no caller to catch it, so
+            // a dead output stream must not turn a status frame into an uncaught exception.
+            if (statusTimer !== null) {
+              clearInterval(statusTimer);
+              statusTimer = null;
+            }
+            below = 0;
+            belowText = '';
+          }
+        }, 120);
+        if (typeof statusTimer.unref === 'function') statusTimer.unref();
+      }
+      syncBelow();
+    },
+
     onInterrupt: hub.onInterrupt,
 
     close(): void {
       if (closed) return;
+      // The block comes down BEFORE `closed` is set, because `statusRows` refuses to render for a
+      // closed terminal — flipping the flag first would make `clearBelow` a no-op and leave the
+      // status rows sitting under the shell prompt for the rest of the day.
+      if (statusTimer !== null) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+      }
+      statusRender = null;
+      clearBelow();
       closed = true;
       ended = true;
+      pendingSegments = [];
       const hadOverlay = spinnerActive || painted;
       if (spinnerActive) stopSpinnerTimer();
       if (painted) painted = false;
@@ -758,9 +1111,13 @@ function createPipedTerminalIo(
   });
   rl.setPrompt('');
 
-  rl.on('line', (line: string) => {
-    queue.push(line);
+  // The fold, not a bare push: `first \` then `second` must reach the session as one two-line
+  // turn on a pipe exactly as it does on a raw terminal, or the scripted stand-in below tests a
+  // behaviour the real piped path does not have.
+  const foldLine = continuationFold((entry) => {
+    queue.push(entry);
   });
+  rl.on('line', foldLine);
   rl.on('close', () => {
     queue.end();
   });
@@ -772,6 +1129,10 @@ function createPipedTerminalIo(
   let closed = false;
   return {
     isTTY: false,
+    // A pipe has no width. 80 is the conventional answer and the one every other module in this
+    // program defaults to (`detectWidth`), so a renderer handed this one lays out the same way a
+    // redirected `army view` does.
+    width: 80,
     write(text: string): void {
       output.write(text);
     },
@@ -795,9 +1156,12 @@ function createPipedTerminalIo(
       rl.close();
     },
     // No cursor to animate for, and nothing reading a spinner frame in a redirected file — same
-    // reasoning `createProgressSink`'s `live` flag uses for the campaign ticker.
+    // reasoning `createProgressSink`'s `live` flag uses for the campaign ticker. The status block
+    // is the same case one step further on: it is not merely animated, it is painted with cursor
+    // movement, and a redirected transcript that contains `ESC[2A` is a corrupted transcript.
     setBusy(): void {},
     setIdle(): void {},
+    setStatus(): void {},
   };
 }
 
@@ -828,6 +1192,15 @@ export interface ScriptedIo extends ChatIo {
   readonly prompts: readonly string[];
   /** `busy:<label>` / `idle`, in order — the record `setBusy`/`setIdle` leave for an assertion. */
   readonly states: readonly string[];
+  /**
+   * The status renderer currently installed, or null.
+   *
+   * Exposed rather than recorded as a transcript line: the block never reaches a scripted
+   * transcript (it is cursor-painted chrome, and a script has no cursor), so the only way a test
+   * can assert on what a session PUT there is to render it itself. `runChat`'s renderer is pure
+   * over a tick and a width, so calling it is safe and deterministic.
+   */
+  readonly status: StatusRenderer | null;
 }
 
 export interface ScriptedIoOptions {
@@ -838,6 +1211,16 @@ export interface ScriptedIoOptions {
    * message.
    */
   open?: boolean;
+  /**
+   * Claim to be a terminal.
+   *
+   * Default false, which is what a script IS. It is switchable because `isTTY` is not only a
+   * question about escape bytes any more — `runChat` gates the whole session chrome on it — and
+   * a scripted session that can never be a terminal is a scripted session that can never reach
+   * the code paths a terminal takes. The transcript stays free of cursor control either way: a
+   * `ScriptedIo` records what it is TOLD, and the block is painted by the raw terminal alone.
+   */
+  isTTY?: boolean;
 }
 
 export function createScriptedIo(
@@ -845,18 +1228,29 @@ export function createScriptedIo(
   options: ScriptedIoOptions = {},
 ): ScriptedIo {
   const queue = createLineQueue();
-  for (const line of lines) queue.push(line);
+  // The same fold the piped path applies, so a scripted `['first \\', 'second']` drives the
+  // exact multiline entry a human would have typed. An entry left open by the script is dropped
+  // at end of input, the same way a half-typed line dies with its terminal.
+  const foldLine = continuationFold((entry) => {
+    queue.push(entry);
+  });
+  for (const line of lines) foldLine(line);
   if (options.open !== true) queue.end();
   const chunks: string[] = [];
   const prompts: string[] = [];
   const states: string[] = [];
   const handlers = new Set<() => void>();
   let ended = false;
+  let status: StatusRenderer | null = null;
 
   return {
-    isTTY: false,
+    isTTY: options.isTTY === true,
+    width: 80,
     get transcript(): string {
       return chunks.join('');
+    },
+    get status(): StatusRenderer | null {
+      return status;
     },
     get prompts(): readonly string[] {
       return prompts;
@@ -875,7 +1269,7 @@ export function createScriptedIo(
       queue.abort();
     },
     feed(line: string): void {
-      queue.push(line);
+      foldLine(line);
     },
     onInterrupt(handler: () => void): () => void {
       handlers.add(handler);
@@ -895,6 +1289,9 @@ export function createScriptedIo(
     },
     setIdle(): void {
       states.push('idle');
+    },
+    setStatus(render: StatusRenderer | null): void {
+      status = render;
     },
   };
 }

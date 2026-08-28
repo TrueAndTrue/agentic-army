@@ -35,6 +35,51 @@ export type CommandRunner = (
 /** Default ceiling for one acceptance command. A build plus a suite fits inside this. */
 export const DEFAULT_VERIFY_TIMEOUT_MS = 180_000;
 
+/**
+ * Exit codes a POSIX shell reserves for "I could not run that at all".
+ *
+ * 126 is found-but-not-executable, 127 is not-found. Neither is a check result — a command that
+ * exits 126 or 127 has said nothing about the work it was supposed to be checking. Kept here
+ * rather than in the gate because the baseline reader and the gate both have to agree on it.
+ */
+export const SHELL_CANNOT_EXECUTE: readonly number[] = [126, 127];
+
+/**
+ * What a verify command did BEFORE the work it exists to check.
+ *
+ * ## Why a campaign takes this reading at all
+ *
+ * A spec's `verify` commands define done. A command that cannot pass — because it is malformed,
+ * or names a tool that is not installed, or was mangled on its way into the spec — therefore
+ * defines a done that can never be reached, and the campaign spends every attempt it has
+ * discovering that. Measured in the field: one campaign ran three Engineers for 37.6 minutes and
+ * $8.86, two of which SUCCEEDED, and delivered nothing, because
+ * `sh -c 'grep -q \"\\\"dependencies\\\": {}\" package.json'` exits 2 against any file on earth.
+ *
+ * Reading each command against the untouched base tree costs seconds and turns that into a fact
+ * available before the first Engineer is spawned: this command already fails, here is its output.
+ *
+ * ## What it is NOT
+ *
+ * Not a classifier, and not a licence to skip anything. A command failing at base is usually
+ * CORRECT — `node --test` should fail before the feature exists. The reading is only ever compared
+ * against the same command's result after the work, and the comparison reports a fact ("identical
+ * before and after") rather than a judgement about whose fault it is.
+ */
+export interface VerifyBaseline {
+  command: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  /**
+   * The distinct lines this command printed, deduplicated and capped.
+   *
+   * A SET rather than a blob, because the useful relation is containment: the baseline runs
+   * against a tree where the work does not exist, so a broken command legitimately says MORE at
+   * base than it does afterwards. See `saysNothingNew` in `src/verify/gate.ts`.
+   */
+  lines: readonly string[];
+}
+
 /** What one acceptance command did. */
 export interface VerifyOutcome {
   command: string;
@@ -48,6 +93,18 @@ export interface VerifyOutcome {
    * know WHAT failed, and an untruncated test log would crowd out the orders it is attached to.
    */
   output: string;
+  /**
+   * This command failed IDENTICALLY before the Engineer existed.
+   *
+   * Not "the spec is wrong" — this module does not get to decide that. It is the narrower,
+   * checkable statement that the command produced the same exit code and the same output against
+   * the untouched base tree, and therefore did not distinguish the work from its absence. A gate
+   * made of such commands cannot be made to pass by doing the work, so retrying is spending money
+   * on a foregone conclusion.
+   *
+   * `false` when no baseline was taken. Absence of evidence is never evidence here.
+   */
+  unchangedFromBaseline: boolean;
 }
 
 /**

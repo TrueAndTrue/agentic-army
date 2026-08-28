@@ -2501,6 +2501,48 @@ describe('codex confinement', () => {
     assert.ok(c.enforced.includes('Edit(~/.agentic-army)'));
   });
 
+  /**
+   * THE INSPECTOR'S BLINDNESS.
+   *
+   * `-s workspace-write` denies `listen`. Campaign of 2026-08-07: 50 `EPERM ... syscall: 'listen'`
+   * failures in one reviewer's stream, on all three review attempts, because the suite under
+   * review binds 127.0.0.1 — so the campaign's headline end-to-end criterion was never executed by
+   * any reviewer, and all three still returned `testsRun: true`.
+   *
+   * Both directions are pinned, and the `guarded` half matters as much as the fix: the flag is
+   * emitted EXPLICITLY either way, so a user's `config.toml` cannot widen a guarded run or narrow
+   * an unguarded one. The value is read off `networkAccess` rather than grepped out of `args`,
+   * and then `args` is checked separately — a test that only asserted the boolean would pass
+   * while the flag went missing from execve.
+   */
+  test('the codex sandbox opens the network under `unguarded` and pins it shut under `guarded`', () => {
+    const cwd = '/work/tree';
+
+    const guarded = codexConfinement(spec({ harness: 'codex', cwd, posture: 'guarded' }), ENV, HOME);
+    assert.equal(guarded.networkAccess, false);
+    assert.ok(
+      guarded.args.includes('sandbox_workspace_write.network_access=false'),
+      `guarded did not pin the flag shut:\n${guarded.args.join(' ')}`,
+    );
+
+    const unguarded = codexConfinement(spec({ harness: 'codex', cwd, posture: 'unguarded' }), ENV, HOME);
+    assert.equal(unguarded.networkAccess, true);
+    assert.ok(
+      unguarded.args.includes('sandbox_workspace_write.network_access=true'),
+      `unguarded did not open the network:\n${unguarded.args.join(' ')}`,
+    );
+
+    // ABSENT means SHUT. `SoldierSpec.posture` is optional so that a call site which has never
+    // heard of the posture builds a confined worker, and this is that polarity on the wire.
+    const silent = codexConfinement(spec({ harness: 'codex', cwd }), ENV, HOME);
+    assert.equal(silent.networkAccess, false, 'a spec with no posture opened the network');
+
+    // Opening the network changes the NETWORK and nothing else — the write sandbox is the reason
+    // a leased worktree is an isolation boundary, and it is not part of this trade.
+    assert.deepEqual(unguarded.writableRoots, guarded.writableRoots);
+    assert.deepEqual(unguarded.breaches, guarded.breaches);
+  });
+
   test('read-denies are UNENFORCEABLE and reported as such, never as enforced', () => {
     const c = codexConfinement(
       spec({ harness: 'codex', cwd: '/work/tree', deny: denyFor(['~/.ssh', '~/.agentic-army']) }),

@@ -48,7 +48,38 @@ import {
   digestStream,
   walkTree,
 } from '../src/view/tree.ts';
-import { ASCII_GLYPHS, asciiFold, chooseColumns, formatAge, renderJson, renderTree } from '../src/view/render.ts';
+import {
+  ASCII_GLYPHS,
+  UNICODE_GLYPHS,
+  asciiFold,
+  chooseColumns,
+  clipTo,
+  displayWidth,
+  formatAge,
+  formatDuration,
+  padTo,
+  renderJson,
+  renderTree,
+} from '../src/view/render.ts';
+import { describeToolUse, formatToolAction } from '../src/view/activity.ts';
+import {
+  createProgressSink,
+  dispositionOf,
+  formatTokens,
+  renderProgressEvent,
+  sanitize,
+} from '../src/view/progress.ts';
+import type { ProgressEvent } from '../src/view/progress.ts';
+import {
+  REPO_UNKNOWN,
+  describeRepo,
+  formatElapsed,
+  formatRepo,
+  renderHeader,
+  renderRoster,
+  renderStatusBar,
+} from '../src/view/chrome.ts';
+import type { HeaderModel, RepoState, RosterUnit, StatusModel } from '../src/view/chrome.ts';
 import {
   createJsonlReader,
   followCampaign,
@@ -1744,4 +1775,1203 @@ test('--list flags an active campaign whose directory has not moved in hours, an
   } finally {
     fs.rmSync(archiveRoot, { recursive: true, force: true });
   }
+});
+
+// ===============================================================================================
+// SESSION CHROME — the header, the status bar and the roster
+//
+// Every test here is a pure-function test, which is the whole reason `src/view/chrome.ts` takes
+// its charset, colour, width, elapsed milliseconds and animation frame as arguments. The one
+// property that is not about looks is load-bearing on `src/chat/io.ts` and is asserted first:
+// a row wider than the terminal WRAPS, and a wrapped row puts the cursor arithmetic that pins
+// the block under the composer out by one for the rest of the session.
+// ===============================================================================================
+
+const CHROME_REPO: RepoState = {
+  branch: 'main',
+  head: 'a1b2c3d',
+  dirty: 3,
+  ahead: 2,
+  behind: 1,
+};
+
+const CHROME_ROSTER: RosterUnit[] = [
+  {
+    agentId: 'cpt-01',
+    rank: 'CAPTAIN',
+    role: 'ENGINEER',
+    harness: 'claude',
+    attempt: 2,
+    state: 'returned',
+    elapsedMs: 0,
+    detail: 'the session is read once per request and cached on the request object',
+    detailAgeMs: 0,
+    thinkingTokens: null,
+    silentMs: 0,
+  },
+  {
+    agentId: 'cpt-02',
+    rank: 'CAPTAIN',
+    role: 'INSPECTOR',
+    harness: 'claude',
+    attempt: 1,
+    state: 'working',
+    elapsedMs: 72_000,
+    detail: null,
+    detailAgeMs: null,
+    thinkingTokens: null,
+    silentMs: 0,
+  },
+];
+
+const CHROME_STATUS: StatusModel = {
+  repo: CHROME_REPO,
+  project: 'agentic-army',
+  model: 'claude-opus-5',
+  rung: 'rung 2 (pull request)',
+  turns: 3,
+  dispatches: 1,
+  costUsd: 0.4137,
+  roster: CHROME_ROSTER,
+  hint: null,
+};
+
+const CHROME_HEADER: HeaderModel = {
+  title: '◆ COL·COMMANDER — a live session',
+  subtitle: 'it holds the objective, and one inert tool: TodoWrite',
+  facts: [
+    { key: 'project', value: 'agentic-army' },
+    { key: 'path', value: '/Users/someone/organizations/personal/agentic-army' },
+    { key: 'branch', value: 'main · a1b2c3d · 3 uncommitted' },
+    { key: 'dropped', value: '' },
+  ],
+  hints: ['every dispatch is reviewed by an independent Inspector'],
+};
+
+/** Columns a row occupies once the SGR is taken off. */
+function chromeColumns(line: string): number {
+  return line.replace(/\[[0-9;]*m/gu, '').length;
+}
+
+  const widths = [24, 40, 62, 80, 100, 200];
+
+test('session chrome — every row fits the terminal it was rendered for — no status row is ever wider than width - 1, in either charset', () => {
+  for (const charset of ['unicode', 'ascii'] as const) {
+    for (const width of widths) {
+      for (const model of [CHROME_STATUS, { ...CHROME_STATUS, hint: 'Ctrl-C again to leave' }]) {
+        const rows = renderStatusBar(model, 3, { charset, color: true, width });
+        for (const row of rows) {
+          assert.ok(
+            chromeColumns(row) <= width - 1,
+            `${charset}@${String(width)}: ${String(chromeColumns(row))} columns — ${JSON.stringify(row)}`,
+          );
+        }
+      }
+    }
+  }
+});
+
+test('session chrome — every row fits the terminal it was rendered for — no header row is ever wider than width - 1, and the box is square', () => {
+  for (const charset of ['unicode', 'ascii'] as const) {
+    for (const width of widths) {
+      const lines = renderHeader(CHROME_HEADER, { charset, color: false, width });
+      for (const line of lines) {
+        assert.ok(
+          chromeColumns(line) <= width - 1,
+          `${charset}@${String(width)}: ${JSON.stringify(line)}`,
+        );
+      }
+      // The four frame rows — top, title, subtitle, bottom — are the block's own rectangle, and
+      // a box whose corners do not line up is the most visible possible way to fail this.
+      const framed = lines.filter((line) => line.trim() !== '').slice(0, 4);
+      const widthsOf = new Set(framed.map((line) => chromeColumns(line)));
+      assert.equal(
+        widthsOf.size,
+        1,
+        `${charset}@${String(width)}: the box is not rectangular — ${JSON.stringify(framed)}`,
+      );
+    }
+  }
+});
+
+test('session chrome — every row fits the terminal it was rendered for — nothing the chrome emits is a newline or a cursor move', () => {
+  // `src/chat/io.ts` paints the block with relative cursor movement and counts the rows it
+  // wrote. A renderer that emitted its own `\n`, or its own `ESC[2A`, would put that count out
+  // — so the only escape sequence allowed out of this file is SGR colour.
+  const rows = [
+    ...renderStatusBar(CHROME_STATUS, 0, { charset: 'unicode', color: true, width: 80 }),
+    ...renderHeader(CHROME_HEADER, { charset: 'unicode', color: true, width: 80 }),
+  ];
+  for (const row of rows) {
+    assert.doesNotMatch(row, /[\n\r]/u, `a chrome row carried a line break: ${JSON.stringify(row)}`);
+    // An escape whose FINAL byte is not `m` — i.e. anything that is not SGR colour. The first
+    // spelling of this was `[^m]*[A-Za-z]`, which matches the `m` itself with an empty middle
+    // and therefore fired on every colour code in the file: a guard that fails on correct output
+    // is a guard that gets deleted rather than one that catches anything.
+    const escapes = row.match(/\u001b\[[0-9;]*[^0-9;m]/gu) ?? [];
+    assert.deepEqual(escapes, [], `a chrome row carried a non-SGR escape: ${JSON.stringify(row)}`);
+  }
+});
+
+test('session chrome — every row fits the terminal it was rendered for — the ascii charset leaves no unrenderable character behind', () => {
+  const rows = [
+    ...renderStatusBar(CHROME_STATUS, 0, { charset: 'ascii', color: false, width: 100 }),
+    ...renderHeader(CHROME_HEADER, { charset: 'ascii', color: false, width: 100 }),
+  ];
+  for (const row of rows) {
+    assert.doesNotMatch(
+      row,
+      /\?/u,
+      `a glyph fell through the fold table to a literal "?": ${JSON.stringify(row)}`,
+    );
+    // eslint-disable-next-line no-control-regex
+    assert.doesNotMatch(row, /[^ -~]/u, `non-ASCII survived: ${JSON.stringify(row)}`);
+  }
+});
+
+test('the repository, as the bar and the header report it — an unread working copy is never rendered as a clean one', () => {
+  // The one failure mode a status bar must not have. `git status` timing out and `git status`
+  // coming back empty are different facts, and a bar that spells them the same way is a bar
+  // that tells a reader they have nothing uncommitted when nobody has checked.
+  const unread: RepoState = { ...REPO_UNKNOWN, branch: 'main', head: 'a1b2c3d' };
+  const clean: RepoState = { ...unread, dirty: 0 };
+  assert.equal(formatRepo(unread, UNICODE_GLYPHS), 'main');
+  assert.equal(formatRepo(clean, UNICODE_GLYPHS), 'main');
+  // Identical on the bar, where there is no room to say it — and never identical in the header.
+  assert.match(describeRepo(unread), /working copy not read/);
+  assert.match(describeRepo(clean), /clean/);
+  assert.notEqual(describeRepo(unread), describeRepo(clean));
+});
+
+test('the repository, as the bar and the header report it — dirt, ahead and behind each get exactly one mark', () => {
+  assert.equal(formatRepo(CHROME_REPO, UNICODE_GLYPHS), 'main*↑2↓1');
+  assert.equal(formatRepo(CHROME_REPO, ASCII_GLYPHS), 'main*^2v1');
+  assert.equal(
+    formatRepo({ ...CHROME_REPO, dirty: 0, ahead: 0, behind: 0 }, UNICODE_GLYPHS),
+    'main',
+    'a quiet branch carries no marks at all',
+  );
+});
+
+test('the repository, as the bar and the header report it — a detached HEAD says so rather than inventing a branch', () => {
+  const detached: RepoState = { ...REPO_UNKNOWN, branch: null, head: 'a1b2c3d' };
+  assert.equal(formatRepo(detached, UNICODE_GLYPHS), '—a1b2c3d');
+  assert.match(describeRepo(detached), /detached at a1b2c3d/);
+  // And a directory git could not be asked about at all renders as nothing, rather than as a
+  // branch called "null" — the header drops the row, because an empty fact value is dropped.
+  assert.equal(describeRepo(REPO_UNKNOWN), '');
+  assert.equal(formatRepo(REPO_UNKNOWN, UNICODE_GLYPHS), 'no branch');
+});
+
+test('the status bar drops what does not fit, in order of what matters — the branch survives every width, and the counters are the first to go', () => {
+  const wide = renderStatusBar(CHROME_STATUS, 0, { charset: 'unicode', color: false, width: 120 });
+  const narrow = renderStatusBar(CHROME_STATUS, 0, { charset: 'unicode', color: false, width: 46 });
+  const contextOf = (rows: string[]): string => rows[rows.length - 1] as string;
+  assert.match(contextOf(wide), /main\*↑2↓1/);
+  assert.match(contextOf(wide), /\$0\.41/, 'a wide bar should carry the cost');
+  assert.match(contextOf(narrow), /main\*↑2↓1/, 'the branch was dropped to make room for less');
+  assert.doesNotMatch(contextOf(narrow), /\$0\.41/, 'the cost outlived the width');
+  // Dropped whole, never clipped to a half-word — the row is read at a glance and `rung 2 (pull
+  // req…` costs a reader more than the segment was worth.
+  assert.doesNotMatch(contextOf(narrow), /…/u);
+});
+
+test('the status bar drops what does not fit, in order of what matters — a hint outranks every counter, because it expires and they do not', () => {
+  const hinted: StatusModel = {
+    ...CHROME_STATUS,
+    hint: 'dispatch in flight — Ctrl-C lets it settle',
+  };
+  const rows = renderStatusBar(hinted, 0, { charset: 'unicode', color: false, width: 80 });
+  const context = rows[rows.length - 1] as string;
+  assert.match(context, /dispatch in flight/, 'the hint did not survive an 80-column bar');
+  assert.doesNotMatch(context, /3 turns/, 'the counters queued ahead of a rule about a keystroke');
+});
+
+test('the status bar drops what does not fit, in order of what matters — a session that has spent nothing measurable says so without lying about zero', () => {
+  const model = (costUsd: number | null): string => {
+    const rows = renderStatusBar(
+      { ...CHROME_STATUS, roster: [], hint: null, costUsd },
+      0,
+      { charset: 'unicode', color: false, width: 120 },
+    );
+    return rows[rows.length - 1] as string;
+  };
+  assert.match(model(0.0004), /<\$0\.01/);
+  assert.match(model(0), /\$0\b/);
+  assert.doesNotMatch(model(null), /\$/, 'a harness that reported no cost must not imply zero');
+});
+
+test('the roster — one row per unit, and a clock only on the one that is running — the spinner advances with the tick and only the working unit carries a clock', () => {
+  const style = { charset: 'unicode' as const, color: false, width: 120 };
+  const frame0 = renderRoster(CHROME_ROSTER, 0, style);
+  const frame1 = renderRoster(CHROME_ROSTER, 1, style);
+  assert.equal(frame0.length, 2);
+  assert.notEqual(frame0[1], frame1[1], 'the working row did not animate');
+  assert.equal(frame0[0], frame1[0], 'a finished row animated, which reads as still running');
+  assert.match(frame0[1] as string, /CPT·INSPECTOR · cpt-02 working 1m12s/);
+  assert.doesNotMatch(frame0[0] as string, /\d+s/u, 'a returned unit was given a running clock');
+  // The attempt number appears only when there has been more than one — a `#1` on every row is
+  // a column of noise that says nothing.
+  assert.match(frame0[0] as string, /cpt-01 #2 returned/);
+  assert.doesNotMatch(frame0[1] as string, /#1/u);
+});
+
+test("the roster — one row per unit, and a clock only on the one that is running — a unit's own summary cannot move the cursor or overwrite its label", () => {
+  // Model-controlled text, on a row that is repainted in place. `\r` would put the summary on
+  // top of the unit id it belongs to, and `ESC[2J` would clear the screen of the person
+  // reading it.
+  const hostile: RosterUnit = {
+    ...(CHROME_ROSTER[0] as RosterUnit),
+    detail: 'done\r[2Jand the screen is mine\nsecond line',
+  };
+  const [row] = renderRoster([hostile], 0, { charset: 'unicode', color: false, width: 200 });
+  assert.doesNotMatch(row as string, /[\n\r]/u);
+  assert.ok(!(row as string).includes(''), `an escape survived: ${JSON.stringify(row)}`);
+  assert.match(row as string, /CPT·ENGINEER · cpt-01/, 'the label was overwritten');
+  assert.match(row as string, /\[2Jand the screen is mine/, 'the text should survive as text');
+});
+
+test('the roster — one row per unit, and a clock only on the one that is running — a long summary is clipped rather than allowed to push the unit off the row', () => {
+  const chatty: RosterUnit = { ...(CHROME_ROSTER[0] as RosterUnit), detail: 'x'.repeat(500) };
+  const [row] = renderRoster([chatty], 0, { charset: 'unicode', color: false, width: 80 });
+  assert.ok(chromeColumns(row as string) <= 79);
+  assert.match(row as string, /CPT·ENGINEER · cpt-01 #2 returned/);
+});
+
+test('formatElapsed — a clock a human is watching, not a duration — keeps the seconds moving where formatDuration would sit still for a minute', () => {
+  assert.equal(formatElapsed(0), '0s');
+  assert.equal(formatElapsed(47_000), '47s');
+  assert.equal(formatElapsed(72_000), '1m12s');
+  assert.equal(formatElapsed(119_000), '1m59s');
+  assert.equal(formatElapsed(3_600_000), '1h00m');
+  assert.equal(formatElapsed(3_840_000), '1h04m');
+  assert.equal(formatElapsed(-5), '0s', 'a clock that has not started must not run backwards');
+  // The contrast this function exists for: `formatDuration` answers "how long was it silent",
+  // and reads 1m for everything from 60s to 119s. A reader watching a unit work needs the
+  // number to move, because a number that does not move is the question "has this hung?".
+  assert.equal(formatDuration(72_000), '1m');
+  assert.equal(formatDuration(119_000), '1m');
+});
+
+// ===============================================================================================
+// COLUMNS — why `String.length` was never the right measure
+//
+// `src/view/chrome.ts` states that exact column counting is load-bearing: every row is clipped to
+// `width - 1` because a wrapped row adds a physical line that `src/chat/io.ts`'s `ESC[nA`
+// arithmetic does not know about, and from then on the cursor is one row adrift for the rest of
+// the session. These tests are that claim, made checkable.
+// ===============================================================================================
+
+const ESC = '\u001b';
+
+test('displayWidth counts terminal columns, not UTF-16 code units', () => {
+  assert.equal(displayWidth('abc'), 3);
+  // A CJK ideograph is ONE code unit and TWO columns — the direction `String.length` gets wrong
+  // in the way that makes a row overflow rather than come up short.
+  assert.equal('世界'.length, 2);
+  assert.equal(displayWidth('世界'), 4);
+  // An emoji is TWO code units and TWO columns; counting units happens to agree here, which is
+  // exactly why measuring one and assuming the other survived so long.
+  assert.equal('🔥'.length, 2);
+  assert.equal(displayWidth('🔥'), 2);
+  // A combining accent is one code unit and NO columns.
+  assert.equal('é'.length, 2);
+  assert.equal(displayWidth('é'), 1);
+  assert.equal(displayWidth(''), 0);
+});
+
+test('clipTo cuts to columns and never emits a half-drawn double-width cell', () => {
+  assert.equal(clipTo('abcdef', 10, '…'), 'abcdef');
+  assert.equal(displayWidth(clipTo('abcdefghij', 5, '…')), 5);
+  // Four ideographs are eight columns. Clipped to five, the ellipsis takes one and only two whole
+  // ideographs fit in the remaining four — the fifth column is left EMPTY rather than filled with
+  // half a character, because a terminal draws the whole cell or none of it.
+  const clipped = clipTo('世界世界', 5, '…');
+  assert.ok(displayWidth(clipped) <= 5, `clip overflowed: ${String(displayWidth(clipped))} columns`);
+  assert.ok(clipped.endsWith('…'));
+  // The invariant that actually matters, across every width a narrow terminal might hand us.
+  for (let width = 1; width <= 12; width += 1) {
+    const out = clipTo('a世b界c🔥d', width, '…');
+    assert.ok(
+      displayWidth(out) <= width,
+      `width ${String(width)}: clipped to ${String(displayWidth(out))} columns`,
+    );
+  }
+});
+
+test('padTo pads to columns, so a CJK cell is not padded twice', () => {
+  assert.equal(padTo('ab', 5, 'left'), 'ab   ');
+  assert.equal(displayWidth(padTo('世', 5, 'left')), 5);
+  assert.equal(displayWidth(padTo('世', 5, 'right')), 5);
+  // Already at or past the budget: never truncates. That is `clipTo`'s job, and doing both here
+  // would silently shorten a column somebody had already measured.
+  assert.equal(padTo('世界世', 4, 'left'), '世界世');
+});
+
+// ===============================================================================================
+// SANITISING — everything a terminal obeys rather than displays
+// ===============================================================================================
+
+test('sanitize strips bidi overrides, which a terminal obeys as surely as an escape', () => {
+  // Trojan Source, in the one slot a model chooses the bytes for: without this, the row displays
+  // a path that was never written.
+  assert.ok(!sanitize('Write lib/\u202esj.esrever').includes('\u202e'), 'an RLO survived');
+  assert.ok(!sanitize('a\u2066b\u2069c').includes('\u2066'), 'a bidi isolate survived');
+  // Zero-width characters go too: they let a string be arbitrarily longer than it measures.
+  assert.equal(sanitize('a\u200bb'), 'a b');
+  assert.equal(sanitize('a\ufeffb'), 'a b');
+  // Collapsed to a space rather than deleted — a word boundary the author intended must not close
+  // up into a different word.
+  assert.equal(sanitize('one\u200btwo'), 'one two');
+  // The original contract still holds.
+  assert.equal(sanitize(`a${ESC}[2Kb`), 'a[2Kb');
+  assert.equal(sanitize('  a\tb\n c  '), 'a b c');
+});
+
+test('every sanitized string measures the same before and after painting', () => {
+  // The composed guarantee: sanitize removes the invisible, displayWidth measures what is left,
+  // and clipTo cuts on that measure. A hostile summary cannot make a row wider than its budget.
+  const hostile = `${ESC}[2J\u202ewide 世界 \u200b\u200b\u200b🔥 ${'x'.repeat(200)}`;
+  const out = clipTo(sanitize(hostile), 40, '…');
+  assert.ok(displayWidth(out) <= 40, `${String(displayWidth(out))} columns survived a 40 budget`);
+  assert.ok(!out.includes(ESC), 'an escape byte reached a painted row');
+});
+
+// ===============================================================================================
+// DESCRIBING A TOOL CALL — the only function permitted to read model-chosen tool input
+// ===============================================================================================
+
+const WT = '/Users/x/.agentic-army-trees/trees/proj-abc/wt-01';
+
+test('describeToolUse names the salient argument for each claude tool', () => {
+  const at = (name: string, input: unknown): string =>
+    formatToolAction(describeToolUse(name, input, { root: WT }));
+  assert.equal(at('Write', { file_path: `${WT}/lib/html.js` }), 'Write(lib/html.js)');
+  assert.equal(at('Read', { file_path: `${WT}/package.json` }), 'Read(package.json)');
+  assert.equal(at('Edit', { file_path: `${WT}/lib/cli.js` }), 'Edit(lib/cli.js)');
+  assert.equal(at('Glob', { pattern: '**/*.ts' }), 'Glob(**/*.ts)');
+  assert.equal(at('Grep', { pattern: 'seo-audit/1.0' }), 'Grep(seo-audit/1.0)');
+  // The COMMAND, not the model's description of it — a description is a claim, the command is the
+  // fact, and the command is what a permission layer is about to refuse.
+  assert.equal(
+    at('Bash', { command: 'node --test', description: 'Run the suite' }),
+    'Bash(node --test)',
+  );
+  // A tool with nothing worth naming is reported by name alone, never with an invented argument.
+  assert.equal(at('StructuredOutput', {}), 'StructuredOutput');
+  assert.equal(at('Glob', {}), 'Glob');
+});
+
+test('describeToolUse translates codex tool shapes into the same vocabulary', () => {
+  const at = (name: string, input: unknown): string =>
+    formatToolAction(describeToolUse(name, input, { root: WT }));
+  // The `/bin/zsh -lc` wrapper is on every single codex command and is pure constant — nine
+  // columns that would push the informative half of the row off the end.
+  assert.equal(
+    at('command_execution', { command: ['/bin/zsh', '-lc', 'npm test'] }),
+    'Bash(npm test)',
+  );
+  assert.equal(at('command_execution', { command: "/bin/zsh -lc 'npm test'" }), 'Bash(npm test)');
+  assert.equal(at('command_execution', { command: 'npm test' }), 'Bash(npm test)');
+  assert.equal(
+    at('file_change', { changes: [{ path: `${WT}/a.js` }, { path: `${WT}/b.js` }] }),
+    'Edit(a.js +1 more)',
+  );
+  assert.equal(
+    at('mcp_tool_call', { server: 'virlo', tool: 'get_trends' }),
+    'MCP(virlo.get_trends)',
+  );
+});
+
+test('describeToolUse strips the worktree prefix but never a path outside it', () => {
+  const inside = describeToolUse('Write', { file_path: `${WT}/lib/a.js` }, { root: WT });
+  assert.equal(inside.target, 'lib/a.js');
+  // An absolute path OUTSIDE the lease is the shape of a worker writing where it should not, and
+  // is exactly the thing a reader most needs to see whole.
+  const outside = describeToolUse('Write', { file_path: '/tmp/scratch.js' }, { root: WT });
+  assert.equal(outside.target, '/tmp/scratch.js');
+  // No root: nothing is stripped, and nothing throws.
+  assert.equal(describeToolUse('Write', { file_path: '/a/b.js' }).target, '/a/b.js');
+});
+
+test('describeToolUse sanitises and clips before anything downstream sees the target', () => {
+  const hostile = describeToolUse(
+    'Bash',
+    { command: `${ESC}[2Jrm -rf ${'x'.repeat(400)}` },
+    { root: WT, max: 30 },
+  );
+  assert.ok(!hostile.target.includes(ESC), 'an escape byte survived into a target');
+  assert.ok(
+    displayWidth(hostile.target) <= 30,
+    `target was ${String(displayWidth(hostile.target))} columns against a 30 budget`,
+  );
+  // Non-record input must not throw: `ToolUseEvent.input` is optional and `unknown`.
+  assert.equal(describeToolUse('Bash', undefined).target, '');
+  assert.equal(describeToolUse('Bash', 'a string').target, '');
+  assert.equal(describeToolUse('Bash', null).verb, 'Bash');
+});
+
+test('bookkeeping tools are marked, so a caller can drop them instead of drowning in them', () => {
+  // 25 of the reference run's 107 calls were these, in bursts of nine.
+  for (const name of ['TaskCreate', 'TaskUpdate', 'TodoWrite', 'ToolSearch']) {
+    assert.equal(describeToolUse(name, {}).bookkeeping, true, `${name} was not bookkeeping`);
+  }
+  for (const name of ['Write', 'Bash', 'Read', 'Grep', 'Task']) {
+    assert.equal(describeToolUse(name, {}).bookkeeping, false, `${name} was marked bookkeeping`);
+  }
+});
+
+// ===============================================================================================
+// THE ACTIVITY EVENTS, AND THE TICKER THEY NEARLY KILLED
+// ===============================================================================================
+
+test('dispositionOf separates printing from ticker-safe from never-printed', () => {
+  assert.equal(dispositionOf({ kind: 'unit-thinking', agentId: 'a', tokens: 1 }), 'silent');
+  assert.equal(
+    dispositionOf({ kind: 'unit-acted', agentId: 'a', toolUseId: 't', isError: false }),
+    'silent',
+  );
+  assert.equal(
+    dispositionOf({
+      kind: 'unit-acting',
+      agentId: 'a',
+      toolUseId: 't',
+      tool: 'Write',
+      target: 'a.js',
+      depth: 0,
+    }),
+    'activity',
+  );
+  assert.equal(dispositionOf({ kind: 'note', level: 'info', message: 'x' }), 'lifecycle');
+});
+
+test('formatTokens rounds rather than claiming an accuracy the harness does not have', () => {
+  assert.equal(formatTokens(0), '0');
+  assert.equal(formatTokens(950), '950');
+  assert.equal(formatTokens(1200), '1.2k');
+  assert.equal(formatTokens(23_550), '24k');
+  assert.equal(formatTokens(1_500_000), '1.5M');
+  // Never renders as a negative or a NaN, whatever the harness reports.
+  assert.equal(formatTokens(-5), '0');
+  assert.equal(formatTokens(Number.NaN), '0');
+});
+
+const STYLE = { self: 'army', charset: 'unicode' as const };
+
+test('a tool call prints one line; a result and a reasoning tick print nothing', () => {
+  const acting = renderProgressEvent(
+    {
+      kind: 'unit-acting',
+      agentId: 'cpt-01',
+      toolUseId: 't',
+      tool: 'Write',
+      target: 'lib/a.js',
+      depth: 0,
+    },
+    STYLE,
+  );
+  assert.match(acting, /Write\(lib\/a\.js\)/u);
+  // A line per RESULT would double the feed to say "the thing you saw start has stopped", which
+  // the next line already implies.
+  assert.equal(
+    renderProgressEvent({ kind: 'unit-acted', agentId: 'a', toolUseId: 't', isError: false }, STYLE),
+    '',
+  );
+  // 662 of these arrived on the reference run. Every one of them printing is a worse terminal
+  // than none of them printing.
+  assert.equal(renderProgressEvent({ kind: 'unit-thinking', agentId: 'a', tokens: 900 }, STYLE), '');
+});
+
+test('a nested subagent call is indented under its parent, and the nesting is capped', () => {
+  const call = (depth: number): string =>
+    renderProgressEvent(
+      { kind: 'unit-acting', agentId: 'a', toolUseId: 't', tool: 'Write', target: 'a.js', depth },
+      STYLE,
+    );
+  assert.ok(call(1).length > call(0).length, 'a depth-1 call was not indented past its parent');
+  // `depth` comes from the harness and nothing here may assume it is small: an absurd depth must
+  // not push the line off the right edge.
+  assert.equal(call(9).length, call(3).length, 'nesting was not capped');
+});
+
+test('a refused call names the command, and quotes only the sentence addressed to a human', () => {
+  const line = renderProgressEvent(
+    {
+      kind: 'unit-blocked',
+      agentId: 'cpt-01',
+      tool: 'Bash',
+      target: 'cat > /tmp/probe.js',
+      reason:
+        "Permission to use Bash has been denied because Claude Code is running in don't ask mode. " +
+        'IMPORTANT: You *may* attempt to accomplish this action using other tools. ' +
+        'x'.repeat(300),
+    },
+    STYLE,
+  );
+  // The command, not just the tool name: `Bash refused` says something was blocked, and
+  // `Bash(cat > /tmp/...) refused` says the worker reached outside its worktree.
+  assert.match(line, /cat > \/tmp\/probe\.js/u);
+  assert.match(line, /refused/u);
+  assert.ok(!line.includes('IMPORTANT'), 'advice addressed to the model reached the human');
+  assert.ok(line.length < 220, `a denial line ran to ${String(line.length)} characters`);
+});
+
+/**
+ * A sink over a fake stream and fake timers, so no test waits on a real one.
+ *
+ * `clear` genuinely REMOVES the handle, and `tick` fires only what is still live. That is not a
+ * detail: the first version of this helper ignored `clear`, so a ticker the sink had stopped kept
+ * painting when the test poked it — and the regression test for "an activity event must not kill
+ * the ticker" passed happily against the very bug it was written to catch. A fake that is more
+ * forgiving than the real timer makes every assertion built on it worthless.
+ */
+function scriptedSink(columns: number): {
+  writes: string[];
+  emit: (event: ProgressEvent) => void;
+  /** Fire every live timer. Returns how many there were — zero means nothing is ticking. */
+  tick: () => number;
+  advance: (ms: number) => void;
+  close: () => void;
+} {
+  const writes: string[] = [];
+  const live = new Map<number, () => void>();
+  let next = 0;
+  let clock = 1_000_000;
+  const sink = createProgressSink({
+    stream: { write: (text: string) => writes.push(text), isTTY: true, columns },
+    self: 'army',
+    live: true,
+    now: () => clock,
+    timers: {
+      set: (fn: () => void) => {
+        const handle = next;
+        next += 1;
+        live.set(handle, fn);
+        return handle;
+      },
+      clear: (handle: unknown) => {
+        live.delete(handle as number);
+      },
+    },
+  });
+  return {
+    writes,
+    emit: (event) => sink.emit(event),
+    tick: () => {
+      const fns = [...live.values()];
+      for (const fn of fns) fn();
+      return fns.length;
+    },
+    advance: (ms) => {
+      clock += ms;
+    },
+    close: () => sink.close(),
+  };
+}
+
+const DISPATCHED: ProgressEvent = {
+  kind: 'unit-dispatched',
+  agentId: 'cpt-01',
+  rank: 'CAPTAIN',
+  role: 'ENGINEER',
+  harness: 'claude',
+  attempt: 1,
+};
+
+test('the elapsed ticker survives a tool call, and does not restart its clock', () => {
+  // The regression this exists for: `emit` used to stop the ticker on EVERY event and restart it
+  // only on `unit-dispatched`, so the first activity event permanently disabled the one live
+  // signal `army campaign` has. Capable of failing — revert that and the second assert goes dead.
+  const s = scriptedSink(100);
+  s.emit(DISPATCHED);
+  s.advance(120_000);
+  assert.equal(s.tick(), 1, 'no ticker was started at dispatch');
+  assert.match(s.writes[s.writes.length - 1] ?? '', /120s/u, 'no elapsed reading before the call');
+
+  s.emit({
+    kind: 'unit-acting',
+    agentId: 'cpt-01',
+    toolUseId: 't1',
+    tool: 'Write',
+    target: 'lib/a.js',
+    depth: 0,
+  });
+  s.advance(5_000);
+  // The assertion that catches the regression: a stopped-and-not-restarted ticker leaves NO live
+  // timer, and the fake reports that honestly rather than firing a handle the sink has cleared.
+  assert.equal(s.tick(), 1, 'the activity event left no live ticker');
+  const after = s.writes[s.writes.length - 1] ?? '';
+  assert.match(after, /\d+s$/u, `the ticker stopped after a tool call: ${after}`);
+  // And still counting from the DISPATCH, not from the tool call: a restart that re-read the
+  // clock would turn the one number a watching human trusts into a stopwatch measuring the gap
+  // between tool calls.
+  assert.match(after, /125s/u, `the elapsed clock restarted: ${after}`);
+  s.close();
+});
+
+test('a reasoning tick moves the live row without stopping or repainting the ticker', () => {
+  const s = scriptedSink(100);
+  s.emit(DISPATCHED);
+  const before = s.writes.length;
+  for (let i = 0; i < 50; i += 1) {
+    s.emit({ kind: 'unit-thinking', agentId: 'cpt-01', tokens: i * 100 });
+  }
+  // Fifty reasoning ticks wrote NOTHING. They arrive every couple of seconds for minutes at a
+  // time; each one reaching the stream is a visible flicker on a line that repaints itself.
+  assert.equal(s.writes.length, before, 'a reasoning tick wrote to the stream');
+  s.advance(3_000);
+  s.tick();
+  assert.match(s.writes[s.writes.length - 1] ?? '', /thinking/u, 'the count never reached the row');
+  s.close();
+});
+
+test('the ticker never emits a row wider than the terminal', () => {
+  // A wrapped ticker row is unrecoverable: `CLEAR_LINE` erases exactly one row, so the tail stays
+  // on screen forever. `detail` now carries model-chosen file paths, which is how a row gets long.
+  const s = scriptedSink(40);
+  s.emit(DISPATCHED);
+  s.emit({
+    kind: 'unit-acting',
+    agentId: 'cpt-01',
+    toolUseId: 't',
+    tool: 'Write',
+    target: 'a/very/deeply/nested/path/that/keeps/going/forever/and/ever/file.js',
+    depth: 0,
+  });
+  s.tick();
+  const frame = (s.writes[s.writes.length - 1] ?? '').replace(`\r${ESC}[2K`, '');
+  assert.ok(displayWidth(frame) < 40, `the ticker painted ${String(displayWidth(frame))} of 40`);
+  s.close();
+});
+
+// ===============================================================================================
+// THE ROSTER ROW, THROUGH A REASONING GAP
+// ===============================================================================================
+
+function workingUnit(over: Partial<RosterUnit> = {}): RosterUnit {
+  return {
+    agentId: 'cpt-01',
+    rank: 'CAPTAIN',
+    role: 'ENGINEER',
+    harness: 'claude',
+    attempt: 1,
+    state: 'working',
+    elapsedMs: 200_000,
+    detail: null,
+    detailAgeMs: null,
+    thinkingTokens: null,
+    silentMs: 0,
+    ...over,
+  };
+}
+
+const WIDE = { charset: 'unicode' as const, color: false, width: 120 };
+
+test('a working row keeps naming the last action, and dates it once it goes stale', () => {
+  // The complaint, exactly: through a 248-second reasoning gap the row must not go blank. It
+  // keeps the last action AND says how old it is, so it is never a claim about the present tense.
+  const fresh =
+    renderRoster([workingUnit({ detail: 'Write(lib/html.js)', detailAgeMs: 2_000 })], 0, WIDE)[0] ??
+    '';
+  assert.match(fresh, /Write\(lib\/html\.js\)/u);
+  assert.ok(!/ago/u.test(fresh), 'a two-second-old action was dated');
+
+  const stale =
+    renderRoster(
+      [workingUnit({ detail: 'Write(lib/html.js)', detailAgeMs: 183_000 })],
+      0,
+      WIDE,
+    )[0] ?? '';
+  assert.match(stale, /Write\(lib\/html\.js\)/u, 'the row went blank during a reasoning gap');
+  assert.match(stale, /3m03s ago/u, 'a three-minute-old action was not dated');
+});
+
+test('unknown is a real state on the roster row, never zero', () => {
+  // `src/view/chrome.ts` states this rule for the repo state; it holds just as hard here. A
+  // harness that reports no reasoning telemetry and a model that has done no reasoning are
+  // different facts, and the bar may not merge them.
+  const silent = renderRoster([workingUnit()], 0, WIDE)[0] ?? '';
+  assert.ok(!/thinking/u.test(silent), 'a null token count rendered as a claim');
+  assert.ok(!/ago/u.test(silent), 'a null detail age rendered as a claim');
+  assert.match(renderRoster([workingUnit({ thinkingTokens: 23_550 })], 0, WIDE)[0] ?? '', /24k/u);
+});
+
+test('a stalled unit is distinguishable from one that is thinking hard', () => {
+  // The harness reports reasoning tokens roughly every 1.5s, so silence on this scale is not
+  // thinking — and before this existed a reader could only tell by waiting.
+  const busy =
+    renderRoster([workingUnit({ thinkingTokens: 900, silentMs: 3_000 })], 0, WIDE)[0] ?? '';
+  assert.ok(!/silent/u.test(busy), 'a three-second gap was called a stall');
+  const stalled =
+    renderRoster([workingUnit({ thinkingTokens: 900, silentMs: 120_000 })], 0, WIDE)[0] ?? '';
+  assert.match(stalled, /silent 2m/u, 'a two-minute silence was not reported');
+});
+
+test('a settled row is never dated or given a live token count', () => {
+  // Its detail is the final summary, and dating it would say "this finished four minutes ago" in
+  // the slot a reader is using to read what it found.
+  const returned =
+    renderRoster(
+      [
+        workingUnit({
+          state: 'returned',
+          detail: 'built the crawler',
+          detailAgeMs: 200_000,
+          thinkingTokens: 900,
+        }),
+      ],
+      0,
+      WIDE,
+    )[0] ?? '';
+  assert.match(returned, /built the crawler/u);
+  assert.ok(!/ago/u.test(returned), 'a returned unit had its summary dated');
+  assert.ok(!/thinking/u.test(returned), 'a returned unit was still shown thinking');
+});
+
+test('no roster row ever exceeds its width, however hostile the detail', () => {
+  const hostile = workingUnit({
+    detail: `${ESC}[2J\u202e${'世界'.repeat(80)}`,
+    detailAgeMs: 500_000,
+    thinkingTokens: 999_999,
+    silentMs: 500_000,
+  });
+  for (const width of [24, 40, 80, 120]) {
+    const row = renderRoster([hostile], 0, { charset: 'unicode', color: false, width })[0] ?? '';
+    assert.ok(
+      displayWidth(row) < width,
+      `width ${String(width)}: row painted ${String(displayWidth(row))} columns`,
+    );
+    assert.ok(!row.includes(ESC), `width ${String(width)}: an escape byte reached the row`);
+  }
+});
+
+test('the ascii charset folds every new glyph rather than printing a question mark', () => {
+  // The tool and blocked marks are new. A glyph with no FOLD entry becomes `?`, which on a
+  // codepage-437 console makes a REFUSED call indistinguishable from a rendering failure.
+  const style = { self: 'army', charset: 'ascii' as const };
+  const acting = renderProgressEvent(
+    { kind: 'unit-acting', agentId: 'a', toolUseId: 't', tool: 'Write', target: 'a.js', depth: 0 },
+    style,
+  );
+  const blocked = renderProgressEvent(
+    { kind: 'unit-blocked', agentId: 'a', tool: 'Bash', target: 'cat x', reason: 'denied.' },
+    style,
+  );
+  for (const line of [acting, blocked]) {
+    assert.ok(!line.includes('?'), `an unfolded glyph reached the ascii path: ${line}`);
+    assert.ok(!/[^ -~]/u.test(line), `a non-ascii byte survived the fold: ${line}`);
+  }
+});
+
+// -----------------------------------------------------------------------------------------------
+// Prose — the commander's answers rendered: gutter, wrap, and markdown as ink.
+//
+// Every stream test collects writes into one string and asserts on it whole, because the thing
+// under test is what a terminal ends up SHOWING, and the terminal does not care how many writes
+// it took. The pure pieces (parseInline, blockShape) get their own assertions because they are
+// the grammar, and a grammar bug would render every streaming assertion misleading at once.
+// -----------------------------------------------------------------------------------------------
+
+import type { ProseStream } from '../src/view/prose.ts';
+import { blockShape, createProseStream, firstOpenMarker, parseInline } from '../src/view/prose.ts';
+
+const BOLD = '[1m';
+const DIM = '[2m';
+const CYAN = '[36m';
+const RESET = '[0m';
+
+test('parseInline: bold and code become runs, unmatched markers stay literal', () => {
+  assert.deepEqual(parseInline('plain **bold** and `code` here'), [
+    { text: 'plain ', style: 'plain' },
+    { text: 'bold', style: 'bold' },
+    { text: ' and ', style: 'plain' },
+    { text: 'code', style: 'code' },
+    { text: ' here', style: 'plain' },
+  ]);
+  // An unmatched marker is text. A style that swallowed the rest of the line would turn one
+  // stray asterisk pair into an answer that LOOKS truncated.
+  assert.deepEqual(parseInline('2 ** 3 is 8'), [{ text: '2 ** 3 is 8', style: 'plain' }]);
+  // Backticks win over bold, so `**` inside code is code, not emphasis.
+  assert.deepEqual(parseInline('`a ** b`'), [{ text: 'a ** b', style: 'code' }]);
+});
+
+test('firstOpenMarker: the point past which a stream must not print early', () => {
+  assert.equal(firstOpenMarker('all closed **here** and `there`'), -1);
+  assert.equal(firstOpenMarker('safe then **still open'), 10);
+  assert.equal(firstOpenMarker('safe then `still open'), 10);
+});
+
+test('blockShape: headings strip, lists hang under their text, fences classify', () => {
+  assert.deepEqual(blockShape('## The plan', false), { kind: 'heading', hang: 0, text: 'The plan' });
+  assert.deepEqual(blockShape('- first point', false), { kind: 'list', hang: 2, text: '- first point' });
+  assert.deepEqual(blockShape('12. later point', false), { kind: 'list', hang: 4, text: '12. later point' });
+  assert.equal(blockShape('```sh', false).kind, 'fence');
+  // Inside a fence, a line that would otherwise be a list is code.
+  assert.equal(blockShape('- not a list', true).kind, 'fence');
+  assert.equal(blockShape('just words', false).kind, 'paragraph');
+});
+
+/** One whole turn through one stream, collected. */
+function prose(width: number, color: boolean, feed: (s: ProseStream) => void): string {
+  let out = '';
+  const stream = createProseStream({
+    width: () => width,
+    color,
+    charset: 'unicode',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  feed(stream);
+  stream.end();
+  return out;
+}
+
+test('an answer wraps at word boundaries and hangs under the gutter', () => {
+  const out = prose(40, false, (s) => {
+    s.push('the quick brown fox jumps over the lazy dog and keeps going\n');
+  });
+  const rows = out.split('\n');
+  assert.equal(rows[0], '◆ the quick brown fox jumps over the');
+  assert.equal(rows[1], '  lazy dog and keeps going');
+  for (const row of rows) {
+    assert.ok(row.length <= 39, `a row reached the final column: ${JSON.stringify(row)}`);
+  }
+});
+
+test('a list continuation indents under the item text, not under the margin', () => {
+  const out = prose(40, false, (s) => {
+    s.push('- dealership sites only, scraped directly and reliably\n');
+  });
+  const rows = out.split('\n');
+  assert.equal(rows[0], '◆ - dealership sites only, scraped');
+  assert.equal(rows[1], '    directly and reliably');
+});
+
+test('markdown renders as ink: markers gone, bold and code and gutter painted', () => {
+  const out = prose(80, true, (s) => {
+    s.push('**Question 1: what do we hit?** Run `army doctor` first.\n');
+  });
+  assert.ok(!out.includes('**'), `a bold marker survived rendering:\n${JSON.stringify(out)}`);
+  assert.ok(!out.includes('`'), `a code marker survived rendering:\n${JSON.stringify(out)}`);
+  assert.ok(out.includes(`${BOLD}Question 1: what do we hit?${RESET}`), 'bold text is not bold');
+  assert.ok(out.includes(`${CYAN}army doctor${RESET}`), 'code text is not cyan');
+  assert.ok(out.includes(`${CYAN}◆ ${RESET}`), 'the gutter is not painted');
+});
+
+test('colour off: markers still stripped, no escape byte anywhere', () => {
+  const out = prose(80, false, (s) => {
+    s.push('**bold** and `code`\n');
+  });
+  assert.equal(out, '◆ bold and code\n');
+});
+
+test('a fenced block keeps its quotes: nothing inside it is eaten as markdown', () => {
+  const out = prose(80, true, (s) => {
+    s.push('```sh\ngrep -q "deps" package.json\n```\n');
+  });
+  const rows = out.split('\n');
+  // The body is highlighted now (the string paints green), so the assertion is on CONTENT
+  // surviving, not on a single dim run: strip the ink and the bytes must be exactly the line,
+  // left rule and all.
+  const plain = (rows[0] ?? '').replace(/\[\d+m/gu, '');
+  assert.equal(plain, '◆ │ grep -q "deps" package.json', `fence body is wrong:\n${JSON.stringify(rows[0])}`);
+  // The ``` lines print NOTHING, not even the blank row they used to occupy. The body is the
+  // whole block, and the rule down its edge says `code` without the model's syntax showing.
+  assert.ok(!out.includes('```'), `a fence marker survived into the rendering:\n${JSON.stringify(out)}`);
+  assert.equal(out.split('\n').length, 2, `the dropped markers left rows behind:\n${JSON.stringify(out)}`);
+});
+
+test('spill prints whole words only, and the line continues seamlessly after it', () => {
+  let out = '';
+  const stream = createProseStream({
+    width: () => 80,
+    color: false,
+    charset: 'unicode',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  stream.push('The Engineer is still working on the acc');
+  stream.spill();
+  assert.ok(out.endsWith('the'), `spill did not stop at a word boundary:\n${JSON.stringify(out)}`);
+  assert.ok(!out.includes('acc'), 'a partial word was printed, and printed cannot be unprinted');
+  stream.push('eptance gate now.');
+  stream.end();
+  assert.equal(out, '◆ The Engineer is still working on the acceptance gate now.');
+});
+
+test('spill holds an unclosed bold span, and the close renders it styled', () => {
+  let out = '';
+  const stream = createProseStream({
+    width: () => 80,
+    color: true,
+    charset: 'unicode',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  stream.push('So: **Question 1 (of');
+  stream.spill();
+  assert.ok(!out.includes('**'), `spill printed an unclosed marker:\n${JSON.stringify(out)}`);
+  stream.push(' several)** follows.');
+  stream.end();
+  assert.ok(out.includes(`${BOLD}Question 1 (of several)${RESET}`), 'the closed span did not render bold');
+  assert.ok(!out.includes('**'), 'a marker leaked into the transcript');
+});
+
+test('a stray unclosed marker prints literally at turn end, because it is the truth', () => {
+  const out = prose(80, false, (s) => {
+    s.push('the result of 2 ** 10');
+  });
+  assert.equal(out, '◆ the result of 2 ** 10');
+});
+
+test('an empty turn still gets its bare gutter, and ascii folds it', () => {
+  let out = '';
+  const stream = createProseStream({
+    width: () => 80,
+    color: false,
+    charset: 'ascii',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  stream.end();
+  assert.equal(out, '#');
+});
+
+test('a word wider than the row hard-breaks at the width instead of at the terminal edge', () => {
+  const out = prose(24, false, (s) => {
+    s.push('see /Users/somebody/organizations/personal/agentic-army/src/view/prose.ts\n');
+  });
+  for (const row of out.split('\n')) {
+    assert.ok(row.length <= 23, `a row reached the final column: ${JSON.stringify(row)}`);
+  }
+});
+
+test('blank lines survive: a paragraph gap is part of what was said', () => {
+  const out = prose(80, false, (s) => {
+    s.push('first paragraph.\n\nsecond paragraph.\n');
+  });
+  assert.equal(out, '◆ first paragraph.\n\n  second paragraph.\n');
+});
+
+// ---- links ------------------------------------------------------------------------------------
+
+test('parseInline: a link run carries its url, and brackets without one stay text', () => {
+  assert.deepEqual(parseInline('see [docs](u.io) here'), [
+    { text: 'see ', style: 'plain' },
+    { text: 'docs', style: 'link', url: 'u.io' },
+    { text: ' here', style: 'plain' },
+  ]);
+  // `array[0]` has a bracket and no destination: text, never a link.
+  assert.deepEqual(parseInline('array[0] wins'), [{ text: 'array[0] wins', style: 'plain' }]);
+});
+
+test('firstOpenMarker: a link is open until all three of its delimiters have arrived', () => {
+  assert.equal(firstOpenMarker('see [docs](u.io) ok'), -1);
+  assert.equal(firstOpenMarker('see [docs'), 4);
+  // The `]` is the last known character: the next chunk may bring the `(` that makes a link.
+  assert.equal(firstOpenMarker('see [docs]'), 4);
+  assert.equal(firstOpenMarker('see [docs](u.i'), 4);
+  assert.equal(firstOpenMarker('see [docs] more'), -1);
+});
+
+test('a link renders its text cyan and its destination dim, or cyan alone when they match', () => {
+  const out = prose(80, true, (s) => {
+    s.push('read [the docs](https://ex.io/d) or [https://a.io](https://a.io) now\n');
+  });
+  assert.ok(
+    out.includes(`${CYAN}the docs${RESET} ${DIM}(https://ex.io/d)${RESET}`),
+    `the two halves are not two inks:\n${JSON.stringify(out)}`,
+  );
+  assert.ok(out.includes(`${CYAN}https://a.io${RESET} now`), 'a self-link repeats its url');
+  assert.ok(!out.includes(']('), 'link markers reached the terminal');
+});
+
+test('colour off, a link is its text with the destination in parentheses, markers gone', () => {
+  const out = prose(80, false, (s) => {
+    s.push('read [the docs](https://ex.io/d).\n');
+  });
+  assert.equal(out, '◆ read the docs (https://ex.io/d).\n');
+});
+
+test('spill holds an unfinished link, and the close renders it whole', () => {
+  let out = '';
+  const stream = createProseStream({
+    width: () => 80,
+    color: false,
+    charset: 'unicode',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  stream.push('see [the ');
+  stream.spill();
+  assert.equal(out, '◆ see', `spill printed part of a pending link:\n${JSON.stringify(out)}`);
+  stream.push('guide](http://g.io) now');
+  stream.end();
+  assert.equal(out, '◆ see the guide (http://g.io) now');
+});
+
+test('punctuation tight after a styled span wraps with the span, not on a row of its own', () => {
+  const out = prose(80, false, (s) => {
+    s.push('so [same](same). And `gate.ts`, then **bold**.\n');
+  });
+  assert.equal(out, '◆ so same. And gate.ts, then bold.\n');
+});
+
+// ---- horizontal rules -------------------------------------------------------------------------
+
+test('a line of dashes renders as a dim rule, not as those characters', () => {
+  const out = prose(80, true, (s) => {
+    s.push('---\n');
+  });
+  assert.ok(out.includes(`${DIM}${'─'.repeat(40)}${RESET}`), `no rule:\n${JSON.stringify(out)}`);
+  assert.ok(!out.replace(/\[\d+m/gu, '').includes('---'), 'the dashes leaked through');
+  // Stars and underscores are the same rule, and colour off draws it plain.
+  assert.equal(prose(80, false, (s) => s.push('***\n')), `◆ ${'─'.repeat(40)}\n`);
+  assert.equal(prose(80, false, (s) => s.push('___\n')), `◆ ${'─'.repeat(40)}\n`);
+});
+
+test('a narrow terminal shortens the rule instead of wrapping it', () => {
+  const out = prose(30, false, (s) => {
+    s.push('---\n');
+  });
+  // usable 29, gutter 2: the rule spans 27 columns, under the 40 cap.
+  assert.equal(out, `◆ ${'─'.repeat(27)}\n`);
+});
+
+test('ascii charset draws the rule in plain dashes', () => {
+  let out = '';
+  const stream = createProseStream({
+    width: () => 80,
+    color: false,
+    charset: 'ascii',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  stream.push('---\n');
+  stream.end();
+  assert.equal(out, `# ${'-'.repeat(40)}\n`);
+});
+
+test('dashes followed by words are a paragraph, not a rule', () => {
+  const out = prose(80, false, (s) => {
+    s.push('--- but wait\n');
+  });
+  assert.equal(out, '◆ --- but wait\n');
+});
+
+// ---- tables -----------------------------------------------------------------------------------
+
+test('a table aligns every column to its widest cell, divider row included', () => {
+  const out = prose(80, false, (s) => {
+    s.push('| name | cost |\n|---|---|\n| cpt-01 | $8.86 |\n| c | $0.41 |\n');
+    s.push('after.\n');
+  });
+  const rows = out.split('\n');
+  assert.equal(rows[0], '◆ | name   | cost  |');
+  assert.equal(rows[1], '  |────────|───────|');
+  assert.equal(rows[2], '  | cpt-01 | $8.86 |');
+  assert.equal(rows[3], '  | c      | $0.41 |');
+  // The paragraph after the table is what flushed it.
+  assert.equal(rows[4], '  after.');
+});
+
+test('inline styles apply inside cells and alignment measures the visible text', () => {
+  const out = prose(80, true, (s) => {
+    s.push('| **who** | note |\n| cpt-01 | ok |\n');
+    s.push('done\n');
+  });
+  assert.ok(out.includes(`${BOLD}who${RESET}`), 'bold in a cell is not bold');
+  assert.ok(!out.includes('**'), 'a marker reached a cell');
+  const plain = out.replace(/\[\d+m/gu, '');
+  // Markers stripped BEFORE measuring: the column is as wide as `cpt-01`, not `**who**`.
+  assert.ok(plain.includes('| who    | note |'), `alignment counted the markers:\n${plain}`);
+  assert.ok(plain.includes('| cpt-01 | ok   |'), `alignment is off:\n${plain}`);
+});
+
+test('spill never flushes a partial table; the turn end aligns it whole', () => {
+  let out = '';
+  const stream = createProseStream({
+    width: () => 80,
+    color: false,
+    charset: 'unicode',
+    write: (text) => {
+      out += text;
+    },
+  });
+  stream.begin();
+  stream.push('| a | boo |\n| ccc ');
+  stream.spill();
+  assert.equal(out, '', `a partial table reached the terminal:\n${JSON.stringify(out)}`);
+  stream.push('| d |\n');
+  stream.end();
+  assert.equal(out, '◆ | a   | boo |\n  | ccc | d   |\n');
+});
+
+test('a table wider than the terminal shrinks its widest column and wraps the cells into it', () => {
+  const long = `| ${'alpha '.repeat(9).trim()} | ${'beta '.repeat(9).trim()} |`;
+  const out = prose(40, false, (s) => {
+    s.push(`${long}\n| a | b |\n`);
+    s.push('done\n');
+  });
+  const rows = out.split('\n').filter((row) => row.includes('|'));
+  // Every row of the table fits, and every one is the SAME width: that is what alignment means,
+  // and it is the thing the old raw-lines fallback could not give. A hundred-column window makes
+  // almost every table a model writes too wide, so this path is the normal one, not the corner.
+  const widths = new Set(rows.map((row) => row.length));
+  assert.equal(widths.size, 1, `the table rows are ragged:\n${out}`);
+  assert.ok((rows[0] ?? '').length <= 39, `the table overruns the window:\n${out}`);
+  // The wrap is inside the cells, so the words are all still there, in order.
+  assert.equal((out.match(/alpha/gu) ?? []).length, 9, `words were lost in the wrap:\n${out}`);
+  assert.equal((out.match(/beta/gu) ?? []).length, 9, `words were lost in the wrap:\n${out}`);
+});
+
+test('a table with more columns than the window can seat still falls back to raw dim lines', () => {
+  const many = `| ${['a', 'b', 'c', 'd', 'e', 'f'].join(' | ')} |`;
+  const out = prose(24, true, (s) => {
+    s.push(`${many}\n`);
+    s.push('done\n');
+  });
+  assert.ok(out.includes(`${DIM}${many}${RESET}`), `the unseatable row is not raw and dim:\n${out}`);
+});
+
+// The fence body goes through the highlighter (src/view/highlight.ts); these assert the WIRING,
+// not the grammar, which has its own suite in test/highlight.test.ts.
+
+const GREEN = '\u001b[32m';
+
+test('a fenced block with a language highlights: keywords cyan, strings green, rest dim', () => {
+  const out = prose(80, true, (s) => {
+    s.push("```js\nconst x = 'hi';\n```\n");
+  });
+  assert.ok(out.includes(`${CYAN}const${RESET}`), `the keyword is not cyan:\n${JSON.stringify(out)}`);
+  assert.ok(out.includes(`${GREEN}'hi'${RESET}`), `the string is not green:\n${JSON.stringify(out)}`);
+  // The info string still picks the language even though its line never prints.
+  assert.ok(!out.includes('```'), `a fence marker survived into the rendering:\n${JSON.stringify(out)}`);
+});
+
+test('a fence with no language stays exactly the dim block it was before highlighting existed', () => {
+  const out = prose(80, true, (s) => {
+    s.push('```\nwords with no grammar\n```\n');
+  });
+  assert.ok(out.includes(`${DIM}words with no grammar${RESET}`), `unhighlighted body is not one dim run:\n${out}`);
+});
+
+test('highlight state does not leak between fences: a block comment left open dies with its block', () => {
+  const out = prose(80, true, (s) => {
+    s.push('```js\n/* never closed\n```\n');
+    s.push('```js\nreturn 1;\n```\n');
+  });
+  assert.ok(out.includes(`${CYAN}return${RESET}`), `the second fence inherited comment state:\n${out}`);
 });

@@ -70,6 +70,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type { CampaignStatus, TaskRow } from '../contracts/archive.ts';
+import type { PermissionPosture } from '../contracts/config.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import { RUNG_LABEL } from '../contracts/delivery.ts';
 import type {
@@ -91,7 +92,8 @@ import {
   validateVerdict,
 } from '../contracts/report.ts';
 import type { AcceptanceResult, CommandRunner } from '../contracts/verify.ts';
-import { DEFAULT_VERIFY_TIMEOUT_MS } from '../contracts/verify.ts';
+import { DEFAULT_VERIFY_TIMEOUT_MS, SHELL_CANNOT_EXECUTE } from '../contracts/verify.ts';
+import type { VerifyBaseline } from '../contracts/verify.ts';
 import type { Lease, ReleaseResult } from '../contracts/worktree.ts';
 import { armyBranch } from '../contracts/worktree.ts';
 
@@ -103,7 +105,7 @@ import {
   listCampaignIds,
 } from '../archive/archive.ts';
 import type { ArchiveConfig } from '../archive/archive.ts';
-import { loadConfig } from '../config/load.ts';
+import { loadConfig, postureNotice } from '../config/load.ts';
 import { armyHome, configPath, worktreesRootFor } from '../config/paths.ts';
 import type { Env } from '../config/paths.ts';
 import {
@@ -122,14 +124,19 @@ import type {
   MergeRequest,
 } from '../delivery/ladder.ts';
 import { RungNotImplementedError, projectCeiling, runLadder } from '../delivery/ladder.ts';
-import { runAcceptanceGate } from '../verify/index.ts';
+import { runAcceptanceGate, runVerifyBaseline, unrunnableCommands } from '../verify/index.ts';
 import { createClaudeAdapter } from '../harness/claude.ts';
 import type { ClaudeAdapterOptions } from '../harness/claude.ts';
 import { createCodexAdapter, isCodexSoldier } from '../harness/codex.ts';
 import type { CodexAdapterOptions } from '../harness/codex.ts';
 import { killSoldierTree } from '../harness/kill.ts';
 import { installHint, invokedAs } from '../setup/checks.ts';
-import { autoInitRepo, decideAutoInit, mainRootFromCommonDir } from '../setup/enlist.ts';
+import {
+  autoInitRepo,
+  decideAutoInit,
+  detachedFromEnclosingRepo,
+  mainRootFromCommonDir,
+} from '../setup/enlist.ts';
 import type { Fix } from '../setup/fixes.ts';
 import {
   doThis,
@@ -145,6 +152,7 @@ import { PoolExhaustedError, UnlandedWorkError } from '../worktree/cold.ts';
 import { selectWorktreeProvider } from '../worktree/index.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import type { ProgressEvent, ProgressListener } from '../view/progress.ts';
+import { describeToolUse } from '../view/activity.ts';
 
 import {
   briefInspectorFromAttempt,
@@ -236,7 +244,14 @@ export type CampaignNoteCode =
    * `enlist` does. Recorded so `--json` and the final report say a repository now exists that
    * did not when the command was typed.
    */
-  | 'auto-init';
+  | 'auto-init'
+  /**
+   * How tightly this campaign's workers are confined — `PermissionPosture`. Raised on every
+   * campaign, beside the delivery ceiling, because the two answer the same class of question:
+   * what is this run allowed to do. `warn` under `unguarded` so a reader who did not choose it
+   * sees it, `info` under `guarded` so a reader who did is not nagged.
+   */
+  | 'permissions';
 
 export interface CampaignNote {
   level: 'info' | 'warn' | 'error';
@@ -460,6 +475,17 @@ export interface CampaignOptions {
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
+
+/**
+ * How rarely a reasoning-token reading may be re-announced, and how much growth overrides that.
+ *
+ * The harness emits one of these roughly every 1.5 seconds for the entire duration of a reasoning
+ * gap — 166 of them inside a single 248-second silence on the reference run. The interval keeps a
+ * quiet stretch from repainting more often than a human can read; the token floor makes a sudden
+ * burst visible before the interval is up, so the number moves when the work does.
+ */
+const THINKING_MIN_INTERVAL_MS = 2_000;
+const THINKING_MIN_TOKENS = 250;
 const DEFAULT_REQUESTED_RUNG: Rung = 2;
 
 // ---------------------------------------------------------------------------------------------
@@ -540,6 +566,14 @@ export interface BuildSpecInput {
   /** Resolved army home, so the deny-list carries absolute globs as well as `~`-relative ones. */
   home: string;
   /**
+   * How tightly to confine this worker — `PermissionPosture` in `src/contracts/config.ts`.
+   *
+   * Optional and defaulting to `guarded`, matching `permissionsFor` and `SoldierSpec.posture`:
+   * every call site that has not been taught about the posture builds the confined spec it built
+   * before, and only a caller that has read the config can loosen one.
+   */
+  posture?: PermissionPosture;
+  /**
    * The spec's `verify` commands, for an ENGINEER whose orders instruct it to run them.
    *
    * Each becomes an EXACT-match `Bash(<command>)` allow rule via `verifyAllowRules` — see that
@@ -585,7 +619,8 @@ export interface BuildSpecInput {
 export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
   // Rank AND role. The rank has been on this input since the first spec was built; until it was
   // passed here it decided a label and a substrate and nothing about what the worker could do.
-  const { allow, deny } = permissionsFor(input.rank, input.role, input.home);
+  const posture: PermissionPosture = input.posture ?? 'guarded';
+  const { allow, deny } = permissionsFor(input.rank, input.role, input.home, posture);
   assertNoFlagLikeRules(allow, `${input.role} allow-list`);
   assertNoFlagLikeRules(deny, 'global deny-list');
   const who = `${input.agentId} (${input.rank}·${input.role})`;
@@ -608,8 +643,14 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
           'permissionsFor.',
       );
     }
-    for (const rule of verifyAllowRules(input.verifyCommands)) {
-      if (!allow.includes(rule)) allow.push(rule);
+    // Under `unguarded` the loadout already holds a bare `Bash`, so an exact-match grant for one
+    // spelling of one command adds nothing and would only put back the noise this posture exists
+    // to remove. Skipped rather than emitted-and-ignored: an allow-list that lists rules with no
+    // effect is a list nobody can read for what it actually permits.
+    if (posture === 'guarded') {
+      for (const rule of verifyAllowRules(input.verifyCommands)) {
+        if (!allow.includes(rule)) allow.push(rule);
+      }
     }
   }
 
@@ -627,8 +668,11 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
           'guards inside permissionsFor.',
       );
     }
-    for (const rule of fileRunRules(input.filesInScope)) {
-      if (!allow.includes(rule)) allow.push(rule);
+    // Same reasoning as the verify block above: a bare `Bash` already runs the file.
+    if (posture === 'guarded') {
+      for (const rule of fileRunRules(input.filesInScope)) {
+        if (!allow.includes(rule)) allow.push(rule);
+      }
     }
   }
   assertNoFlagLikeRules(allow, `${input.role} allow-list (with verify and file-run rules)`);
@@ -675,6 +719,7 @@ export function buildSoldierSpec(input: BuildSpecInput): SoldierSpec {
     sessionId: randomUUID(),
     allow,
     deny,
+    posture,
     orders: input.orders,
   };
   if (roster.length > 0) spec.subagents = roster;
@@ -721,6 +766,30 @@ export interface RunSoldierHooks {
    * interrupt.
    */
   onSpawn?: (soldier: Soldier) => void;
+
+  /**
+   * Every normalised event, as it arrives — the seam that makes a running soldier visible.
+   *
+   * ## Why this exists
+   *
+   * `src/contracts/harness.ts` already says of `Soldier.stream()`: "Single consumer: the
+   * supervisor tees it to `stream.jsonl` (truth) and to the dashboard." Only the first half was
+   * ever built. The pump below wrote 993 KB of tool calls, reasoning telemetry and permission
+   * denials to disk while the human who started the campaign watched one static line for
+   * twenty-seven minutes. This closes the claim rather than adding a feature.
+   *
+   * ## The contract a listener owes
+   *
+   * SYNCHRONOUS, FAST, AND NON-THROWING. This runs inside the loop draining the child's stdout, so
+   * a listener that awaits, blocks or floods lets the OS pipe buffer fill and stalls the model
+   * itself. At most one terminal write per call. Throwing is guarded here — see the call site —
+   * but a listener that throws on every event is still a listener that does nothing.
+   *
+   * `runSoldier` calls this BEFORE the archive write, deliberately: the archive write is the one
+   * that can fail and be recorded in `errors`, and a full disk must not also be the reason a
+   * human's terminal goes quiet.
+   */
+  onEvent?: (event: SoldierEvent) => void;
 }
 
 export async function runSoldier(
@@ -749,6 +818,14 @@ export async function runSoldier(
         if (isRecord(event.raw) && Array.isArray(event.raw['permission_denials'])) {
           denials.push(...(event.raw['permission_denials'] as unknown[]));
         }
+      }
+      // Before the archive write, and in its own guard: a listener that throws must not be able to
+      // divert this loop from the write that makes the run replayable, and an archive failure must
+      // not be able to silence the terminal. Neither is worth the other.
+      try {
+        hooks?.onEvent?.(event);
+      } catch {
+        /* narration is never load-bearing — the same rule `progress` follows */
       }
       try {
         archive.appendEvent(spec.agentId, event);
@@ -810,6 +887,140 @@ export async function runSoldier(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Narrating a running soldier
+// ---------------------------------------------------------------------------------------------
+
+export interface ActivityTranslatorOptions {
+  /** The unit these events belong to. Every emitted `ProgressEvent` carries it. */
+  agentId: string;
+  /** The worker's working directory, stripped from the front of the paths it names. */
+  root: string;
+  /** Where the translated events go. Called synchronously; must not throw. */
+  emit: (event: ProgressEvent) => void;
+  /** Injected clock, so the coalescing windows are deterministic in a test. */
+  now?: () => number;
+}
+
+/**
+ * Turn one soldier's raw event stream into the handful of moments worth narrating.
+ *
+ * ## Why the coalescing is the whole job
+ *
+ * The reference run produced 972 events for 107 tool calls: 662 of them were reasoning-token
+ * deltas arriving roughly every 1.5 seconds, and 25 more were the worker updating its own task
+ * list. Forwarding all of them would be a worse terminal than forwarding none. What a watching
+ * human needs is (a) a line per real tool call, (b) a number that moves during the long silences
+ * between them, and (c) anything that went wrong — and nothing else.
+ *
+ * ## Why bookkeeping tools produce no line
+ *
+ * `TaskCreate`/`TaskUpdate`/`ToolSearch` are the worker organising itself. On the reference run
+ * they were 25 of 107 calls and arrived in bursts of nine, which is long enough to push the two
+ * `Write`s around them off a short terminal. They are dropped rather than counted because the
+ * reasoning heartbeat already proves the worker is alive during those seconds, which is the only
+ * thing their presence was evidence of.
+ *
+ * ## Module-level, not a closure inside `runCampaign`
+ *
+ * It began life inside the campaign loop, where it could only be exercised by running a campaign.
+ * The coalescing windows and the denial de-duplication are exactly the kind of state that is wrong
+ * in ways an end-to-end run does not surface, so this takes its clock and its sink as arguments
+ * and a test replays a real `stream.jsonl` through it.
+ *
+ * ## State is per agent
+ *
+ * An Engineer and an Inspector never run at once today, but this keys off nothing global, so the
+ * day they do, two callers get two independent clocks rather than one shared one reporting
+ * whichever unit spoke last.
+ */
+export function createActivityTranslator(
+  options: ActivityTranslatorOptions,
+): (event: SoldierEvent) => void {
+  const { agentId, root, emit } = options;
+  const now = options.now ?? ((): number => Date.now());
+  /**
+   * Announced calls, keyed by tool-use id.
+   *
+   * Two jobs: a result is only reported for a start that was actually announced, and a DENIAL is
+   * reported with the call it refused. The harness's denial event carries a `tool_use_id` and a
+   * tool name but not the arguments, so without this the most important line the feed can print
+   * would name a tool and not the command.
+   */
+  const openCalls = new Map<string, string>();
+  const reportedBlocks = new Set<string>();
+  let reportedTokens = 0;
+  let lastThinkingAt = 0;
+
+  return (event: SoldierEvent): void => {
+    switch (event.type) {
+      case 'tool_use': {
+        const action = describeToolUse(event.name, event.input, { root });
+        if (action.bookkeeping) return;
+        openCalls.set(event.toolUseId, action.target);
+        emit({
+          kind: 'unit-acting',
+          agentId,
+          toolUseId: event.toolUseId,
+          tool: action.verb,
+          target: action.target,
+          depth: event.depth,
+        });
+        return;
+      }
+
+      case 'tool_result': {
+        // Only for a call we actually announced. A result for a bookkeeping call has no start to
+        // close, and reporting it would put an unexplained event in the roster's history.
+        if (!openCalls.delete(event.toolUseId)) return;
+        emit({ kind: 'unit-acted', agentId, toolUseId: event.toolUseId, isError: event.isError });
+        return;
+      }
+
+      case 'unknown': {
+        const raw = isRecord(event.raw) ? event.raw : {};
+        if (event.harnessType === 'system/thinking_tokens') {
+          // The CUMULATIVE figure, never the delta: a reader wants "how much thinking has gone
+          // into this", and summing deltas here would drift from the harness's own count on every
+          // dropped or coalesced event.
+          const total = raw['estimated_tokens'];
+          if (typeof total !== 'number' || !Number.isFinite(total)) return;
+          const at = now();
+          const quiet = at - lastThinkingAt >= THINKING_MIN_INTERVAL_MS;
+          const grown = total - reportedTokens >= THINKING_MIN_TOKENS;
+          if (!quiet && !grown) return;
+          lastThinkingAt = at;
+          reportedTokens = total;
+          emit({ kind: 'unit-thinking', agentId, tokens: total });
+          return;
+        }
+        // `system/permission_denied` is the LIVE denial. `permission_denial` is the same facts
+        // replayed on the result event, which `recordDenials` already turns into signal rows —
+        // five denials arrived twice on the reference run, and reporting both would show a reader
+        // every refusal twice.
+        if (event.harnessType === 'system/permission_denied') {
+          const id = typeof raw['tool_use_id'] === 'string' ? raw['tool_use_id'] : '';
+          if (id !== '' && reportedBlocks.has(id)) return;
+          if (id !== '') reportedBlocks.add(id);
+          emit({
+            kind: 'unit-blocked',
+            agentId,
+            tool: typeof raw['tool_name'] === 'string' ? raw['tool_name'] : 'a tool',
+            // The call as it was announced a moment ago. Empty when the denial names an id this
+            // translator never saw — a bookkeeping tool, or a denial that arrived first.
+            target: openCalls.get(id) ?? '',
+            reason: typeof raw['message'] === 'string' ? raw['message'] : 'no reason given',
+          });
+        }
+        return;
+      }
+
+      default:
+        return;
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Project resolution
 // ---------------------------------------------------------------------------------------------
 
@@ -860,29 +1071,46 @@ export async function resolveProjectRootOrInit(options: {
 }): Promise<string> {
   const { cwd, init, needs, onCreated } = options;
   let project = await resolveProjectRoot(cwd);
-  if (project === null && init) {
+  // `project !== null` is not the same question as "this directory belongs to that project" —
+  // `git rev-parse` walks up, so a new folder inside any repository resolves to that repository.
+  // See `detachedFromEnclosingRepo` for the campaign that leased a worktree of an entire home
+  // directory because of it.
+  const detached = project !== null && init && (await detachedFromEnclosingRepo(cwd));
+  if (init && (project === null || detached)) {
+    // `detached` means an enclosing project EXISTS and is usable; `project === null` means there
+    // is nothing to fall back to. Every failure below therefore refuses in the second case and
+    // falls back in the first — a directory git cannot initialise is a reason to work on the
+    // enclosing repo the way this command always did, never a reason to end a campaign that
+    // would otherwise run.
+    const enclosing = project;
     const decision = decideAutoInit(cwd, os.homedir());
     if (decision.kind === 'refuse') {
-      // The reason already carries its own instruction ("cd into the project directory…"), so
-      // the fix restates the action rather than offering `git init` — a runnable command HERE
-      // would be a command that initialises the exact directory the guard just protected.
-      throw new CampaignSetupError(
-        `${cwd} is not inside a git repository, and one will not be created here: ${decision.reason}`,
-        doThis('cd into the project directory and run this again'),
-      );
+      if (enclosing === null) {
+        // The reason already carries its own instruction ("cd into the project directory…"), so
+        // the fix restates the action rather than offering `git init` — a runnable command HERE
+        // would be a command that initialises the exact directory the guard just protected.
+        throw new CampaignSetupError(
+          `${cwd} is not inside a git repository, and one will not be created here: ${decision.reason}`,
+          doThis('cd into the project directory and run this again'),
+        );
+      }
+    } else {
+      const outcome = await autoInitRepo(decision.dir);
+      if (!outcome.ok) {
+        if (enclosing === null) {
+          throw new CampaignSetupError(
+            `${cwd} is not inside a git repository, and creating one failed: ${outcome.error}`,
+            initRepoFix(cwd),
+          );
+        }
+      } else {
+        onCreated(decision.dir);
+        // Re-derive rather than trust `decision.dir` — the real root goes through
+        // `mainRootFromCommonDir` and realpath, and shortcutting that here is how this route
+        // would silently diverge from every other route to a project root in this file.
+        project = await resolveProjectRoot(cwd);
+      }
     }
-    const outcome = await autoInitRepo(decision.dir);
-    if (!outcome.ok) {
-      throw new CampaignSetupError(
-        `${cwd} is not inside a git repository, and creating one failed: ${outcome.error}`,
-        initRepoFix(cwd),
-      );
-    }
-    onCreated(decision.dir);
-    // Re-derive rather than trust `decision.dir` — the real root goes through
-    // `mainRootFromCommonDir` and realpath, and shortcutting that here is how this route would
-    // silently diverge from every other route to a project root in this file.
-    project = await resolveProjectRoot(cwd);
   }
   if (project === null) {
     // Both halves of the fix, on purpose. `git init` alone lands the reader on the NEXT refusal
@@ -1028,8 +1256,16 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     }
   };
 
+  const activityFor = (agentId: string, root: string): ((event: SoldierEvent) => void) =>
+    createActivityTranslator({ agentId, root, emit: progress });
+
   const loaded = await loadConfig({ home, env });
   const config = loaded.config;
+  // ONE read, at the top, shared by every spec this campaign builds. Reading it per spawn would
+  // let an Engineer and the Inspector reviewing its work run under different confinements, and a
+  // reviewer confined more tightly than the worker is exactly how the 2026-08-07 campaign shipped
+  // three verdicts whose headline criterion no reviewer could execute.
+  const posture = config.permissions.mode;
 
   const project = await resolveProjectRootOrInit({
     cwd,
@@ -1056,6 +1292,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     // change a setting they already chose is noise, and this line prints on every campaign.
     ceilingLookup.source === 'project' ? undefined : enlistCeilingFix(project, home),
   );
+
+  // Next to the ceiling on purpose. The ceiling says how far the WORK may travel; this says how
+  // tightly the WORKER is held while producing it. A reader looking for either is looking at the
+  // same moment of the run, and a posture that only appeared in a config file would be a posture
+  // nobody reads.
+  note(posture === 'unguarded' ? 'warn' : 'info', 'permissions', postureNotice(posture));
 
   // ---- the archive ----------------------------------------------------------------------
   const archiveRoot = config.archiveRoot;
@@ -1396,6 +1638,53 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     const worktree = lease.path;
     baseCommit = (await runGit(['rev-parse', 'HEAD'], { cwd: worktree })).stdout.trim() || null;
 
+    // ---- what the acceptance commands do BEFORE anybody works ---------------------------
+    //
+    // Taken once, here, because this is the only moment the tree is at base: attempt 2 runs in the
+    // same worktree with attempt 1's branch still checked out, so a reading taken inside the loop
+    // would be a reading of the previous Engineer's work.
+    //
+    // The reason it is worth the seconds it costs is a measured one. A campaign ran three
+    // Engineers for 37.6 minutes and $8.86 — two of which SUCCEEDED, with tests passing — and
+    // delivered nothing, because one of its six verify commands had been mangled into
+    // `sh -c 'grep -q \"\\\"dependencies\\\": {}\" package.json'`, which exits 2 against any file
+    // that has ever existed. Nothing in the system could tell that from a failing test, so it
+    // retried twice more against a foregone conclusion.
+    const verifyCommands = options.spec?.verify;
+    let verifyBaseline: readonly VerifyBaseline[] = [];
+    if (verifyCommands !== undefined && verifyCommands.length > 0) {
+      throwIfInterrupted('the acceptance baseline');
+      verifyBaseline = await runVerifyBaseline({
+        commands: verifyCommands,
+        cwd: worktree,
+        ...(options.verifyRun === undefined ? {} : { run: options.verifyRun }),
+        timeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
+      });
+      for (const entry of verifyBaseline) {
+        if (entry.exitCode === 0 && !entry.timedOut) continue;
+        // A verify command failing at base is the NORMAL case — `node --test` should fail before
+        // the feature exists, and warning about it every time would train a reader to skip the
+        // one line that matters. So this is `info`, except for the two exit codes with which a
+        // shell says it could not run the thing at all.
+        const cannotExecute =
+          entry.exitCode !== null && SHELL_CANNOT_EXECUTE.includes(entry.exitCode);
+        note(
+          cannotExecute ? 'warn' : 'info',
+          'acceptance',
+          `baseline: \`${entry.command}\` exits ${entry.timedOut ? 'timeout' : String(entry.exitCode)} ` +
+            `against the untouched tree${cannotExecute ? ' — a shell could not execute it' : ''}`,
+          cannotExecute
+            ? noFix(
+                'exit 126/127 is a shell saying the command is not executable or not found, ' +
+                  'which is a fact about the command rather than about the work. It will exit ' +
+                  'the same way after the Engineer, so this campaign cannot pass its own gate. ' +
+                  'Fix the command in the spec.',
+              )
+            : undefined,
+        );
+      }
+    }
+
     // ---- the attempt loop -------------------------------------------------------------
     const maxAttempts = Math.max(1, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
     let previousVerdict: Verdict | undefined;
@@ -1405,6 +1694,13 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     let previousMissingBehaviours: number[] | undefined;
     /** Set only when the PREVIOUS attempt failed at the harness level. See the engineer branch. */
     let previousFailure: string | undefined;
+    /**
+     * Verify commands the PREVIOUS attempt could not move off their baseline reading.
+     *
+     * Carried across attempts because one such command is a bad attempt and two in a row is a bad
+     * command — see where this is consumed.
+     */
+    let unchangedPreviously = new Set<string>();
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       // A signal that landed between attempts (or before the first) must not dispatch a fresh
@@ -1435,6 +1731,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         orders: engineerOrders,
         outputSchemaPath: REPORT_SCHEMA_PATH,
         home,
+        posture,
         // Approved with the spec; see `BuildSpecInput.verifyCommands`.
         ...(options.spec?.verify === undefined ? {} : { verifyCommands: options.spec.verify }),
         // Approved with the spec; see `BuildSpecInput.filesInScope`.
@@ -1472,10 +1769,12 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       // something to watch. It is emitted once — repeating it before every unit would turn the
       // one line that tells the reader what to do next into part of the noise.
       //
-      // BEFORE the dispatch line, not after, and that ordering is load-bearing. The sink starts
-      // its elapsed ticker on `unit-dispatched` and stops it on the next event of any kind, so a
-      // hint emitted afterwards would silently cancel the ticker for the Engineer — the single
-      // longest wait in the campaign, and the exact minutes this whole change exists to fill.
+      // BEFORE the dispatch line, which reads better and used to be load-bearing: the sink once
+      // started its ticker on `unit-dispatched` and stopped it on the next event of any kind, so
+      // a hint emitted afterwards silently cancelled the Engineer's clock. That is no longer true
+      // — `createProgressSink` now restarts the ticker after any printed event while a unit is
+      // still in flight, because activity events print constantly and the old rule would have
+      // killed the clock on the first tool call. The ordering is now taste, not a constraint.
       if (attempt === 1) progress({ kind: 'watch-hint', campaignId });
       progress({
         kind: 'unit-dispatched',
@@ -1493,7 +1792,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         // The signal handler above kills whatever this points at. Set before orders are sent,
         // cleared as soon as the soldier is down — a handler must never kill a tree from a
         // PREVIOUS attempt.
-        { onSpawn: (soldier) => (liveSoldier = soldier) },
+        {
+          onSpawn: (soldier) => (liveSoldier = soldier),
+          onEvent: activityFor(engineerId, engineerSpec.cwd),
+        },
       );
       liveSoldier = null;
       recordDenials(archive, engineerId, engineerRun.denials, note);
@@ -1669,6 +1971,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         cwd: worktree,
         ...(options.verifyRun === undefined ? {} : { run: options.verifyRun }),
         timeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
+        baseline: verifyBaseline,
         // Reuses the campaign's own progress channel rather than a bespoke one — a gate command
         // starting and finishing is exactly the kind of "is this still alive" narration
         // `ProgressEvent`'s `note` kind already exists for.
@@ -1699,6 +2002,72 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         previousAcceptance = acceptance;
         previousVerdict = undefined;
         previousMissingBehaviours = undefined;
+
+        // ---- a gate that cannot be passed is not a verdict on the work ----------------------
+        //
+        // A command that failed IDENTICALLY against the untouched tree did not measure anything
+        // the Engineer did. Retrying spends another Engineer to reach the same exit code, which
+        // is what turned one malformed `grep` into 37.6 minutes and $8.86 across three attempts,
+        // two of which had produced working, tested code.
+        //
+        // This does NOT relax the gate. The campaign still delivers nothing — `src/verify/gate.ts`
+        // is explicit that a gate which has verified nothing returns `passed: false`, and passing
+        // on the surviving commands would be exactly the "quietly reported the same shape as a
+        // passing gate" failure that module exists to prevent. What changes is only WHO is told
+        // to fix it: this is reported as a defect in the spec, to the human, instead of as a
+        // verdict on an Engineer who cannot do anything about it.
+        const unrunnable = unrunnableCommands(acceptance);
+        for (const outcome of unrunnable) {
+          note(
+            'warn',
+            'acceptance',
+            `\`${outcome.command}\` failed identically with and without the work — it exited ` +
+              `${outcome.timedOut ? 'timeout' : String(outcome.exitCode)} against the untouched ` +
+              'tree too, so on this attempt it did not distinguish the work from its absence.',
+            noFix(
+              'either the command cannot pass at all — a malformed one defines a done nobody can ' +
+                'reach — or this attempt did not change what it measures. Both are worth your ' +
+                `eye before another Engineer is spent. Its output is: ${outcome.output.split('\n')[0]}`,
+            ),
+          );
+        }
+
+        // ---- twice is a pattern; once is a bad attempt ---------------------------------------
+        //
+        // A command that says the same thing with and without the work is EVIDENCE that it cannot
+        // read the work, but on its own it is not proof: an Engineer that committed something
+        // useless produces the identical reading, and that Engineer deserves the retry it would
+        // otherwise have had. Two attempts in a row is where the two explanations separate —
+        // a second Engineer failing to move the same command the same way is the command's fault.
+        //
+        // This does NOT relax the gate. The campaign still delivers nothing; `src/verify/gate.ts`
+        // is explicit that a gate which verified nothing returns `passed: false`, and passing on
+        // the surviving commands would be exactly the failure that module exists to prevent. What
+        // changes is only who is told to fix it, and how much is spent finding out.
+        const unchangedNow = new Set(unrunnable.map((o) => o.command));
+        const unchangedTwice = [...unchangedNow].filter((c) => unchangedPreviously.has(c));
+        unchangedPreviously = unchangedNow;
+
+        if (unchangedTwice.length > 0) {
+          retriesExhausted = true;
+          note(
+            'error',
+            'retry',
+            `stopping after attempt ${String(attempt)} of ${String(maxAttempts)}: ` +
+              `${unchangedTwice.map((c) => `\`${c}\``).join(', ')} failed identically on two ` +
+              'consecutive attempts AND against the untouched tree. No Engineer has moved it, so ' +
+              'the next one will not either.',
+            noFix(
+              'treat this as a defect in the spec rather than in the branch: a verify command ' +
+                'defines done, so one that never changes defines a done nobody can reach. Fix the ' +
+                `command and re-run. The branch ${branch} is durable and holds what was built — it ` +
+                'was never judged, because the thing meant to judge it never read it.',
+            ),
+          );
+          outcome = 'engineer-failed';
+          break;
+        }
+
         if (attempt >= maxAttempts) {
           retriesExhausted = true;
           note(
@@ -1766,6 +2135,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         orders: inspectorBrief,
         outputSchemaPath: VERDICT_SCHEMA_PATH,
         home,
+        posture,
       });
 
       // Tasks nest. The review is a child task of the work, not a second attempt at it —
@@ -1812,8 +2182,14 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
         adapterFor(options, inspectorSpec.harness),
         inspectorSpec,
         archive,
-        // Same seam as the Engineer's: the signal handler kills whatever is in flight.
-        { onSpawn: (soldier) => (liveSoldier = soldier) },
+        // Same seam as the Engineer's: the signal handler kills whatever is in flight, and the
+        // Inspector narrates its reading exactly as the Engineer narrates its writing. It is the
+        // shorter of the two waits but not a short one, and it is the wait during which a reader
+        // most wants to know whether anything is being RUN — see `Verdict.testsRun`.
+        {
+          onSpawn: (soldier) => (liveSoldier = soldier),
+          onEvent: activityFor(inspectorId, inspectorSpec.cwd),
+        },
       );
       liveSoldier = null;
       recordDenials(archive, inspectorId, inspectorRun.denials, note);
@@ -1877,9 +2253,33 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           summary: verdict.summary,
         });
       }
-      // A reviewer that returned nothing is narrated by the error note below, not by a `verdict`
-      // event: the review gate fails CLOSED, and printing a verdict line for a verdict that does
-      // not exist is the one shape of this stream that could mislead.
+      else {
+        // A reviewer that returned nothing still has to come BACK on the stream.
+        //
+        // Not a `verdict` event — the review gate fails closed, and printing a verdict line for a
+        // verdict that does not exist is the one shape of this stream that could mislead. But
+        // `unit-returned` claims nothing about the review; it says this unit finished, with this
+        // adapter status, and here is the first thing it complained about. That is exactly what
+        // the Engineer's own path already emits, and the Inspector was the only unit in the tree
+        // that had no way of telling a watching terminal it had ended at all.
+        //
+        // The field report that forced this: a Codex Inspector hit its account's usage limit
+        // twelve seconds in. The campaign refused to deliver, correctly, and said so in an error
+        // note — but the note is a sentence, not a unit, so the last thing anyone saw ATTACHED to
+        // cpt-02 was `dispatched`. The reasonable reading of that screen is that the Inspector
+        // never ran, which is the reading it got, and the reason a working reviewer was diagnosed
+        // as a broken install. An ended unit must look ended.
+        progress({
+          kind: 'unit-returned',
+          agentId: inspectorId,
+          rank: 'CAPTAIN',
+          role: 'INSPECTOR',
+          status: inspectorRun.status,
+          // Model-controlled in general and adapter-controlled here; `renderProgressEvent`
+          // sanitises and clips either way, which is why this hands over the raw string.
+          summary: inspectorRun.errors[0] ?? null,
+        });
+      }
 
       // Same placement rule as the Engineer's check: after the review's own bookkeeping, before
       // a killed reviewer can be misread as `inspector-unavailable` and fail the gate closed.

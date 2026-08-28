@@ -57,6 +57,7 @@ import {
   SPAWN_TOOLS,
   subordinateBriefing,
 } from '../src/command/permissions.ts';
+import type { PermissionPosture } from '../src/contracts/config.ts';
 import {
   maxSubagentDepth,
   ROLES,
@@ -192,9 +193,19 @@ function refsIn(bare: string): string[] {
 }
 
 /** An `AGENTIC_ARMY_HOME` with a `config.toml` naming exactly the ceilings a test wants. */
-function makeHome(projects: Record<string, number> = {}, dispatchToml = ''): string {
+/**
+ * `posture` is deliberately OPTIONAL and deliberately NOT defaulted here: omitting it writes no
+ * `[permissions]` block, so the loader's own default applies and the campaign tests exercise
+ * whatever a real user gets. A test that cares which posture it is running under says so.
+ */
+function makeHome(
+  projects: Record<string, number> = {},
+  dispatchToml = '',
+  posture?: PermissionPosture,
+): string {
   const home = mkTmp('home');
-  const lines = ['version = 1', '', dispatchToml, '', '[delivery]', 'default_ceiling = 0', '', '[projects]'];
+  const permissionsToml = posture === undefined ? '' : `[permissions]\nmode = "${posture}"\n`;
+  const lines = ['version = 1', '', dispatchToml, '', permissionsToml, '[delivery]', 'default_ceiling = 0', '', '[projects]'];
   for (const [project, ceiling] of Object.entries(projects)) {
     lines.push(`${JSON.stringify(project)} = { ceiling = ${String(ceiling)} }`);
   }
@@ -1198,8 +1209,18 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
       attempt: 1,
       spec: specWithVerify,
     });
-    assert.match(orders, /within your authority to run/i);
-    assert.match(orders, /allow-list VERBATIM/);
+    assert.match(orders, /should be within your authority/i);
+    assert.match(orders, /allow-list as an exact match/);
+
+    // The claim is HEDGED, and that hedge is load-bearing. An exact-match rule matches what the
+    // worker TYPES, and a verify command that is not valid shell does not survive being typed —
+    // measured in the field, a model silently normalised the escaping on
+    // `sh -c 'grep -q \"\\\"dependencies\\\": {}\" package.json'`, missed the rule and was denied,
+    // then denied again on the literal form, across three attempts and eleven denial signals. The
+    // absolute promise is what made it retry: it contradicted the never-retry rule beneath it.
+    assert.doesNotMatch(orders, /VERBATIM/, 'the absolute guarantee came back');
+    assert.match(orders, /do NOT retry it/i, 'a denial must not read as something to work around');
+    assert.match(orders, /defect in the spec/i, 'a denied verify command must be named as a defect');
 
     // No verify, no authority claim — the sentence would be false without Fix A's rules behind it.
     const withoutVerify = renderEngineerOrders({
@@ -1209,7 +1230,7 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
       attempt: 1,
       spec: SAMPLE_SPEC,
     });
-    assert.doesNotMatch(withoutVerify, /within your authority to run/i);
+    assert.doesNotMatch(withoutVerify, /within your authority/i);
   });
 
   it('a MIXED verify list puts the safe commands under the authority claim and the unsafe ones under a do-not-attempt passage naming the gate', () => {
@@ -1225,7 +1246,7 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
     });
 
     // The safe command is still rendered under the authority claim.
-    assert.match(orders, /within your authority to run/i);
+    assert.match(orders, /within your authority/i);
     assert.ok(orders.includes(`\`${safe}\``), 'the grantable command is not rendered verbatim');
 
     // The unsafe command is named, marked ungrantable, and the Engineer is told not to try it.
@@ -1241,7 +1262,7 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
     // The blanket authority sentence must not be widened to cover the ungrantable command too —
     // it is under the safe-list claim only, so the unsafe command is never claimed as `within
     // your authority`.
-    const authorityLineIndex = orders.search(/within your authority to run/i);
+    const authorityLineIndex = orders.search(/within your authority/i);
     const doNotAttemptIndex = orders.search(/cannot be granted to you/i);
     assert.ok(authorityLineIndex !== -1 && doNotAttemptIndex !== -1);
     assert.ok(doNotAttemptIndex > authorityLineIndex, 'the do-not-attempt passage should follow the authority claim');
@@ -1259,7 +1280,7 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
       attempt: 1,
       spec: specWithVerify,
     });
-    assert.match(orders, /within your authority to run/i);
+    assert.match(orders, /within your authority/i);
     assert.doesNotMatch(orders, /cannot be granted to you/i);
     assert.doesNotMatch(orders, /DO NOT ATTEMPT/);
   });
@@ -1274,7 +1295,7 @@ describe('the spec — carried into a brief, or explicitly absent', () => {
       attempt: 1,
       spec: specWithVerify,
     });
-    assert.doesNotMatch(orders, /within your authority to run/i);
+    assert.doesNotMatch(orders, /within your authority/i);
     assert.match(orders, /cannot be granted to you/i);
     assert.ok(orders.includes(`\`${unsafe}\``));
   });
@@ -1441,6 +1462,85 @@ describe('permissions', () => {
     // Rank is not the reason an Inspector cannot edit — its ROLE is. Both Captains here.
     assert.equal(WRITES_FILES.CAPTAIN, true);
     assert.equal(writesFiles('CAPTAIN', 'INSPECTOR'), false);
+  });
+
+  /**
+   * The invariant that makes `unguarded` a posture rather than a hole.
+   *
+   * It is checked across EVERY rank × role rather than on the two units a campaign happens to
+   * field, because the claim is about the function, not about today's org chart. What must hold:
+   * the set of TOOLS is identical under both postures, the deny half is byte-identical, and the
+   * only difference is that argv scoping is gone. A posture that ever added a tool name would
+   * make `ROLE_ALLOW` stop being the single source of truth for who holds what — and every guard
+   * inside `permissionsFor` reads `ROLE_ALLOW`.
+   */
+  it('the unguarded posture removes argv scoping and changes nothing else, at every rank and role', () => {
+    const home = '/tmp/army-home';
+    const nameOf = (rule: string): string => rule.replace(/\(.*\)$/su, '');
+
+    for (const rank of Object.keys(WRITES_FILES) as Rank[]) {
+      for (const role of ROLES) {
+        const where = `${rank}·${role}`;
+
+        // Some pairs are unconstructible — a GEN·SENTRY narrows to an empty list, and an empty
+        // list is refused because the adapter omits the flag and the worker then gets EVERY tool.
+        // A posture must not turn a refusal into a spawn, so the refusal is asserted rather than
+        // stepped around: both postures reject the same pairs, for the same reason.
+        let guarded: ReturnType<typeof permissionsFor>;
+        try {
+          guarded = permissionsFor(rank, role, home, 'guarded');
+        } catch (error) {
+          assert.throws(
+            () => permissionsFor(rank, role, home, 'unguarded'),
+            `${where}: guarded refused this unit (${String((error as Error).message).slice(0, 60)}…) ` +
+              'but unguarded built one',
+          );
+          continue;
+        }
+        const unguarded = permissionsFor(rank, role, home, 'unguarded');
+
+        // 1. The same tools, and no more. This is the whole safety argument.
+        assert.deepEqual(
+          [...new Set(unguarded.allow.map(nameOf))].sort(),
+          [...new Set(guarded.allow.map(nameOf))].sort(),
+          `${where}: the unguarded loadout does not name the same tools as the guarded one`,
+        );
+
+        // 2. Nothing scoped survives, and every entry is a bare tool name.
+        for (const rule of unguarded.allow) {
+          assert.equal(rule, nameOf(rule), `${where}: ${rule} kept its argv scoping`);
+        }
+
+        // 3. The deny half is untouched — credentials, the archive, and the three command
+        //    spellings are denied identically, and deny still beats allow in the engine.
+        assert.deepEqual(unguarded.deny, guarded.deny, `${where}: the deny half moved`);
+
+        // 4. Rank narrowing still bites. A rank that may not write holds no write tool under
+        //    either posture, which is the guard `unscoped` is routed THROUGH rather than around.
+        if (!writesFiles(rank, role)) {
+          for (const tool of ['Edit', 'Write', 'NotebookEdit']) {
+            assert.ok(
+              !unguarded.allow.includes(tool),
+              `${where}: the unguarded posture handed a non-writing unit ${tool}`,
+            );
+          }
+        }
+      }
+    }
+
+    // The commander's context guard is the sharpest case: unscoping a loadout that holds no shell
+    // and no Read must not conjure one, or `assertCommanderLoadout` would have to catch it.
+    const commander = permissionsFor('COLONEL', 'COMMANDER', home, 'unguarded');
+    for (const tool of ['Bash', 'Read', 'Grep', 'Glob']) {
+      assert.ok(!commander.allow.includes(tool), `an unguarded COMMANDER was handed ${tool}`);
+    }
+
+    // And the default is the tight one — `SoldierSpec.posture` depends on this polarity.
+    assert.deepEqual(
+      permissionsFor('CAPTAIN', 'ENGINEER', home).allow,
+      permissionsFor('CAPTAIN', 'ENGINEER', home, 'guarded').allow,
+      'omitting the posture did not produce the guarded loadout',
+    );
   });
 
   it('narrowToRank subtracts and never adds, for every rank and every role', () => {
@@ -2812,10 +2912,17 @@ describe('the acceptance gate', () => {
       verifyRun: run,
     });
     assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0]?.command, 'npm test');
+    // TWO calls, not one: the baseline reads every verify command against the untouched tree
+    // before the Engineer is dispatched, and the gate runs the same command again afterwards.
+    // Comparing the two is what tells a broken acceptance command from a failing branch.
+    assert.equal(calls.length, 2, `expected a baseline then a gate run: ${JSON.stringify(calls)}`);
+    assert.equal(calls[0]?.command, 'npm test', 'the first call must be the baseline');
+    assert.equal(calls[1]?.command, 'npm test', 'the second call must be the gate');
     assert.ok(result.lease.path !== null);
-    assert.equal(calls[0]?.cwd, result.lease.path, "the gate's cwd was not the Engineer's worktree");
+    // Both run in the leased worktree — the baseline would be measuring a different tree
+    // otherwise, and the comparison would be meaningless.
+    assert.equal(calls[0]?.cwd, result.lease.path, "the baseline's cwd was not the worktree");
+    assert.equal(calls[1]?.cwd, result.lease.path, "the gate's cwd was not the Engineer's worktree");
   });
 
   it('a failing gate fails the attempt, and the Inspector is never spawned', async () => {
@@ -2920,7 +3027,10 @@ describe('the acceptance gate', () => {
       verifyRun: run,
     });
     assert.equal(result.outcome, 'engineer-failed', renderCampaignResult(result));
-    assert.equal(calls.length, 0, 'the gate ran despite the Engineer never reporting done');
+    // Exactly ONE call: the pre-dispatch baseline, which runs before anyone knows how the attempt
+    // will end. The GATE never ran — that is what this test is about, and `acceptance: null` is
+    // the assertion that proves it, since a baseline produces no `AcceptanceResult`.
+    assert.equal(calls.length, 1, 'the gate ran despite the Engineer never reporting done');
     assert.equal(result.attempts[0]?.acceptance, null);
   });
 
@@ -2952,6 +3062,90 @@ describe('the acceptance gate', () => {
     assert.ok(retry.includes('node calc.js'), 'the failed command is not in the retry brief');
     assert.ok(retry.includes('SENTINEL-CALC-FAILURE'), "the failed command's output is not in the retry brief");
   });
+
+  it('a verify command no Engineer can move stops the campaign early, and still delivers nothing', async () => {
+    // THE FIELD INCIDENT. A spec carried `sh -c 'grep -q \"\\\"dependencies\\\": {}\" package.json'`,
+    // which exits 2 against every file that has ever existed. Three Engineers ran for 37.6 minutes
+    // and $8.86 — two of them SUCCEEDED, with tests passing — and the campaign delivered nothing,
+    // because nothing could tell an unpassable command from a failing branch.
+    //
+    // The fake runner answers identically every time, which is exactly what such a command does.
+    const repo = makeRepo('gate-unmovable');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-unmovable', 'ok', ['pass']);
+    const { run, calls } = fakeVerifyRun({
+      'npm test': { exitCode: 2, stderr: 'grep: {}": No such file or directory' },
+    });
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], verify: ['npm test'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 3,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+
+    // Two attempts, not three. One identical reading is a bad attempt; two in a row is a bad
+    // command, and the third Engineer would have reached the same exit code for the same money.
+    assert.equal(result.attempts.length, 2, renderCampaignResult(result));
+    // One baseline plus one gate run per attempt.
+    assert.equal(calls.length, 3, `expected baseline + two gate runs: ${JSON.stringify(calls)}`);
+
+    // FAIL CLOSED, still and always. Stopping early changes who is told to fix it, never whether
+    // unverified work ships.
+    assert.equal(result.outcome, 'engineer-failed', renderCampaignResult(result));
+    assert.equal(result.deliveredRung, null, 'an unpassable gate delivered something');
+
+    const rendered = renderCampaignResult(result);
+    assert.match(rendered, /failed identically/u, 'the reader is never told what was detected');
+    assert.match(rendered, /two consecutive attempts/u, 'the evidence for stopping is not stated');
+  });
+
+  it('a command that starts failing and then passes never trips the early stop', async () => {
+    // The safe direction, and the normal case: `npm test` SHOULD fail against a tree where the
+    // feature does not exist yet. Failing at base must never, on its own, mean anything — or every
+    // healthy campaign would be accused of a broken spec.
+    const repo = makeRepo('gate-recovers');
+    const home = makeHome({ [repo]: 0 });
+    const bins = makeHarnesses('gate-recovers', 'ok', ['pass']);
+    let seen = 0;
+    const run: typeof fakeVerifyRun extends never ? never : Parameters<typeof campaign>[0]['verifyRun'] =
+      (command, cwd, timeoutMs) => {
+        seen += 1;
+        void cwd;
+        void timeoutMs;
+        void command;
+        // Call 1 is the baseline (fails, as it should); call 2 is the gate after real work.
+        return Promise.resolve(
+          seen === 1
+            ? { exitCode: 1, stdout: '', stderr: "Cannot find module './calc'", timedOut: false }
+            : { exitCode: 0, stdout: 'ok 1 - multiply', stderr: '', timedOut: false },
+        );
+      };
+    const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], verify: ['npm test'] };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      maxAttempts: 3,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(result.attempts.length, 1, 'a healthy campaign retried');
+    assert.doesNotMatch(
+      renderCampaignResult(result),
+      /failed identically/u,
+      'a passing gate was accused of being unmovable',
+    );
+  });
 });
 
 // ===============================================================================================
@@ -2963,7 +3157,10 @@ describe('the acceptance gate', () => {
 describe("the spec's approved verify commands reach the Engineer as exact allow rules", () => {
   it('ON THE WIRE: a campaign with spec.verify spawns its Engineer with those exact rules in --allowedTools', async () => {
     const repo = makeRepo('verify-authority');
-    const home = makeHome({ [repo]: 0 });
+    // Pinned `guarded`, because exact-match verify rules ARE the guarded posture — under
+    // `unguarded` the Engineer holds a bare `Bash` and no per-command rule is emitted at all.
+    // See the sibling test below for that shape.
+    const home = makeHome({ [repo]: 0 }, '', 'guarded');
     const bins = makeHarnesses('verify-authority', 'ok', ['pass']);
     const { run } = fakeVerifyRun({});
     const verify = ['node --check webvitals.js', 'node webvitals.js https://example.com --detail'];
@@ -3011,7 +3208,7 @@ describe("the spec's approved verify commands reach the Engineer as exact allow 
     // The `slugify.js` incident itself: the Engineer was denied every ad-hoc run of the file the
     // approved spec had named, including `node slugify.js "Hello, World!"`.
     const repo = makeRepo('file-run-authority');
-    const home = makeHome({ [repo]: 0 });
+    const home = makeHome({ [repo]: 0 }, '', 'guarded');
     const bins = makeHarnesses('file-run-authority', 'ok', ['pass']);
     const spec: TechnicalSpec = { ...SAMPLE_SPEC, behaviours: [], filesInScope: ['slugify.js', 'README.md'] };
     const result = await campaign({
@@ -3046,6 +3243,80 @@ describe("the spec's approved verify commands reach the Engineer as exact allow 
     for (const rule of ROLE_ALLOW.ENGINEER) assert.ok(allowed.includes(rule), `lost ${rule}`);
     for (const rule of DENIED_COMMAND_RULES) {
       assert.ok(argv.includes(rule), `the deny-list lost ${rule} when file-run rules were added`);
+    }
+  });
+
+  /**
+   * THE FIELD FAILURE, on the wire, in the posture that fixes it.
+   *
+   * Campaign of 2026-08-07: the Engineer was handed exact-match rules for its own verify
+   * commands, ran them as `<command>; echo "exit=$?"` to read the exit status, and was denied six
+   * times for a string that differs from the grant by a suffix. It was also denied
+   * `git clean -f -- seo-audit/debug-redirect.mjs` — not by any deny rule, but because
+   * `ENGINEER_BASH_PREFIXES` never named `git clean`, and under `--permission-mode dontAsk`
+   * absent from the allow-list IS denied. 65 minutes, ~$14.86, nothing delivered.
+   *
+   * What this pins is that `unguarded` removes the SCOPING and nothing else: one bare `Bash`
+   * instead of ~28 prefix rules, zero exact-match rules, the same tool NAMES the guarded posture
+   * would have granted, and a deny-list that is byte-identical — so `git push --force` is still
+   * refused by a worker that may now run anything else.
+   */
+  it('ON THE WIRE: an unguarded campaign spawns its Engineer with a bare Bash, no exact rules, and the deny-list intact', async () => {
+    const repo = makeRepo('unguarded-authority');
+    const home = makeHome({ [repo]: 0 }, '', 'unguarded');
+    const bins = makeHarnesses('unguarded-authority', 'ok', ['pass']);
+    const { run } = fakeVerifyRun({});
+    const verify = ['node --check webvitals.js', 'node webvitals.js https://example.com --detail'];
+    const spec: TechnicalSpec = {
+      ...SAMPLE_SPEC,
+      behaviours: [],
+      verify,
+      filesInScope: ['slugify.js', 'README.md'],
+    };
+    const result = await campaign({
+      objective: spec.objective,
+      spec,
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      claudeBin: bins.claudeBin,
+      codexBin: bins.codexBin,
+      verifyRun: run,
+    });
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+
+    const argv = JSON.parse(
+      fs.readFileSync(bins.claudeArgvLog, 'utf8').split('\n')[0] ?? '[]',
+    ) as string[];
+    const at = argv.indexOf('--allowedTools');
+    assert.notEqual(at, -1, `--allowedTools never reached execve:\n${argv.join(' ')}`);
+    const allowed: string[] = [];
+    for (let i = at + 1; i < argv.length && !(argv[i] as string).startsWith('--'); i += 1) {
+      allowed.push(argv[i] as string);
+    }
+
+    // The shell is granted whole, so every spelling the Engineer reaches for is the same grant.
+    assert.ok(allowed.includes('Bash'), `no bare Bash on the wire:\n${allowed.join('\n')}`);
+    const scoped = allowed.filter((rule) => rule.startsWith('Bash('));
+    assert.deepEqual(scoped, [], 'a scoped Bash rule survived into the unguarded posture');
+    for (const command of verify) {
+      assert.ok(
+        !allowed.includes(`Bash(${command})`),
+        'an exact verify rule was emitted alongside a bare Bash, which permits nothing further',
+      );
+    }
+
+    // The same TOOLS the guarded posture grants — the posture drops scoping, it never widens.
+    const guardedNames = [...new Set(ROLE_ALLOW.ENGINEER.map((r) => r.replace(/\(.*\)$/su, '')))];
+    assert.deepEqual(
+      [...allowed].sort(),
+      [...guardedNames].sort(),
+      'the unguarded loadout is not the guarded one with its scoping removed',
+    );
+
+    // The load-bearing half, untouched: a worker that may run anything still may not run these.
+    for (const rule of DENIED_COMMAND_RULES) {
+      assert.ok(argv.includes(rule), `the deny-list lost ${rule} under the unguarded posture`);
     }
   });
 });
@@ -3414,6 +3685,7 @@ describe('failure paths', () => {
     const repo = makeRepo('nocodex');
     const home = makeHome({ [repo]: 2 });
     const bins = makeHarnesses('nocodex', 'ok', ['pass']);
+    const events: ProgressEvent[] = [];
     const result = await campaign({
       objective: 'Add a multiply function',
       cwd: repo,
@@ -3422,7 +3694,35 @@ describe('failure paths', () => {
       claudeBin: bins.claudeBin,
       codexBin: path.join(mkTmp('void'), 'definitely-not-a-binary'),
       ghProbe: ghProbe({ available: true, authenticated: true }),
+      onProgress: (event) => void events.push(event),
     });
+
+    // ---- AN ENDED UNIT LOOKS ENDED --------------------------------------------------------
+    //
+    // The field report this pins: a Codex Inspector hit its account's usage limit twelve seconds
+    // in. The campaign refused to deliver — correctly, and it said why in an error note — but the
+    // note is a SENTENCE, and the last thing on screen attached to `cpt-02` was `dispatched`. The
+    // reasonable reading of that screen is that the Inspector never launched, which is the
+    // reading it got: a working reviewer with an empty quota was diagnosed as a broken install.
+    //
+    // So the Inspector reports back whether or not it produced a verdict. Never as a `verdict`
+    // event — the gate fails closed and a verdict line for a verdict that does not exist is the
+    // one shape of this stream that could mislead — but as `unit-returned`, which claims nothing
+    // about the review and everything about the unit.
+    const inspectorEvents = events.filter(
+      (e) => 'agentId' in e && e.agentId === 'cpt-02',
+    );
+    assert.deepEqual(
+      inspectorEvents.map((e) => e.kind),
+      ['unit-dispatched', 'unit-returned'],
+      `the Inspector never came back on the stream: ${JSON.stringify(inspectorEvents)}`,
+    );
+    const returned = inspectorEvents[1];
+    assert.ok(returned !== undefined && returned.kind === 'unit-returned');
+    assert.notEqual(returned.status, 'ok', 'a reviewer that produced nothing reported status ok');
+    // And it carries WHY, so the roster row and the narration line both name the cause rather
+    // than leaving it to an error note three lines further down.
+    assert.match(returned.summary ?? '', /ENOENT|spawn/iu, JSON.stringify(returned));
 
     assert.equal(result.outcome, 'inspector-unavailable');
     assert.equal(result.verdict, null);

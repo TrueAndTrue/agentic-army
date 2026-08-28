@@ -1168,8 +1168,38 @@ test('an explicit Engineer effort in the config overrides the low default', () =
     'why = "this repo always wants the strongest class"',
   ].join('\n');
   const { config, warnings } = parseConfig(toml, '/tmp/h/config.toml');
-  assert.deepEqual(warnings, []);
   assert.equal(config.dispatch.rules[0]?.use[0]?.effort, 'xhigh', 'explicit config value must survive');
+  // It survives, AND it is now remarked on. A config written before 2026-08-05 still says `xhigh`
+  // and nothing migrates it — `army init` never rewrites a config, which is right — so a run in
+  // the field spent 27.1 minutes and $6.93 on one Engineer attempt that the same trial had
+  // measured at a quarter of both, in silence. The warning changes nothing and says so.
+  assert.equal(warnings.length, 1, `expected exactly the effort-drift warning: ${warnings.join(' | ')}`);
+  assert.match(warnings[0] ?? '', /effort is "xhigh", above the measured default "low"/u);
+  assert.match(warnings[0] ?? '', /Nothing has been changed/u, 'the warning must not imply a rewrite');
+});
+
+/**
+ * The other half of the same rule, and the one that keeps the warning from becoming noise: a
+ * config sitting AT the measured default says nothing at all, and neither does the Inspector's
+ * deliberately-higher class.
+ *
+ * A reviewer at `high` must not share the builder's blind spots — that is a separate, deliberate
+ * choice, and warning about it would teach a reader to ignore the one warning that matters.
+ */
+test('a config at the measured default warns about effort not at all', () => {
+  const toml = [
+    '[[dispatch.rules]]',
+    'when = "Any change to any file."',
+    'use = [ { harness = "claude", model = "claude-sonnet-5", effort = "low" } ]',
+    'why = "the measured default"',
+    '',
+    '[[dispatch.rules]]',
+    'when = "An Engineer has claimed done and its branch needs review."',
+    'use = [ { harness = "codex", model = "gpt-5.5", effort = "high" } ]',
+    'why = "reviewer must not share the builder\'s blind spots"',
+  ].join('\n');
+  const { warnings } = parseConfig(toml, '/tmp/h/config.toml');
+  assert.deepEqual(warnings, [], 'a config at the default, plus a codex reviewer, must be silent');
 });
 
 /**
@@ -1973,7 +2003,14 @@ test('TOLERANCE: a config carrying the old `when` and `dispatch.default` still l
   ].join('\n');
 
   const { config, warnings } = parseConfig(toml, '/tmp/h/config.toml');
-  assert.deepEqual(warnings, [], 'an already-valid config must not start warning');
+  // "An already-valid config must not start warning" held absolutely until the effort default
+  // moved and nothing migrated the configs written before it. This fixture carries `xhigh`, so it
+  // now earns exactly one warning — and the guard is narrowed rather than dropped: NOTHING about
+  // the shapes this test exists for (the old `dispatch.default` key, an unrecognised `when`, a
+  // two-target reviewer rule) may warn. The pinned message keeps that honest, because a new
+  // tolerance regression would show up here as a second warning.
+  assert.equal(warnings.length, 1, `an old-shaped config warned about more than effort: ${warnings.join(' | ')}`);
+  assert.match(warnings[0] ?? '', /above the measured default/u, 'the one warning is the effort drift');
 
   // `when` is carried verbatim, whatever it says — nothing validates it as a predicate.
   assert.equal(config.dispatch.rules[0]?.when, 'the moon is waxing and the task smells like refactoring');

@@ -45,6 +45,12 @@ army chat — a live session with a commanding officer
   Engineer's account of what it did — and delivered up to the project ceiling.
   It is the same gate \`${invokedAs()} campaign\` runs, because it is the same code.
 
+  Chat needs no setup first. On the way in it creates ~/.agentic-army and the
+  default config where they are missing, turns a bare directory into a git
+  repository, and registers the project at ceiling 0, the fail-closed default
+  an unregistered project already has. Nothing it creates widens authority;
+  raising a ceiling still takes \`${invokedAs()} enlist --ceiling N\` from a terminal.
+
 USAGE
   ${invokedAs()} chat [options]
 
@@ -61,13 +67,30 @@ OPTIONS
   --no-init            Outside a repository, refuse instead of running the
                        auto-init \`${invokedAs()} enlist\` runs: git init plus one empty
                        commit, never in your home directory or a filesystem root.
+  --plain              No session chrome: no boxed header, and no status block
+                       pinned under the prompt. The block is painted with cursor
+                       movement, so this is the escape hatch for a terminal that
+                       reports itself as one and does not honour it — an editor's
+                       embedded console, a CI runner with a PTY. Off a terminal
+                       it is already the default.
   -h, --help           This.
 
 IN THE SESSION
+  \\ then Enter         Continue on the next line; the whole entry submits as one
+                       message. A trailing \\\\ submits a literal backslash.
   Ctrl-C               Stop the answer in flight. The session survives it — the
                        interrupt is a stdin message, not a signal. Again to leave.
+                       With a continued entry open, it discards the draft instead.
   Ctrl-D, /exit        Leave.
+  /status              The header again, with the working copy re-read.
   /help                The same, from inside.
+
+WHAT THE STATUS BLOCK SAYS
+  Pinned under the prompt, repainted in place: the branch you are on and whether
+  it is dirty, the project, the commander's model, the rung a dispatch will ask
+  for, what the session has spent — and, while a dispatch runs, a row per unit in
+  flight with its own clock. It steps aside while an answer streams, where the
+  spinner on the answer's own line is already saying the same thing.
 
 WHAT PERSISTS
   Every turn is a signal row and every event is a line in stream.jsonl, written
@@ -111,6 +134,8 @@ export interface ChatArgs {
   campaignId?: string;
   /** False when `--no-init` was passed — mirrors `enlist`, which grew the flag first. */
   init: boolean;
+  /** False when `--plain` was passed. Never true off a terminal — `runChat` clamps it. */
+  chrome: boolean;
   help: boolean;
 }
 
@@ -123,7 +148,7 @@ function asRung(raw: string | undefined): Rung {
 }
 
 export function parseChatArgs(argv: readonly string[]): ChatArgs {
-  const args: ChatArgs = { init: true, help: false };
+  const args: ChatArgs = { init: true, chrome: true, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] as string;
     const next = (): string | undefined => argv[++i];
@@ -178,6 +203,9 @@ export function parseChatArgs(argv: readonly string[]): ChatArgs {
       case '--no-init':
         args.init = false;
         break;
+      case '--plain':
+        args.chrome = false;
+        break;
       default:
         if (arg.startsWith('-')) throw new UsageError(`unknown option ${arg}`);
         // A chat takes no objective — that is the difference between it and a campaign, and a
@@ -231,6 +259,7 @@ export async function chatCommand(
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.init ? {} : { init: false }),
+    ...(args.chrome ? {} : { chrome: false }),
     ...overrides,
     io,
   };

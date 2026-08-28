@@ -43,10 +43,12 @@ import {
   toolNameOf,
 } from '../src/command/permissions.ts';
 import { PROTECTED_CONFIG_GLOBS } from '../src/setup/init.ts';
+import { loadConfig } from '../src/config/load.ts';
 import { ROLES, WRITES_FILES } from '../src/contracts/ranks.ts';
 import { buildSoldierSpec } from '../src/command/campaign.ts';
 import { parseChatArgs, CHAT_HELP, chatCommand } from '../src/command/chat.ts';
 import {
+  continuationStep,
   createScriptedIo,
   createTerminalIo,
   applyKey,
@@ -57,8 +59,21 @@ import {
   renderComposerFrame,
   splitPromptLead,
 } from '../src/chat/io.ts';
-import type { ChatIo, ComposerView, ScriptedIo, EditorState, EditorAction, Key, EditorHistory } from '../src/chat/io.ts';
+import type {
+  ChatIo,
+  ComposerView,
+  ScriptedIo,
+  EditorState,
+  EditorAction,
+  Key,
+  EditorHistory,
+  StatusRenderer,
+} from '../src/chat/io.ts';
 import { guardedProgress } from '../src/chat/dispatch.ts';
+import { REPO_UNKNOWN } from '../src/view/chrome.ts';
+import { displayWidth } from '../src/view/render.ts';
+import { readRepoState } from '../src/chat/repo.ts';
+import type { RepoState } from '../src/view/chrome.ts';
 import { renderProgressEvent } from '../src/view/progress.ts';
 import { formatUnit } from '../src/contracts/ranks.ts';
 import {
@@ -588,6 +603,9 @@ function epipeOn(io: ScriptedIo, pattern: RegExp, swallowed: string[]): ChatIo {
     get isTTY(): boolean {
       return io.isTTY;
     },
+    get width(): number {
+      return io.width;
+    },
     write(text: string): void {
       if (pattern.test(text)) {
         swallowed.push(text);
@@ -603,6 +621,7 @@ function epipeOn(io: ScriptedIo, pattern: RegExp, swallowed: string[]): ChatIo {
     close: () => io.close(),
     setBusy: (label) => io.setBusy(label),
     setIdle: () => io.setIdle(),
+    setStatus: (render) => io.setStatus(render),
   };
 }
 
@@ -619,6 +638,9 @@ function snapshotOn(io: ScriptedIo, pattern: RegExp, snapshots: string[]): ChatI
     get isTTY(): boolean {
       return io.isTTY;
     },
+    get width(): number {
+      return io.width;
+    },
     write(text: string): void {
       if (pattern.test(text)) snapshots.push(io.transcript);
       io.write(text);
@@ -629,6 +651,7 @@ function snapshotOn(io: ScriptedIo, pattern: RegExp, snapshots: string[]): ChatI
     close: () => io.close(),
     setBusy: (label) => io.setBusy(label),
     setIdle: () => io.setIdle(),
+    setStatus: (render) => io.setStatus(render),
   };
 }
 
@@ -1895,8 +1918,14 @@ describe('Ctrl-C interrupts the turn, not the session', () => {
     assert.equal(result.dispatches[0]?.outcome, 'delivered', 'the interrupt killed the dispatch');
     assert.match(io.transcript, /worktree released/);
     assert.notEqual(result.exitReason, 'interrupt', 'the Ctrl-C leaked into the session exit');
-    // And it did not arm the exit either — the next Ctrl-C is still the first one.
-    assert.ok(!io.transcript.includes('again to leave'), 'the refusal armed an exit as a side effect');
+    // And it did not arm the exit either — the next Ctrl-C is still the first one. Matched on the
+    // handler's whole line rather than on the phrase `again to leave`, which the session's own
+    // header also contains: a substring shared with the banner is a substring that is true from
+    // the first byte of every session, and this assertion would then have been unfailable.
+    assert.ok(
+      !io.transcript.includes('(again to leave, or /exit)'),
+      'the refusal armed an exit as a side effect',
+    );
   });
 
   it('…even when the narration stream is a dead pipe', async () => {
@@ -2100,7 +2129,10 @@ describe('Ctrl-C interrupts the turn, not the session', () => {
     // Both lines the handler writes with no turn in flight. The `leaving.` line matters twice
     // over: it is followed by `abortLine()`, which is the call that actually ends the session, so
     // a throw ahead of it does not just crash — it hangs.
-    const io = epipeOn(base, /again to leave|leaving\./, swallowed);
+    // Anchored on the parenthesis for the reason the test above spells out: `again to leave` on
+    // its own also appears in the session header, so an unanchored pattern would kill the banner
+    // write instead of the interrupt line and this test would be testing the setup window.
+    const io = epipeOn(base, /\(again to leave|leaving\./, swallowed);
     const running = chat(rig, io);
 
     const { value: result, escaped } = await withoutEscapes(() =>
@@ -2439,12 +2471,306 @@ describe('the conversation is in the archive, and army view reads it back', () =
 });
 
 // ===============================================================================================
+// 9B. THE SESSION CHROME — the header and the status block, driven by a whole session
+//
+// `src/view/chrome.ts` is tested for LOOKS in `test/view.test.ts`: widths, charsets, dropped
+// segments, hostile summaries. Nothing there can say whether a session ever put a real branch
+// into one. These tests do, by running `runChat` with a scripted terminal that claims to be a TTY
+// and calling the renderer the session installed.
+//
+// Every content assertion is made WHILE THE SESSION IS LIVE, which is not a convenience: the
+// renderer is torn down in `runChat`'s `finally`, so a session that has returned has no status
+// block by design, and a test that read one afterwards would be asserting on a corpse. The
+// teardown itself gets its own test rather than being smuggled in as the reason the others are
+// awkward.
+// ===============================================================================================
+
+describe('army chat — the session chrome', () => {
+  /** A working copy that answers differently each time, so a stale read is a visible one. */
+  const repoSequence = (
+    ...states: RepoState[]
+  ): { read: () => Promise<RepoState>; calls: number } => {
+    const box = {
+      calls: 0,
+      read: (): Promise<RepoState> => {
+        const state = states[Math.min(box.calls, states.length - 1)] as RepoState;
+        box.calls += 1;
+        return Promise.resolve(state);
+      },
+    };
+    return box;
+  };
+
+  /**
+   * The same shape section 8's dispatch tests use, spelled again here rather than shared: that
+   * one lives inside its own describe, and reaching into another suite's fixture is how a test
+   * ends up failing for a reason that has nothing to do with what it is testing.
+   */
+  const DISPATCH_RIG = (label: string): Rig =>
+    makeRig(
+      label,
+      [
+        'at your orders.',
+        `on it.\n\n${dispatchBlock('add a multiply function to calc.js')}`,
+        'it landed.',
+      ],
+      { engineerDelayMs: 900 },
+    );
+
+  const ON_A_BRANCH: RepoState = {
+    branch: 'army/t-1',
+    head: 'a1b2c3d',
+    dirty: 3,
+    ahead: 2,
+    behind: 0,
+  };
+
+  /** Run a session, hold it at its first prompt, look at the chrome, then let it leave. */
+  async function atThePrompt(
+    rig: Rig,
+    io: ScriptedIo,
+    inspect: () => void,
+    overrides: Partial<ChatOptions> = {},
+  ): Promise<ChatResult> {
+    const running = chat(rig, io, overrides);
+    return settling(running, io, async () => {
+      await waitFor(() => io.prompts.length >= 1, 15000, 'the session to reach its prompt');
+      inspect();
+      io.feed('/exit');
+    });
+  }
+
+  /** The block as it stands right now, rendered wide enough that nothing is dropped. */
+  const barOf = (io: ScriptedIo): string[] => [...(io.status?.(0, 200) ?? [])];
+
+  it('the header names the branch, and the bar the session installs carries it too', async () => {
+    const rig = makeRig('chrome-branch', ['at your orders.']);
+    const io = createScriptedIo([], { open: true, isTTY: true });
+    const repo = repoSequence(ON_A_BRANCH);
+    let bar: string[] = [];
+    const result = await atThePrompt(rig, io, () => {
+      bar = barOf(io);
+    }, { readRepo: repo.read });
+
+    // The header — printed once, and the reason the working copy is read before anything else.
+    assert.match(io.transcript, /army\/t-1/, `the header never named the branch:\n${io.transcript}`);
+    assert.match(io.transcript, /3 uncommitted/, 'the header did not say the tree was dirty');
+    assert.match(io.transcript, /2 ahead/);
+    assert.equal(repo.calls, 1, 'a session with no dispatch read the working copy more than once');
+
+    // The bar — installed, and a live function of the session rather than a snapshot of its start.
+    assert.ok(bar.length > 0, 'a TTY session installed no status block at all');
+    const context = bar[bar.length - 1] ?? '';
+    assert.match(context, /army\/t-1\*↑2/, `the bar did not carry the branch: ${JSON.stringify(bar)}`);
+    assert.match(context, /rung/, 'the bar did not say how far a dispatch may go');
+    assert.equal(result.exitReason, 'command');
+  });
+
+  it('the block is taken down when the session leaves', async () => {
+    // It is rows of chrome pinned under the conversation, and the close-out writes the archive
+    // path into the same region. A bar still installed would be repainted over the last thing
+    // this command says — and, on a real terminal, left sitting under the shell prompt.
+    const rig = makeRig('chrome-teardown', ['at your orders.']);
+    const io = createScriptedIo([], { open: true, isTTY: true });
+    let live = false;
+    await atThePrompt(rig, io, () => {
+      live = io.status !== null;
+    }, { readRepo: () => Promise.resolve(ON_A_BRANCH) });
+    assert.ok(live, 'the block was never up, so its removal proves nothing');
+    assert.equal(io.status, null, 'the session left with its status block still installed');
+  });
+
+  it('a session that is not a terminal installs nothing, and never shells out to git', async () => {
+    // Two properties, one cause. A redirected session has no cursor to move, so there is nothing
+    // to install; and having nothing to put them in, it has no business spawning five git
+    // processes to decorate a transcript nobody is watching.
+    const rig = makeRig('chrome-piped', ['at your orders.']);
+    const io = createScriptedIo([], { open: true, isTTY: false });
+    const repo = repoSequence(ON_A_BRANCH);
+    let live: StatusRenderer | null = null;
+    await atThePrompt(rig, io, () => {
+      live = io.status;
+    });
+    assert.equal(live, null, 'a redirected session pinned a status block');
+    assert.equal(repo.calls, 0);
+    // The header still prints — it is ordinary output — but with no branch row to fill.
+    assert.match(io.transcript, /COL·COMMANDER/);
+    assert.doesNotMatch(io.transcript, /^\s*branch\s/mu, 'a branch row appeared with nothing in it');
+  });
+
+  it('--plain refuses the chrome on a terminal that reports itself as one', async () => {
+    const rig = makeRig('chrome-plain', ['at your orders.']);
+    const io = createScriptedIo([], { open: true, isTTY: true });
+    const repo = repoSequence(ON_A_BRANCH);
+    let live: StatusRenderer | null = null;
+    await atThePrompt(rig, io, () => {
+      live = io.status;
+    }, { chrome: false, readRepo: repo.read });
+    assert.equal(live, null, '--plain left a status block pinned');
+    // And it is ONLY the painted rows. The header under a `--plain` session still names the
+    // branch, and `/status` still re-reads it: the flag is about cursor movement, not about
+    // withholding from a reader who is sitting right there.
+    assert.equal(repo.calls, 1, '--plain stopped the header from knowing where it was');
+    assert.match(io.transcript, /army\/t-1/, '--plain took the branch out of the header');
+  });
+
+  it('/status re-reads the working copy and prints the header again', async () => {
+    const rig = makeRig('chrome-status', ['at your orders.']);
+    const io = createScriptedIo([], { open: true, isTTY: true });
+    const repo = repoSequence(ON_A_BRANCH, { ...ON_A_BRANCH, branch: 'army/t-2', dirty: 0 });
+    let bar: string[] = [];
+    const running = chat(rig, io, { readRepo: repo.read });
+    const result = await settling(running, io, async () => {
+      await waitFor(() => io.prompts.length >= 1, 15000, 'the session to reach its prompt');
+      io.feed('/status');
+      await waitFor(() => io.transcript.includes('army/t-2'), 15000, 'the re-read header');
+      bar = barOf(io);
+      io.feed('/exit');
+    });
+
+    assert.equal(repo.calls, 2, '/status did not re-read the working copy');
+    assert.match(io.transcript, /clean/, 'the re-read did not reach the header');
+    // A slash command is not a turn — the commander was never spoken to.
+    assert.equal(result.turns, 0, '/status was recorded as a human turn');
+    assert.match(bar[bar.length - 1] ?? '', /army\/t-2/, 'the bar kept the stale branch');
+  });
+
+  it('a dispatch fills the roster, clears it when it settles, and re-reads the branch', async () => {
+    const rig = DISPATCH_RIG('chrome-roster');
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true, isTTY: true });
+    const repo = repoSequence(ON_A_BRANCH, { ...ON_A_BRANCH, ahead: 3 });
+    const running = chat(rig, io, { readRepo: repo.read });
+    let working: string[] = [];
+    let settled: string[] = [];
+
+    const result = await settling(running, io, async () => {
+      await waitFor(
+        () => io.transcript.includes('dispatched (claude'),
+        15000,
+        'the Engineer dispatch line to be narrated',
+      );
+      // WHILE it runs: the Engineer is on the roster with a clock of its own, and the bar says
+      // what the key the reader is most likely to press does differently right now.
+      working = barOf(io);
+      await waitFor(() => io.transcript.includes('worktree released'), 25000, 'the dispatch to settle');
+      settled = barOf(io);
+      io.feed('/exit');
+    });
+
+    assert.equal(result.dispatches[0]?.approved, true);
+    assert.ok(working.length >= 2, `the roster was empty while a unit was out: ${JSON.stringify(working)}`);
+    assert.match(working[0] ?? '', /CPT·ENGINEER · cpt-01 working \d/u, JSON.stringify(working));
+    assert.match(working[working.length - 1] ?? '', /dispatch in flight/, JSON.stringify(working));
+
+    // AFTER it settles: nothing is running, so nothing is drawn as running. A roster left
+    // standing would show an Engineer working for the rest of the session.
+    assert.equal(settled.length, 1, `the roster outlived the dispatch: ${JSON.stringify(settled)}`);
+    assert.match(settled[0] ?? '', /1 dispatch/, 'the bar did not count the dispatch');
+    // And the branch was re-read, because a dispatch is exactly the thing that changes it.
+    assert.ok(repo.calls >= 2, 'the working copy was never re-read after a dispatch');
+    assert.match(settled[0] ?? '', /↑3/u, `the bar kept the pre-dispatch state: ${JSON.stringify(settled)}`);
+  });
+
+  it('the campaign ticker stands down when the roster is up', async () => {
+    // Both draw the same fact — this unit is working, and for this long. Two writers animating
+    // one screen is the bug the io seam exists to prevent, so exactly one of them runs, and the
+    // roster is the better of the two: every unit rather than the newest, and it survives the
+    // narration lines that land on top of a ticker.
+    const rig = DISPATCH_RIG('chrome-ticker');
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true, isTTY: true });
+    const running = chat(rig, io, { readRepo: () => Promise.resolve(REPO_UNKNOWN) });
+    await settling(running, io, async () => {
+      await waitFor(() => io.transcript.includes('worktree released'), 25000, 'the dispatch to settle');
+      io.feed('/exit');
+    });
+    // The ticker's frames go through `io.write`, so the transcript is where they would show up.
+    assert.doesNotMatch(
+      io.transcript,
+      /cpt-01 working \d+s/u,
+      'the sink animated a ticker while the status block was drawing the same unit',
+    );
+  });
+});
+
+// ===============================================================================================
+// 9C. READING THE WORKING COPY — the one thing in the chat session that shells out
+//
+// `readRepoState` decorates a status bar. Its whole contract is therefore negative: it must never
+// throw, never block, and never report a fact it did not establish. Everything below is a test of
+// one of those three, against a real repository — the probes are five real git invocations, and a
+// fake git would be testing the fake.
+// ===============================================================================================
+
+describe('readRepoState — a decoration that is never allowed to fail', () => {
+  it('reads the branch, the head, the dirt and the divergence from a real repository', async () => {
+    const repo = makeRepo('repo-state');
+    const clean = await readRepoState(repo);
+    assert.equal(clean.branch, 'main');
+    assert.match(clean.head ?? '', /^[0-9a-f]{7,}$/u, `not a short commit id: ${String(clean.head)}`);
+    assert.equal(clean.dirty, 0, 'a freshly committed tree read as dirty');
+    // No upstream, so divergence is UNKNOWN rather than zero — a branch that has never been
+    // pushed and one that is perfectly in sync are different facts.
+    assert.equal(clean.ahead, null);
+    assert.equal(clean.behind, null);
+
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export const add = (a, b) => a + b; // edited\n');
+    fs.writeFileSync(path.join(repo, 'untracked.txt'), 'and this one is not tracked\n');
+    const dirty = await readRepoState(repo);
+    assert.equal(dirty.dirty, 2, 'an untracked file counts — a dispatch would pick it up too');
+  });
+
+  it('counts ahead and behind separately once there is an upstream', async () => {
+    const repo = makeRepo('repo-state-upstream');
+    makeOrigin(repo);
+    git(repo, 'push', '--quiet', '-u', 'origin', 'main');
+    const synced = await readRepoState(repo);
+    assert.equal(synced.ahead, 0, 'a pushed branch is not ahead');
+    assert.equal(synced.behind, 0);
+
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export const add = (a, b) => a + b; // local\n');
+    git(repo, 'commit', '--quiet', '-am', 'a local commit');
+    const ahead = await readRepoState(repo);
+    assert.equal(ahead.ahead, 1, 'a local commit did not register as ahead');
+    assert.equal(ahead.behind, 0, 'a local commit registered as behind');
+  });
+
+  it('a detached HEAD has a commit and no branch, rather than a branch called null', async () => {
+    const repo = makeRepo('repo-state-detached');
+    const head = git(repo, 'rev-parse', 'HEAD').trim();
+    git(repo, 'checkout', '--quiet', '--detach', head);
+    const state = await readRepoState(repo);
+    assert.equal(state.branch, null);
+    assert.match(state.head ?? '', /^[0-9a-f]{7,}$/u);
+  });
+
+  it('a directory that is not a repository is unknown, not an error', async () => {
+    // The status bar's whole vocabulary for this is `null`, and a session started outside a
+    // repository must reach its prompt regardless — `runChat` awaits this before it prints a
+    // single byte, so a throw here is a session that never starts.
+    const state = await readRepoState(mkTmp('repo-state-bare'));
+    assert.equal(state.branch, null);
+    assert.equal(state.head, null);
+    assert.equal(state.dirty, null, 'a non-repository reported a dirt count it cannot have');
+    assert.equal(state.ahead, null);
+    assert.equal(state.behind, null);
+  });
+
+  it('a directory that does not exist at all is unknown too, and does not reject', async () => {
+    const state = await readRepoState(path.join(mkTmp('repo-state-gone'), 'no-such-directory'));
+    assert.deepEqual(state, REPO_UNKNOWN, 'a missing directory produced something other than unknown');
+  });
+});
+
+// ===============================================================================================
 // 10. THE CLI SKIN
 // ===============================================================================================
 
 describe('army chat — the command', () => {
   it('parses its options and refuses an objective with the command that takes one', () => {
-    assert.deepEqual(parseChatArgs([]), { init: true, help: false });
+    assert.deepEqual(parseChatArgs([]), { init: true, chrome: true, help: false });
+    // `--plain` is the only way to turn the chrome off, and it is off by default nowhere: the
+    // clamp to "terminals only" lives in `runChat`, so the parsed args say what was ASKED for.
+    assert.deepEqual(parseChatArgs(['--plain']), { init: true, chrome: false, help: false });
     assert.equal(parseChatArgs(['--rung', '1']).requestedRung, 1);
     assert.equal(parseChatArgs(['--attempts', '5']).maxAttempts, 5);
     assert.equal(parseChatArgs(['--model', 'claude-sonnet-5']).model, 'claude-sonnet-5');
@@ -2596,6 +2922,136 @@ describe('army chat — the command', () => {
     assert.equal(code, 1, `expected a prompt refusal exit, got ${String(code)}:\n${err}`);
     assert.match(err, /home directory/);
     assert.equal(fs.existsSync(path.join(fakeHome, '.git')), false, 'a repository was created at the fake home');
+  });
+
+  // ===========================================================================================
+  // FIRST-RUN SETUP. Chat is the front door, and until this section's subject existed the front
+  // door had a queue in front of it: `init`, then `cd`, then `enlist`, then the command the
+  // reader wanted. Every piece was already idempotent, so the only thing between "fresh machine"
+  // and "conversation" was that nobody called them. Neither step may widen authority: the home
+  // is created only where it is missing, and the registration records the fail-closed ceiling 0
+  // that an unregistered project already answers through `projectCeiling`.
+  // ===========================================================================================
+
+  // ===========================================================================================
+  // PROSE — on a terminal, an answer is rendered: gutter, word wrap under it, markdown as ink.
+  // Off a terminal every test above already proves the raw bytes still flow untouched, because
+  // every one of them asserts on transcripts written through the non-TTY path.
+  // ===========================================================================================
+
+  it('on a terminal, the answer renders as prose: gutter, no markers, a hanging wrap', async () => {
+    const rig = makeRig('prose-tty', [
+      '**Bold claim** about `calc.js` that keeps going long enough to be certain of wrapping ' +
+        'past the eighty column terminal a scripted io reports, which takes a fair few words.',
+    ]);
+    const io = createScriptedIo([], { isTTY: true });
+    await chat(rig, io, {
+      env: { NO_COLOR: '1' },
+      readRepo: () => Promise.resolve(REPO_UNKNOWN),
+    });
+    // The banner draws its own `◆` in the header box, so the answer is found by its content and
+    // then checked to be gutter-led, rather than found by the first `◆` on the screen.
+    const at = io.transcript.indexOf('◆ Bold claim about calc.js');
+    assert.notEqual(
+      at,
+      -1,
+      `markers survived, or the gutter is detached from the answer:\n${io.transcript}`,
+    );
+    const answer = io.transcript.slice(at, io.transcript.indexOf('\n\n', at));
+    assert.ok(!answer.includes('**'), `a bold marker reached the terminal:\n${answer}`);
+    assert.match(answer, /\n  \w/u, `no continuation row hangs under the gutter:\n${answer}`);
+    for (const row of answer.split('\n')) {
+      assert.ok(displayWidth(row) <= 79, `a row reached the final column: ${JSON.stringify(row)}`);
+    }
+  });
+
+  it('a fresh machine gets archive, config and enlistment from chat alone, before the banner', async () => {
+    const repo = makeRepo('firstrun-repo');
+    // The home DOES NOT EXIST. Not makeHome(), which builds the exact layout this test exists
+    // to prove chat builds for itself.
+    const home = path.join(mkTmp('firstrun'), '.agentic-army');
+    const bins = mkTmp('bins-firstrun');
+    const commanderBin = writeFakeCommander(bins, 'fake-commander.mjs', {
+      replies: ['at your orders.'],
+    });
+    const io = createScriptedIo(['/exit']);
+    const result = await runChat({
+      io,
+      cwd: repo,
+      env: {},
+      home,
+      commanderBin,
+      campaignId: 'chat-firstrun',
+      charset: 'unicode',
+    });
+    assert.equal(result.exitReason, 'command');
+
+    // The file agrees with what the session announced, read back through the real loader.
+    const loaded = await loadConfig({ home });
+    assert.equal(
+      loaded.config.projects[result.project]?.ceiling,
+      0,
+      'the project was not registered at the fail-closed 0',
+    );
+
+    const created = io.transcript.indexOf('created the war archive in');
+    const enlisted = io.transcript.indexOf(`enlisted ${result.project} at ceiling 0`);
+    const banner = io.transcript.indexOf('COL·COMMANDER');
+    assert.notEqual(created, -1, `no archive-creation line:\n${io.transcript}`);
+    assert.notEqual(enlisted, -1, `no enlistment line:\n${io.transcript}`);
+    assert.notEqual(banner, -1, `the session never reached its banner:\n${io.transcript}`);
+    assert.ok(
+      created < banner && enlisted < banner,
+      'the setup notices did not come before the session started',
+    );
+  });
+
+  it('an already-registered project is left exactly alone: no rewrite, no notice', async () => {
+    const rig = makeRig('already-enlisted', ['at your orders.'], { ceiling: 2 });
+    const configFile = path.join(rig.home, 'config.toml');
+    const before = fs.readFileSync(configFile, 'utf8');
+    const io = createScriptedIo([]);
+    await chat(rig, io);
+    // Byte-identical, not merely same-ceiling: a rewrite that preserved the value would still be
+    // a tool editing a file it had nothing to say to.
+    assert.equal(
+      fs.readFileSync(configFile, 'utf8'),
+      before,
+      'chat rewrote a config it had nothing to add to',
+    );
+    assert.ok(
+      !io.transcript.includes('enlisted '),
+      `an enlistment was announced for a project already registered:\n${io.transcript}`,
+    );
+    assert.ok(
+      !io.transcript.includes('created the war archive'),
+      'the archive was announced as created over an existing one',
+    );
+  });
+
+  it('a config that cannot be written costs one note, never the conversation', async () => {
+    const rig = makeRig('readonly-config', ['at your orders.']);
+    const configFile = path.join(rig.home, 'config.toml');
+    // Deregister the project, then take the write bit away, so the registration MUST fail while
+    // everything else about the session still works. The session's authority is unchanged
+    // either way: unregistered already answers ceiling 0.
+    fs.writeFileSync(configFile, 'version = 1\n\n[projects]\n');
+    fs.chmodSync(configFile, 0o400);
+    try {
+      const io = createScriptedIo([]);
+      await chat(rig, io);
+      assert.match(
+        io.transcript,
+        /note: could not record .*; continuing at ceiling 0/,
+        `no degrade note:\n${io.transcript}`,
+      );
+      assert.ok(
+        io.transcript.includes('COL·COMMANDER'),
+        `the session did not survive the failed registration:\n${io.transcript}`,
+      );
+    } finally {
+      fs.chmodSync(configFile, 0o600);
+    }
   });
 
   /**
@@ -2991,14 +3447,17 @@ function fakeTtyInput(): FakeTtyInput {
 interface FakeTtyOutput {
   readonly isTTY: true;
   columns: number;
+  /** Terminal height. Read for exactly one decision — whether a status block fits at all. */
+  rows: number;
   data: string;
   write(text: string): boolean;
 }
 
-function fakeTtyOutput(columns = 80): FakeTtyOutput {
+function fakeTtyOutput(columns = 80, rows = 24): FakeTtyOutput {
   return {
     isTTY: true,
     columns,
+    rows,
     data: '',
     write(text: string): boolean {
       this.data += text;
@@ -3007,12 +3466,12 @@ function fakeTtyOutput(columns = 80): FakeTtyOutput {
   };
 }
 
-function rawIo(columns = 80): { io: ChatIo; input: FakeTtyInput; output: FakeTtyOutput } {
+function rawIo(columns = 80, rows = 24): { io: ChatIo; input: FakeTtyInput; output: FakeTtyOutput } {
   const input = fakeTtyInput();
-  const output = fakeTtyOutput(columns);
+  const output = fakeTtyOutput(columns, rows);
   const io = createTerminalIo({
     input: input as unknown as NodeJS.ReadableStream & { isTTY?: boolean; setRawMode?: (mode: boolean) => void },
-    output: output as unknown as NodeJS.WritableStream & { isTTY?: boolean; columns?: number },
+    output: output as unknown as NodeJS.WritableStream & { isTTY?: boolean; columns?: number; rows?: number },
   });
   return { io, input, output };
 }
@@ -3030,29 +3489,51 @@ function stripColour(text: string): string {
   return text.replace(/\[[0-9;]*m/g, '');
 }
 
+interface Screen {
+  /** Every row the session has written, in order. */
+  lines: string[];
+  /** Which of them the cursor is sitting on. */
+  row: number;
+  col: number;
+}
+
 /**
- * A dumb terminal, just enough of one: `\r[2K` clears the current line, a bare `\r` returns
- * the column to 0 so the NEXT characters overwrite in place (this file's own cursor-positioning
- * trick relies on that), and `\n` starts a new one. Good enough to ask "what does the current line
- * say", which is everything these tests need to know.
+ * A dumb terminal, just enough of one.
+ *
+ * `\u001b[2K` clears the current row, a bare `\r` returns the column to 0 so the NEXT characters
+ * overwrite in place (the composer's cursor-positioning trick relies on that), `\n` starts a new
+ * row at column 0 — a real terminal's ONLCR, which is on for stdout even in raw mode — and
+ * `\u001b[nA` moves the cursor UP n rows without moving it sideways.
+ *
+ * That last one is why this grew from a list of lines into a cursor. The status block is painted
+ * BELOW the cursor and then moved back up over, so a model that only ever appends can see the
+ * rows go down and has no way to represent them being left behind — the block would read as part
+ * of the transcript, and the assertion that the transcript is clean would be unfailable.
  */
-function renderScreen(raw: string): string[] {
+function screenOf(raw: string): Screen {
   const plain = stripColour(raw);
   const lines: string[] = [''];
+  let row = 0;
   let col = 0;
   let i = 0;
+  const up = /^\u001b\[(\d+)A/u;
   while (i < plain.length) {
-    const erase = '\r[2K';
-    if (plain.startsWith(erase, i)) {
-      lines[lines.length - 1] = '';
-      col = 0;
-      i += erase.length;
+    if (plain.startsWith('\u001b[2K', i)) {
+      lines[row] = (lines[row] as string).slice(0, col);
+      i += 4;
+      continue;
+    }
+    const upMatch = up.exec(plain.slice(i));
+    if (upMatch !== null) {
+      row = Math.max(0, row - Number(upMatch[1]));
+      i += upMatch[0].length;
       continue;
     }
     const ch = plain[i] as string;
     if (ch === '\n') {
-      lines.push('');
+      row += 1;
       col = 0;
+      while (lines.length <= row) lines.push('');
       i += 1;
       continue;
     }
@@ -3061,18 +3542,42 @@ function renderScreen(raw: string): string[] {
       i += 1;
       continue;
     }
-    const current = lines[lines.length - 1] as string;
+    const current = lines[row] as string;
     const padded = current.length < col ? current + ' '.repeat(col - current.length) : current;
-    lines[lines.length - 1] = padded.slice(0, col) + ch + padded.slice(col + 1);
+    lines[row] = padded.slice(0, col) + ch + padded.slice(col + 1);
     col += 1;
     i += 1;
   }
-  return lines;
+  return { lines, row, col };
 }
 
+function renderScreen(raw: string): string[] {
+  return screenOf(raw).lines;
+}
+
+/**
+ * The row the cursor is on — which, for every test written before the status block existed, is
+ * also the last row on screen. It is the CURSOR's row rather than the last one because that is
+ * the property those tests were always asking about ("what does the live line say"), and with a
+ * block pinned underneath the two answers stop agreeing.
+ */
 function lastLine(raw: string): string {
-  const lines = renderScreen(raw);
-  return lines[lines.length - 1] ?? '';
+  const screen = screenOf(raw);
+  return screen.lines[screen.row] ?? '';
+}
+
+/**
+ * The rows below the cursor — the status block, when there is one, and nothing otherwise.
+ *
+ * Trailing blanks are dropped, because on a real terminal a row that has been erased and a row
+ * that was never written are the same thing: both are blank, and the block coming down is
+ * precisely the act of turning the first into the second.
+ */
+function blockBelow(raw: string): string[] {
+  const screen = screenOf(raw);
+  const rows = screen.lines.slice(screen.row + 1).map((line) => line.trimEnd());
+  while (rows.length > 0 && rows[rows.length - 1] === '') rows.pop();
+  return rows;
 }
 
 describe('createTerminalIo — the raw-mode TTY path', () => {
@@ -3259,6 +3764,201 @@ describe('createTerminalIo — the raw-mode TTY path', () => {
   });
 });
 
+// ===============================================================================================
+// 13B. THE STATUS BLOCK — rows pinned UNDER the conversation, and the cursor arithmetic that
+// keeps them there
+//
+// Every assertion below is about the SCREEN, not the byte stream: `screenOf` replays the writes
+// through a cursor, so "the transcript is clean" means the rows the reader would scroll back
+// through are clean, rather than that some substring is absent from a buffer. That distinction is
+// the whole point — a status block that leaked into the transcript would still produce a
+// perfectly ordinary-looking `output.data`.
+// ===============================================================================================
+
+describe('createTerminalIo — the status block under the composer', () => {
+  /** Two rows, so every count in these tests is a count that could be wrong by one. */
+  const twoRows = (): StatusRenderer => (tick, width) => [
+    `  working ${String(tick)} of ${String(width)}`,
+    '  main · agentic-army',
+  ];
+
+  it('paints below the composer and leaves the cursor back on the composer row', async () => {
+    const { io, input, output } = rawIo();
+    io.setStatus(twoRows());
+    const pending = io.nextLine('you › ');
+    type(input, 'hello');
+
+    assert.equal(
+      lastLine(output.data),
+      'you › hello',
+      'the cursor did not come back to the composer row',
+    );
+    assert.deepEqual(
+      blockBelow(output.data),
+      ['  working 0 of 80', '  main · agentic-army'],
+      'the block is not the two rows under the composer',
+    );
+
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'hello');
+    io.close();
+  });
+
+  it('Enter echoes the line exactly once, and not again a row lower', async () => {
+    // The bug this pins, found by replaying a whole session through a cursor rather than by
+    // reading the code: `emit` ends by putting the block back, and putting it back means
+    // returning the cursor by re-writing whatever `currentExtra()` says. With the composer still
+    // marked painted at that instant, every Enter drew the submitted line and then drew it AGAIN
+    // on the row below — a duplicate per line typed, invisible to every assertion that looked at
+    // the byte stream instead of the screen.
+    const { io, input, output } = rawIo();
+    io.setStatus(() => ['  main · agentic-army']);
+    const pending = io.nextLine('\nyou › ');
+    type(input, 'fix the tests');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'fix the tests');
+
+    const screen = screenOf(output.data);
+    const echoes = screen.lines.filter((line) => line.includes('fix the tests'));
+    assert.equal(echoes.length, 1, `the line was echoed ${String(echoes.length)} times: ${JSON.stringify(screen.lines)}`);
+    assert.deepEqual(blockBelow(output.data), ['  main · agentic-army'], 'the block did not follow');
+    io.close();
+  });
+
+  it('a keystroke repaints the composer without redrawing the block', () => {
+    // The composer's repaint runs per keystroke and the spinner's runs eight times a second. If
+    // either of them dragged the block along, a session would be rewriting three rows for every
+    // character typed — and, worse, every one of those rewrites is a cursor move that has to be
+    // exactly right. The block does not move when the row above it is redrawn, so it does not
+    // have to be.
+    const { io, input, output } = rawIo();
+    io.setStatus(() => ['  main · agentic-army']);
+    void io.nextLine('you › ');
+    type(input, 'ab');
+    const before = output.data.length;
+    type(input, 'c');
+    const written = output.data.slice(before);
+    assert.ok(written.includes('abc'), 'the keystroke did not repaint the composer at all');
+    assert.ok(
+      !written.includes('agentic-army'),
+      `a keystroke redrew the status block:\n${JSON.stringify(written)}`,
+    );
+    io.close();
+  });
+
+  it('output erases the block first, so nothing of it lands in the transcript', () => {
+    const { io, output } = rawIo();
+    io.setStatus(() => ['  main · agentic-army']);
+    io.write('first line\n');
+    io.write('second line\n');
+    const screen = screenOf(output.data);
+    const transcript = screen.lines.slice(0, screen.row);
+    assert.deepEqual(
+      transcript.map((line) => line.trimEnd()),
+      ['first line', 'second line'],
+      `the block leaked into the transcript:\n${JSON.stringify(transcript)}`,
+    );
+    // …and it is still on screen underneath, having been repainted after the write.
+    assert.deepEqual(blockBelow(output.data), ['  main · agentic-army']);
+    io.close();
+  });
+
+  it('steps aside while a line is unfinished, and returns on the newline that ends it', () => {
+    // The rule `statusRows` states: the block is drawn only when the cursor's row is finished
+    // with. Mid-answer the tail is a partial line of streamed prose that grows without bound, and
+    // the cursor-restoring rewrite that puts the block back assumes that line fits on one row.
+    const { io, output } = rawIo();
+    io.setStatus(() => ['  main · agentic-army']);
+    io.write('◆ ');
+    assert.deepEqual(blockBelow(output.data), [], 'the block stayed up over an unfinished row');
+    io.write('an answer streaming in');
+    assert.deepEqual(blockBelow(output.data), []);
+    io.write('\n');
+    assert.deepEqual(blockBelow(output.data), ['  main · agentic-army'], 'the block never came back');
+    io.close();
+  });
+
+  it('a block that shrinks erases the rows it gave up', () => {
+    // The failure this catches is a unit that finished still being drawn as working for the rest
+    // of the session, because the row it was on was simply never written to again.
+    const { io, output } = rawIo();
+    let rows = ['  ⠋ cpt-01 working', '  ⠋ cpt-02 working', '  main · agentic-army'];
+    io.setStatus(() => rows);
+    io.write('narration\n');
+    assert.equal(blockBelow(output.data).length, 3);
+    rows = ['  main · agentic-army'];
+    io.write('more narration\n');
+    assert.deepEqual(
+      blockBelow(output.data),
+      ['  main · agentic-army'],
+      'a row the block gave up was left on screen',
+    );
+    io.close();
+  });
+
+  it('a renderer that returns a newline cannot put the row count out', () => {
+    // The renderer is trusted to be pure, not to be careful. One embedded newline would make the
+    // block one row taller than the cursor move that comes after it, and the session would be a
+    // row adrift from then on — a corruption that grows rather than one that shows up at once.
+    const { io, output } = rawIo();
+    io.setStatus(() => ['  one\ntwo']);
+    io.write('narration\n');
+    assert.deepEqual(blockBelow(output.data), ['  one two']);
+    assert.equal(lastLine(output.data), '', 'the cursor is no longer on the row it was left on');
+    io.close();
+  });
+
+  it('a terminal too short for the block gets no block at all', () => {
+    const { io, output } = rawIo(80, 3);
+    io.setStatus(twoRows());
+    io.write('narration\n');
+    assert.deepEqual(
+      blockBelow(output.data),
+      [],
+      'a two-row block was pinned into a three-row terminal',
+    );
+    io.close();
+  });
+
+  it('setStatus(null) takes it down, and so does close()', () => {
+    const { io, output } = rawIo();
+    io.setStatus(() => ['  main · agentic-army']);
+    io.write('narration\n');
+    assert.equal(blockBelow(output.data).length, 1);
+    io.setStatus(null);
+    assert.deepEqual(blockBelow(output.data), [], 'setStatus(null) left the block on screen');
+
+    io.setStatus(() => ['  main · agentic-army']);
+    io.write('more\n');
+    assert.equal(blockBelow(output.data).length, 1, 'the block did not come back');
+    io.close();
+    assert.deepEqual(
+      blockBelow(output.data),
+      [],
+      'close() left the status rows sitting under the shell prompt',
+    );
+  });
+
+  it('the piped path records nothing and emits no cursor control', () => {
+    const input = new PassThrough();
+    const output: { data: string; write(text: string): boolean } = {
+      data: '',
+      write(text: string): boolean {
+        this.data += text;
+        return true;
+      },
+    };
+    const io = createTerminalIo({
+      input: input as unknown as NodeJS.ReadableStream,
+      output: output as unknown as NodeJS.WritableStream,
+    });
+    io.setStatus(() => ['  main · agentic-army']);
+    io.write('narration\n');
+    assert.equal(output.data, 'narration\n', 'a redirected transcript grew chrome');
+    io.close();
+  });
+});
+
 describe('createTerminalIo — the piped path releases stdin on close', () => {
   it('close() leaves the input paused, so a still-open writer cannot hold the loop', () => {
     // The raw path shipped exactly this hang: a preflight refusal printed and the process sat on
@@ -3306,12 +4006,12 @@ describe('the composer repaints in place, driven with runChat\'s real prompt byt
       'a keystroke repaint emitted a newline — the cursor walks down the screen, one row per key',
     );
     assert.equal(renderScreen(output.data).length, rowsAtPaint, 'typing grew the screen');
-    assert.equal(lastLine(output.data), 'you › I am building a calculator');
+    assert.equal(lastLine(output.data), '▌ I am building a calculator');
     press(input, { name: 'return', sequence: '\r' });
     assert.equal(await pending, 'I am building a calculator');
     const plain = stripColour(output.data);
     assert.equal(
-      (plain.match(/you › I am building a calculator\n/g) ?? []).length,
+      (plain.match(/▌ I am building a calculator\n/g) ?? []).length,
       1,
       'exactly one permanent transcript line must land on submit',
     );
@@ -3325,7 +4025,7 @@ describe('the composer repaints in place, driven with runChat\'s real prompt byt
     type(input, 'hello');
     // The whole screen, top to bottom: reply, ONE blank separator (PROMPT's leading newline),
     // then the live composer. Nothing stale above it.
-    assert.deepEqual(renderScreen(output.data), ['◆ a streamed reply.', '', 'you › hello']);
+    assert.deepEqual(renderScreen(output.data), ['◆ a streamed reply.', '', '▌ hello']);
     press(input, { name: 'return', sequence: '\r' });
     assert.equal(await pending, 'hello');
     io.close();
@@ -3339,7 +4039,7 @@ describe('the composer repaints in place, driven with runChat\'s real prompt byt
     // Walk back to the typo and fix it in place, the way a human actually would.
     for (let i = 0; i < 7; i += 1) press(input, { name: 'left', sequence: '' });
     press(input, { sequence: 'l' });
-    assert.equal(lastLine(output.data), 'you › hello world');
+    assert.equal(lastLine(output.data), '▌ hello world');
     assert.equal(renderScreen(output.data).length, rowsBefore, 'an in-place edit grew the screen');
     press(input, { name: 'return', sequence: '\r' });
     assert.equal(await pending, 'hello world');
@@ -3372,7 +4072,7 @@ describe('the composer repaints in place, driven with runChat\'s real prompt byt
     type(input, 'hello');
     assert.equal(
       lastLine(output.data),
-      'you › hello',
+      '▌ hello',
       'a zero-column terminal swallowed the typed text',
     );
     press(input, { name: 'return', sequence: '\r' });
@@ -3390,8 +4090,8 @@ describe('the composer repaints in place, driven with runChat\'s real prompt byt
     io.write('the reply.\n');
     assert.equal(await io.nextLine(PROMPT), 'and then add tests');
     const plain = stripColour(output.data);
-    assert.equal((plain.match(/you › and then add tests\n/g) ?? []).length, 1);
-    assert.deepEqual(renderScreen(output.data).slice(-3), ['', 'you › and then add tests', '']);
+    assert.equal((plain.match(/▌ and then add tests\n/g) ?? []).length, 1);
+    assert.deepEqual(renderScreen(output.data).slice(-3), ['', '▌ and then add tests', '']);
     io.close();
   });
 });
@@ -3630,5 +4330,119 @@ describe('a throw before the first turn settles the archive', () => {
     const state = readState(rig.home);
     assert.equal(state.campaign, 'aborted', 'campaign.json is frozen at active — a phantom live session');
     assert.equal(state.task, 'blocked', 'the conversation task is in_flight forever');
+  });
+});
+
+// ===============================================================================================
+// 17. BACKSLASH CONTINUATION: multiline input without a multi-row composer.
+//
+// A single trailing backslash on Enter holds the line open; the next line joins it with a
+// newline. The composer never holds a newline: finished segments are echoed above and only the
+// live segment sits on the cursor row, so the one-row repaint model and the `ESC[nA` arithmetic
+// are untouched by design. The rule lives in one pure function (`continuationStep`) shared by
+// the raw path, the piped path and the scripted stand-in, which is what these tests lean on:
+// the pure rule first, then each surface it drives.
+// ===============================================================================================
+
+describe('backslash continuation', () => {
+  it('one trailing backslash continues, two submit a literal one, mid-line ones pass through', () => {
+    assert.deepEqual(continuationStep([], 'first\\'), { kind: 'continue', segment: 'first' });
+    assert.deepEqual(continuationStep(['first'], 'second'), { kind: 'submit', line: 'first\nsecond' });
+    assert.deepEqual(continuationStep([], 'ends hard\\\\'), { kind: 'submit', line: 'ends hard\\' });
+    assert.deepEqual(continuationStep([], 'C:\\temp\\x file'), { kind: 'submit', line: 'C:\\temp\\x file' });
+    // A lone backslash opens an entry with an empty first line — legal, and the join says so.
+    assert.deepEqual(continuationStep([], '\\'), { kind: 'continue', segment: '' });
+    assert.deepEqual(continuationStep([''], 'body'), { kind: 'submit', line: '\nbody' });
+  });
+
+  it('on a raw terminal the read stays pending and the continuation prompt paints', async () => {
+    const { io, input, output } = rawIo();
+    const pending = io.nextLine(PROMPT);
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    type(input, 'first\\');
+    press(input, { name: 'return', sequence: '\r' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, 'a continued entry settled the read early');
+    // The live row is a fresh continuation prompt. The finished segment is echoed above under
+    // the entry bar, as typed and backslash included, because the transcript records keystrokes
+    // and because one entry should read as one block, not as a head and a train of tails.
+    assert.equal(lastLine(output.data), '… ');
+    assert.ok(
+      renderScreen(output.data).includes('▌ first\\'),
+      `the first segment is not in scrollback:\n${renderScreen(output.data).join('\n')}`,
+    );
+    type(input, 'second');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'first\nsecond');
+    assert.ok(
+      renderScreen(output.data).includes('▌ second'),
+      'the closing segment did not join the entry block',
+    );
+    io.close();
+  });
+
+  it('Ctrl-C mid-continuation abandons the draft without firing the interrupt hub', async () => {
+    const { io, input, output } = rawIo();
+    let fired = 0;
+    io.onInterrupt(() => {
+      fired += 1;
+    });
+    const pending = io.nextLine(PROMPT);
+    type(input, 'half a thought\\');
+    press(input, { name: 'return', sequence: '\r' });
+    press(input, { ctrl: true, name: 'c', sequence: '\u0003' });
+    assert.equal(fired, 0, 'an abandoned draft reached the hub and can arm an exit');
+    assert.equal(lastLine(output.data), '▌ ', 'the composer did not return to the main prompt');
+    type(input, 'clean');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await pending, 'clean', 'the abandoned draft polluted the next submit');
+    // With no draft open, the same keystroke is the exit gesture again.
+    press(input, { ctrl: true, name: 'c', sequence: '\u0003' });
+    assert.equal(fired, 1, 'a plain Ctrl-C no longer reaches the hub');
+    io.close();
+  });
+
+  it('history recalls a multiline entry flattened to one row', async () => {
+    const { io, input, output } = rawIo();
+    const first = io.nextLine(PROMPT);
+    type(input, 'alpha\\');
+    press(input, { name: 'return', sequence: '\r' });
+    type(input, 'beta');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await first, 'alpha\nbeta');
+    const second = io.nextLine(PROMPT);
+    press(input, { name: 'up' });
+    // The composer is one physical row, so the recalled entry is the delivered text with its
+    // newlines flattened to spaces, a stated trade made at store time so recall, edit and
+    // resubmit all see the same string.
+    assert.equal(lastLine(output.data), '▌ alpha beta');
+    press(input, { name: 'return', sequence: '\r' });
+    assert.equal(await second, 'alpha beta');
+    io.close();
+  });
+
+  it('a continued entry reaches the commander as ONE multiline turn', async () => {
+    const rig = makeRig('multiline-turn', ['at your orders.', 'received.']);
+    const io = createScriptedIo(['first\\', 'second']);
+    await chat(rig, io);
+    const turns = readNulSeparated(rig.commanderTurnLog).map(
+      (payload) => JSON.parse(payload) as { kind: string; text?: string },
+    );
+    const human = turns.filter((turn) => turn.kind === 'human');
+    assert.equal(human.length, 1, 'the two script lines arrived as two separate turns');
+    assert.equal(human[0]?.text, 'first\nsecond');
+  });
+
+  it('a double trailing backslash submits a literal backslash instead of continuing', async () => {
+    const rig = makeRig('literal-backslash', ['at your orders.', 'noted.']);
+    const io = createScriptedIo(['ends with one\\\\']);
+    await chat(rig, io);
+    const human = readNulSeparated(rig.commanderTurnLog)
+      .map((payload) => JSON.parse(payload) as { kind: string; text?: string })
+      .filter((turn) => turn.kind === 'human');
+    assert.equal(human[0]?.text, 'ends with one\\');
   });
 });

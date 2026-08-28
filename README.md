@@ -53,21 +53,34 @@ node src/cli.ts doctor       # changes nothing on your machine, so it is a safe 
 
 ## First run
 
-Four steps, in whichever spelling you are on. **You never have to keep track of which one that
-is**: every command this tool prints for you to type is emitted in the form you actually invoked
-it with. A checkout's `node src/cli.ts doctor` ends with ``Next: `node src/cli.ts init` ``; the
-installed `army doctor` ends with ``Next: `army init` ``. Same for every fix line, every usage
-line and every error.
+One step:
+
+```sh
+cd ~/code/some-repo
+army chat        # or just `army` — no command, on a terminal, opens a chat
+```
+
+Chat does its own setup on the way in. It creates `~/.agentic-army/` and writes `config.toml`
+where they are missing, turns a bare directory into a git repository, and registers the project
+at delivery ceiling 0, the fail-closed default an unregistered project already has. Nothing it
+creates widens authority; raising a ceiling still takes `army enlist --ceiling N` from a
+terminal.
+
+Every piece is also its own command, in whichever spelling you are on. **You never have to keep
+track of which one that is**: every command this tool prints for you to type is emitted in the
+form you actually invoked it with. A checkout's `node src/cli.ts doctor` ends with
+``Next: `node src/cli.ts init` ``; the installed `army doctor` ends with ``Next: `army init` ``.
+Same for every fix line, every usage line and every error.
 
 | | installed | from a checkout | via `npx`, once it publishes |
 |---|---|---|---|
 | what is missing, and the exact command to fix each thing | `army doctor` | `node src/cli.ts doctor` | `npx agentic-army doctor` |
 | create `~/.agentic-army/` and write `config.toml` | `army init` | `node src/cli.ts init` | `npx agentic-army init` |
-| register this repo — delivery ceiling 0, commit only | `army enlist` | `node src/cli.ts enlist` | `npx agentic-army enlist` |
+| register this repo, delivery ceiling 0, commit only | `army enlist` | `node src/cli.ts enlist` | `npx agentic-army enlist` |
 | run one objective end to end | `army campaign "…"` | `node src/cli.ts campaign "…"` | `npx agentic-army campaign "…"` |
 
-`enlist` and `campaign` read the current directory, so `cd` into the repository you want worked
-on before either of them. From here on this README writes `army …`; substitute your column.
+`chat`, `enlist` and `campaign` read the current directory, so `cd` into the repository you want
+worked on first. From here on this README writes `army …`; substitute your column.
 
 There is a fourth form and it is handled too: `npm run dev -- doctor` ends with
 ``Next: `npm run dev -- init` ``, `--` included, because without it npm eats the flags.
@@ -284,6 +297,36 @@ early costs nothing and hands the retry Engineer an exact command and its output
 `verify` is optional, and its absence is *reported*, never assumed. A gate that did not run comes
 back `passed: false`, because a gate that did not run has not passed anything.
 
+**And the gate itself is checked, against the tree before anybody worked on it.** A verify command
+defines done, so a command that can never pass defines a done nobody can reach — and the campaign
+will spend every attempt it has discovering that. It happened: a spec carried
+
+```sh
+sh -c 'grep -q \"\\\"dependencies\\\": {}\" package.json'
+```
+
+which has balanced quotes, contains no denied word, passes every static check, and exits 2 against
+every file that has ever existed. Three Engineers ran for 37.6 minutes and $8.86 — **two of them
+succeeded, with tests passing** — and nothing was delivered, because nothing in the system could
+tell an unpassable command from a failing branch.
+
+So every `verify` command is now run once against the untouched worktree before the first Engineer
+is dispatched, and what it said is kept. Two things come of that. The failing ones are printed
+immediately, seconds after you approve a dispatch rather than half an hour into it. And when the
+gate runs for real, a command that says *nothing the baseline had not already said* is flagged: it
+did not distinguish the work from its absence.
+
+One such reading is a warning, not a verdict — an Engineer that committed something useless
+produces the identical reading, and it deserves its retry. Two in a row is where the explanations
+separate: a second Engineer failing to move the same command the same way is the command's fault,
+and the campaign stops rather than buying a third. The comparison is deliberately reluctant —
+containment rather than equality, because the baseline legitimately says *more* than a later run
+(the files are not there yet), and any genuine failure introduces a line the baseline never had. It
+would rather miss a broken command than tell you your spec is at fault when your branch is.
+
+None of this relaxes the gate. `passed` is still `false`, nothing is delivered, and the branch stays
+durable. What changes is who is told to fix it, and how much is spent finding out.
+
 **Per-behaviour verdicts.** The second defect was subtler. A spec listed six behaviours; clause 2
 was never implemented. The Engineer wrote the tests as well as the code, so its suite was blind in
 exactly the place its code was — and the Inspector's mutation check disturbed the ordering the
@@ -329,7 +372,7 @@ army chat --rung 2          # highest rung any dispatch may attempt, still clamp
 ```
 
 ```
-you › I want calc.js to also export a multiply function. Propose the objective.
+▌ I want calc.js to also export a multiply function. Propose the objective.
 
 ◆ I haven't read `calc.js` — I don't know whether it uses CommonJS or ESM, so I'm keeping
   the objective about behaviour, not style, so it can't drift into a rewrite.
@@ -369,6 +412,127 @@ than a signal, so an answer in flight aborts in milliseconds and the same sessio
 line. During a dispatch it refuses instead, and says why: only the campaign's own cleanup can
 settle a lease, and abandoning one mid-flight is how a worktree leaks. A second Ctrl-C, or
 Ctrl-D, exits.
+
+### An answer reads as an answer, and your words read as yours
+
+On a terminal the commander's answers render instead of streaming out raw. Each answer hangs
+under a `◆` gutter, wraps at word boundaries with the indent kept on every continuation row, and
+the markdown a model actually sends becomes ink: `**bold**` prints bold with the markers gone,
+`` `code` `` prints cyan, list continuations align under their item text, `[text](url)` paints
+the text cyan with the destination dim beside it, and `---` becomes a dim rule.
+
+Pipe tables render aligned with dim borders. A table too wide for the window has its widest
+columns taken down and its cells wrapped inside them, which is what a person does by hand; only a
+table with more columns than the window can seat gives up and prints its raw lines dim. It is the
+one construct that waits for its last row, since alignment printed early could never be corrected.
+
+Fenced code drops its backticks and takes a dim rule down its left edge instead, the same way
+`**bold**` prints without its asterisks. The body is syntax highlighted for js/ts, json, sh,
+python, toml and diff (`src/view/highlight.ts`), muted so a block reads as one quiet region:
+comments grey, strings green, keywords cyan, everything else dim.
+
+Your own turns are a block, not a label. Every row of a submitted entry carries a green `▌` down
+the left edge and wraps to the window like the answers do, so the two voices are two regions on
+the screen rather than two kinds of sentence. The composer accepts multiline input the way Claude
+Code does: a trailing `\` then Enter continues on the next line under a dim `…` prompt, and the
+whole entry lands as one bar-marked block and one message. Streaming survives it: answers render line by line as they
+arrive, and a commander that stalls mid-sentence has its held words printed after a beat rather
+than hidden, so the wedge is visible with everything it managed to say. Piped or redirected,
+none of this engages and the transcript stays raw bytes (`src/view/prose.ts`).
+
+### The session tells you where you are
+
+A session opens with a header, and keeps a status block pinned under the prompt for as long as it
+runs. Both exist for the same reason: a commanding session approves work against a *place* — a
+repository, on a branch, with or without uncommitted changes — and the one command in this tool
+where that place was never named was the one that dispatches Engineers into it.
+
+```
+╭───────────────────────────────────────────────────────╮
+│ ◆ COL·COMMANDER — a live session                      │
+│ it holds the objective, and one inert tool: TodoWrite │
+╰───────────────────────────────────────────────────────╯
+
+  project    calc
+  path       /Users/you/code/calc
+  branch     main · bbaf74f · 3 uncommitted · 2 ahead
+  commander  claude · claude-opus-5
+  ceiling    0 (commit)   dispatches ask for at most 0 (commit)
+  archive    /Users/you/.agentic-army/campaigns/2026-08-07-chat
+
+  every dispatch is reviewed by an independent Inspector
+  Ctrl-C stops the answer in flight · a second one leaves · /help for the rest
+  army view 2026-08-07-chat   reads this conversation back
+```
+
+The block under the prompt is repainted in place rather than scrolled, so it is still there an
+hour later. It carries the branch and whether it is dirty, the project, the commander's model, the
+rung a dispatch will ask for, and what the session has spent — and while a dispatch runs, **a row
+per unit in flight, each with its own clock**:
+
+```
+  · CPT·ENGINEER · cpt-01 returned – the session is read once per request and cached
+  ⠋ CPT·INSPECTOR · cpt-02 working 1m12s
+  main*↑2 · dispatch in flight — Ctrl-C lets it settle · calc · claude-opus-5
+```
+
+That last row is the block earning its place. Ctrl-C behaves differently during a dispatch than
+anywhere else in the session — it waits, because a campaign holds a worktree lease only its own
+cleanup may settle — and that is a surprising rule to meet for the first time by pressing the key.
+
+It degrades rather than guesses. `git` unavailable, or a `git status` that times out, renders as an
+absent branch and never as a clean one. A terminal too short for the block gets no block. Piped or
+redirected there is neither block nor git probe, because escape bytes in a saved transcript are a
+corruption rather than a feature. `--plain` turns the painted rows off on a terminal that reports
+itself as one and does not honour cursor movement — an editor's embedded console, a CI runner with
+a PTY — and leaves the header, which is ordinary output, exactly where it was. `/status` prints
+the header again with the working copy re-read.
+
+### The session tells you what a unit is doing, not just that it exists
+
+A dispatch used to say one thing and then nothing: `CPT·ENGINEER · cpt-01 working 14m00s`, for as
+long as it took. Everything else went to `stream.jsonl` and stopped there — for a 27-minute
+Engineer that was 972 events, 107 tool calls, five permission denials and 662 reasoning-token
+readings, written to disk and shown to nobody.
+
+The supervisor now narrates the run. Finished tool calls scroll past as they happen:
+
+```
+  ⏺ Write(lib/html.js)
+  ⏺ Write(lib/checks.js)
+  ⏺ Bash(cat > /tmp/redirect_test.js << 'EOF' const http = require('http'); …)
+  ⊘ Bash(cat > /tmp/redirect_test.js << 'EOF' …) refused – Permission to use Bash has been denied…
+  ⏺ Bash(node --test 2>&1)
+```
+
+and the pinned row carries whichever unit is in flight:
+
+```
+  ⠸ CPT·ENGINEER · cpt-01 working 3m19s – Bash(node --version) · 3m03s ago · thinking 18k
+```
+
+Three things there are deliberate. The row shows the **command**, not the model's description of
+it — a description is a claim, and the command is what a permission layer is about to refuse. A
+finished tool call does **not** blank the row; it keeps naming the last action and dates it, because
+75% of a run's wall clock is reasoning *between* tool calls and a blank row through those minutes
+was the original complaint. And `thinking 18k` is the harness's own reasoning telemetry, which
+arrives every second or so — it is the only thing that moves during a long silence, so it is what
+tells you the difference between a model working hard and a wedged process. If nothing arrives at
+all for 45 seconds the row says `silent 1m20s` instead of pretending.
+
+What it never does is invent a number. There is no percent bar and no ETA, because there is no
+denominator for an agent. A harness that reports no reasoning tokens renders no token count rather
+than `thinking 0` — unknown is a real state here exactly as it is for the branch. Bookkeeping calls
+(`TaskCreate`, `TaskUpdate`, `ToolSearch`) produce no line at all: they were 25 of the reference
+run's 107 calls and arrived in bursts of nine, which is enough to push the real work off a short
+terminal.
+
+Nothing downstream of the translator can carry a tool's payload. `describeToolUse`
+(`src/view/activity.ts`) is the only function permitted to read `ToolUseEvent.input`, and the event
+it produces carries `tool` and `target` as already-sanitised, already-clipped strings — so a 40 MB
+tool result has no type-legal route to a terminal. Model-chosen paths on a repainted row are also
+why `displayWidth` exists: a CJK ideograph is one UTF-16 unit and two columns, and a row measured
+the wrong way wraps, which puts the cursor permanently one line adrift.
 
 The conversation is archived like any campaign — `army view` renders it, and the query/answer
 pairs are linked in `signals.jsonl`, so a crash costs you nothing.
