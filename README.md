@@ -2,16 +2,23 @@
 
 A war-hierarchy multi-agent orchestrator. You are the **Commander**; everything below you is
 an agent with a rank (its authority), a role (its branch of service), and a bounded blast
-radius. Officers hold strategy and are structurally incapable of editing a file; Captains and
-below do the work in a leased worktree rather than in your checkout; and every change is
-reviewed by an Inspector that was briefed by the *parent*, from the original orders, never by
-the agent under review. The design goal is that nothing enters a commanding agent's context
-except a hard-schema report — guarded by mechanism rather than by discipline.
+radius. Officers hold strategy and are structurally incapable of editing a file; exactly one
+rank writes, and it is the one rank that leases a worktree, so the work happens there rather
+than in your checkout; and every change is reviewed by an Inspector that was briefed by the
+*parent*, from the original orders, never by the agent under review. Between those two sits an
+optional feature owner — a `MAJ·OVERSEER` that cuts one feature into concurrent workstreams and
+answers the questions climbing to it from below — and after them a `CPT·VALIDATOR` that judges
+the integrated branch against what was originally asked for. The design goal is that nothing
+enters a commanding agent's context except a hard-schema report — guarded by mechanism rather
+than by discipline.
 
 > **Status: the loop runs; the package is not published.** `army doctor`, `army init`,
 > `army enlist`, `army chat`, `army campaign`, `army view` and `army rebuild` are all
-> implemented, and every transcript below is real output from running them. What is missing is
-> distribution:
+> implemented, and every transcript below is real output from running them — bytes off a real
+> terminal or a real stdout, never composed by hand. Some of those runs put stand-in `claude` and
+> `codex` executables on `PATH` instead of the live vendor CLIs; where that is true the paragraph
+> above the transcript says so, because what a screen looks like and what a model would have said
+> are two different claims. What is missing is distribution:
 > `agentic-army` is not on the npm registry, so `npx agentic-army …` and `npm install -g
 > agentic-army` both 404 today — run it from a checkout, see [Getting it](#getting-it).
 >
@@ -152,10 +159,17 @@ is reported as the host worded it and the campaign stops there. Re-running is sa
 pull request is adopted rather than opened a second time, and one that is already merged is a
 no-op rather than an error.
 
-`army campaign --rung 3` still refuses, and says why. The campaign command does not yet hand the
-ladder the two facts rung 3 needs from it — whether the Engineer finished, and whether the retry
-budget ran out — and a rung whose evidence is missing refuses rather than shipping rung 2 under a
-rung-3 heading. `src/delivery/ladder.ts` is where that gate lives.
+The two facts rung 3 needs — whether the Engineer finished, and whether the retry budget ran out
+— are read off the campaign's own state by `mergeEvidence` and handed to `runLadder`, which
+refuses outright for a caller that supplies neither rather than shipping rung 2 under a rung-3
+heading. Neither field is a literal: if this call site answered `done` and `false`
+unconditionally, both of the ladder's refusals would be unreachable from it, and a dead gate is
+worse than an absent one because everybody stops thinking about it.
+`src/delivery/ladder.ts` is where the gate lives. What a refused rung 3 says is the rung it could
+actually reach and why — asked for on a ceiling-3 project with no `origin`, it comes back *"rung 3
+refused, delivered rung 2: there is no pull request to merge — rung 2 was not reached, so rung 3
+cannot be. The rungs are prefixes: a merge is the last step of a pull request, not an alternative
+to one."*
 
 ```sh
 army enlist                 # ceiling 0
@@ -203,6 +217,65 @@ Entries are keyed by the **main** repository root, so running `enlist` inside a 
 updates that project rather than registering the worktree as a separate one with its own
 ceiling. Since every Engineer works in a worktree, that is the common path.
 
+## The ladder, and what each rung may hold
+
+Rank is authority. Role is branch of service. They are orthogonal — any role can hold any rank —
+and a spawner may only assign a rank strictly junior to its own. The order is real US Army
+seniority, so a tree that reads top to bottom also reads senior to junior.
+
+| Rank | Substrate | Writes files | Who holds it |
+|---|---|---|---|
+| ☆ GENERAL | process | no | the supervising process that owns a campaign |
+| ◆ COLONEL | process | no | the Commander you talk to in `army chat` |
+| ◈ MAJOR | process | no | the feature owner, one per feature: `MAJ·OVERSEER` |
+| ◇ CAPTAIN | process | **yes** | engineers, inspectors, the validator, scouts |
+| ▪ SERGEANT | subagent | no | sub-agents a scout or an engineer fields |
+| · PRIVATE | subagent | no | the floor: spare depth below a Sergeant, spawns nothing |
+
+**Exactly one cell in that column is `true`**, and it is the rank that leases a worktree. That is
+not tidiness, it is the two properties this project is built on in one table: officers are
+structurally incapable of a bad `rm`, and a diff always has one owner. A `SGT·ENGINEER` therefore
+holds Read, Grep, Glob and TodoWrite and no editor, exactly as a `COL·ENGINEER` does — rank
+narrows what a role asks for and never widens it.
+
+MAJOR is the newest entry and was briefly a writing rank, because an overseer that merges needs
+git and `Bash` counts as write-capable. The loadout was the thing that was wrong: the overseer
+*decides* which workstream merges, and the supervising process performs the merge, so there was
+nothing for the table to subtract and MAJOR went back with the officers.
+
+The roles, and the loadout each one is actually built with — this is `permissionsFor` output, not
+a description of it:
+
+| Role | Loadout |
+|---|---|
+| COMMANDER | `TodoWrite`, and nothing else, at any rank |
+| SCOUT | Read, Grep, Glob, WebFetch, WebSearch. No worktree |
+| OVERSEER | Read, Grep, Glob, TodoWrite. No editor, no shell, no network |
+| ENGINEER | Read, Grep, Glob, Edit, Write, NotebookEdit, TodoWrite, Task, Agent, and 28 `Bash` prefixes |
+| INSPECTOR | Read, Grep, Glob, TodoWrite, and 24 `Bash` prefixes — plus, on some spawns, a scoped test write. See below |
+| VALIDATOR | the Inspector's, plus the spec's own `verify` commands as exact-match rules |
+| SENTRY | `Bash(gh pr view:*)`, `Bash(gh run list:*)`. **Declared and never spawned** — `army --help` says so out loud rather than leaving the gap for you to find |
+
+The Inspector's 24 prefixes are the Engineer's 28 minus `git`, `prettier`, `eslint` and `ruff`.
+The last three are gone rather than narrowed, and the reason generalises: a `Bash(prefix:*)` rule
+constrains the *start* of a command line and nothing after it, so `Bash(prettier --check:*)` would
+still permit a trailing `--write`. Every one of those three has a documented in-place write mode.
+
+**One thing here is worth reading before you trust any of it.** `[permissions] mode` in
+`config.toml` ships as `unguarded`, which is what `army init` writes, and under it the scoped
+rules above collapse to bare tool names: an Engineer holds `Bash` rather than 28 prefixes of one.
+Every campaign prints the consequence in its own result rather than leaving it in a config file:
+*"workers hold their tools unscoped, so an Engineer runs any command rather than a listed one, and
+the codex reviewer may open a socket to run your tests. Still enforced: rank narrowing, the
+commander context guard, the credential and archive denies, and the codex write sandbox."* It is a
+`warn` under `unguarded` and an `info` under `guarded`, so the posture is on screen either way.
+
+What survives the posture is what the rest of this README leans on: rank narrowing, the
+commander's one inert tool, the credential and `~/.agentic-army/**` denies, and the codex sandbox.
+What does not survive it is the command scoping. Both halves are stated because a reader who
+takes "an Engineer may run these 28 commands" as a boundary, on the configuration this ships,
+would be wrong.
+
 ## `army campaign`
 
 One objective, end to end. A CPT·ENGINEER (claude) takes a leased worktree, cuts
@@ -211,48 +284,199 @@ One objective, end to end. A CPT·ENGINEER (claude) takes a leased worktree, cut
 what it did. On PASS the work is made durable and the delivery ladder runs, clamped by the
 project ceiling. On FAIL a fresh Engineer retries in the same worktree with the findings.
 
-**One tree per campaign, and the Inspector shares it.** A campaign leases exactly one worktree
-and runs the Engineer and then the Inspector in it, so the Inspector reads and tests the branch
-in place. Its independence is *not* a fact about the tree, and it is worth being exact about
-where it does come from: the **brief** (the original orders plus the branch, assembled by the
-GENERAL — the Engineer's `report.md` is never handed to it) and the **loadout** (an INSPECTOR is
-granted Read, Grep, Glob, TodoWrite and a fixed set of `Bash` prefixes, and no `Edit`, `Write` or
-`NotebookEdit` at any rank). A second, disposable tree per Inspector is a reasonable thing to
-want — it would stop a mutation-test edit from being visible to a retrying Engineer — but it is
-not what runs, and the trigger to build it is the first campaign that fields an Engineer and an
-Inspector *concurrently*, which today's strictly sequential attempt loop never does.
+**One tree per workstream, and its Inspector shares it.** A campaign with one workstream leases
+exactly one worktree and runs the Engineer and then the Inspector in it, so the Inspector reads
+and tests the branch in place. Its independence is *not* a fact about the tree, and it is worth
+being exact about where it does come from: the **brief** (the original orders plus the branch,
+assembled by the GENERAL — the Engineer's `report.md` is never handed to it, and there is no field
+on `InspectorBrief` that could carry one) and the **loadout** (Read, Grep, Glob, TodoWrite and the
+24 `Bash` prefixes above). A second, disposable tree per Inspector is a reasonable thing to want —
+it would stop a mutation-test edit from being visible to a retrying Engineer — but it is not what
+runs.
 
 ```sh
 army campaign "add a multiply function to calc.js"
 ```
 
-Against a throwaway repo at ceiling 0, that printed (paths shortened):
+Against a throwaway repo at ceiling 0, asked for `--rung 3`, the result block was (paths
+shortened, and the notes that follow it left out):
 
 ```
-campaign 2026-08-03-add-a-multiply-function-to-calc-js  —  delivered
-  project   …/demo-repo
-  task      t-b5ad0c70d0c1
-  branch    army/t-b5ad0c70d0c1
+campaign 2026-09-01-add-a-multiply-function-to-calc-js  —  delivered
+  project   …/repo
+  task      t-77bf06a47e23
+  branch    army/t-77bf06a47e23
   ceiling   0 (commit)   requested 3 (merge)
   delivered rung 0 (commit)
-  durable   mirror …/mirrors/demo-repo-7d030673.git
+  durable   mirror …/mirrors/repo-dab84036.git
+  acceptance not run — no `verify` commands were checked mechanically; nothing above confirms it
   worktree  released — work is durable; the tree was returned to the pool
 
-  attempt 1  ◇ cpt-01 (ok)  →  cpt-02 PASS (NO TESTS RUN — verdict is from reading only)
-             Added a multiply(a,b) function to calc.js and exported it alongside add, …
-             The branch adds and exports multiply in calc.js; no substitutions or debris
-             found, but no test suite exists to run or mutate.
-
-  ⚠ requested rung 3 (merge) exceeds the ceiling for …/demo-repo, which is 0 (commit).
-    Delivering at rung 0. A campaign may go lower than its ceiling, never higher.
+  attempt 1  ◇ cpt-01 (ok)  →  cpt-02 PASS (tests run: node --test)
+             changed calc.js
+             the branch does what it was cut to do
 ```
 
-Three things there are the design, not decoration. **The Inspector qualifies its own PASS** —
-`NO TESTS RUN — verdict is from reading only` — instead of letting "PASS" imply a green suite
-that never existed. **The ceiling clamped the request** rather than honouring `--rung 3`, and
-said so. And **durability happened before the lease was returned**, so the commit survived the
-worktree being reset and handed to the next campaign; it is readable out of the mirror
-afterwards with plain `git`.
+That run had stand-in vendor CLIs on `PATH`, so the two model summaries are theirs and not a real
+model's; everything else on the screen is the supervisor's own. Four things there are the design,
+not decoration. **The verdict carries whether tests were actually run** — a reviewer that only
+read prints `PASS (NO TESTS RUN — verdict is from reading only)` instead of letting "PASS" imply
+a green suite that never existed. **The acceptance row is printed even when there was nothing to
+run**, because a gate that did not run has not passed anything and must never look like one that
+did. **The ceiling clamped the request** rather than honouring `--rung 3`, and said so in a note
+underneath. And **durability happened before the lease was returned**, so the commit survived the
+worktree being reset and handed to the next campaign; it is readable out of the mirror afterwards
+with plain `git`.
+
+### One overseer, several workstreams, one integration
+
+`--overseer` puts a `MAJ·OVERSEER` above the campaign. It reads the repository, cuts the feature
+into workstreams with declared file ownership, answers the questions its engineers raise so they
+never reach you, and decides which accepted workstream merges and when. It holds Read, Grep, Glob
+and TodoWrite: no editor, no shell, no git. **This process performs every merge it decides on**,
+exactly as it performs the rung 3 merge no worker may perform at any rank.
+
+```sh
+army campaign "add multiply and divide to calc.js" --overseer --workstreams 2
+```
+
+`--workstreams` is how many run at once — default 3, clamped to 8, and it multiplies what a
+campaign costs while only dividing its wall clock, because each one is another model session,
+another worktree and another branch to merge. Off by default for the same reason: an overseer is a
+whole session spent before any engineer starts, and a two-line objective does not need a feature
+owner. **A campaign that segments into one workstream runs exactly as it did before either flag
+existed** — that is the same code at N = 1 rather than a compatibility path, and it has a test on
+it.
+
+With several workstreams, the two gates *move* rather than multiply. The spec's `verify` commands
+and the objective both describe the whole feature, so running either against one partial branch
+would fail every workstream by construction; both run once, on the integrated branch. What does
+multiply is the review: each workstream is inspected on its own branch, by its own Inspector,
+briefed from that workstream's slice and diff.
+
+**Segmentation is a declaration, not a fence.** Two workstreams claiming the same file up front is
+a planning error and the overseer is asked to segment again — once, and then the campaign gives up
+on segmenting and runs whole. But an engineer that needs a neighbour's file takes it and the
+overlap is *announced*, because a fence around the files an engineer may touch turns a solvable
+merge into a blocked workstream. Overlap is read twice: live off the tool-use stream while the
+engineer runs, and completely off `git diff --name-only` once it is down. **It cannot see a
+shell** — a command line is not a file list, and guessing one from `>` or `tee` would give you a
+detector that is wrong in both directions — which matters more than it sounds, because under the
+shipped `unguarded` posture an engineer holds a bare `Bash`.
+
+A merge git resolves needs nobody. A conflict becomes a **reconciliation workstream**: the
+supervisor writes the orders, because every field in them is a branch this process cut or a file
+git reported, and a fresh engineer resolves it in its own worktree where an inspector reviews the
+resolution like any other work. Here is one, end to end, with stand-in vendor CLIs on `PATH`. Two
+engineers were told to own different files and both wrote `calc.js`. Absolute paths are elided
+with `…` and one line carrying nothing but a path is dropped; every line that is here is here as
+it was emitted, so the long notes run as long as they run — a terminal soft-wraps them, this page
+does not:
+
+```
+☆ campaign 2026-09-01-add-multiply-and-divide-to-calc-js · add multiply and divide to calc.js
+  ◈ MAJ·OVERSEER · maj-01 dispatched (claude, attempt 1)
+  ◈ MAJ·OVERSEER · maj-01 returned ok
+  · worktree leased (cold) → …/trees/repo-e33e3b53/wt-01
+  ◇ CPT·ENGINEER · cpt-02 dispatched (claude, attempt 1)
+  · worktree leased (cold) → …/trees/repo-e33e3b53/wt-02
+  ◇ CPT·ENGINEER · cpt-01 dispatched (claude, attempt 1)
+  ⚠ divide wrote calc.js, which is outside its own declaration (multiply declared it). Seen in the branch diff. This is announced, not refused.
+  ◇ CPT·ENGINEER · cpt-02 returned ok – changed calc.js
+  ◇ CPT·INSPECTOR · cpt-03 dispatched (codex, attempt 1)
+  ◇ CPT·ENGINEER · cpt-01 returned ok – changed calc.js
+  ◇ CPT·INSPECTOR · cpt-04 dispatched (codex, attempt 1)
+  ◇ CPT·INSPECTOR · cpt-04 → PASS – the branch does what it was cut to do
+  ◇ CPT·INSPECTOR · cpt-03 → PASS – the branch does what it was cut to do
+  · worktree released → …/trees/repo-e33e3b53/wt-02 – work is durable; the tree was returned to the pool
+  · worktree released → …/trees/repo-e33e3b53/wt-01 – work is durable; the tree was returned to the pool
+  · integration tree at …/trees/repo-e33e3b53/wt-01 on army/t-8616dc59c8e3
+  ⚠ divide (army/t-8616dc59c8e3-divide) conflicts with army/t-8616dc59c8e3 in calc.js. A fresh engineer reconciles it; nothing here resolves a conflict by hand.
+  · worktree leased (cold) → …/trees/repo-e33e3b53/wt-02
+  ◇ CPT·ENGINEER · cpt-05 dispatched (claude, attempt 1)
+  ◇ CPT·ENGINEER · cpt-05 returned ok – reconciled both sides in calc.js
+  ◇ CPT·INSPECTOR · cpt-06 dispatched (codex, attempt 1)
+  ◇ CPT·INSPECTOR · cpt-06 → PASS – the branch does what it was cut to do
+  · worktree released → …/trees/repo-e33e3b53/wt-02 – work is durable; the tree was returned to the pool
+  ◇ CPT·VALIDATOR · cpt-07 dispatched (codex, attempt 1)
+  ◇ CPT·VALIDATOR · cpt-07 → PASS – the branch does what it was cut to do
+  · delivered rung 0 (commit) → …/mirrors/repo-e33e3b53.git
+```
+
+and its result block, which is where the shape of the run is legible:
+
+```
+campaign 2026-09-01-add-multiply-and-divide-to-calc-js  —  delivered
+  ceiling   0 (commit)   requested 0 (commit)
+  delivered rung 0 (commit)
+  workstreams 3, at most 2 at once
+    multiply  accepted  army/t-8616dc59c8e3-multiply
+    divide  accepted  army/t-8616dc59c8e3-divide, 1 overlap(s) announced
+    divide-merge  accepted  army/t-8616dc59c8e3-divide-merge
+  integration army/t-8616dc59c8e3 — 2 merged, 1 conflict(s), tree released
+```
+
+Two workstreams were planned and three ran: `divide-merge` is the reconciliation, named after the
+workstream whose merge failed. The merge itself reports a conflict and never resolves one — it
+reads the conflicted paths out of the index, then aborts back to exactly where it started and
+proves the restoration against the dirty set it captured *before* the attempt, because integrating
+the next workstream onto a half-merged branch is the failure that has no good recovery. **Nothing
+partial is delivered**: if any accepted workstream never reaches the integration branch, the
+campaign says so and delivers nothing, and every branch is still made durable.
+
+Last, once every workstream has merged, one `CPT·VALIDATOR` runs on the integrated branch. It asks
+a different question from an Inspector's: not "does this diff do what it was cut to do" but "is
+this the thing that was asked for". It holds the spec's `verify` commands as exact-match rules so
+it can run them, and it reads the acceptance gate's mechanical output as *evidence* rather than as
+an answer — the gate says whether the commands pass, the validator says whether that amounts to
+the feature. A validator that refuses sends the integrated branch back to one more engineer,
+working in the integration tree on the integrated branch, under a validation budget that is
+separate from each workstream's retry budget rather than shared with it. One pool across N
+concurrent workstreams turns a budget into a race.
+
+The validator is **skipped** whenever the campaign did not segment, any workstream ended other
+than delivered, integration failed, the acceptance gate never passed inside the budget, or an
+abort landed in between. That list is why the next section matters.
+
+### The Inspector may now write tests, and it is not the permission model that stops it lying
+
+The design wants the reviewer to write the test that exercises its own finding. So on a segmented
+campaign an Inspector is granted the editing tools, scoped to test paths — 27 rules over
+`test/**`, `tests/**`, `spec/**`, `__tests__/**`, `**/*.test.*` and four more — with every
+non-test file already on the branch named on its deny half. The grant is **per spawn, by the
+supervisor, never by the role table**: `ROLE_WRITES_FILES.INSPECTOR` is still `false`, and
+`permissionsFor` refuses a loadout that disagrees with it.
+
+An inspector that can write can make its own verdict pass. The first attempt at containing that
+was measured and found inert, and the measurement is the interesting part. The Inspector runs on
+codex, and the codex adapter reads `spec.deny` to build sandbox roots and **never reads
+`spec.allow` at all** — so a scoped allow-list on that role is not weakened there, it is absent.
+The shipped posture is `unguarded`, which drops argv scoping. And a bare `Bash` writes the tree
+with `sed -i` whatever an editor is scoped to. On the configuration this project ships, neither
+half of the permission rule bites.
+
+**What holds is supervisor-side and harness-independent.** The tree is read before the reviewer
+spawns and again after it exits, with `git status --porcelain -z --untracked-files=all`; the
+difference is what that reviewer wrote. Three outcomes, not two: `clean`, `strayed`, and `unread`
+— because "it wrote outside its scope" and "the tree could not be read" are different facts owed
+different explanations, and an unreadable tree is not a clean tree. Either of the last two
+**discards the verdict** and puts the files back. A reviewer can still write. It cannot write and
+be believed.
+
+And the durable artefact follows the fact rather than preceding it. Nothing a reviewer writes is
+committed where it was written: the content is lifted out of the workstream tree, the tree is put
+back as if the tests were temporary, and the files are applied to the integration tree for the
+gate and the validator to execute. They become history only after a validator has actually
+produced a verdict on a tree containing them, and if none ever does they are withdrawn and nothing
+on any branch ever claimed otherwise. That is the fourth precondition, and its first spelling was
+a boolean handed in at spawn time — a claim about a future, at a call site, which is exactly the
+shape this codebase's permission model exists to avoid. It could not be false, because nothing
+computed it; and it was routinely wrong, because of that skip list above. Two workstreams and one
+refusal was enough: zero validators ran, both inspectors held all 27 rules, and a reviewer's test
+sat committed on a durable branch under a note saying a validator would run it.
+
+The `CPT·VALIDATOR` itself may write **nothing at all**, test paths included. It is the last agent
+of the campaign, so a test it wrote would be executed only by the run whose verdict it supports.
 
 ## The spec, and why the workers are cheap
 
@@ -269,11 +493,13 @@ So the cheap default is **coupled to the brief, not chosen despite it**:
   in `src/command/campaign.ts`. Failing toward *more* reasoning when the brief is thin is the safe
   direction, and it is what the trial's one reliable thin-brief success actually needed.
 
-A spec has six fields, and all six are required: objective, files in scope, acceptance, behaviours
-and edge cases, decisions already made, and constraints. Validation is **structural only** —
-present, single line, within caps. It never judges content, because you approve the spec before
-anything spawns and a validator that filled a gap in would have answered one of the six questions
-itself.
+A spec has seven fields and six of them are required: objective, files in scope, acceptance,
+behaviours and edge cases, decisions already made, and constraints. The seventh is `verify`, the
+executable half of `acceptance`, and it is optional because not every task has a runnable check
+and forcing one would produce `true` and a gate that is theatre — see the next section for what it
+buys and what its absence costs. Validation is **structural only** — present, single line, within
+caps. It never judges content, because you approve the spec before anything spawns and a validator
+that filled a gap in would have answered one of the six questions itself.
 
 ```sh
 army campaign --spec ./spec.json          # a spec you wrote
@@ -310,11 +536,14 @@ every file that has ever existed. Three Engineers ran for 37.6 minutes and $8.86
 succeeded, with tests passing** — and nothing was delivered, because nothing in the system could
 tell an unpassable command from a failing branch.
 
-So every `verify` command is now run once against the untouched worktree before the first Engineer
-is dispatched, and what it said is kept. Two things come of that. The failing ones are printed
-immediately, seconds after you approve a dispatch rather than half an hour into it. And when the
-gate runs for real, a command that says *nothing the baseline had not already said* is flagged: it
-did not distinguish the work from its absence.
+So every `verify` command is now run once against an untouched tree before the first Engineer is
+dispatched, and what it said is kept. Two things come of that. The failing ones are printed
+immediately — in `army chat` they are printed *before* the approval prompt, and a command a shell
+cannot execute means no prompt is offered at all, which is
+[the alignment gate](#before-anything-is-built-a-scout-and-a-gate-that-is-not-a-keystroke). And
+when the gate runs for real, a command that says *nothing the baseline had not already said* is
+flagged: *"`false` failed identically with and without the work — it exited 1 against the untouched
+tree too, so on this attempt it did not distinguish the work from its absence."*
 
 One such reading is a warning, not a verdict — an Engineer that committed something useless
 produces the identical reading, and it deserves its retry. Two in a row is where the explanations
@@ -361,35 +590,19 @@ flat, because the sentence reads fine either way.
 A campaign is one objective, decided up front. `chat` is the other shape: a live session with a
 **COL·COMMANDER** that can raise work mid-conversation.
 
-It will not propose a dispatch until it can fill all six spec fields. It interrogates one question
-at a time, carries its own recommended answer on each so you can agree with a word, and when you
-genuinely do not know something it records the decision it took on your behalf under *Decisions
-already made* and says so. The failure being replaced is the assumption nobody wrote down.
+It will not propose a dispatch until it can fill all six required spec fields. It interrogates one
+question at a time, carries its own recommended answer on each so you can agree with a word, and
+when you genuinely do not know something it records the decision it took on your behalf under
+*Decisions already made* and says so. The failure being replaced is the assumption nobody wrote
+down.
 
 ```sh
 army chat
 army chat --rung 2          # highest rung any dispatch may attempt, still clamped by the ceiling
-```
-
-```
-▌ I want calc.js to also export a multiply function. Propose the objective.
-
-◆ I haven't read `calc.js` — I don't know whether it uses CommonJS or ESM, so I'm keeping
-  the objective about behaviour, not style, so it can't drift into a rewrite.
-
-  ```army-dispatch
-  {"objective": "Add a multiply function to calc.js that returns the product of its two
-   numeric arguments, and export it alongside the existing exports using the same
-   module/export style already in that file; leave existing functions unchanged."}
-  ```
-
-  ◇ dispatch this? [y/N] y
-  ◇ cpt-01 ENGINEER (ok)  →  cpt-02 PASS (NO TESTS RUN)
-  delivered · branch army/t-e12c2e318b38 · rung 0 (commit) · worktree released
-
-◆ Delivered, first attempt, verdict pass. One caveat worth your attention: `testsRun: false`.
-  There's no package.json, so nothing verified the behaviour beyond the Inspector reading
-  the diff. The claim that it multiplies correctly rests on review, not execution.
+army chat --attempts 5      # Engineer attempts per dispatch, including the first. Default 3
+army chat --overseer        # put a MAJ·OVERSEER over each dispatch, as `campaign --overseer` does
+army chat --concurrency 4   # workstreams at once, with an overseer. Shown on the status block
+army chat --plain           # no pinned status block, for a terminal that lies about being one
 ```
 
 **The commander's entire loadout is `TodoWrite`.** Read, Grep, Glob, Edit, Write, Bash and
@@ -397,21 +610,185 @@ network are all denied to it by the same permission layer that governs every wor
 tool rather than an empty list, deliberately: an empty allow-list makes the harness omit
 `--allowedTools` altogether, and the worker then inherits every tool there is — so "no tools" is
 the most permissive thing this program can start, not the least.
-That is why it says *"I haven't read calc.js"* — not modesty, and not an instruction it was given
-that it might ignore. Asked directly to read a file, it answers that the function is not there to
-call. This is the point of the rank: the window holding your objective cannot be spent one source
-file at a time, because spending it that way is not an available action.
+When it says it has not read a file, that is not modesty and not an instruction it was given that
+it might ignore. Asked directly to read one, it answers that the function is not there to call.
+This is the point of the rank: the window holding your objective cannot be spent one source file
+at a time, because spending it that way is not an available action. What it does instead is ask
+for a scout — see below.
 
-**Nothing is dispatched without a keystroke.** The commander proposes; you approve. Everything it
-raises goes through the gate `army campaign` uses — the same code, so the same independent
-Inspector briefed from the objective and the branch, the same durability, the same ceiling clamp.
-`--rung` sets a maximum for the session and is itself clamped; it can lower, never raise.
+**Nothing is dispatched without a keystroke, and the keystroke is no longer the whole gate.** The
+commander proposes; a mechanical gate runs; you approve last. Everything it raises then goes
+through the gate `army campaign` uses — the same code, so the same independent Inspector briefed
+from the objective and the branch, the same durability, the same ceiling clamp. `--rung` sets a
+maximum for the session and is itself clamped; it can lower, never raise.
 
-**Ctrl-C stops the turn, not the session.** The interrupt is a control message on stdin rather
-than a signal, so an answer in flight aborts in milliseconds and the same session takes your next
-line. During a dispatch it refuses instead, and says why: only the campaign's own cleanup can
-settle a lease, and abandoning one mid-flight is how a worktree leaks. A second Ctrl-C, or
+**Ctrl-C means one thing at a time, and never "kill sixteen agents".** The interrupt is a control
+message on stdin rather than a signal, so an answer in flight aborts in milliseconds and the same
+session takes your next line. Where the session is decides what it stops, and each press does
+exactly one of these: with a worker's question open it leaves the question unanswered and hands
+the session back, and the dispatch keeps running and keeps its worktree; during the alignment gate
+it stops the gate, and every command it did not reach is recorded as unrun rather than as passed;
+during a dispatch it waits, because only the campaign's own cleanup can settle a lease and
+abandoning one mid-flight is how a worktree leaks. **Ending a running campaign is `/stop`**, which
+confirms first. None of those presses arms the exit — one gesture, one meaning — so the press
+after any of them lands wherever the session is by then. A second Ctrl-C at an idle prompt, or
 Ctrl-D, exits.
+
+### Before anything is built: a scout, and a gate that is not a keystroke
+
+A commander that holds no reader cannot answer "how does this repository do X today", and the
+honest move is not to guess. So it may ask for a **`CPT·SCOUT`**: a reader that holds Read, Grep,
+Glob and the web, writes nothing, and **holds no worktree**, because a lease exists to isolate a
+writing worker's changes and a scout makes none. It gets its own `[y/N]`, separate from the
+dispatch prompt, because a reader and a writer are different decisions and should not share a key.
+
+```
+  ◇ proposed recce
+     how does calc.js export its functions today?
+     a CPT·SCOUT reads the repository and the web. It writes nothing, holds no
+     worktree, may field at most 4 subordinates and none of them may field any,
+     and has 10 minutes.
+  ◇ send a scout? [y/N] y
+  ◇ scouting — one CPT·SCOUT, reading only.
+
+  ◇ cpt-01 reported — the words below are the SCOUT'S, not this process's, and 2
+    subordinate(s) contributed to them.
+     calc.js has a single named export, add, defined as an arrow function
+     · calc.js:1 `export const add = (a, b) => a + b;` — one named export, no
+       default
+     · there is no test directory and no package.json test script in the
+       repository
+     ? could not determine: whether anything outside this repository imports
+       calc.js
+     it is carried into the segmentation of anything dispatched from here.
+```
+
+A scout is the first fan-out this project has bounded on purpose rather than by accident, and its
+three ceilings are worth different amounts. **Depth** is the harness's: a Captain may field the
+subagent ranks, and a Sergeant fields nothing, so the nesting cap that goes onto the worker's
+environment is 1 — derived from the rank table rather than typed in. **Count** is the supervisor's,
+because a roster names who may be fielded and has no position for how many: distinct spawn
+identities are counted off the normalised event stream and the crossing kills the process. That
+kill costs something and the cost is stated where it happens — a unit still fanning out has
+usually not answered yet, so the common outcome of a halt is a recce with nothing to show. An
+`interrupt()` was tried first and was measured dead: the soldier's stdin is closed immediately
+after its orders, so by the time any event reaches the listener the adapter's `interrupt()` rejects
+with `is not running`, and every crossing fell through to the kill anyway. **Cost** is arithmetic —
+at most 1 + 4 = 5 model sessions in one process inside 10 minutes — plus a session ledger that
+refuses a further recce once cumulative reconnaissance spend crosses $5.
+
+A crossing looks like this, and the last paragraph is the ceiling saying what it cost you rather
+than congratulating itself:
+
+```
+  ◇ scouting — one CPT·SCOUT, reading only.
+  ⚠ scout stopped — it fielded more than 4 subordinates
+
+  ◇ cpt-01 reported — the words below are the SCOUT'S, not this process's, and 7
+    subordinate(s) contributed to them.
+     calc.js has a single named export, add, defined as an arrow function
+     …
+  ! the scout fielded 7 subordinates, past the ceiling of 4, and its process was
+    killed. Every one of them runs inside that process and is billed to the same
+    subscription, so an uncapped fan-out spends the budget before an Engineer
+    has been raised. Anything it had already reported is above; a scout that had
+    not answered yet returns nothing, which is what a ceiling that stops rather
+    than asks actually costs.
+```
+
+The live line quotes the ceiling and the account afterwards quotes the final measured count. They
+differ — 4 against 7 — because events keep arriving through the kill, and reporting the same number
+twice would mean one of them was a guess.
+
+Note the reporting line. Everything under it is the scout's own words, and the screen says so
+before printing any of them, because a subordinate's prose entering a commanding context is
+exactly where a briefing gets forged. The finding is capped by schema and neutralised once, at
+capture.
+
+**Then the alignment gate, and the keystroke is last.** A dispatch that carries a spec begins
+phase 2 only when three things hold, in this order: every required field is answered, every
+verification command **executes** against the base commit, and you confirm. That ordering is the
+change. What it replaces was one keystroke on a printed objective, which is a confirmation of
+nothing in particular.
+
+```
+  ◇ running the spec's verification commands against the base commit…
+      baseline: `true` exited 0 against the base tree
+      baseline: `false` exited 1 against the base tree
+
+  ◇ alignment gate
+    ✓ spec         every required field answered (6 of them; verification
+                   commands are the optional seventh)
+    ✓ criteria     2 of 2 executed against 19cc6aa
+      ✓ `true`
+          exit 0 at base — already green before any work. It is a real check and
+          it will not be the one that proves the feature.
+      ✓ `false`
+          exit 1 at base — a red criterion, which is the normal starting point.
+          The reading is recorded, so phase 3 can tell a test that was already
+          failing from one the work broke.
+
+  ◇ dispatch this? [y/N] y
+  ◇ spec written to docs/army-specs/pty-w5-gatered/spec.md
+  ◇ dispatching — Engineer, then an independent Inspector.
+```
+
+**The second condition is the load-bearing one and its two halves are kept apart everywhere.** A
+command that *executes* and exits non-zero **passes**, with its reading banked, because a red test
+is where work starts and `node --test` should fail before the feature exists. A command a shell
+cannot execute, one that returns no exit code, and one still running at the deadline all **fail**,
+because each has told the system nothing — `src/contracts/verify.ts` already draws that line: a
+non-zero exit says the work is wrong, a timeout says nobody found out. Collapsing "failed" into
+"could not run" is the mistake that would make this gate refuse every honest red test in existence.
+
+When it fails, no keystroke is offered at all:
+
+```
+  ◇ running the spec's verification commands against the base commit…
+      baseline: `army-no-such-tool-w5 --check` exited 127 against the base tree
+
+  ◇ alignment gate
+    ✓ spec         every required field answered (6 of them; verification
+                   commands are the optional seventh)
+    ✗ criteria     0 of 1 executed against 41c63c9
+      ✗ `army-no-such-tool-w5 --check`
+          a shell could not execute it — exit 126 is found-but-not-executable
+          and 127 is not-found. That is a fact about the command rather than
+          about the work, and it will be just as true after an Engineer, so this
+          campaign could never pass its own gate.
+
+  ◇ not dispatched — the alignment gate did not pass.
+```
+
+That is the $8.86 incident closed at the front instead of half an hour in. A spec with no `verify`
+commands passes, loudly: the absence is reported, the screen says nothing was executed and phase 3
+has no baseline, and `AcceptanceResult.ran` says the same thing one phase later. A proposal with
+**no spec at all** does not enter the gate — the free-text path stays exactly what it was, and it
+is visibly the worse deal rather than the cheaper one, because a spec-less brief escalates the
+Engineer to the most expensive reasoning class there is:
+
+```
+  ◇ alignment gate — NOT RUN
+     This proposal carries no spec, so there is nothing to align: none of the six questions was
+     asked, no verification command exists to run against the base commit, and phase 3 will have no
+     baseline to compare against. The Engineer is escalated to the highest reasoning class to make
+     up for it, which is the most expensive way to answer a question a sentence would have settled.
+```
+
+**What phase 1 leaves behind.** The settled spec, the interrogation that produced it, and the
+gate's readings go to the campaign archive as `spec.md`, `spec.json` and `interrogation.md` under
+`agents/col-01/`, unconditionally and with no key that turns it off — a decision record with an
+off switch is a record nobody can rely on being there. `[planning] spec_to_repo` in `config.toml`
+decides whether the *same three documents* also land in the checkout, under
+`docs/army-specs/<campaign-id>/`. It is **off by default**, because a rejected branch should not
+strand design documents in the repo: a campaign that ends `inspector-failed` still produced a spec,
+and with this on that spec is an untracked directory describing a feature nobody shipped. Turn it
+on when the spec is meant to be reviewed next to the diff. One function renders both copies, so
+they are byte-identical by construction rather than by a test.
+
+The three transcripts above came from real sessions driven under a pty, with stand-in vendor CLIs
+on `PATH` — the screen is production code and the bytes are what a terminal received; the
+commander's and the scout's words are the stand-in's.
 
 ### An answer reads as an answer, and your words read as yours
 
@@ -435,10 +812,113 @@ Your own turns are a block, not a label. Every row of a submitted entry carries 
 the left edge and wraps to the window like the answers do, so the two voices are two regions on
 the screen rather than two kinds of sentence. The composer accepts multiline input the way Claude
 Code does: a trailing `\` then Enter continues on the next line under a dim `…` prompt, and the
-whole entry lands as one bar-marked block and one message. Streaming survives it: answers render line by line as they
+whole entry lands as one bar-marked block and one message. Pasted text is one message too. A
+newline inside a paste ends the row and not the turn, so a dictated paragraph reaches the
+commander whole rather than as its first line plus four interruptions of the answer to it. The
+terminal's bracketed paste mode is what tells the two apart, and where a terminal does not offer
+it, a line break with more bytes behind it in the same read is read as pasted. A paste never
+sends by itself: your Enter does. Streaming survives it: answers render line by line as they
 arrive, and a commander that stalls mid-sentence has its held words printed after a beat rather
 than hidden, so the wedge is visible with everything it managed to say. Piped or redirected,
 none of this engages and the transcript stays raw bytes (`src/view/prose.ts`).
+
+### A worker can stop and ask you
+
+An Engineer that hits a decision it has no authority to make reports `blocked` with a question
+instead of guessing, and the question climbs to your terminal while the dispatch is still running.
+It arrives as a block that marks whose words are whose: the agent, the task and the branch are the
+supervisor's own facts, and everything the worker wrote is quoted under a heading that says so.
+
+```
+  ? QUESTION 1 · cpt-01 · workstream t-f14690b69c1b
+  ◇ cpt-01 (CAPTAIN·ENGINEER) is blocked and is asking.
+    attempt 1 · task t-f14690b69c1b · branch army/t-f14690b69c1b
+    objective   add a multiply function to calc.js
+
+    ITS QUESTION, in its own words:
+      > should multiply() throw on a non-number, or coerce it?
+
+    ITS ACCOUNT of where it got to:
+      > the objective needs a decision I cannot make
+
+    WHAT IT SAYS IT TRIED OR RULED OUT:
+      > blocker: both spellings are defensible
+    a blank answer, or Ctrl-C, leaves the question unanswered.
+  ◇ your answer
+```
+
+**A question climbs one rung at a time.** With an overseer over the campaign, the `MAJ·OVERSEER`
+is asked first, and it answers only what it owns: `answer: null` is a first-class return that
+sends the question on to you unchanged, and declining is what makes the rung worth having rather
+than a rung that guesses. A wrong answer there is more expensive than a question that reaches a
+human, because nothing above it will look at it again. Without an overseer the question comes
+straight to you, which is what this looks like.
+
+**That prompt is not the composer.** Everything typed at `▌` goes to the commander; this one line
+goes to a worker that is holding a worktree and waiting, so the two never share a prompt — and it
+reads only what you type after seeing the question. Anything you had already typed while the
+dispatch ran stays queued for the commander and reaches it, in order, once the dispatch is over.
+That is a property of the *line* rather than of the read, and it is written that way because it
+broke three times when it was a property of the read: a line inherits the addressee of the prompt
+it was typed under, a read consumes only lines addressed to it, and the field is required, so
+omitting it is a compile error rather than a missing guard. A half-typed draft caught by the prompt
+changing under it is not eaten either — it is displaced to the commander's queue, and the session
+says so in as many words: *"the line you were typing was addressed to the prompt that just
+changed. It is queued for the Commander rather than sent to this one"*.
+
+A blank answer, Ctrl-C, or a closed terminal all mean the same thing: the question goes unanswered,
+the block ends that attempt, and the branch and the worktree are settled the way any other ending
+settles them. The status block says which of the two states you are in while it is true.
+
+**Several questions queue rather than interrupt.** Each arrives as a block in scrollback under its
+own `? QUESTION n` marker naming the agent and the workstream that raised it, and the count of what
+is open sits on the status block. Nothing seizes what you were typing. With one open, typing
+answers it and the prompt says so; with several, the prompt names the one you are answering and
+`/next` cycles. While a question is outstanding its workstream parks and holds its worktree, and
+every sibling workstream keeps running.
+
+An answer resumes the work as a fresh Engineer against the same task in the same worktree, briefed
+with your decision, and answering does not spend an attempt from the retry budget — a worker that
+stops to ask should not end up with fewer tries than one that guessed. There are two counters and
+exactly one line where they diverge. `MAX_QUESTION_ROUNDS` is 3 and bounds it, per workstream
+rather than per campaign, for the same reason the retry budget is per workstream: one pool across N
+concurrent workstreams turns a budget into a race. Both halves are in the archive as linked `query`
+and `answer` signals, so `army view` reads back what was asked and what you said. Run headless
+(`army campaign` in a script) there is nobody to ask: the block ends the attempt, and the
+unanswered question is still recorded, because a campaign that stopped on a question nobody was
+there to answer is a thing you want to be able to see afterwards.
+
+A `blocked` report **may** carry a question and is not required to. Requiring it was tried and
+withdrawn: JSON Schema cannot express "required when another property equals a value", so a model
+that followed the schema and skipped the prose lost its *whole* report to the validator — no
+`report.json`, and the block's own account of itself gone from the archive. A block with a question
+climbs; a block without one is terminal exactly as it was before, and everything the worker did say
+is still on disk.
+
+### `/stop`, `/work` and `/next`
+
+Three commands exist because a campaign is no longer something you sit and watch.
+
+**`/stop`** ends the running campaign, and confirms first, because every worktree in flight has to
+be settled rather than dropped. It tells you how many agents it is about to end before it asks.
+Ctrl-C never means this. A line typed while the confirmation is armed and which is not a yes or a
+no is not swallowed as a decline — it is re-routed, so it can still be another slash command, and
+otherwise it is queued for the Commander as your next turn. It is explicitly *not* eligible to
+become a parked worker's answer: a sentence typed at `stop the campaign? [y/N]` was not typed for
+an engineer.
+
+**`/work <id>`** prints one agent or workstream into scrollback: its rank and state and why, its
+task, its harness and model, its worktree, its cost, its branch read off the task rather than off
+the model's own summary, the head of its `orders.md`, and a diffstat. It prints rather than opens,
+because a pager would need the alternate screen this interface deliberately does not use. It
+answers after the dispatch has ended, too.
+
+**`/next`** moves to the next open question. It cycles; it does not answer, skip or remove
+anything.
+
+The session's own budget is on the status block from the first spawn: agents raised against the
+concurrency cap, and what has been spent. A tree that can grow to dozens of agents should never be
+a surprise on a bill.
 
 ### The session tells you where you are
 
@@ -466,22 +946,32 @@ where that place was never named was the one that dispatches Engineers into it.
 ```
 
 The block under the prompt is repainted in place rather than scrolled, so it is still there an
-hour later. It carries the branch and whether it is dirty, the project, the commander's model, the
-rung a dispatch will ask for, and what the session has spent — and while a dispatch runs, **a row
-per unit in flight, each with its own clock**:
+hour later. Its last row is the context row and never moves, so the eye learns one position: the
+branch and whether it is dirty, then whatever the session most needs to say, then the questions
+open, the agents raised against the concurrency cap, the spend, the project, the model and the
+rung. Above it, **while a dispatch runs, the campaign's live tree**:
 
 ```
-  · CPT·ENGINEER · cpt-01 returned – the session is read once per request and cached
-  ⠋ CPT·INSPECTOR · cpt-02 working 1m12s
-  main*↑2 · dispatch in flight — Ctrl-C lets it settle · calc · claude-opus-5
+└─ ▸ add a multiply function …  —         —    —  blocked    —                    1 attem…   5s ago
+   └─ ◇ CPT·ENGINEER · cpt-01   CPT       1   -2  dead       agent-row:exited     exited,…   5s ago
+  main · asking: type to answer, Ctrl-C to skip · 1 question open · 1/1 agents · $0.50 · repo
 ```
 
-That last row is the block earning its place. Ctrl-C behaves differently during a dispatch than
-anywhere else in the session — it waits, because a campaign holds a worktree lease only its own
-cleanup may settle — and that is a surprising rule to meet for the first time by pressing the key.
+**That tree is not a second renderer.** It is the same `TreeModel` `army view` builds from the
+campaign's own archive files, drawn by the same function, truncated to the rows the block is
+allowed — never more than a third of the window, with three rows held back. When it does not fit,
+rows are scored and the *running* ones are kept over the finished ones, and one row accounts for
+what was dropped and points at `army view` for the rest. A running unit is never dropped to keep a
+settled one.
+
+The context row is the block earning its place. Ctrl-C behaves differently during a dispatch than
+anywhere else in the session, and differently again with a question open, and the row says which
+you are in while it is true — that is a surprising rule to meet for the first time by pressing the
+key.
 
 It degrades rather than guesses. `git` unavailable, or a `git status` that times out, renders as an
-absent branch and never as a clean one. A terminal too short for the block gets no block. Piped or
+absent branch and never as a clean one. A terminal too short for the whole block gets **no block at
+all** rather than a trimmed one, which is why the tree does its own arithmetic first. Piped or
 redirected there is neither block nor git probe, because escape bytes in a saved transcript are a
 corruption rather than a feature. `--plain` turns the painted rows off on a terminal that reports
 itself as one and does not honour cursor movement — an editor's embedded console, a CI runner with
@@ -505,7 +995,8 @@ The supervisor now narrates the run. Finished tool calls scroll past as they hap
   ⏺ Bash(node --test 2>&1)
 ```
 
-and the pinned row carries whichever unit is in flight:
+and where the block cannot draw the tree — the archive unreadable, or a window under 38 columns —
+it falls back to a roster, one row per unit in flight with its own clock:
 
 ```
   ⠸ CPT·ENGINEER · cpt-01 working 3m19s – Bash(node --version) · 3m03s ago · thinking 18k
@@ -549,17 +1040,33 @@ army view --list            # what is in the archive
 army view <id> --follow     # poll and redraw, no fs.watch and no native dependency
 ```
 
+This is the segmented campaign from further up, read back after it finished:
+
 ```
-* add a multiply function to calc.js - 2026-08-03-add-a-multiply-function-to-calc-js - done
-  2 tasks - 2 attempts - ranks CPT - depth 1-1 - busy 0 idle 0 unknown 0 dead 2
+☆ add multiply and divide to calc.js · 2026-09-01-add-multiply-and-divide-to-calc-js · done
+  /private/tmp/doc-conflict-yb8gUQ/repo
+  9 tasks · 8 attempts · ranks MAJ→CPT · depth 1–1 · busy 0 idle 0 unknown 0 dead 8
 
-UNIT                      RANK  DEPTH  GAP  STATE      WHY                   DOING              WHEN
-`- > add a multiply f...  -         -    -  done       -> cpt-01             army/t-b5ad...   9s ago
-   |- o CPT.ENGINEER ...  CPT       1   -1  dead       agent-row:exited      exited, exit 0   1m ago
-   `- > review army/t...  -         -    -  done       -> cpt-02             army/t-b5ad...   9s ago
-      `- o CPT.INSPEC...  CPT       1   -1  dead       agent-row:exited      exited, exit 0   9s ago
+UNIT                            RANK  DEPTH  GAP  STATE      WHY                   DOING        WHEN
+└─ ▸ add multiply and divide …  —         —    —  done       —                     army/t-…   8m ago
+   ├─ ▸ segment: add multiply…  —         —    —  done       → maj-01              1 attem…   8m ago
+   │  └─ ◈ MAJ·OVERSEER · maj…  MAJ       1   -1  dead       agent-row:exited      exited,…   8m ago
+   ├─ ▸ add and export multip…  —         —    —  done       → cpt-01              army/t-…   8m ago
+   │  ├─ ◇ CPT·ENGINEER · cpt…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
+   │  └─ ▸ review army/t-8616…  —         —    —  done       → cpt-04              army/t-…   8m ago
+   │     └─ ◇ CPT·INSPECTOR ·…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
+   ├─ ▸ add and export divide…  —         —    —  done       → cpt-02              army/t-…   8m ago
+   │  ├─ ◇ CPT·ENGINEER · cpt…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
+   │  └─ ▸ review army/t-8616…  —         —    —  done       → cpt-03              army/t-…   8m ago
+   │     └─ ◇ CPT·INSPECTOR ·…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
+   ├─ ▸ Reconcile army/t-8616…  —         —    —  done       → cpt-05              army/t-…   8m ago
+   │  ├─ ◇ CPT·ENGINEER · cpt…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
+   │  └─ ▸ review army/t-8616…  —         —    —  done       → cpt-06              army/t-…   8m ago
+   │     └─ ◇ CPT·INSPECTOR ·…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
+   └─ ▸ validate army/t-8616d…  —         —    —  done       → cpt-07              army/t-…   8m ago
+      └─ ◇ CPT·VALIDATOR · cp…  CPT       1   -2  dead       agent-row:exited      exited,…   8m ago
 
-  read-only - source files - 2026-08-03T02:51:15.930Z
+  read-only · source files · 2026-09-01T21:34:00.575Z
 ```
 
 **Read-only is enforced, not promised.** The default source is the files, so the common path
@@ -574,8 +1081,12 @@ real state rather than a confident guess: no stream, no events, or silence past 
 all report as `unknown` rather than as `idle`.
 
 `RANK` and `DEPTH` are separate columns on purpose. Rank is assigned by the spawner and must be
-strictly junior to it; it is not derived from depth. A `GAP` of `-1` above is normal — a General
-detaching a Captain directly skips two ranks. A *positive* gap is the anomaly, and gets a `!`.
+strictly junior to it; it is not derived from depth. `GAP` is depth minus rank seniority, so the
+two values above are both normal and both mean something: the `-1` on the overseer is a General
+detaching a Major and skipping COLONEL; the `-2`s are a Captain detached directly, skipping
+COLONEL and MAJOR. A *positive* gap is the anomaly — more nesting levels than ranks consumed,
+which is only possible if a spawn failed to go strictly junior — and those rows get a `!` and are
+listed.
 
 ## `army rebuild`
 
@@ -589,7 +1100,7 @@ army rebuild <campaign-id>  # one
 ```
 
 ```
-2026-08-03-add-a-multiply-function-to-calc-js  tasks 2  agents 2  signals 9  events 55
+2026-09-01-add-multiply-and-divide-to-calc-js  tasks 9  agents 8  signals 31  events 32
 ```
 
 It exits 1 if rows were present in the files but did not make it into the index, and names every
@@ -645,7 +1156,7 @@ refused and never ran). Three codes because a script needs to tell the second fr
 
 ```
 ~/.agentic-army/
-  config.toml                      # ceilings + dispatch rules + hooks. Yours to edit.
+  config.toml                      # ceilings + dispatch rules + hooks + planning. Yours to edit.
   campaigns/<date>-<campaign>/
     campaign.db                    # the INDEX: agents, tasks, signals, timings, cost
     campaign.json                  # truth. campaign.db is rebuilt FROM these, never the reverse
@@ -653,10 +1164,15 @@ refused and never ran). Three codes because a script needs to tell the second fr
     agents/cpt-01/
       agent.json                   # truth
       orders.md  report.json  report.md  stream.jsonl  diff.patch
+    agents/col-01/
+      spec.md  spec.json  interrogation.md   # what phase 1 settled. Always written.
   mirrors/<basename>-<hash>.git    # durability when a project has no remote
 
 ~/.agentic-army-trees/             # the leased worktree pool, created on first use
-  trees/<project>-<hash>/wt-01/    # one leased worktree per slot
+  trees/<project>-<hash>/wt-01/    # one leased worktree per slot; the integration tree is one too
+
+<your repo>/
+  docs/army-specs/<campaign-id>/   # the same three documents, ONLY with planning.spec_to_repo
 ```
 
 The pool is a **sibling** of `~/.agentic-army`, not a directory inside it, and it does not follow
@@ -672,9 +1188,9 @@ default and opens no database at all. The mirror name carries a hash of the proj
 path because two checkouts sharing a basename would otherwise share a mirror and collide on
 identical `army/<task-id>` branches.
 
-Reports never land in your repositories. `AGENTIC_ARMY_HOME` relocates this whole directory,
-including every ceiling in it — it is read from your own environment at startup, and a
-supervisor must never accept it from a worker.
+Reports never land in your repositories, and the one thing that can is off by default and named
+above. `AGENTIC_ARMY_HOME` relocates this whole directory, including every ceiling in it — it is
+read from your own environment at startup, and a supervisor must never accept it from a worker.
 
 ## Development
 
@@ -703,41 +1219,73 @@ exercised end to end while writing it and what was not. Everything below was run
 a checkout, against a throwaway git repository, with `AGENTIC_ARMY_HOME` pointed at a temporary
 directory.
 
-**Run, and the output is what you see above:** `doctor` (fully ok, and again with `codex`/`gh`
-removed from `PATH` and `ANTHROPIC_API_KEY` set, to see all three degradations and exit 0);
-`init`, twice, for the idempotence claim; `enlist`, and `enlist --ceiling 2` and `--ceiling 3`
-non-interactively to see the refusal and the exact config line it prints instead; `campaign`,
-end to end, Engineer through Inspector to durability; `chat`, against real claude and codex —
-one objective proposed, approved at the prompt, dispatched through the gate to a rung-0
-delivery, plus the refusal when the commander was asked to read a file, and a live interrupt
-mid-answer; `view`, `view --list`, `view --source db`,
-`view --follow`; `rebuild`; `trial`, five times against live claude across two seeds — 32 arms
-spawned, 30 of which produced a result. What that measured is written up under
+There are now three grades of evidence behind this document and they are not interchangeable, so
+they get three headings rather than one list.
+
+**Run against live claude and codex, and the output is what you see above:** `doctor` (fully ok,
+and again with `codex`/`gh` removed from `PATH` and `ANTHROPIC_API_KEY` set, to see all three
+degradations and exit 0); `init`, twice, for the idempotence claim; `enlist`, and
+`enlist --ceiling 2` and `--ceiling 3` non-interactively to see the refusal and the exact config
+line it prints instead; `campaign`, end to end, Engineer through Inspector to durability; `chat` —
+one objective proposed, approved at the prompt, dispatched through the gate to a rung-0 delivery,
+plus the refusal when the commander was asked to read a file, and a live interrupt mid-answer;
+`view`, `view --list`, `view --source db`, `view --follow`; `rebuild`; `trial`, five times across
+two seeds — 32 arms spawned, 30 of which produced a result. What that measured is written up under
 [What a trial measured](#what-a-trial-measured) below. The `army` spelling in the first column of
 [First run](#first-run) was checked too, against a built `dist/` on `PATH`, because the claim
 that suggestions match your invocation is only interesting if it holds in more than one form.
 
-**Implemented but NOT exercised here, so take the description and not a demonstration:**
+**Run with stand-in vendor CLIs on `PATH`, so the screen is real and the model is not.** Everything
+above the vendor CLI is production code — the supervisor, the permission layer, the worktree pool,
+git, the archive, the renderer — and the transcripts of it in this README are the bytes those runs
+emitted. What is *not* demonstrated is anything a real model would have decided. On that footing:
+the whole overseer path (`--overseer`, segmentation, two concurrent workstreams each with its own
+tree and branch, the overlap announcement, a real merge conflict, a reconciliation workstream, the
+`CPT·VALIDATOR`, delivery); `--rung 3` on a ceiling-3 project, reaching the ladder and being
+refused by it for the rung it could not reach; and, driven under a pty on a real terminal in raw
+mode, the `army chat` surface — the scout proposal and its finding, the alignment gate passing and
+refusing, a worker's question arriving and being answered, a half-typed line being displaced to the
+Commander rather than sent to a worker, and the pinned status block with the live tree in it.
 
-- **Delivery rungs 1, 2 and 3 through `army campaign`.** Only rung 0 was run that way. Push,
-  pull request and merge need a real remote and a `gh` login against one, which a throwaway repo
-  does not have.
-- **Rung 3 against a real host.** The merge rung is exercised in `test/delivery.test.ts` against
-  local infrastructure only: real repositories, a real bare repo standing in for `origin`, a real
+**Implemented but NOT exercised end to end at all, so take the description and not a
+demonstration:**
+
+- **The whole of the five waves above against a real objective and real vendor CLIs.** This is the
+  big one and it is worth stating plainly rather than distributing across the bullets below. The
+  overseer, the question ladder's middle rung, per-workstream inspectors, the fix loop, the
+  validator, the scout, the alignment gate and the chat surface have been driven under a pty and
+  through the real supervisor many times, and never once with claude and codex actually behind
+  them on a real repository and a real objective. Every sentence in this README about what those
+  units *decide* — a segmentation a model would return, a question an overseer would decline, a
+  verdict a validator would give — is a claim about the machinery that carries the decision, not
+  evidence about the decision.
+- **Delivery rungs 1, 2 and 3 through `army campaign` against a real host.** Only rung 0 has been
+  delivered that way. The merge rung is exercised in `test/delivery.test.ts` against local
+  infrastructure only: real repositories, a real bare repo standing in for `origin`, a real
   durability push, the real allow-list on every argv, and a stand-in `gh` executable on disk that
-  performs the merge by moving the bare repo's `main`. So "it merged" is a fact about a
-  repository on this machine, and the gates, the argv, the idempotence and the reporting are all
-  demonstrated. What is NOT demonstrated: that the real `gh` accepts these flags, and that
-  GitHub's branch protection refuses the way the stand-in does. Those two remain code claims.
+  performs the merge by moving the bare repo's `main`. So "it merged" is a fact about a repository
+  on this machine, and the gates, the argv, the idempotence and the reporting are all demonstrated.
+  What is NOT demonstrated: that the real `gh` accepts these flags, and that GitHub's branch
+  protection refuses the way the stand-in does.
 - **The spec path against a live commander.** `TechnicalSpec` validation, the effort coupling, the
   `--spec` flag, the interrogation text and every briefing that carries the spec downward are
-  covered by tests and were exercised end to end in-process — a spec parsed out of a dispatch
-  block reaches `renderEngineerOrders` with every entry intact, and `dispatchFor` returns `low`
-  with a spec and `xhigh` without. What has NOT happened is a live `chat` session where a real
-  commander interrogated a real human and produced a spec it then dispatched. The wording of the
-  interrogation is a code claim until that runs.
-- **The retry path.** The Inspector passed on attempt 1, so no second Engineer was fielded.
+  covered by tests and were exercised end to end in-process. What has NOT happened is a live `chat`
+  session where a real commander interrogated a real human and produced a spec it then dispatched.
+  The wording of the interrogation is a code claim until that runs.
+- **A scout's fan-out against a real model.** The count ceiling, the kill at the crossing and the
+  session ledger are all driven and observed under a pty, with a stand-in that fans out on demand.
+  Nobody has watched a real `CPT·SCOUT` choose how many subordinates to field.
+- **Reviewer-written tests reaching a branch.** The authorship reading, the discard on a stray
+  write, the hold-out-of-history and `commitInspectorTests` are covered by tests, and the
+  transcripts above are from campaigns where the repository had no test directory, so
+  `testsArePermanent` was false and nothing was ever held. The path from a reviewer's editor to a
+  commit on the integrated branch has not been walked with a model at the top of it.
+- **The retry path against a real Inspector FAIL.** Every recorded live Inspector passed on attempt
+  1, so no second Engineer has been fielded by a real refusal.
 - **Raising a ceiling from a real TTY.** Only the non-interactive refusal was observed.
+- **The `guarded` permission posture in a real campaign.** The shipped default is `unguarded`, and
+  that is what every run above used. The scoped rules are built and asserted by tests at both
+  postures; no campaign has been fought under `guarded`.
 - **Windows.** Untested, and never claimed otherwise. Paths are built with `node:path` and the
   glyph set falls back to ASCII on a codepage-437 console, but neither has been run there.
 
