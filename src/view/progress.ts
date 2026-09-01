@@ -227,6 +227,42 @@ export function sanitize(text: string): string {
   return out.replace(/\s+/gu, ' ').trim();
 }
 
+/**
+ * `sanitize`, applied a line at a time, for model prose that is stored as a DOCUMENT.
+ *
+ * ## Why the flattening version cannot be reused here
+ *
+ * `sanitize` ends in `.replace(/\s+/gu, ' ').trim()`, which is exactly right for its callers: a
+ * status row, a signal body and a one-line finding are all single lines by contract, and
+ * collapsing whitespace is what makes a two-line summary fit one row. Phase 1 writes something
+ * different — the interrogation transcript and the settled spec, as markdown, into the campaign
+ * archive and (when the config says so) into the repository. Flattening those turns a
+ * conversation into one paragraph and a bulleted list into a sentence, which destroys the artefact
+ * this whole feature exists to produce.
+ *
+ * So the line structure survives and everything a terminal would OBEY does not. The hazard is the
+ * same one `sanitize` names and it is not hypothetical for a file: these documents are read with
+ * `cat` and `less`, both of which honour an escape sequence exactly as a live status row does, and
+ * a U+202E in a spec entry misrepresents a path in a document a human is approving work against.
+ *
+ * Blank lines are preserved and trailing whitespace is not, so a round trip through this is
+ * idempotent and a diff of two transcripts is a diff of what was said.
+ *
+ * ONE ACCEPTED COST, stated because it is a real loss rather than a detail: `sanitize` ends in a
+ * `trim()`, so LEADING INDENTATION inside a line does not survive. A fenced code sample in the
+ * commander's prose comes out flush left. The alternative was a second character filter that
+ * indented differently, and this repo has already watched two copies of one audit drift until the
+ * defect was fixed in the copy nobody used. One table, one filter, one place to widen it.
+ */
+export function sanitizeBlock(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => sanitize(line))
+    .join('\n')
+    .replace(/\n{3,}/gu, '\n\n')
+    .trim();
+}
+
 function clipTo(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }

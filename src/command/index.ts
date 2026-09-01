@@ -67,6 +67,20 @@ OPTIONS
                        that a worker doing its own thinking needs the budget
                        for it.
   --attempts <n>       Total Engineer attempts including the first. Default 3.
+  --overseer           Put a MAJ·OVERSEER over the campaign. It reads the repo,
+                       cuts the feature into workstreams with declared file
+                       ownership, and answers the questions its engineers raise
+                       so they never reach you. It holds Read, Grep and Glob and
+                       cannot edit, run a command or merge; this process performs
+                       every merge it decides on. Off by default: an overseer is
+                       a whole model session spent before an engineer starts, and
+                       a small objective does not need a feature owner.
+  --workstreams <n>    How many workstreams run at once. Default 3, ceiling 8.
+                       Each one is another model session, another worktree and
+                       another branch to merge, so this multiplies what a
+                       campaign costs while only dividing its wall clock. Read
+                       with --overseer; a campaign that segments into one
+                       workstream runs exactly as it did before either flag.
   --cwd <dir>          Project to fight the campaign in. Default: this directory.
   --provider <id>      Worktree provider. There is one pooled provider today;
                        the seam is what lets a devcontainer or a snapshotting
@@ -108,6 +122,10 @@ export interface CampaignArgs {
   campaignId?: string;
   /** Raw `--spec` path, unread and unvalidated. `campaignCommand` does the I/O. */
   specPath?: string;
+  /** True when `--overseer` was passed: spawn a MAJ·OVERSEER over the campaign. */
+  overseer?: boolean;
+  /** `--workstreams N`: how many workstreams may run at once. */
+  maxConcurrentWorkstreams?: number;
   /** False when `--no-init` was passed — mirrors `enlist`, which grew the flag first. */
   init: boolean;
   json: boolean;
@@ -193,6 +211,21 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
         args.specPath = value;
         break;
       }
+      case '--overseer':
+        args.overseer = true;
+        break;
+      case '--workstreams': {
+        // The concurrency cap, and the one number that decides how much a campaign may spend at
+        // once. Refused rather than clamped when it is not a positive integer, for the reason
+        // `--attempts` above is: a budget silently corrected to something the user did not type
+        // is a budget nobody agreed to.
+        const value = Number(next());
+        if (!Number.isInteger(value) || value < 1) {
+          throw new UsageError('--workstreams expects a positive integer');
+        }
+        args.maxConcurrentWorkstreams = value;
+        break;
+      }
       case '--no-init':
         args.init = false;
         break;
@@ -265,6 +298,29 @@ export function renderCampaignResult(result: CampaignResult, self: string = invo
   if (result.delivery !== null) {
     const durability = result.delivery.durability;
     lines.push(`  durable   ${durability.target.kind} ${durability.target.url}`);
+  }
+  // -----------------------------------------------------------------------------------------
+  // THE WORKSTREAMS AND THE CAP, on the screen rather than in a config file. A campaign that can
+  // grow to several concurrent model sessions should never be a surprise on a bill, so the cap
+  // prints beside what it actually bounded. Suppressed for the single-workstream case, where
+  // there is nothing to say that "branch" above has not already said, and where printing it
+  // would change the screen every existing campaign produces.
+  // -----------------------------------------------------------------------------------------
+  if (result.workstreams.length > 1) {
+    lines.push(
+      `  workstreams ${result.workstreams.length}, at most ${result.maxConcurrentWorkstreams} at once`,
+    );
+    for (const ws of result.workstreams) {
+      const overlaps =
+        ws.overlaps.length === 0 ? '' : `, ${ws.overlaps.length} overlap(s) announced`;
+      lines.push(`    ${ws.id}  ${ws.status}  ${ws.branch}${overlaps}`);
+    }
+  }
+  if (result.integration !== null) {
+    lines.push(
+      `  integration ${result.integration.branch} — ${result.integration.merged.length} merged, ` +
+        `${result.integration.conflicts.length} conflict(s), tree ${result.integration.state}`,
+    );
   }
   // -----------------------------------------------------------------------------------------
   // THE ACCEPTANCE GATE, NAMED ON EVERY SCREEN — this is the line the incident on
@@ -531,6 +587,10 @@ export async function campaignCommand(
     ...(args.requestedRung === undefined ? {} : { requestedRung: args.requestedRung }),
     ...(args.maxAttempts === undefined ? {} : { maxAttempts: args.maxAttempts }),
     ...(args.provider === undefined ? {} : { worktreeProvider: args.provider }),
+    ...(args.overseer === true ? { overseer: true } : {}),
+    ...(args.maxConcurrentWorkstreams === undefined
+      ? {}
+      : { maxConcurrentWorkstreams: args.maxConcurrentWorkstreams }),
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
     ...(args.init ? {} : { init: false }),
     // Spread LAST, so a caller that wants its own listener — or none — wins over the default.

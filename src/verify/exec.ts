@@ -32,7 +32,7 @@ import { killProcessTree } from '../setup/checks.ts';
  */
 const HARD_BACKSTOP_GRACE_MS = 1000;
 
-export const runCommand: CommandRunner = (command, cwd, timeoutMs) => {
+export const runCommand: CommandRunner = (command, cwd, timeoutMs, signal) => {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -48,10 +48,15 @@ export const runCommand: CommandRunner = (command, cwd, timeoutMs) => {
     });
 
     const timers: NodeJS.Timeout[] = [];
+    let unlisten: (() => void) | null = null;
     const finish = (exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       for (const timer of timers) clearTimeout(timer);
+      // Removed rather than left on the signal: one `AbortSignal` covers every command in a gate,
+      // so a listener per command that is never taken off accumulates for the length of the run
+      // and keeps a reference to a child that has already gone.
+      if (unlisten !== null) unlisten();
       resolve({ exitCode, stdout, stderr, timedOut });
     };
 
@@ -67,6 +72,24 @@ export const runCommand: CommandRunner = (command, cwd, timeoutMs) => {
       stderr += `\n${error.message}`;
       finish(null);
     });
+
+    // The caller changed its mind — a human pressed Ctrl-C at the alignment gate. The same kill
+    // the deadline performs, WITHOUT `timedOut`: nothing timed out, somebody asked it to stop, and
+    // the two readings are told apart everywhere else in this system. 'close' reports whatever the
+    // command had said by then.
+    if (signal !== undefined) {
+      if (signal.aborted) {
+        killProcessTree(child);
+      } else {
+        const onAbort = (): void => {
+          killProcessTree(child);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        unlisten = (): void => {
+          signal.removeEventListener('abort', onAbort);
+        };
+      }
+    }
 
     // Soft deadline: kill the tree and let 'close' report whatever was captured.
     const soft = setTimeout(() => {

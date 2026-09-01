@@ -17,6 +17,7 @@ import type {
   VerifyOutcome,
 } from '../contracts/verify.ts';
 import { DEFAULT_VERIFY_TIMEOUT_MS, SHELL_CANNOT_EXECUTE } from '../contracts/verify.ts';
+import { sanitize } from '../view/progress.ts';
 import { runCommand } from './exec.ts';
 
 /** The tail is where the failure is — see `output` below. */
@@ -106,7 +107,17 @@ export function outputLines(stdout: string, stderr: string): string[] {
   const seen = new Set(
     raw
       .split('\n')
-      .map((line) => line.trim())
+      // NEUTRALISED AT CAPTURE, and this is the capture. These lines are UNTRUSTED PROCESS OUTPUT
+      // — a test runner's ANSI colour, a compiler quoting a source file somebody else wrote — and
+      // they do not stop at a comparison: `VerifyBaseline.lines` is written into `spec.json` in
+      // the campaign archive and, when `planning.spec_to_repo` is on, into the repository, where a
+      // human reads it with `cat`. `JSON.stringify` escapes C0 and leaves U+009B and U+202E, so
+      // the file is not what makes them safe.
+      //
+      // It also makes the comparison steadier rather than weaker: `saysNothingNew` asks whether a
+      // run said anything the baseline had not, and two runs whose only difference is a colour
+      // sequence were saying the same thing all along.
+      .map((line) => sanitize(line))
       .filter((line) => line !== ''),
   );
   // Deduplicated and capped. A command that prints the same complaint per file would otherwise
@@ -146,6 +157,16 @@ export interface VerifyBaselineInput {
   run?: CommandRunner;
   timeoutMs?: number;
   onProgress?: (line: string) => void;
+  /**
+   * Stop, and stop the command that is running.
+   *
+   * The alignment gate runs this while a human waits at a prompt with nothing started, so it needs
+   * a way out that is not the clock — four commands that never finish used to hold that human for
+   * twelve minutes with no keystroke that reached anything. Every command still gets a ROW: an
+   * abandoned one reports no exit code, which the gate already reads as "it has said nothing about
+   * the work". Silence about a command that was never run would be the worse answer.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -169,8 +190,20 @@ export async function runVerifyBaseline(input: VerifyBaselineInput): Promise<Ver
 
   const baseline: VerifyBaseline[] = [];
   for (const command of commands) {
+    // Checked BEFORE each command as well as inside the runner: an abort that lands between two
+    // commands must not start the next one, and a runner that ignores the signal (every injected
+    // one in the tests does) still stops here.
+    if (input.signal?.aborted === true) {
+      baseline.push({
+        command,
+        exitCode: null,
+        timedOut: false,
+        lines: ['not run: the gate was stopped before this command started'],
+      });
+      continue;
+    }
     try {
-      const result = await run(command, input.cwd, timeoutMs);
+      const result = await run(command, input.cwd, timeoutMs, input.signal);
       baseline.push({
         command,
         exitCode: result.exitCode,
