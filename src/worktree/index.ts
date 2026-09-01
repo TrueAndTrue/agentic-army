@@ -22,6 +22,7 @@ import type { ColdWorktreeProviderOptions } from './cold.ts';
 
 export * from './cold.ts';
 export * from './hooks.ts';
+export * from './integration.ts';
 
 /** A machine-readable note. `code` is stable; `message` is for humans. */
 export interface WorktreeNote {
