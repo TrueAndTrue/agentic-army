@@ -1,17 +1,36 @@
 /**
  * Worktree isolation.
  *
- * ONE LEASE PER CAMPAIGN, HELD BY TWO WORKERS. `src/command/campaign.ts` calls `acquire` exactly
- * once and hands the SAME `lease.path` to the Engineer's spawn and to the Inspector's — one
- * writable tree, one `leaseId`, no second acquisition anywhere in the tree. The Inspector's tree
- * is not attenuated and could not be: it runs the suite there, and a suite writes — caches,
- * coverage, build output, the mutations mutation testing needs.
+ * ONE LEASE PER WORKSTREAM, HELD BY TWO WORKERS. `src/command/campaign.ts` has exactly one call to
+ * `acquire`, and it hands the SAME `lease.path` to that workstream's Engineer and to the Inspector
+ * that reviews it — one writable tree, one `leaseId`, no second acquisition anywhere in the tree.
+ * The Inspector's tree is not attenuated and could not be: it runs the suite there, and a suite
+ * writes — caches, coverage, build output, the mutations mutation testing needs.
+ *
+ * A campaign nobody segmented has ONE workstream and therefore one lease, which is what this
+ * sentence said before workstreams existed. A segmented one leases a tree per workstream, from the
+ * same call site, and settles each one through the same discipline: `src/command/campaign.ts`
+ * settles every lease it took on every exit path, and its integration tree alongside them.
+ *
+ * TWO UNITS HOLD NO LEASE AT ALL, and both are deliberate. A `MAJ·OVERSEER` reads the primary
+ * checkout: it holds no editor and no shell, so there is nothing it could do to a tree, and giving
+ * it one of a pool of sixteen would spend a worktree on a reader. The integration tree is not
+ * leased from this provider either; it comes from `src/contracts/integration.ts`, whose
+ * `IntegrationTree` has its own `release`.
  *
  * What keeps the Inspector off the branch is its LOADOUT, not the filesystem. `ROLE_ALLOW` gives
  * an INSPECTOR no Edit, no Write and no NotebookEdit (`src/command/permissions.ts`), so the
  * independence of the review gate is a property of the permission set on the command line rather
  * than of the tree the worker is standing in. Do not go looking for a mount flag that enforces
  * it; there is not one, and a comment claiming otherwise would send the next reader hunting.
+ *
+ * ONE LEASE IS WHY THAT ABSENCE HAS TO BE ACCOUNTED FOR. The reviewer stands in the same tree the
+ * Engineer's branch is checked out in, because there is one tree, so an editing tool issued to the
+ * Inspector reaches the branch it is reviewing directly. A SCOPED ONE IS NOW ISSUED, per spawn and
+ * never by the role table, and only where a `CPT·VALIDATOR` will re-run what it wrote — see
+ * `INSPECTOR_TEST_WRITE_RULES` for the four preconditions, what each is worth on each harness, and
+ * why the half that holds on the configuration this project ships is the supervisor reading back
+ * what the reviewer actually wrote rather than any rule on the wire.
  *
  * Scouts and Sentries, when something spawns one, work against the primary checkout and lease
  * nothing. Nothing in the current slice spawns either of those two

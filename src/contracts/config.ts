@@ -76,11 +76,16 @@ export interface DispatchRule {
  * WHAT RUNS: `INSPECTOR` → codex, and every other role → claude. That is the whole rule, and it
  * is computed from the role in `dispatchFor`, not from anything in this file.
  *
- * SCOUT and SENTRY are members of `Role` that NOTHING SPAWNS (see the deferral note on
- * `ROLE_ALLOW` in `src/command/permissions.ts`), so a claim about which vendor they land on
- * describes no traffic. They are named here only to say that: were one fielded today it would
- * take the non-INSPECTOR branch and land on claude — including SENTRY, which the config template
- * used to promise would go to codex.
+ * SENTRY is the one member of `Role` that NOTHING SPAWNS (see the deferral note on `ROLE_ALLOW` in
+ * `src/command/permissions.ts`), so a claim about which vendor it lands on describes no traffic.
+ * It is named here only to say that: were one fielded today it would take the non-INSPECTOR branch
+ * and land on claude — which the config template used to promise would go to codex.
+ *
+ * SCOUT does get fielded, by `army chat` in phase 1, and it takes the same branch: claude, with
+ * the first claude rule's model. Its EFFORT is the one thing the rule does not decide — the chat
+ * session overrides it to `UNSPECIFIED_BRIEF_EFFORT`, on the same reasoning `dispatchFor` applies
+ * to a spec-less ENGINEER. A scout has no spec by construction; it is sent to produce the
+ * information a spec would have carried.
  *
  * Both subscription pools get used without coordination, and cross-vendor review independence
  * becomes STRUCTURAL rather than a rule someone must remember: a Sonnet Inspector reviewing
@@ -166,7 +171,48 @@ export interface GlobalConfig {
   dispatch: DispatchConfig;
 
   permissions: PermissionsConfig;
+
+  planning: PlanningConfig;
 }
+
+// -----------------------------------------------------------------------------------------------
+// `[planning]` — what phase 1 leaves behind
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * Where the settled spec and the interrogation transcript are written.
+ *
+ * ## The archive is not a setting
+ *
+ * Phase 1 writes `spec.md`, `spec.json` and `interrogation.md` into the campaign archive
+ * unconditionally, and there is no key here that turns that off. The archive is append-only,
+ * audited and outside every repository — it is the record, and a record with an off switch is a
+ * record nobody can rely on being there.
+ *
+ * ## The repository copy is, and it is off
+ *
+ * `spec_to_repo` decides whether the SAME three documents also land in the git checkout, under
+ * `docs/army-specs/<campaign-id>/`. Off by default, for the reason stated wherever this feature is
+ * described: **a rejected branch should not strand design documents in the repo.** A campaign that
+ * ends `inspector-failed` still produced a spec, and with this on that spec is now an untracked
+ * directory describing a feature nobody shipped, which somebody has to notice and delete.
+ *
+ * Turn it on when the spec is meant to be reviewed alongside the diff — a team that wants the
+ * design decision in the pull request rather than in a directory under `~`.
+ */
+export interface PlanningConfig {
+  /** TOML `planning.spec_to_repo`. Anything that is not a boolean warns and falls back. */
+  specToRepo: boolean;
+}
+
+/**
+ * The default, and the one place to change it.
+ *
+ * `false`. The conservative direction here is the one where nothing appears in somebody's working
+ * copy without being asked for: an unexpected file in `git status` after an overnight run is a
+ * cost paid by every user, and the archive already holds the document for the ones who want it.
+ */
+export const DEFAULT_SPEC_TO_REPO = false;
 
 // -----------------------------------------------------------------------------------------------
 // `[permissions]` — how tightly a worker is confined while it works

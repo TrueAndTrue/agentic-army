@@ -7,10 +7,18 @@
  * in the UI and the gap between them is diagnostic.
  */
 
-/** Seniority order, most senior first. Index into this array IS the seniority number. */
+/**
+ * Seniority order, most senior first. Index into this array IS the seniority number.
+ *
+ * The order is real US Army seniority, so a tree that reads top to bottom also reads senior to
+ * junior. MAJOR sits between COLONEL and CAPTAIN and holds the feature owner (`MAJ·OVERSEER`),
+ * which is why it was inserted rather than appended: the alternative was demoting the engineers
+ * and the inspectors, whose CAPTAIN rank is already the one the rest of the tables are built on.
+ */
 export const RANK_ORDER = [
   'GENERAL',
   'COLONEL',
+  'MAJOR',
   'CAPTAIN',
   'SERGEANT',
   'PRIVATE',
@@ -42,28 +50,64 @@ export type Rank = (typeof RANK_ORDER)[number];
  * A COMMANDER delegates and reads capped reports. That is its whole tool loadout, and because
  * the loadout is derived from this value rather than asserted in a briefing, it is a property of
  * the process rather than a request made of the model.
+ *
+ * OVERSEER and VALIDATOR are the feature-owning and final-judgement branches of service.
+ *
+ * An OVERSEER owns one feature: it segments the work into workstreams, asks for an engineer per
+ * workstream, adjudicates what the inspectors find, decides which accepted workstream merges into
+ * the integration branch and when, and answers the questions climbing to it from below. It is the
+ * rank ladder made useful: the unit that exists so a question does not have to reach a human to be
+ * answered.
+ *
+ * It DECIDES the merge and does not perform it. The supervising process runs it, exactly as it
+ * runs the rung 3 merge that no worker may perform at any rank, which is why the role holds no
+ * editor and no shell (`ROLE_ALLOW.OVERSEER`). A conflict needing content-level judgement becomes
+ * a reconciliation workstream a fresh engineer resolves in its own worktree and an inspector
+ * reviews. An overseer that resolved one by hand would be an overseer whose work nothing reviews.
+ *
+ * A VALIDATOR is the last unit of a campaign. It judges the MERGED branch against the ORIGINAL
+ * ask, which is a different question from the one an INSPECTOR answers about a diff, and it runs
+ * the spec's verification commands rather than only reading. Two questions get asked at the end
+ * and they are not the same one: the acceptance gate answers "do the commands pass" mechanically,
+ * and the VALIDATOR answers "is this the thing that was asked for".
+ *
+ * Neither is spawned by anything in this build. They are declared because a permission set and a
+ * rank are the vocabulary everything else in the design is written in, and because a role that
+ * exists in the table but nowhere in the code is a gap that `army --help` states out loud
+ * (`test/contracts.test.ts` enforces that it does).
  */
-export const ROLES = ['SCOUT', 'ENGINEER', 'INSPECTOR', 'SENTRY', 'COMMANDER'] as const;
+export const ROLES = [
+  'SCOUT',
+  'OVERSEER',
+  'ENGINEER',
+  'INSPECTOR',
+  'VALIDATOR',
+  'SENTRY',
+  'COMMANDER',
+] as const;
 
 export type Role = (typeof ROLES)[number];
 
 /**
- * Seniority index. Lower is more senior. GENERAL = 0 … PRIVATE = 4.
+ * Seniority index. Lower is more senior. GENERAL = 0 … PRIVATE = 5.
  * Never persist this number — persist the `Rank` string; the index is presentation/comparison
- * only and would silently change meaning if a rank were ever inserted.
+ * only and would silently change meaning if a rank were ever inserted. Inserting MAJOR moved
+ * CAPTAIN from 2 to 3, which is exactly the drift that sentence exists to warn about.
  */
 export const RANK_SENIORITY: Record<Rank, number> = {
   GENERAL: 0,
   COLONEL: 1,
-  CAPTAIN: 2,
-  SERGEANT: 3,
-  PRIVATE: 4,
+  MAJOR: 2,
+  CAPTAIN: 3,
+  SERGEANT: 4,
+  PRIVATE: 5,
 };
 
-/** UI glyphs. */
+/** UI glyphs. Ordered by visual weight, so a tree reads as a ladder without reading the labels. */
 export const RANK_GLYPH: Record<Rank, string> = {
   GENERAL: '☆', // ☆
   COLONEL: '◆', // ◆
+  MAJOR: '◈', // ◈
   CAPTAIN: '◇', // ◇
   SERGEANT: '▪', // ▪
   PRIVATE: '·', // ·
@@ -73,6 +117,7 @@ export const RANK_GLYPH: Record<Rank, string> = {
 export const RANK_ABBREV: Record<Rank, string> = {
   GENERAL: 'GEN',
   COLONEL: 'COL',
+  MAJOR: 'MAJ',
   CAPTAIN: 'CPT',
   SERGEANT: 'SGT',
   PRIVATE: 'PVT',
@@ -90,6 +135,7 @@ export type Substrate = (typeof SUBSTRATES)[number];
 export const SUBSTRATE: Record<Rank, Substrate> = {
   GENERAL: 'process',
   COLONEL: 'process',
+  MAJOR: 'process',
   CAPTAIN: 'process',
   SERGEANT: 'subagent',
   PRIVATE: 'subagent',
@@ -107,11 +153,31 @@ export const SUBSTRATE: Record<Rank, Substrate> = {
  * well. Flip an entry here and the tools a worker of that rank receives change; there is no
  * second copy to keep in step and no generator to re-run.
  *
- * CAPTAIN is the highest rank that writes.
+ * MAJOR IS `false`, AND IT WAS BRIEFLY `true`. The reason it was flipped is worth keeping,
+ * because the pressure that produced it will come back.
+ *
+ * `WRITE_CAPABLE_TOOLS` counts `Bash` as write-capable, because a `Bash(prefix:*)` rule bounds the
+ * START of a command line and nothing after it, so there is no spelling of a shell rule that is
+ * provably read-only. A rank marked `false` here therefore loses every shell rule its role asked
+ * for, scoped or not. When the `MAJ·OVERSEER` was given git prefixes so it could merge, `false`
+ * would have subtracted them on the way to the harness, so the rank was made a writing rank to
+ * keep them: a table changed to fit a loadout.
+ *
+ * The loadout was the thing that was wrong. The overseer does not run the merge: it DECIDES which
+ * workstream merges and when, and the supervising process performs the merge, exactly as it
+ * already performs the rung 3 merge that no worker may perform at any rank. So `ROLE_ALLOW`
+ * grants it no shell, there is nothing for this entry to subtract, and MAJOR goes back to `false`
+ * with the officers. Exactly one rank writes, and it is the one rank that leases a worktree.
+ *
+ * The consequence is the same at both ends: a `MAJ·OVERSEER` holds Read, Grep, Glob and TodoWrite,
+ * whether that is read off the role half or the rank half. See the OVERSEER entry in `ROLE_ALLOW`
+ * for why a feature owner that can edit or resolve a conflict by hand stops being a reviewer of
+ * its engineers.
  */
 export const WRITES_FILES: Record<Rank, boolean> = {
   GENERAL: false,
   COLONEL: false,
+  MAJOR: false,
   CAPTAIN: true,
   SERGEANT: false,
   PRIVATE: false,
@@ -187,6 +253,7 @@ export const WRITES_FILES: Record<Rank, boolean> = {
 export const SPAWNS_UNITS: Record<Rank, boolean> = {
   GENERAL: true,
   COLONEL: true,
+  MAJOR: true,
   CAPTAIN: true,
   SERGEANT: false,
   PRIVATE: false,
@@ -194,8 +261,22 @@ export const SPAWNS_UNITS: Record<Rank, boolean> = {
 
 /**
  * Roles that write files at all — meaning HOLD Edit/Write/NotebookEdit, not "cannot cause a byte
- * to change". An INSPECTOR runs `npm test` in a writable tree and is `false` here regardless,
- * because the review gate's independence comes from it never holding an editing tool.
+ * to change". A role that runs `npm test` in a writable tree changes bytes and can still be
+ * `false` here; the question this map answers is which roles are issued an editing tool.
+ *
+ * THE INSPECTOR IS STILL `false`, AND IT NOW HOLDS AN EDITOR ON SOME SPAWNS. That is not a
+ * contradiction, it is the reason this map answers a narrower question than it looks like. The
+ * design wants the reviewer to write the test that exercises its own finding. An earlier pass
+ * bought that by flipping this entry and scoping the editing tools to test paths in `ROLE_ALLOW`,
+ * and the scope did not scope: the role runs on codex, which reads only the deny half of a
+ * permission set, and the shipped posture is `unguarded`, which drops argv scoping on claude.
+ *
+ * The grant is back, and it is somewhere else. It is a SUPERVISOR DECISION TAKEN PER SPAWN — see
+ * `INSPECTOR_TEST_WRITE_RULES` in `src/command/permissions.ts` — because its fourth precondition
+ * is that a `CPT·VALIDATOR` re-runs what the reviewer wrote, which is true of some campaigns and
+ * false of others. A role table cannot say "iff a validator follows". So the ROLE holds no editor,
+ * this entry says so, `permissionsFor` still refuses a loadout that disagrees with it, and the
+ * per-spawn grant goes through a guard of its own that reads the spec about to go on the wire.
  *
  * Intersected with `WRITES_FILES` by rank in `writesFiles` below. Checked against the loadout it
  * describes on every spawn: `permissionsFor` refuses a role whose `ROLE_ALLOW` entry disagrees
@@ -203,8 +284,15 @@ export const SPAWNS_UNITS: Record<Rank, boolean> = {
  */
 export const ROLE_WRITES_FILES: Record<Role, boolean> = {
   SCOUT: false,
+  // An OVERSEER reviews its engineers' work and decides what merges. A feature owner that can
+  // edit will edit, and then nothing above an engineer is reviewing what the engineer did. So the
+  // role holds Read, Grep, Glob and TodoWrite: no editing tool and no shell, at any rank.
+  OVERSEER: false,
   ENGINEER: true,
   INSPECTOR: false,
+  // A VALIDATOR runs the spec's verification commands against the merged branch and judges the
+  // result against the original ask. It reports; it never changes what it is judging.
+  VALIDATOR: false,
   SENTRY: false,
   COMMANDER: false,
 };
@@ -310,9 +398,10 @@ export function assertMayField(parent: Rank, child: Rank, who: string): void {
  *
  * The obvious guard to write here is "capability never increases going down the order", and it is
  * WRONG — it would reject this project's central design decision. `WRITES_FILES` is a BAND, not a
- * slope: GENERAL and COLONEL do not write, CAPTAIN does, SERGEANT and PRIVATE do not. A CAPTAIN is
- * junior to a COLONEL and holds strictly more, on purpose, because officers are kept incapable of
- * a bad `rm` while the rank that owns a worktree is the rank that works in it. A monotonicity
+ * slope: GENERAL, COLONEL and MAJOR do not write, CAPTAIN does, SERGEANT and PRIVATE do not. A
+ * CAPTAIN is junior to a COLONEL and holds strictly more, on purpose, because officers are kept
+ * incapable of a bad `rm` while the rank that owns a worktree is the rank that works in it. A
+ * monotonicity
  * check over `WRITES_FILES` was written first and the suite rejected it immediately, which is the
  * only reason this paragraph exists rather than a quietly weakened table.
  *

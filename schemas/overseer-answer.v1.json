@@ -1,0 +1,21 @@
+{
+  "title": "OverseerAnswer",
+  "description": "A MAJ·OVERSEER's answer to a question climbing from one of its engineers. Mirrors src/contracts/workstream.ts. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Declining is a first-class answer: `answer: null` sends the question on to the human unchanged, which is what makes this rung worth having rather than a rung that guesses.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer", "rationale"],
+  "properties": {
+    "answer": {
+      "type": ["string", "null"],
+      "description": "The decision, in your own words, one line. It goes into the next engineer's orders with the same standing the human's own answer would have, so answer only what you actually own. null when you will not decide: anything the human already settled differently, anything that changes the objective, anything you would be guessing at. A wrong answer here is more expensive than a question that reaches a human, because nothing above it will look at it again.",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "rationale": {
+      "type": "string",
+      "description": "One line on why you answered, or why you would not. Recorded in the archive beside the question.",
+      "minLength": 1,
+      "maxLength": 280
+    }
+  }
+}

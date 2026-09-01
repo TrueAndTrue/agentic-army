@@ -36,8 +36,35 @@ import { HARNESS_IDS, SOLDIER_EVENT_TYPES } from '../contracts/harness.ts';
 import { RANK_ORDER, ROLES } from '../contracts/ranks.ts';
 import { RUNGS } from '../contracts/delivery.ts';
 
-/** Bumped whenever the DDL below changes. Guards application, and tells `rebuild` what it wrote. */
-export const SCHEMA_VERSION = 1;
+/**
+ * Bumped whenever the DDL below changes. Guards application, and tells `rebuild` what it wrote.
+ *
+ * VERSION 2 widened two CHECK lists and nothing else: `agents.rank` gained `MAJOR` and
+ * `agents.role` gained `OVERSEER` and `VALIDATOR`, because both lists are generated from
+ * `RANK_ORDER` and `ROLES`. No column was added, renamed or dropped.
+ *
+ * ## Whether that needs a migration, worked out rather than assumed
+ *
+ * IT NEEDS ONE, and the reason is not the CHECK lists. `applySchema` runs on every WRITER open
+ * (`openIndex`), and a database written by version 1 has `user_version = 1`, which is below
+ * `SCHEMA_VERSION`, so it falls straight past the fast path and executes `SCHEMA_SQL` against a
+ * database that already has every table in it. The first statement is a plain `CREATE TABLE
+ * campaigns` (plain, because the signals DDL is frozen and cannot be an `IF NOT EXISTS`), so
+ * without the branch below the bump turns every campaign created by the previous release from
+ * readable into unopenable, with `table campaigns already exists` as the whole explanation.
+ *
+ * Only the writer path is affected, and that is why the answer is a refusal rather than a table
+ * rebuild. `army view` reads through `openCampaignReadOnly`, which runs no `applySchema` and no
+ * `mkdirSync`, so old campaigns are still viewable. `army rebuild` writes a NEW file from the
+ * jsonl, which is truth, and applies this schema to it. The migration for an archive that must
+ * be written to again therefore already exists as a command, and the branch below names it
+ * instead of quietly rebuilding tables underneath a running supervisor.
+ *
+ * A v1 archive cannot record a MAJOR or an OVERSEER either way: its CHECK lists were generated
+ * before those values existed, so an insert would fail on the constraint at 3am rather than at
+ * open. Refusing at open is the same failure moved to the moment a human can read it.
+ */
+export const SCHEMA_VERSION = 2;
 
 function quotedList(values: readonly string[]): string {
   return values.map((value) => `'${value}'`).join(', ');
@@ -199,26 +226,80 @@ CREATE INDEX events_by_parent   ON events(parent_tool_use_id);
 `;
 
 /**
+ * Refuse a database written by an older release, rather than executing the DDL over the top of it.
+ *
+ * `user_version` 0 is an empty file this function is about to fill in. Anything between 1 and
+ * `SCHEMA_VERSION` is a campaign a previous release created, and the DDL below is a set of plain
+ * `CREATE TABLE`s, and running it there fails on the first statement with `table campaigns
+ * already exists`, which is a true sentence that explains nothing. The instruction is the point: the
+ * files are truth and the rebuild command regenerates the index from them at the current schema,
+ * so the upgrade path already exists and this only has to name it.
+ *
+ * ## Naming the command, without inverting the layering
+ *
+ * A refusal that says "rebuild it" and prints no command line leaves the reader a paragraph and
+ * no invocation. `invokedAs()` is the only honest way to print one in this codebase, because it
+ * resolves `army`, `npx agentic-army`, `npm run x --` or `node src/cli.ts` from the running
+ * process, and it lives in `src/setup/checks.ts`. Importing it here is NOT what this does, for
+ * the same reason `archiveDurabilityNote` and `missingConfigWarning` do not: `src/setup/**` sits
+ * above `src/archive/**`, and a storage layer that depends on environment detection is a
+ * dependency running both ways. Mechanically there is no cycle today, since `checks.ts` reaches
+ * `archive/db.ts` and nothing reaches back, so this is the layering rule rather than a compiler
+ * complaint. The rule is what stops a cycle appearing.
+ *
+ * So the invocation arrives from above as an optional parameter, exactly as
+ * `missingConfigWarning` takes it, and its ABSENCE is a deliberate third state: a caller that
+ * cannot spell the reader's invocation gets a sentence naming the SUBCOMMAND without asserting
+ * how to reach it, and never a hardcoded `army` that a reader running `node src/cli.ts` cannot
+ * type. `openIndex` passes `ArchiveConfig.self`, which the two commands that create campaigns
+ * fill in from `invokedAs()`.
+ *
+ * @param self  The command prefix the reader actually invoked, when the caller knows it.
+ */
+function assertSchemaUpgradable(version: number, self?: string): void {
+  if (version === 0 || version >= SCHEMA_VERSION) return;
+  const rebuild = self === undefined ? 'the `rebuild` command' : `\`${self} rebuild\``;
+  throw new Error(
+    `this campaign index was written at schema version ${version} and this build applies ` +
+      `version ${SCHEMA_VERSION}. The tables it holds cannot be widened in place: the rank and ` +
+      'role CHECK lists are generated from the contract constants, so an index written before a ' +
+      `rank existed would reject a row naming it. ${rebuild} regenerates this index ` +
+      'from the campaign files, which are truth, and writes it at the current version. Reading ' +
+      'an old campaign needs none of this: the read-only open applies no schema.',
+  );
+}
+
+/**
  * Apply the schema to a fresh database, returning true iff it actually wrote anything.
  *
  * Idempotent, and safe when several supervisor processes open the same campaign at once: the
  * signals DDL is a plain `CREATE TABLE`, so re-running it would throw, and the check-then-apply is
  * therefore done inside `BEGIN IMMEDIATE` where the second process waits for the first and then
  * sees the bumped `user_version`.
+ *
+ * @param self  Passed straight to `assertSchemaUpgradable`, which is the only thing here that
+ *              addresses a human. See that function for why it arrives as a parameter.
  */
-export function applySchema(db: {
-  exec(sql: string): void;
-  prepare(sql: string): { get<T>(): T | undefined };
-  transaction<T>(fn: () => T): T;
-}): boolean {
+export function applySchema(
+  db: {
+    exec(sql: string): void;
+    prepare(sql: string): { get<T>(): T | undefined };
+    transaction<T>(fn: () => T): T;
+  },
+  self?: string,
+): boolean {
   // Fast path first: opening an existing campaign is the common case and must not take a write
   // lock, or every `army` command would briefly block every running supervisor.
   const seen = db.prepare('PRAGMA user_version').get<{ user_version: number }>();
   if ((seen?.user_version ?? 0) >= SCHEMA_VERSION) return false;
+  assertSchemaUpgradable(seen?.user_version ?? 0, self);
 
   return db.transaction(() => {
     const row = db.prepare('PRAGMA user_version').get<{ user_version: number }>();
     if ((row?.user_version ?? 0) >= SCHEMA_VERSION) return false;
+    // Re-checked under the write lock for the same reason the version is: the process that won
+    // the race may have been an older build that applied an older schema between the two reads.
+    assertSchemaUpgradable(row?.user_version ?? 0, self);
     db.exec(SCHEMA_SQL);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     return true;

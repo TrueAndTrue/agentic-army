@@ -1,0 +1,54 @@
+{
+  "title": "Segmentation",
+  "description": "How a MAJ·OVERSEER cut one feature into workstreams. Mirrors src/contracts/workstream.ts. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` at every level and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Segmentation is a declaration of ownership, not a fence: an engineer that needs a neighbour's file takes it and the overlap is announced. What is refused is two workstreams claiming the same file up front, which is a planning error and is free to fix before an engineer is spent on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["workstreams", "rationale"],
+  "properties": {
+    "workstreams": {
+      "type": "array",
+      "description": "One entry per line of work. One workstream is a legal answer when the feature does not split.",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/workstream" }
+    },
+    "rationale": {
+      "type": "string",
+      "description": "One line on why the feature was cut this way. For a human reading the campaign afterwards.",
+      "minLength": 1,
+      "maxLength": 280
+    }
+  },
+  "$defs": {
+    "workstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "slice", "expectedFiles"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique within this segmentation. It becomes a git branch name and a directory, so: lowercase letters, digits, and single `-` or `_` between them. No slashes, no dots, no spaces.",
+          "minLength": 1,
+          "maxLength": 48,
+          "pattern": "^[a-z0-9](?:[a-z0-9]|[-_][a-z0-9])*$"
+        },
+        "slice": {
+          "type": "string",
+          "description": "This workstream's slice of the objective, in your own words. One line, no newlines. It is the whole of what its engineer is told to build, so it must stand alone.",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "expectedFiles": {
+          "type": "array",
+          "description": "Repository-relative paths or directories this workstream is expected to touch. A directory covers everything under it. NO TWO WORKSTREAMS MAY NAME THE SAME PATH: that is a planning error and you will be asked to segment again. An empty list is legal and means you would not commit to a file list, which is worth saying out loud rather than guessing at.",
+          "maxItems": 40,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      }
+    }
+  }
+}

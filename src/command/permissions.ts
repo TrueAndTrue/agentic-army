@@ -6,7 +6,9 @@
  * ALLOW  ENGINEER   Read Grep Glob, Edit Write, Bash(git*|test|build|lint)
  *                   + spec-derived authority: the approved `verify` commands as EXACT Bash rules,
  *                   and a run rule for each runnable `filesInScope` entry as a PREFIX Bash rule
- *        INSPECTOR  Read Grep Glob, Bash(test|lint)
+ *        INSPECTOR  Read Grep Glob, Bash(test|lint), and no editing tool at any rank
+ *        OVERSEER   Read Grep Glob TodoWrite, and no editing tool and no shell at any rank
+ *        VALIDATOR  Read Grep Glob, Bash(test|lint)
  *
  * NARROW (by rank, subtracted from whatever the role asked for)
  *        GENERAL COLONEL   no Edit Write NotebookEdit, no Bash at all
@@ -142,13 +144,316 @@ export const ENGINEER_BASH_PREFIXES: readonly string[] = Object.freeze([
   'prettier',
 ]);
 
-/** The read-only half of an INSPECTOR's Bash: run the suite, run the linter, nothing else. */
-export const INSPECTOR_BASH_PREFIXES: readonly string[] = Object.freeze(
-  ENGINEER_BASH_PREFIXES.filter((prefix) => !prefix.startsWith('git')),
+/**
+ * Prefixes whose documented flags rewrite the tree in place.
+ *
+ * `prettier --write src/`, `eslint --fix .` and `ruff check --fix .` are each ONE allowed command
+ * line that edits every file it is pointed at. A `Bash(<prefix>:*)` rule constrains the START of a
+ * command line and nothing after it (see `WRITE_CAPABLE_TOOLS`), so there is no narrowing of these
+ * three that provably cannot take the write flag: `Bash(prettier --check:*)` still permits
+ * `prettier --check x --write`. They are REMOVED from the reviewer's shell rather than narrowed,
+ * because a narrowing that cannot be proved is a boundary that only looks like one.
+ *
+ * The ENGINEER keeps all three: it already holds `Edit`, `Write` and `NotebookEdit` over its own
+ * worktree, so a formatter takes nothing it did not already have.
+ */
+export const IN_PLACE_WRITE_RUNNERS: readonly string[] = Object.freeze([
+  'prettier',
+  'eslint',
+  'ruff',
+]);
+
+/**
+ * The Engineer's shell with git and every in-place writer taken out: run the suite, nothing that
+ * touches a branch, nothing that rewrites a file.
+ *
+ * Carried by the two roles whose whole job is running what somebody else wrote: the INSPECTOR
+ * against one workstream's diff, the VALIDATOR against the merged branch. It is derived from
+ * `ENGINEER_BASH_PREFIXES` rather than typed out so a runner added for the Engineer is a runner
+ * the reviewer can also invoke; a reviewer that cannot run the suite the Engineer ran is reviewing
+ * a different repository.
+ *
+ * `IN_PLACE_WRITE_RUNNERS` is subtracted because of precondition 2 on `INSPECTOR_TEST_WRITE_RULES`:
+ * a path scope on the editing tools means nothing while a single granted command line reaches every
+ * file in the tree. THE SUBTRACTION ONLY BITES UNDER `guarded`. Under `unguarded` the loadout
+ * collapses to a bare `Bash`, which runs `sed -i` too, and there the containment is the supervisor's
+ * post-hoc reading rather than any rule — see `assertInspectorWriteContained`.
+ */
+export const VERIFY_BASH_PREFIXES: readonly string[] = Object.freeze(
+  ENGINEER_BASH_PREFIXES.filter(
+    (prefix) => !prefix.startsWith('git') && !IN_PLACE_WRITE_RUNNERS.includes(prefix),
+  ),
 );
 
 function bashRules(prefixes: readonly string[]): string[] {
   return prefixes.map((prefix) => `Bash(${prefix}:*)`);
+}
+
+/** Every tool that can put bytes on disk. A path rule must cover all of them or it covers none. */
+const WRITE_TOOLS: readonly string[] = Object.freeze(['Write', 'Edit', 'NotebookEdit']);
+
+/** `(['Edit'], ['test/**'])` -> `['Edit(test/**)']`. Used by both halves of a permission set. */
+function pathRules(tools: readonly string[], globs: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const glob of globs) for (const tool of tools) out.push(`${tool}(${glob})`);
+  return out;
+}
+
+/**
+ * Where a test lives, in the spellings the repositories this thing is pointed at actually use.
+ *
+ * NOT IN `ROLE_ALLOW`, AND THAT IS DELIBERATE NOW RATHER THAN A WITHDRAWAL. The write is a
+ * SUPERVISOR DECISION TAKEN PER SPAWN, not a property of the role, because precondition 4 —
+ * a `VALIDATOR` re-runs what the inspector wrote, in a process it does not own — is true of some
+ * campaigns and false of others. A role table cannot say "iff a validator follows"; a call site
+ * can. See `INSPECTOR_TEST_WRITE_RULES` and `assertInspectorWriteContained` below.
+ *
+ * A LIST OF CONVENTIONS, NOT A DISCOVERY. Nothing here inspects the repo. These are the directory
+ * and filename shapes that `test/`-style, `pytest`-style and `go test`-style projects put their
+ * tests in, and a project that names its tests something else gives its INSPECTOR a write that
+ * reaches nothing. That failure is the safe direction (the inspector reports the missing test
+ * instead of writing it) and it is the reason this list is worth widening when a repo needs it,
+ * carefully, rather than replacing with something like `**` scoped by briefing.
+ *
+ * The globs are worktree-relative because the worker's cwd IS its leased worktree, which is also
+ * how `ENGINEER_BASH_PREFIXES` and the spec's `filesInScope` rules are already spelled.
+ */
+export const TEST_PATH_GLOBS: readonly string[] = Object.freeze([
+  'test/**',
+  'tests/**',
+  'spec/**',
+  '__tests__/**',
+  '**/__tests__/**',
+  '**/*.test.*',
+  '**/*.spec.*',
+  '**/*_test.*',
+  '**/test_*.py',
+]);
+
+/**
+ * The INSPECTOR's write, scoped to the paths above. GRANTED PER SPAWN, never by the role table.
+ *
+ * An inspector that can write can write the thing that makes its own verdict pass. The first
+ * attempt at containing that hazard was measured and found inert on the configuration this project
+ * actually ships, and four things had to hold before the grant went back on. Each is now built, and
+ * each is stated below with what it costs and where it stops:
+ *
+ * 1. THE CONTAINMENT IS A DENY, NOT A SCOPED ALLOW. Two independent reasons, either one fatal.
+ *    The INSPECTOR runs on codex by default (`DEFAULT_DISPATCH`, `src/config/load.ts`), and
+ *    `src/harness/codex.ts` says plainly that codex has no equivalent of the permission model:
+ *    `codexConfinement` reads `spec.deny` to build sandbox roots and never reads `spec.allow` at
+ *    all, so a scoped allow-list on this role is not weakened on codex, it is ABSENT. And
+ *    `DEFAULT_PERMISSION_POSTURE` is `unguarded`, which maps every scoped rule in this file to its
+ *    bare tool name — though only on the ALLOW half: `permissionsFor` leaves the deny half
+ *    byte-identical under both postures, which is precisely why the bound has to live there.
+ *
+ *    So `inspectorWriteDeny` builds the containment as DENY rules over the implementation under
+ *    review, and it is emitted at both postures on both harnesses. What it is worth differs, and
+ *    the difference is measured rather than assumed — see `assertInspectorWriteContained`:
+ *
+ *    | harness / posture | what the deny does |
+ *    |---|---|
+ *    | claude, guarded   | **enforced.** deny beats allow, so the editor reaches test paths only |
+ *    | claude, unguarded | **enforced.** the deny half does not collapse; only the allow half does |
+ *    | codex, either     | **UNENFORCEABLE, and reported as such.** the rules are worktree-relative, so `resolveDenyRoot` returns null and `codexConfinement` classifies them `unenforceable` rather than `enforced`. Deliberately relative: an ABSOLUTE deny inside the writable root is a `breach`, and codex REFUSES TO SPAWN on one |
+ *
+ *    On codex the whole worktree is writable and always was, editor or no editor, so the grant adds
+ *    no capability there. What contains it on codex is (3) and (4) below plus the supervisor's own
+ *    post-hoc reading of what the inspector actually wrote, which is harness-independent and is the
+ *    only half of this that holds on the configuration this project ships.
+ * 2. THE SHELL IT ALREADY HOLDS CANNOT WRITE THE TREE. `VERIFY_BASH_PREFIXES` carried
+ *    `Bash(prettier:*)`, `Bash(eslint:*)` and `Bash(ruff:*)`, and all three have a documented
+ *    in-place write mode. All three are gone — see `IN_PLACE_WRITE_RUNNERS` for why they are
+ *    removed rather than narrowed. Under `unguarded` the reviewer holds a bare `Bash` and this buys
+ *    nothing; that is stated rather than glossed, and it is the second reason the supervisor's
+ *    post-hoc reading is the load-bearing half.
+ * 3. THE VERDICT AND THE TEST AUTHORSHIP LAND IN THE ARCHIVE AS SEPARATE SIGNALS. `src/command/
+ *    campaign.ts` writes an `authorship` note and its own `status` signal listing the files the
+ *    inspector wrote, next to and distinct from the `report` signal carrying the verdict.
+ * 4. TESTS IT WRITES RUN AGAIN UNDER THE `VALIDATOR`, in a process the inspector does not own —
+ *    AND THEY BECOME HISTORY ONLY AFTER ONE HAS. This was a promise made at spawn time, which is a
+ *    moment at which nobody can know whether a validator will run: the literal `true` that carried
+ *    it could not be false, and a campaign whose reviewer refused, or whose integration failed, or
+ *    whose gate never passed, committed a reviewer's test onto a durable branch under a note saying
+ *    a validator would run it. Now the campaign HOLDS what a reviewer writes out of history, applies
+ *    it to the integration tree for the gate and the validator to execute, and commits it only once
+ *    a validator has come back with a verdict on a tree containing it. `commitInspectorTests`
+ *    refuses without the validator that ran them. An unsegmented campaign fields no validator, its
+ *    inspector holds no editor, and nothing it might write could ever land.
+ *
+ * See the Permissions section of `docs/main-flow.md`, which is where this list is.
+ *
+ * Every write tool is covered, not just the two that matter, because a path rule that names two of
+ * the three write tools is a path rule with a hole in it.
+ */
+export const INSPECTOR_TEST_WRITE_RULES: readonly string[] = Object.freeze(
+  pathRules(WRITE_TOOLS, TEST_PATH_GLOBS),
+);
+
+/**
+ * `test/**` -> a matcher. `**` crosses separators, `*` does not, everything else is literal.
+ *
+ * Written here rather than pulled in because `TEST_PATH_GLOBS` is the only glob vocabulary this
+ * module has to interpret, and a dependency on a general-purpose matcher would bring a second
+ * definition of what `**` means into a file whose whole job is being unambiguous about scope.
+ */
+function globToRegExp(glob: string): RegExp {
+  let out = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const c = glob[i] as string;
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        if (glob[i + 2] === '/') {
+          // `**/` is ZERO OR MORE directories, so `**&#47;*.test.*` matches `a.test.js` at the root.
+          out += '(?:.*/)?';
+          i += 2;
+        } else {
+          out += '.*';
+          i += 1;
+        }
+      } else {
+        out += '[^/]*';
+      }
+    } else if (c === '?') {
+      out += '[^/]';
+    } else {
+      out += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+const TEST_PATH_MATCHERS: readonly RegExp[] = Object.freeze(TEST_PATH_GLOBS.map(globToRegExp));
+
+/**
+ * Is this repository-relative path one `TEST_PATH_GLOBS` reaches?
+ *
+ * THE SAME LIST THE ALLOW RULES ARE BUILT FROM, read a second way. Two spellings of "where a test
+ * lives" is the drift that would let an inspector's allow-list and the supervisor's after-the-fact
+ * check disagree about one file, and the file they disagree about is the one that matters.
+ *
+ * A leading `./` is stripped, because a worker names a path either way and git names it neither.
+ * A path that escapes the tree (`../`, absolute) is NOT a test path by any reading, and answering
+ * `false` is the safe direction: the caller's `false` branch is "this write is out of scope".
+ */
+export function isTestPath(file: string): boolean {
+  const cleaned = file.replace(/^\.\//, '').trim();
+  if (cleaned === '' || cleaned.startsWith('/') || cleaned.startsWith('../')) return false;
+  return TEST_PATH_MATCHERS.some((matcher) => matcher.test(cleaned));
+}
+
+/**
+ * The containment, as DENY rules over the implementation this inspector is reviewing.
+ *
+ * ## Why these paths and not a region
+ *
+ * The rule grammar has no negation, so "everywhere except the test paths" is not a thing either
+ * harness can be told. What CAN be named exactly is the set the hazard is about: an inspector makes
+ * its own verdict pass by editing the code under review, and the code under review is the branch's
+ * own changed files plus whatever the spec put in scope. Both lists are SUPERVISOR-OWNED — one
+ * comes out of `git diff --name-only`, the other out of a spec a human approved before the Engineer
+ * existed — so neither is a list a reviewee can grow.
+ *
+ * Test paths are filtered OUT of the deny, because a reviewer strengthening an existing test file
+ * is the thing this grant exists for. Everything else the branch touched is denied.
+ *
+ * ## Why every entry stays worktree-relative
+ *
+ * `codexConfinement` resolves an ABSOLUTE write-deny that lands inside the writable root to a
+ * `breach`, and a breach REFUSES THE SPAWN. A relative pattern resolves to no region at all and is
+ * reported `unenforceable`, which is the honest classification and does not cost a reviewer. So a
+ * caller must pass repository-relative paths, and an absolute one is dropped rather than emitted:
+ * a containment rule that stops the reviewer being spawned protects nothing.
+ */
+export function inspectorWriteDeny(paths: readonly string[]): string[] {
+  const globs: string[] = [];
+  for (const raw of paths) {
+    const file = raw.replace(/^\.\//, '').trim();
+    if (file === '' || file.startsWith('/') || file.includes('..')) continue;
+    if (isTestPath(file)) continue;
+    if (!globs.includes(file)) globs.push(file);
+  }
+  return pathRules(WRITE_TOOLS, globs);
+}
+
+/**
+ * Refuse an inspector's editor unless the preconditions a SPEC can carry actually hold for it.
+ *
+ * A MECHANISM, NOT A CHECKLIST SOMEBODY REMEMBERS. The four preconditions were written down once,
+ * measured, and found inert; the way that does not happen twice is that the grant cannot be issued
+ * without this function agreeing, and this function reads the spec that is about to go on the wire
+ * rather than the intention behind it.
+ *
+ * ## What it does NOT check, and where each of those went instead
+ *
+ * Precondition 3 is an archive write that happens after the run, so nothing here can see it. It is
+ * covered by `src/command/campaign.ts` emitting the authorship signal on the same path that emits
+ * the verdict, and by the test that removes it.
+ *
+ * Precondition 4 — a `CPT·VALIDATOR` re-runs what the reviewer wrote — used to be checked here, as
+ * a `validatorFollows: boolean` its one caller passed as the literal `true`. THAT IS THE SHAPE THIS
+ * WHOLE FILE EXISTS TO AVOID: authority derived from a condition asserted at a call site. Nothing
+ * computed it, so the refusal could not fire; and the assertion was regularly false, because a
+ * validator is skipped whenever any workstream ends other than delivered, integration fails, the
+ * gate never passes inside the validation budget, or an abort lands in between. A spawn is simply
+ * not a moment at which "a validator will run" is knowable.
+ *
+ * So it moved to the moment it IS knowable. A reviewer's tests are no longer committed where they
+ * were written; the campaign holds them out of history and `commitInspectorTests` refuses to write
+ * them onto a branch without naming the validator that ran them. The check is the same check, at
+ * the only point where it can be true or false rather than merely asserted, and the durable
+ * artefact now follows the fact instead of preceding it.
+ */
+export function assertInspectorWriteContained(input: {
+  allow: readonly string[];
+  /** The rules `inspectorWriteDeny` produced — NOT the whole deny-list, which is rooted by design. */
+  containment: readonly string[];
+  who: string;
+}): void {
+  const { allow, containment, who } = input;
+  const writeScopes = allow.filter((rule) => WRITE_TOOLS.includes(toolNameOf(rule)));
+  const unscoped = writeScopes.filter((rule) => !rule.includes('('));
+  if (unscoped.length > 0) {
+    throw new Error(
+      `refusing to grant ${who} an editor: ${unscoped.join(', ')} carries no path scope. A bare ` +
+        'write tool on a reviewer is the whole hazard, not a loose end of it.',
+    );
+  }
+  const shell = allow.filter((rule) => toolNameOf(rule) === 'Bash');
+  const writers = shell.filter((rule) =>
+    IN_PLACE_WRITE_RUNNERS.some((runner) => rule.startsWith(`Bash(${runner}`)),
+  );
+  if (writers.length > 0) {
+    throw new Error(
+      `refusing to grant ${who} an editor: its shell still holds ${writers.join(', ')}, and each ` +
+        'of those has a documented in-place write mode. Precondition 2: a path scope on the ' +
+        'editing tools means nothing while a single granted command line reaches every file in ' +
+        'the tree.',
+    );
+  }
+  // Precondition 1, read off the wire rather than off the intention. A deny that names an ABSOLUTE
+  // region would be a codex `breach` and the reviewer would not spawn at all, so the containment
+  // has to be relative — and that is checked here rather than trusted to the builder.
+  for (const rule of containment) {
+    const open = rule.indexOf('(');
+    if (open === -1 || !WRITE_TOOLS.includes(toolNameOf(rule))) continue;
+    const pattern = rule.slice(open + 1, rule.length - 1);
+    if (pattern.startsWith('/')) {
+      throw new Error(
+        `refusing to grant ${who} an editor: the containment rule ${rule} names an absolute path. ` +
+          'codexConfinement classifies an absolute write-deny inside the writable root as a breach ' +
+          'and refuses to spawn, so a containment written that way would stop the review instead ' +
+          'of bounding it.',
+      );
+    }
+    if (isTestPath(pattern)) {
+      throw new Error(
+        `refusing to grant ${who} an editor: the containment rule ${rule} denies a TEST path, and ` +
+          'deny beats allow. The grant would be issued and immediately cancelled, which is a ' +
+          'reviewer told it may write tests and refused every time it tries.',
+      );
+    }
+  }
 }
 
 /**
@@ -295,11 +600,53 @@ export function fileRunRules(filesInScope: readonly string[]): string[] {
 /**
  * The per-role loadout table, as tool rules.
  *
- * SCOUT and SENTRY are deferred from the v1 slice and are present only so this map is
- * total over `Role` — nothing in the slice spawns one.
+ * SENTRY is present only so this map is total over `Role`: nothing in this build spawns one, and
+ * it is deferred from the v1 slice rather than designed away.
+ *
+ * SCOUT's entry is now live. Phase 1 fields a `CPT·SCOUT` from `army chat`, on exactly the five
+ * rules below and NOT ONE MORE — the fan-out roster it is issued at spawn holds the same names,
+ * narrowed by rank, because `subagentRosterFor` computes a subordinate's loadout from this table
+ * rather than from a second list. It holds no `Task` and no `Agent` here, and that is deliberate:
+ * the measurement recorded on `SubagentDefinition` below found the allow half does not gate the
+ * spawn tool at all, so the enforcing form is the roster plus `subagentDeny` plus the harness's
+ * nesting cap — and adding a spawn rule to this table would widen the role for a mechanism that
+ * does not read it.
  */
 export const ROLE_ALLOW: Record<Role, readonly string[]> = Object.freeze({
   SCOUT: Object.freeze(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']),
+  // ==========================================================================================
+  // AN OVERSEER DECIDES. IT RUNS NOTHING.
+  //
+  // Read, Grep and Glob are what "it can look at the code directly" means, and they are the whole
+  // of its reading: the archive it reasons about arrives in its briefing, because every worker is
+  // denied Read on `~/.agentic-army/**` and that deny is what makes the delivery ceiling a
+  // boundary rather than a speed bump.
+  //
+  // NO Edit, NO Write, NO NotebookEdit, at any rank, and the deny half names them too
+  // (`ROLE_DENY.OVERSEER`). A feature owner that can edit will edit, being the unit with the most
+  // context and the most impatience, and the moment it does, nothing above an engineer is
+  // reviewing an engineer's work, which is the entire reason the layer exists.
+  //
+  // NO SHELL EITHER, AND THAT IS THE PART WORTH EXPLAINING, because a feature owner has to get
+  // the work integrated and integrating sounds like git. It does not run the merge. It DECIDES
+  // which workstream merges
+  // and when, and the supervising process performs the merge, exactly as the supervisor already
+  // performs the rung 3 merge that no worker may perform at any rank. A conflict git resolves by
+  // itself needs nobody; a conflict needing content-level judgement becomes a reconciliation
+  // workstream, where a fresh engineer resolves it in its own worktree and an inspector reviews
+  // the resolution like any other work. An overseer that could resolve a conflict by hand is an
+  // overseer whose work nothing reviews, and giving it `Bash(git merge:*)` to avoid one extra
+  // spawn would buy that at the price of the only property this layer has.
+  //
+  // Withholding the shell also means the role no longer needs its rank to be a writing rank:
+  // `WRITE_CAPABLE_TOOLS` counts `Bash`, so a role holding scoped shell rules at a non-writing
+  // rank loses them silently, and that pressure is what made `WRITES_FILES.MAJOR` true for a
+  // while. With nothing to subtract, `narrowToRank` takes nothing from a `MAJ·OVERSEER`.
+  //
+  // `TodoWrite` is the segmentation it is asked to make visible, and it is also what keeps the
+  // allow-list non-empty at every rank, including the officer ranks that narrow hardest.
+  // ==========================================================================================
+  OVERSEER: Object.freeze(['Read', 'Grep', 'Glob', 'TodoWrite']),
   // `Task` and `Agent` are the fan-out. BOTH spellings, and that is not belt-and-braces: measured
   // on claude 2.1.221, `Task` is what the tool roster on `system/init` calls it and `Agent` is what
   // the model actually emitted when asked to spawn one. Naming one of the two would have produced
@@ -318,15 +665,30 @@ export const ROLE_ALLOW: Record<Role, readonly string[]> = Object.freeze({
     'Agent',
     ...bashRules(ENGINEER_BASH_PREFIXES),
   ]),
-  // An Inspector reads and runs; it never edits. Mutation testing does mean an
-  // Inspector needs a WRITABLE tree — that is a worktree question, answered by handing it a
-  // disposable copy, not a licence to hold the Edit tool.
+  // An Inspector reads and runs. It holds NO editing tool, which is what the review gate's
+  // independence rests on: a reviewer that can write can write the thing that makes its own
+  // verdict pass. The scoped test write the design wants is spelled out in
+  // `INSPECTOR_TEST_WRITE_RULES` and deliberately not referenced here. That comment lists the
+  // four things that have to hold first, and the reason the first attempt was withdrawn. It also
+  // holds no git: the branch under review is not the reviewer's to move.
   INSPECTOR: Object.freeze([
     'Read',
     'Grep',
     'Glob',
     'TodoWrite',
-    ...bashRules(INSPECTOR_BASH_PREFIXES),
+    ...bashRules(VERIFY_BASH_PREFIXES),
+  ]),
+  // A Validator runs the merged branch against the spec's verification commands and judges the
+  // result against the ORIGINAL ask. It writes nothing at all: it is the last unit to look at the
+  // work, and the last look has to be at what everybody else produced rather than at anything it
+  // touched. Its shell is the reviewer's, not the Engineer's: no git, because a validator that
+  // could commit could make the branch it is judging into the branch it wanted.
+  VALIDATOR: Object.freeze([
+    'Read',
+    'Grep',
+    'Glob',
+    'TodoWrite',
+    ...bashRules(VERIFY_BASH_PREFIXES),
   ]),
   SENTRY: Object.freeze(['Bash(gh pr view:*)', 'Bash(gh run list:*)']),
   // ==========================================================================================
@@ -367,17 +729,8 @@ export const SECRET_PATH_GLOBS: readonly string[] = Object.freeze([
   '**/id_rsa*',
 ]);
 
-/** Every tool that can put bytes on disk. A path deny must cover all of them or it covers none. */
-const WRITE_TOOLS: readonly string[] = Object.freeze(['Write', 'Edit', 'NotebookEdit']);
-
 /** Reading a credential is exfiltration; the secret globs are denied for reads as well. */
 const READ_TOOLS: readonly string[] = Object.freeze(['Read', 'Grep', 'Glob']);
-
-function denyPaths(tools: readonly string[], globs: readonly string[]): string[] {
-  const out: string[] = [];
-  for (const glob of globs) for (const tool of tools) out.push(`${tool}(${glob})`);
-  return out;
-}
 
 /**
  * The three denied commands, in every spelling a `Bash(...)` prefix rule can carry.
@@ -407,10 +760,10 @@ export const DENIED_COMMAND_RULES: readonly string[] = Object.freeze(
  */
 export const GLOBAL_DENY: readonly string[] = Object.freeze([
   ...DENIED_COMMAND_RULES,
-  ...denyPaths(WRITE_TOOLS, SECRET_PATH_GLOBS),
-  ...denyPaths(READ_TOOLS, SECRET_PATH_GLOBS),
+  ...pathRules(WRITE_TOOLS, SECRET_PATH_GLOBS),
+  ...pathRules(READ_TOOLS, SECRET_PATH_GLOBS),
   // ---- the load-bearing block ----------------------------------------------------------
-  ...denyPaths([...WRITE_TOOLS, ...READ_TOOLS], PROTECTED_CONFIG_GLOBS),
+  ...pathRules([...WRITE_TOOLS, ...READ_TOOLS], PROTECTED_CONFIG_GLOBS),
 ]);
 
 /**
@@ -422,7 +775,7 @@ export const GLOBAL_DENY: readonly string[] = Object.freeze([
  * thing to guess at.
  */
 export function globalDeny(home?: string): string[] {
-  const resolved = home === undefined ? [] : denyPaths([...WRITE_TOOLS, ...READ_TOOLS], protectedConfigGlobs(home));
+  const resolved = home === undefined ? [] : pathRules([...WRITE_TOOLS, ...READ_TOOLS], protectedConfigGlobs(home));
   return [...GLOBAL_DENY, ...resolved];
 }
 
@@ -472,11 +825,26 @@ export function toolNameOf(rule: string): string {
  * that fail independently are worth more here than one: `--allowedTools` omits every tool not
  * named, and `--disallowedTools` names them anyway. If a future flag change, a harness default,
  * or a hand-edited spec ever restores the default loadout, the deny half still holds.
+ *
+ * The OVERSEER and the VALIDATOR are the second and third roles defined by an absence, so they get
+ * the same treatment as the COMMANDER: their allow-lists name no editing tool, and the deny half
+ * names the editing tools anyway. Bare names, never `Edit(<glob>)`: a deny beats an allow in
+ * claude's engine, so a scoped deny would say less, and a scoped ALLOW appearing later in one of
+ * those loadouts is precisely what this is here to kill.
+ *
+ * `Bash` is deliberately NOT denied to the VALIDATOR: it holds scoped `Bash(...)` rules for the
+ * spec's verification commands, and a bare `Bash` deny beats an allow in claude's engine, so it
+ * would leave the validator unable to run the only thing it exists to run. The OVERSEER holds no
+ * shell rules to protect, so nothing here has to make room for any; it is denied the editing tools
+ * and gets its shell-lessness from `ROLE_ALLOW` naming none, which is the stronger of the two
+ * spellings when there is nothing to keep.
  */
 export const ROLE_DENY: Record<Role, readonly string[]> = Object.freeze({
   SCOUT: Object.freeze([]),
+  OVERSEER: Object.freeze([...WRITE_TOOLS]),
   ENGINEER: Object.freeze([]),
   INSPECTOR: Object.freeze([]),
+  VALIDATOR: Object.freeze([...WRITE_TOOLS]),
   SENTRY: Object.freeze([]),
   COMMANDER: Object.freeze(COMMANDER_FORBIDDEN_TOOLS.map((tool) => tool)),
 }) as Record<Role, readonly string[]>;

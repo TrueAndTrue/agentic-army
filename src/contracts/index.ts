@@ -12,9 +12,12 @@
  *   ranks.ts     authority, branch of service, who may spawn whom, who may write
  *   harness.ts   the four-verb adapter contract and the neutral event stream
  *   report.ts    the schema-capped return — the context guard
+ *   question.ts  a blocked worker's question, projected for the human who answers it
  *   spec.ts      the technical spec a commander owes a cheap worker
  *   archive.ts   row shapes; append-only signals; SQLite indexes, files are truth
  *   worktree.ts  leases, detached HEAD, destructive release
+ *   workstream.ts one engineer's line of work: its slice, its declared files, its branch
+ *   integration.ts the seam between deciding a merge and performing one
  *   delivery.ts  the rung ladder and the ceiling clamp
  *   config.ts    dispatch rules and per-project ceilings
  */
@@ -22,8 +25,11 @@
 export * from './ranks.ts';
 export * from './harness.ts';
 export * from './report.ts';
+export * from './question.ts';
 export * from './spec.ts';
 export * from './archive.ts';
 export * from './worktree.ts';
+export * from './workstream.ts';
+export * from './integration.ts';
 export * from './delivery.ts';
 export * from './config.ts';

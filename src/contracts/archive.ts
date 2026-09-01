@@ -66,6 +66,17 @@ export const REPORT_JSON_FILENAME = 'report.json';
 export const REPORT_MD_FILENAME = 'report.md';
 export const STREAM_JSONL_FILENAME = 'stream.jsonl';
 export const DIFF_FILENAME = 'diff.patch';
+/**
+ * The two halves of a question round, written only when the text does not fit a signal body.
+ *
+ * A `question` may be 500 characters and an answer is a human typing, so neither is bounded by
+ * the 280 a body is capped at. The rule the `signals` note below states — cap the body, put
+ * anything large in a file, point `artifact` at it — is what these are for, and it matters here
+ * more than usual: the answer is delivered to the next Engineer IN FULL, so a truncated row
+ * would make the archive disagree with what the work actually acted on.
+ */
+export const QUESTION_FILENAME = 'question.md';
+export const ANSWER_FILENAME = 'answer.md';
 
 export const CAMPAIGN_STATUSES = ['active', 'done', 'failed', 'aborted'] as const;
 export type CampaignStatus = (typeof CAMPAIGN_STATUSES)[number];

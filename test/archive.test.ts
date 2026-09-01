@@ -42,7 +42,14 @@ import {
 import { rebuildCampaign } from '../src/archive/rebuild.ts';
 import type { Db } from '../src/archive/db.ts';
 import { archiveDurabilityNote, assertArchivePragmas, openDb } from '../src/archive/db.ts';
-import { SIGNALS_PRAGMA_SQL, SIGNALS_TABLE_SQL } from '../src/archive/schema.ts';
+import {
+  applySchema,
+  SCHEMA_SQL,
+  SCHEMA_VERSION,
+  SIGNALS_PRAGMA_SQL,
+  SIGNALS_TABLE_SQL,
+} from '../src/archive/schema.ts';
+import { RANK_ORDER, ROLES } from '../src/contracts/ranks.ts';
 import {
   agentDirRelative,
   campaignDbPath,
@@ -146,6 +153,99 @@ test('the signals DDL has not drifted from the frozen block', () => {
   // And the shape the rest of the archive relies on: a total order, and no state column.
   assert.ok(SIGNALS_TABLE_SQL.includes('seq         INTEGER PRIMARY KEY AUTOINCREMENT'));
   assert.ok(!/\bstate\b/.test(SIGNALS_TABLE_SQL), 'signals must never grow a state column');
+});
+
+test('the rank and role CHECK lists are generated, so a new rank is a storable row', () => {
+  // The lists are `quotedList(RANK_ORDER)` and `quotedList(ROLES)`, which is what stops a value
+  // added to the contract from becoming a row the database rejects at 3am. Asserted against the
+  // constants rather than against a retyped list, and then against a real INSERT, because a
+  // generated string that nothing has ever inserted through proves only that it is a string.
+  for (const rank of RANK_ORDER) assert.ok(SCHEMA_SQL.includes(`'${rank}'`), `rank ${rank}`);
+  for (const role of ROLES) assert.ok(SCHEMA_SQL.includes(`'${role}'`), `role ${role}`);
+  // The frozen bus DDL depends on neither, which is what makes a rank or role addition safe to
+  // make: it changes the agents table and leaves the append-only log byte-identical.
+  for (const value of ['MAJOR', 'OVERSEER', 'VALIDATOR']) {
+    assert.ok(!SIGNALS_TABLE_SQL.includes(value), `${value} reached the frozen signals block`);
+  }
+
+  const root = makeTempRoot();
+  try {
+    const archive = createCampaign({ archiveRoot: root }, { project: '/p', title: 'ranks' });
+    const task = archive.createTask({ title: 'own the feature' });
+    // The pair the whole design is written in, through the real insert path. At schema version 1
+    // this row was rejected by the CHECK constraint, not by anything a reader could see.
+    const agent = archive.recordAgentAttempt({
+      id: 'maj-01',
+      taskId: task.id,
+      rank: 'MAJOR',
+      role: 'OVERSEER',
+      harness: 'claude',
+      sessionId: '11111111-1111-4111-8111-111111111111',
+      depth: 1,
+      orders: '# Orders\nOwn the feature.\n',
+    });
+    const stored = archive.listAgents().find((row) => row.id === agent.id);
+    assert.equal(stored?.rank, 'MAJOR');
+    assert.equal(stored?.role, 'OVERSEER');
+    archive.close();
+  } finally {
+    removeTempRoot(root);
+  }
+});
+
+test('an index written by an older release is refused with the reason, not with a DDL error', () => {
+  const root = makeTempRoot();
+  try {
+    const file = path.join(root, 'old.db');
+    const db = openDb(file);
+    try {
+      // Exactly what the previous release left on disk: every table present, an older
+      // `user_version`. `applySchema` would otherwise run the DDL straight over the top of it and
+      // fail on `CREATE TABLE campaigns`, a true sentence that explains nothing and names no fix.
+      db.exec(SCHEMA_SQL);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1};`);
+      assert.throws(
+        () => applySchema(db),
+        /schema version .* the `rebuild` command/su,
+        'an old index must be refused by the version check, not by the first CREATE TABLE',
+      );
+      // A refusal that names a command has to name one THIS reader can type. `src/archive/**`
+      // sits below `src/setup/**` and cannot ask `invokedAs()`, so the invocation arrives as a
+      // parameter and the caller that has one passes it. Both spellings are checked, and the
+      // hardcoded `army` that neither of them is:
+      const self = 'node src/cli.ts';
+      assert.throws(
+        () => applySchema(db, self),
+        new RegExp(`\`${self.replace(/[/.]/g, '\\$&')} rebuild\``, 'su'),
+        'a caller that knows the invocation must get it printed back',
+      );
+      // Capable of failing: drop the parameter and this passes on the word `rebuild` alone.
+      try {
+        applySchema(db, self);
+        assert.fail('the refusal did not throw');
+      } catch (error) {
+        assert.doesNotMatch((error as Error).message, /`army rebuild`/);
+        assert.doesNotMatch((error as Error).message, /the `rebuild` command/);
+      }
+      // …and the fast path is untouched: a current database is a no-op, a fresh one is written.
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+      assert.equal(applySchema(db), false);
+    } finally {
+      db.close();
+    }
+
+    const fresh = openDb(path.join(root, 'fresh.db'));
+    try {
+      assert.equal(applySchema(fresh), true, 'an empty file is version 0 and gets the schema');
+      const version = fresh.prepare('PRAGMA user_version').get<{ user_version: number }>();
+      assert.equal(version?.user_version, SCHEMA_VERSION);
+      assert.equal(applySchema(fresh), false, 'applying twice writes nothing');
+    } finally {
+      fresh.close();
+    }
+  } finally {
+    removeTempRoot(root);
+  }
 });
 
 test('WAL and busy_timeout are actually set on every connection', () => {

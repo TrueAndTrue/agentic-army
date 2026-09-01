@@ -8,7 +8,7 @@
  *
  * ## Why there is an ASCII mode at all
  *
- * The rank glyphs — ☆ ◆ ◇ ▪ · — and the box-drawing characters ├ └ │ are U+2500-block and
+ * The rank glyphs — ☆ ◆ ◈ ◇ ▪ · — and the box-drawing characters ├ └ │ are U+2500-block and
  * U+25xx-block characters. A default Windows `cmd.exe` runs codepage 437 or 850, where none of
  * them exist: the console does not fall back, it prints replacement junk, and the tree becomes
  * unreadable in exactly the environment that has never been tested. So there is a
@@ -127,7 +127,7 @@ export const UNICODE_GLYPHS: Glyphs = {
  * set is: a General is the biggest mark on the page, a Private the smallest.
  */
 export const ASCII_GLYPHS: Glyphs = {
-  ranks: { GENERAL: '*', COLONEL: '#', CAPTAIN: 'o', SERGEANT: '+', PRIVATE: '.' },
+  ranks: { GENERAL: '*', COLONEL: '#', MAJOR: '%', CAPTAIN: 'o', SERGEANT: '+', PRIVATE: '.' },
   task: '>',
   branch: '|- ',
   lastBranch: '`- ',
@@ -163,6 +163,7 @@ const FOLD: Record<string, string> = {
   '→': '->',
   '☆': '*',
   '◆': '#',
+  '◈': '%',
   '◇': 'o',
   '▪': '+',
   '▸': '>',
@@ -206,6 +207,27 @@ export function asciiFold(text: string): string {
     out += code >= 0x20 && code <= 0x7e ? char : '?';
   }
   return out;
+}
+
+/**
+ * `asciiFold` over a document, a line at a time.
+ *
+ * ONE LINE IS THE UNIT `asciiFold` WORKS ON, and the reason is `0x0A`. Everything outside
+ * `0x20..0x7e` that is not in `FOLD` becomes `?`, and a newline is outside it — so folding a
+ * multi-line block collapses the whole thing into a single row with `?` where each break was.
+ * Measured: the alignment gate on an ascii terminal arrived as ONE 582-column row beginning
+ * `?  o alignment gate?    ok  spec...`. Every other caller of `asciiFold` hands it a single line
+ * or a single glyph, which is why the hazard sat there unnoticed.
+ *
+ * Split on `\n` rather than on every line terminator: `\r` is a cursor control this codebase emits
+ * deliberately and never a document break, and a fold that silently turned one into a row boundary
+ * would corrupt the composer's own repaint.
+ */
+export function asciiFoldBlock(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => asciiFold(line))
+    .join('\n');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -480,6 +502,27 @@ const COLUMN_SETS: ColumnId[][] = [
 const GUTTER = 2;
 const MIN_LABEL = 14;
 
+/**
+ * The label width worth borrowing from another column to reach.
+ *
+ * `└─ ◇ CPT·ENGINEER · cpt-01` is 29 columns, and the agent id is at the END of it, so a label
+ * column narrower than this clips off exactly the field every other command takes as an argument.
+ * Found on a real pty: at 80 and at 100 columns the fixed columns took everything and the label
+ * was left with 20, so the status block and `army view` both drew `◇ CPT·ENGINEER ·…` and no id.
+ * The unit column is the one a reader scans; it does not lose to `WHY` and `DOING`.
+ */
+const PREFERRED_LABEL = 30;
+
+/**
+ * How far a column may be squeezed to pay for that.
+ *
+ * Only the two prose columns are borrowed from, and only down to a width where they still say
+ * something: `stream:re…` and `Write(li…` are worse than the full text and far better than
+ * nothing. The fixed-shape columns (rank, depth, gap, state, when) are never touched, because
+ * their contents have known widths and clipping them would produce a lie rather than a hint.
+ */
+const COLUMN_FLOOR: Partial<Record<ColumnId, number>> = { why: 10, doing: 8 };
+
 function fixedWidth(ids: readonly ColumnId[]): number {
   return ids.reduce((total, id) => total + GUTTER + COLUMN_SPECS[id].width, 0);
 }
@@ -625,8 +668,32 @@ function labelFor(ctx: Ctx, row: WalkedRow): string {
   return `${glyph} ${base}${attempt} ${ctx.glyphs.bullet} ${row.node.agentId}`;
 }
 
-/** The whole view, ready for stdout. */
-export function renderTree(model: TreeModel, options: RenderOptions = {}): string {
+/**
+ * The BODY of the tree: one row per walked node, and nothing else.
+ *
+ * Split out of `renderTree` for one reason and it is a rule this project already wrote down: the
+ * status block in `army chat` draws the same tree, and a second renderer would be a second layout
+ * to keep in step. `renderTree` calls this, so the full-screen view and the pinned block cannot
+ * disagree about a column width, a prefix glyph or an ellipsis. They are the same code with a
+ * different frame around it.
+ *
+ * The column header is NOT here: it is a frame decision (`renderTree` prints one, the status block
+ * has no room for one), while the widths those headers describe are computed here and returned
+ * alongside so a caller that wants a header can build one that lines up.
+ *
+ * Every row is at most `width` columns and carries no `\n`. The status block depends on both:
+ * a row that wraps breaks the `ESC[nA` arithmetic in `src/chat/io.ts`, and a row carrying a
+ * newline puts the block's own row count out by one.
+ */
+export interface TreeRows {
+  rows: string[];
+  /** Column header, ready to paint, for a caller that draws one. */
+  header: string;
+  /** True when the model had nothing to walk. */
+  empty: boolean;
+}
+
+export function renderTreeRows(model: TreeModel, options: RenderOptions = {}): TreeRows {
   const charset: Charset = options.charset ?? 'unicode';
   const ctx: Ctx = {
     glyphs: glyphsFor(charset),
@@ -637,42 +704,46 @@ export function renderTree(model: TreeModel, options: RenderOptions = {}): strin
 
   const columns = chooseColumns(ctx.width);
   const hasGap = columns.includes('gap');
-  const rows = walkTree(model);
+  const walked = walkTree(model);
 
   // The unit column is the one the reader actually scans, so it gets what it needs up to
   // `MAX_LABEL` and only then starts truncating. Whatever is left over is handed to `doing`,
   // which is the one column that is genuinely better long — a branch name or a PR url.
   const fixed = fixedWidth(columns);
-  const natural = rows.reduce(
+  const natural = walked.reduce(
     (widest, row) => Math.max(widest, prefixFor(ctx, row.lastFlags).length + labelFor(ctx, row).length),
     0,
   );
-  const labelWidth = Math.min(
+  let labelWidth = Math.min(
     Math.max(MIN_LABEL, natural),
     Math.max(MIN_LABEL, ctx.width - fixed),
   );
   const widths: Record<ColumnId, number> = { ...columnWidths() };
-  const slack = ctx.width - fixed - labelWidth;
+  // Borrow, before slack is handed out, and only what the label actually wants. This moves
+  // columns between two cells of the SAME row, so the row's total width is unchanged and the
+  // column set `chooseColumns` picked is untouched. The only thing that changes is which cell
+  // gets clipped when the window is tight, and the answer is no longer "the agent id".
+  let wanted = Math.min(PREFERRED_LABEL, Math.max(MIN_LABEL, natural)) - labelWidth;
+  for (const id of ['doing', 'why'] as const) {
+    if (wanted <= 0) break;
+    if (!columns.includes(id)) continue;
+    const give = Math.min(wanted, widths[id] - (COLUMN_FLOOR[id] ?? widths[id]));
+    if (give <= 0) continue;
+    widths[id] -= give;
+    labelWidth += give;
+    wanted -= give;
+  }
+  const used = columns.reduce((total, id) => total + GUTTER + widths[id], labelWidth);
+  const slack = ctx.width - used;
   if (slack > 0 && columns.includes('doing')) widths.doing += slack;
 
-  const lines: string[] = [];
-
-  lines.push(...renderHeader(ctx, model));
-
-  if (options.header !== false) {
-    let head = pad('UNIT', labelWidth, 'left');
-    for (const id of columns) {
-      const spec = COLUMN_SPECS[id];
-      head += ' '.repeat(GUTTER) + pad(spec.header, widths[id], spec.align);
-    }
-    lines.push(paint(ctx, 'dim', head.trimEnd()));
+  let head = pad('UNIT', labelWidth, 'left');
+  for (const id of columns) {
+    const spec = COLUMN_SPECS[id];
+    head += ' '.repeat(GUTTER) + pad(spec.header, widths[id], spec.align);
   }
 
-  if (rows.length === 0) {
-    lines.push(paint(ctx, 'dim', `  (no tasks and no units recorded yet)`));
-  }
-
-  for (const row of rows) {
+  const rows = walked.map((row) => {
     const cells =
       row.node.kind === 'unit' ? unitCells(ctx, row.node, hasGap) : taskCells(ctx, row.node);
     const rawLabel = fold(ctx, `${prefixFor(ctx, row.lastFlags)}${labelFor(ctx, row)}`);
@@ -686,8 +757,34 @@ export function renderTree(model: TreeModel, options: RenderOptions = {}): strin
       const ink = cellInk(row, id);
       line += ' '.repeat(GUTTER) + (ink === null ? padded : paint(ctx, ink, padded));
     }
-    lines.push(line.replace(/\s+$/u, ''));
+    return line.replace(/\s+$/u, '');
+  });
+
+  return { rows, header: paint(ctx, 'dim', head.trimEnd()), empty: walked.length === 0 };
+}
+
+/** The whole view, ready for stdout. */
+export function renderTree(model: TreeModel, options: RenderOptions = {}): string {
+  const charset: Charset = options.charset ?? 'unicode';
+  const ctx: Ctx = {
+    glyphs: glyphsFor(charset),
+    color: options.color ?? false,
+    width: Math.max(20, options.width ?? 80),
+    charset,
+  };
+
+  const body = renderTreeRows(model, options);
+  const lines: string[] = [];
+
+  lines.push(...renderHeader(ctx, model));
+
+  if (options.header !== false) lines.push(body.header);
+
+  if (body.empty) {
+    lines.push(paint(ctx, 'dim', `  (no tasks and no units recorded yet)`));
   }
+
+  lines.push(...body.rows);
 
   lines.push(...renderFooter(ctx, model));
   return `${lines.join('\n')}\n`;

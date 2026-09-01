@@ -3,11 +3,11 @@
   "description": "The schema-capped return of a working agent. Transport, not truth: full artifacts persist in the war archive and are reached through `artifacts`. Mirrors src/contracts/report.ts — test/contracts.test.ts fails if the two drift. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` at every level and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Both rules are asserted by test/contracts.test.ts.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "summary", "findings", "artifacts", "branch", "costUsd"],
+  "required": ["status", "summary", "findings", "artifacts", "branch", "costUsd", "question"],
   "properties": {
     "status": {
       "type": "string",
-      "description": "done = the orders were carried out; blocked = stopped on something outside this agent's authority; failed = attempted and could not.",
+      "description": "done = the orders were carried out; blocked = stopped on something outside this agent's authority, in which case put the decision you need into `question`; failed = attempted and could not.",
       "enum": ["done", "blocked", "failed"]
     },
     "summary": {
@@ -38,6 +38,12 @@
       "type": ["number", "null"],
       "description": "Cost of this attempt, as reported by the harness. null if unknown.",
       "minimum": 0
+    },
+    "question": {
+      "type": ["string", "null"],
+      "description": "The decision you could not make. Fill this in whenever status is blocked: a block WITH a question climbs to a human, and the answer comes back to a fresh attempt in this same worktree, briefed with it. A block with none simply ends your attempt, and your summary and findings are all anyone gets. One line, no newlines. State the decision and the options you see, not a description of how you got stuck. null on done and failed.",
+      "minLength": 1,
+      "maxLength": 500
     }
   },
   "$defs": {

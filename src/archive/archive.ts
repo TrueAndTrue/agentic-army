@@ -94,6 +94,18 @@ export interface ArchiveConfig {
   dbFactory?: DbFactory;
   /** Injectable clock. Returns ISO-8601. */
   now?: () => string;
+  /**
+   * The command prefix the reader actually invoked: `army`, `node src/cli.ts`, `npx
+   * agentic-army`. Supply it and the schema refusal on an index written by an older release names
+   * a command they can paste; omit it and that refusal names the subcommand without asserting how
+   * to reach it.
+   *
+   * OPTIONAL, AND THE DEFAULT IS TO NAME NO PREFIX AT ALL, for the layering reason spelled out on
+   * `assertSchemaUpgradable` and on `archiveDurabilityNote`: `src/setup/**` sits above
+   * `src/archive/**`, so this file cannot ask `invokedAs()` itself and a hardcoded `army` would be
+   * a command a reader running `node src/cli.ts` cannot type.
+   */
+  self?: string;
 }
 
 function isoNow(): string {
@@ -1163,6 +1175,32 @@ export class CampaignArchive implements CampaignReader {
     return agentArtifactRelative(agentId, DIFF_FILENAME);
   }
 
+  /**
+   * One text file in an agent's directory, for a signal body that would not fit.
+   *
+   * The generic sibling of the four above, and deliberately the only generic one: they name the
+   * files this archive's shape is built on, and this names the escape hatch `SignalRow.artifact`
+   * documents — cap the body, put the whole of it in a file, point the row at the file. Today
+   * that is `question.md` and `answer.md`.
+   *
+   * `filename` is a BASENAME and is checked as one. An agent id already goes through
+   * `assertSafeId` on its way to a directory name; a filename that could carry `..` or a
+   * separator would walk straight back out of the tree that check exists to keep it inside.
+   */
+  writeAgentText(agentId: string, filename: string, contents: string): string {
+    this.assertWritable('writeAgentText');
+    if (filename === '' || filename !== path.basename(filename) || filename.startsWith('.')) {
+      throw new Error(
+        `writeAgentText: ${JSON.stringify(filename)} is not a plain filename; an artifact name ` +
+          'must be a single basename inside the agent\'s own directory',
+      );
+    }
+    const dir = agentDir(this.root, agentId);
+    fs.mkdirSync(dir, { recursive: true });
+    writeFileAtomic(path.join(dir, filename), contents);
+    return agentArtifactRelative(agentId, filename);
+  }
+
   // -- read models -----------------------------------------------------------------------------
 
   /** The whole campaign, shaped for the read-only tree view in v1. */
@@ -1236,7 +1274,10 @@ function openIndex(campaignRoot: string, config: ArchiveConfig): Db {
   // Before anything is written: a factory that dropped `recursive_triggers` would leave the
   // append-only bus rewritable, and nothing else in the system would notice.
   assertArchivePragmas(db);
-  applySchema(db);
+  // `config.self` and not a constant: the only thing `applySchema` says to a human is its refusal
+  // of an index written by an older release, and that refusal has to name a command the reader
+  // can actually type. See `assertSchemaUpgradable`.
+  applySchema(db, config.self);
   return db;
 }
 

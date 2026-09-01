@@ -1,0 +1,20 @@
+{
+  "title": "Adjudication",
+  "description": "A MAJ·OVERSEER's decision about a branch a reviewer refused. Mirrors src/contracts/workstream.ts. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` and every optional property is nullable, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. Two values and no third: an overseer that could return `maybe` would be a rung the supervisor has to guess on top of, and the whole reason this rung exists is that somebody decides.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["decision", "rationale"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["retry", "accept"],
+      "description": "`retry` sends the work back to a fresh engineer with the reviewer's findings, and spends one attempt out of a budget nothing replenishes. `accept` overrules the refusal and lets the branch through with the finding still in it. Retry when any finding is a blocker or the work does not do what it was cut to do; accept when every finding is a preference the spec does not settle, or when the reviewer refused a slice for not being the whole feature. If you cannot tell, retry — that is what this campaign does with no overseer at all."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "One line on why. On a `retry` this is what the next engineer reads alongside the findings, so make it the sentence that changes what it does. On an `accept` it is the record of a refusal being overruled, which is the decision most worth being able to read back.",
+      "minLength": 1,
+      "maxLength": 280
+    }
+  }
+}

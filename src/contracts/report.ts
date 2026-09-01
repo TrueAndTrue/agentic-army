@@ -34,6 +34,19 @@ export const MAX_ARTIFACTS = 20;
 /** Shared cap for the small pointer strings: branch, file, artifact ref/note, test command. */
 export const SHORT_STRING_MAX_CHARS = 512;
 
+/**
+ * One line, and a longer one than a summary gets.
+ *
+ * A question has to state the decision AND the options a human is choosing between, which a
+ * 280-character account of what happened does not have to do. 500 is the same ceiling
+ * `SPEC_ENTRY_MAX_CHARS` and `OBJECTIVE_MAX_CHARS` use, and it is the same ceiling for the same
+ * reason: a question climbs into the NEXT Engineer's `orders.md`, which is a markdown document
+ * with `##` section headings in it. A single line cannot open a section, so a worker cannot write
+ * itself a forged instruction from the rank above. `validateReport` enforces the newline half; the
+ * schema enforces the length half, and both have to hold because only one of them is on the wire.
+ */
+export const QUESTION_MAX_CHARS = 500;
+
 // ---------------------------------------------------------------------------------------------
 // Value domains
 // ---------------------------------------------------------------------------------------------
@@ -84,6 +97,36 @@ export interface Report {
   /** `army/<task-id>` when the agent cut one. */
   branch?: string;
   costUsd?: number;
+  /**
+   * The decision this agent could not make. OPTIONAL on every status, `blocked` included.
+   *
+   * ## Why it is not required when `blocked`
+   *
+   * It was, for one wave, enforced by `validateReport` because `schemas/report.v1.json` cannot
+   * express "required when another property equals a value" (OpenAI strict mode takes a flat
+   * `required` array and nothing else). The cost was measured and it is not worth paying: a model
+   * that follows the schema and skips the prose returns `blocked` with `question: null`, the
+   * validator then rejects the WHOLE report, and the worker's own account of why it stopped is
+   * lost — no `report.json`, a `report.md` saying "No valid Report was returned", and a report
+   * signal that degrades from the worker's sentence to "no valid report (ok)".
+   *
+   * Trading a whole report for a missing field is a bad trade, so the field is optional and the
+   * two shapes are both legal states of the ladder rather than one legal state and one schema
+   * error:
+   *
+   *   `blocked` WITH a question    — climbs. A human is asked and the answer resumes the work.
+   *   `blocked` WITHOUT a question — terminal, exactly as it was before the ladder existed. The
+   *                                  attempt ends and the summary, the findings and the branch
+   *                                  are all still in the archive.
+   *
+   * The schema names the field in the `blocked` prose so a worker knows to fill it in. Nothing
+   * enforces that it did, because there is no enforcement that does not cost more than it buys.
+   *
+   * WORKER-AUTHORED. When it IS present it crosses into a human's terminal and into the next
+   * Engineer's orders, so the single-line and length rules below still bite: those are the
+   * injection defence and they are not what was reversed.
+   */
+  question?: string;
 }
 
 /**
@@ -167,7 +210,7 @@ export interface Verdict {
  * and every key in the REQUIRED lists is not.
  */
 export const REPORT_REQUIRED_KEYS = ['status', 'summary', 'findings', 'artifacts'] as const;
-export const REPORT_OPTIONAL_KEYS = ['branch', 'costUsd'] as const;
+export const REPORT_OPTIONAL_KEYS = ['branch', 'costUsd', 'question'] as const;
 export const VERDICT_REQUIRED_KEYS = ['verdict', 'summary', 'findings', 'testsRun'] as const;
 export const VERDICT_OPTIONAL_KEYS = ['testCommand', 'behaviours'] as const;
 export const FINDING_REQUIRED_KEYS = ['severity', 'message'] as const;
@@ -400,6 +443,32 @@ export function validateReport(u: unknown): ValidationResult<Report> {
     costUsd = checkCostUsd(u.costUsd, 'costUsd', errors);
   }
 
+  // ---- the question ----------------------------------------------------------------------
+  //
+  // THERE IS NO CONDITIONAL RULE HERE, and the absence is deliberate — see `Report.question`.
+  // Optional on every status, `blocked` included: a validator that rejected a blocked report for
+  // a missing question threw away the whole report, which is a worse outcome than the state it
+  // was refusing. A blocked report with nothing to ask is terminal, and the campaign says so.
+  //
+  // What IS checked is the shape of a question that is present, and both halves are load-bearing.
+  // The length keeps a 500-character ceiling on a string that rides into the next Engineer's
+  // brief; the single-line rule is the injection defence — that brief is a markdown document with
+  // `##` headings in it, and a worker string carrying a newline can carry a heading.
+  //
+  // A `done` report that also asked something is odd, not malformed. Refusing it would turn a
+  // whole successful attempt into a schema failure over a field the campaign is about to ignore.
+  let question: string | undefined;
+  if (!isAbsent(u.question)) {
+    question = checkString(u.question, QUESTION_MAX_CHARS, 'question', errors);
+    if (question !== undefined && /[\r\n]/.test(question)) {
+      errors.push(
+        'question: must be one line. It is rendered into the next Engineer\'s orders, which is a ' +
+          'markdown document, and a worker string carrying a newline can carry a `##` heading.',
+      );
+      question = undefined;
+    }
+  }
+
   if (
     errors.length > 0 ||
     status === undefined ||
@@ -413,6 +482,7 @@ export function validateReport(u: unknown): ValidationResult<Report> {
   const value: Report = { status, summary, findings, artifacts };
   if (branch !== undefined) value.branch = branch;
   if (costUsd !== undefined) value.costUsd = costUsd;
+  if (question !== undefined) value.question = question;
   return { ok: true, value };
 }
 

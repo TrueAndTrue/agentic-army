@@ -13,8 +13,8 @@
  * 1. **Rank and depth are separate columns, and the gap between them is diagnostic.**
  *    Rank is assigned by the spawner and must be strictly junior to it; it is never derived from
  *    depth. `rankDepthGap = depth - RANK_SENIORITY[rank]`. A ceremonial chain
- *    GEN(0)→COL(1)→CPT(2)→SGT(3)→PVT(4) gives a gap of 0 at every level. Skipping ranks — a
- *    General detaching a Captain directly for a two-file fix — gives a NEGATIVE gap, and is
+ *    GEN(0)→COL(1)→MAJ(2)→CPT(3)→SGT(4)→PVT(5) gives a gap of 0 at every level. Skipping ranks —
+ *    a General detaching a Captain directly for a two-file fix — gives a NEGATIVE gap, and is
  *    explicitly legal. A POSITIVE gap is not: it means the chain has more nesting levels than it
  *    consumed ranks, which can only happen if some spawn failed to go strictly junior. So
  *    `gap > 0` is flagged and `gap <= 0` is not, and the reader never has to compute it.
@@ -445,7 +445,7 @@ export interface UnitNode {
   attempt: number;
   /** Structural spawn depth, straight off the row. NEVER derived from rank. */
   depth: number;
-  /** `RANK_SENIORITY[rank]`: GENERAL 0 … PRIVATE 4. Presentation only; never persisted. */
+  /** `RANK_SENIORITY[rank]`: GENERAL 0 … PRIVATE 5. Presentation only; never persisted. */
   rankSeniority: number;
   /** `depth - rankSeniority`. <= 0 is normal, > 0 means the chain outran its ranks. */
   rankDepthGap: number;

@@ -189,6 +189,39 @@ mode = "unguarded"
 
 
 # ---------------------------------------------------------------------------
+# [planning] — what phase 1 leaves behind
+# ---------------------------------------------------------------------------
+# Before any code is written, \`army chat\` interrogates you until it can fill a
+# seven-field technical spec, then runs that spec's verification commands
+# against the base commit to prove they EXECUTE — even if they fail — and only
+# then asks for the keystroke that starts phase 2.
+#
+# The settled spec, the questions and answers that produced it, and the reading
+# of every verification command are written into the campaign archive, always.
+# There is no setting below that turns that off, and there is not going to be
+# one: the archive is append-only, audited, and outside every repository, and a
+# decision record with an off switch is a record nobody can rely on being there.
+#
+# THE ONE KEY HERE decides whether the SAME three documents also land in the
+# repository you are working on, under docs/army-specs/<campaign-id>/.
+#
+# It is off, and the reason is a specific cost rather than a preference: a
+# rejected branch should not strand design documents in the repo. A campaign
+# that ends inspector-failed still produced a spec, and with this on that spec
+# is now an untracked directory describing a feature nobody shipped, sitting in
+# your \`git status\` until you notice it and delete it.
+#
+# Turn it on when the spec is meant to be reviewed next to the diff — a team
+# that wants the design decision in the pull request rather than in a directory
+# under your home. Nothing else about the run changes; the archive copy is
+# written either way, and the two are byte-identical because one function
+# renders both.
+[planning]
+
+# spec_to_repo = false
+
+
+# ---------------------------------------------------------------------------
 # [worktree] — the pool every agent works in
 # ---------------------------------------------------------------------------
 # A campaign leases ONE tree and runs its Engineer and then its Inspector in it.

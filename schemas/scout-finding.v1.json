@@ -1,0 +1,37 @@
+{
+  "title": "ScoutFinding",
+  "description": "What a CPT·SCOUT hands back after reading the repository and the web. Mirrors src/contracts/scout.ts. NO `$schema` KEY: claude --json-schema cannot resolve the 2020-12 meta-schema URI and rejects the file outright. STRICT MODE: every property appears in `required` and no property is optional, because codex --output-schema uses OpenAI strict structured outputs, which rejects any property missing from `required`. A scout never writes to the repository and holds no worktree; this document is the whole of what it produces.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "unknowns"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One line answering the question you were sent with. No newlines: this is rendered into a markdown briefing, and a line that can open a `##` section is a line that can forge an instruction.",
+      "minLength": 1,
+      "maxLength": 280
+    },
+    "findings": {
+      "type": "array",
+      "description": "What you found, one line each, with the file and line or the URL. Dense: your commander is reading this instead of the code, and length costs it the context it needs to act. If you found nothing, say so in one entry rather than returning an empty list.",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "description": "What you could NOT determine, named rather than guessed at. This field is required because you were sent precisely because nobody knew the answer, and a report with no stated gaps is either a question that did not need asking or a gap somebody filled in silently. If you genuinely determined everything, say so in one entry.",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      }
+    }
+  }
+}

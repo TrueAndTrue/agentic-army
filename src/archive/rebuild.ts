@@ -519,6 +519,10 @@ export function rebuildCampaign(campaignRoot: string, options: RebuildOptions = 
     // likely place for a future `INSERT OR REPLACE` to appear. If a swapped driver has lost
     // `recursive_triggers`, that edit would silently destroy audit rows — fail here instead.
     assertArchivePragmas(db);
+    // No `self`: the only thing `applySchema` addresses a human with is its refusal of an index
+    // written by an older release, and `tempPath` is a file this function just created, so its
+    // `user_version` is 0 and the refusal is unreachable here. Rebuild IS the command that
+    // refusal names; a rebuild that had to tell you to rebuild would be a loop.
     applySchema(db);
     counts = insertAll(db, campaign, tasks.rows, agents.rows, signals.rows, campaignRoot);
   } catch (error) {

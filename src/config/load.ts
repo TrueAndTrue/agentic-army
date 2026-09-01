@@ -44,9 +44,11 @@ import type {
   GlobalConfig,
   PermissionPosture,
   PermissionsConfig,
+  PlanningConfig,
 } from '../contracts/config.ts';
 import {
   DEFAULT_PERMISSION_POSTURE,
+  DEFAULT_SPEC_TO_REPO,
   PERMISSION_POSTURES,
 } from '../contracts/config.ts';
 import type { ProjectPolicy, Rung } from '../contracts/delivery.ts';
@@ -196,7 +198,41 @@ export function defaultConfig(configFilePath: string): GlobalConfig {
     projects: {},
     dispatch: DEFAULT_DISPATCH,
     permissions: { mode: DEFAULT_PERMISSION_POSTURE },
+    planning: { specToRepo: DEFAULT_SPEC_TO_REPO },
   };
+}
+
+/**
+ * `[planning] spec_to_repo = true | false`.
+ *
+ * Warns only about a MALFORMED value, and says nothing about a well-formed `false` — the rule
+ * `parsePermissions` below settled and the reason it gives applies unchanged: this array means
+ * "something about YOUR CONFIG is questionable", it is read by `doctor` and by every command that
+ * loads a file, and a warning that fires on every load for every reader is the shape people learn
+ * to scroll past, taking the warnings that matter with it.
+ *
+ * A string `"true"` is a malformed value rather than a truthy one. TOML has a boolean type; a
+ * quoted one is somebody who meant the boolean and got the syntax wrong, and silently honouring it
+ * would mean the next person to write `"false"` gets a directory in their working copy.
+ */
+function parsePlanning(raw: unknown, warnings: string[]): PlanningConfig {
+  let specToRepo = DEFAULT_SPEC_TO_REPO;
+  if (isTable(raw)) {
+    const value = raw['spec_to_repo'];
+    if (typeof value === 'boolean') {
+      specToRepo = value;
+    } else if (value !== undefined) {
+      warnings.push(
+        `planning.spec_to_repo: expected true or false, got ${JSON.stringify(value)}; using ` +
+          `${String(DEFAULT_SPEC_TO_REPO)}`,
+      );
+    }
+  } else if (raw !== undefined) {
+    warnings.push(
+      `planning: expected a table; using spec_to_repo = ${String(DEFAULT_SPEC_TO_REPO)}`,
+    );
+  }
+  return { specToRepo };
 }
 
 /**
@@ -576,6 +612,7 @@ export function parseConfig(toml: string, configFilePath: string): ParsedConfig 
       projects: parseProjects(data['projects'], warnings),
       dispatch: parseDispatch(data['dispatch'], warnings),
       permissions: parsePermissions(data['permissions'], warnings),
+      planning: parsePlanning(data['planning'], warnings),
     },
     warnings,
   };

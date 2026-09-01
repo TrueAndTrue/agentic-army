@@ -30,6 +30,15 @@ export type CommandRunner = (
   command: string,
   cwd: string,
   timeoutMs: number,
+  /**
+   * Kill this command before its deadline.
+   *
+   * OPTIONAL, and a runner is allowed to ignore it: every injected runner in the tests is a
+   * function of the first three arguments and stays correct. What it buys is the case the
+   * alignment gate has and the acceptance gate does not — a human sitting at a prompt while four
+   * commands that may never finish run one after another. See `runAlignmentGate`.
+   */
+  signal?: AbortSignal,
 ) => Promise<CommandResult>;
 
 /** Default ceiling for one acceptance command. A build plus a suite fits inside this. */

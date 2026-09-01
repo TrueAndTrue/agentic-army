@@ -122,13 +122,31 @@ ${pieces}
   against drift, which only becomes a real boundary once workers are denied
   write access to that directory.
 
-RANKS   ☆ GENERAL   ◆ COLONEL   ◇ CAPTAIN   ▪ SERGEANT   · PRIVATE
-ROLES   COMMANDER (decide)   ENGINEER (change)   INSPECTOR (verify)
+RANKS   ☆ GENERAL   ◆ COLONEL   ◈ MAJOR   ◇ CAPTAIN   ▪ SERGEANT   · PRIVATE
+ROLES   COMMANDER (decide)   SCOUT (find out)   OVERSEER (own a feature)
+        ENGINEER (change)   INSPECTOR (verify)
+        VALIDATOR (judge the merged branch)
         A COMMANDER holds one inert tool and nothing that opens a file, runs a
         command or reaches the network. That is what the chat session runs on,
         and it is a permission set rather than a line in a briefing.
-        NOT YET FIELDED: SCOUT (find out), SENTRY (wait). They are declared so
-        the gap is stated rather than hidden; nothing in this build spawns one.
+        A CPT·SCOUT reads the repository and the web and writes nothing. It
+        holds no worktree, because a lease exists to isolate changes and it
+        makes none. It may field a handful of subordinates inside its own
+        process and no deeper; the count is measured off its event stream and
+        crossing it stops the recce. Ask for one from inside a chat session,
+        before the interrogation, when the answer changes what gets built.
+        A MAJ·OVERSEER holds Read, Grep, Glob and TodoWrite, so it can read the
+        repository and change none of it. It segments a feature into workstreams
+        and answers the questions climbing to it; this process performs every
+        merge it decides on. Ask for one with --overseer. Without it a campaign
+        runs a single engineer, exactly as it always did.
+        A CPT·INSPECTOR reviews one branch against the orders it was cut from.
+        Each workstream gets its own. A CPT·VALIDATOR runs last, once, on the
+        integrated branch: the gate answers "do the commands pass", and the
+        validator answers "is this the thing that was asked for". Both are
+        fielded only when a campaign segments, which is --overseer.
+        NOT YET FIELDED: SENTRY (wait). It is declared so the gap is stated
+        rather than hidden; nothing in this build spawns one.
 `;
 }
 
