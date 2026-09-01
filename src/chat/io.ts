@@ -49,6 +49,72 @@
  * and paints it again afterwards. That is the whole protocol, and the two rules that keep it
  * honest are on `statusRows` (when the block may be drawn at all) and on `submitLine` (when
  * `currentExtra()` may be evaluated). Both are stated where they are enforced.
+ *
+ * ## The prompt is not fixed for the life of a read
+ *
+ * `setPrompt` relabels the composer's row under a read that is already pending, buffer and cursor
+ * untouched. It is one more caller of `repaint`, on the same single physical row, and it obeys
+ * every rule above. It exists because the alternative (abort the read, open another) is the one
+ * thing this interface must never do to somebody who is halfway through a word.
+ *
+ * ## THE ADDRESSEE IS A PROPERTY OF THE LINE, NOT OF THE READ
+ *
+ * The property is one sentence: **a line the human typed for one reader is never delivered to a
+ * different one.** It has been broken three times, by three mechanisms, and the third break is
+ * what settled the design.
+ *
+ *   1. The type-ahead QUEUE. `how long is this going to take?`, typed at the composer minutes
+ *      earlier, drained into the only read that happened during a dispatch and reached a blocked
+ *      Engineer as a decision, written into its `orders.md` under "This is a DECISION TAKEN ABOVE
+ *      YOU".
+ *   2. A RELABEL. `COMMANDER PLEASE ALSO ADD DIVIDE`, half typed under the dispatch prompt, was
+ *      relabelled in place by a worker's question and one Enter away from carrying the standing of
+ *      a spec.
+ *   3. The READ ITSELF. `send a scout? [y/N]` opened while a `yes` typed as an ordinary
+ *      interrogation answer sat in the queue, consumed it before the human saw the prompt, and
+ *      spawned a scout on a keystroke nobody gave. The same input at the alignment gate spawned a
+ *      real `CPT·ENGINEER` in a leased worktree.
+ *
+ * The first two were fixed one door at a time, with a flag per door (`{ fresh: true }`) and an
+ * addressee attached to the READ. That design is why there was a third door: every call site had
+ * to remember to ask for the protection, and the two confirm prompts did not.
+ *
+ * So the addressee is on the LINE. A line is typed under some prompt, that prompt reads for some
+ * addressee, and the line carries that addressee from the moment Enter lands. A read consumes only
+ * lines addressed to it; a line addressed elsewhere stays queued, in order, for the reader it was
+ * meant for. There is no flag, so there is nothing to forget, and `NextLineOptions.addressee` is
+ * REQUIRED — a prompt that opens without saying who it reads for does not compile.
+ *
+ * Three details, each stated where it is enforced below:
+ *
+ * **What a line typed before any addressee existed inherits.** On a terminal, the Commander —
+ * `COMMANDER_ADDRESSEE`, which is what `inForce` starts at. A keystroke that lands before any
+ * prompt has named a reader was typed at the session's own composer, and the Commander is the
+ * session's own reader; it is also the only safe default, because it is the one reader in this
+ * system that spawns nothing on a keystroke. On the piped and scripted paths there is no composer
+ * and `readline` hands over lines that were finished before anything was asked, so a line that
+ * surfaces before any read has named an addressee is UNADDRESSED and any read may take it. That is
+ * the boundary of the property rather than a hole in it: a line typed for no reader cannot have
+ * been typed for a different one.
+ *
+ * **The draft in the composer is a line too.** It carries the addressee it was typed under
+ * (`draftAddressee`), and both doors that can change the reader honour it. A `nextLine` for
+ * somebody else PUTS THE DRAFT DOWN and gives it back when that read is over — the human's
+ * half-sentence is not lost and not delivered. A `setPrompt` for somebody else cannot give it back
+ * (the read it relabels is still running), so the draft is returned to the Commander's queue
+ * (`queueLine`, the one direction this file documents as safe) and `setPrompt` RETURNS the
+ * displaced text so its caller can say what happened.
+ *
+ * **What the human sees when a line is held back.** Both cases say so, once, in this file rather
+ * than at a call site: `HELD_DRAFT_NOTICE` when the composer is put down, and `heldLinesNotice`
+ * when a read steps over queued lines addressed elsewhere. Each queued line is announced at most
+ * once, and lines handed back through `queueLine` are pre-announced, because their caller has
+ * already printed its own account of where they went. A line that vanishes with no account of
+ * where it went is its own defect.
+ *
+ * A `setPrompt` that names NO addressee is still a pure relabel, and it is now safe by
+ * construction rather than by care: the row carries the words and the line carries the reader, so
+ * changing the words moves nothing.
  */
 
 import { createInterface, emitKeypressEvents } from 'node:readline';
@@ -56,7 +122,15 @@ import type { Interface as ReadlineInterface } from 'node:readline';
 
 import { detectCharset, detectColor } from '../view/index.ts';
 import type { Charset } from '../view/render.ts';
-import { ANSI, SPINNER_FRAMES, asciiFold, displayWidth, paintInk, wrapPlain } from '../view/render.ts';
+import {
+  ANSI,
+  SPINNER_FRAMES,
+  asciiFold,
+  asciiFoldBlock,
+  displayWidth,
+  paintInk,
+  wrapPlain,
+} from '../view/render.ts';
 
 /**
  * The status block, as a pure function of the animation frame and the terminal's width.
@@ -74,6 +148,81 @@ import { ANSI, SPINNER_FRAMES, asciiFold, displayWidth, paintInk, wrapPlain } fr
  */
 export type StatusRenderer = (tick: number, width: number) => readonly string[];
 
+/**
+ * The one addressee this file knows the name of.
+ *
+ * Everything else in the vocabulary is the caller's and is compared for equality only —
+ * `'question:3'`, `'scout-approval'`, `'stop-confirmation'`. This one is spelled here because two
+ * mechanisms in this file have to name it and neither of them has a caller to ask: the addressee a
+ * keystroke inherits before any prompt has named a reader, and the destination a displaced draft
+ * or a handed-back line is given. Both are documented in the header as the Commander's, and a
+ * string repeated in three files is a string that drifts.
+ */
+export const COMMANDER_ADDRESSEE = 'commander';
+
+/** What a read says about itself. */
+export interface NextLineOptions {
+  /**
+   * Who the next line read at this composer reaches. REQUIRED.
+   *
+   * Opaque to this file apart from `COMMANDER_ADDRESSEE`, and compared for equality only —
+   * `'question:3'`, `'scout-approval'`, `'stop-confirmation'` are the caller's own vocabulary.
+   *
+   * It is required because the previous spelling was optional and a read that named none was
+   * invisible to every protection there was. A prompt that cannot say who it reads for is a prompt
+   * that can be answered by a line typed for somebody else, and the compiler is the only reviewer
+   * that reads every call site. See the header, "THE ADDRESSEE IS A PROPERTY OF THE LINE".
+   */
+  readonly addressee: string;
+}
+
+/** The composer's draft was put down because this read is for somebody else. */
+export const HELD_DRAFT_NOTICE =
+  '  ◇ the line you were typing was for the prompt before this one. It is held, unsent, and comes ' +
+  'back the moment this prompt is answered.\n';
+
+/**
+ * A read stepped over lines the human typed for a different reader.
+ *
+ * Said once per line, at the first read that skipped it, because the alternative is a session that
+ * either lies by omission (a `yes` that appears to do nothing) or repeats itself on every read of
+ * a loop that re-prompts after each line.
+ */
+export function heldLinesNotice(count: number): string {
+  const plural = count === 1 ? 'line' : 'lines';
+  return (
+    `  ◇ ${String(count)} ${plural} you typed earlier ${count === 1 ? 'is' : 'are'} still queued ` +
+    'for the prompt it was typed at. This prompt reads for somebody else and did not take it.\n'
+  );
+}
+
+/** What a relabel says about who is reading now. */
+export interface SetPromptOptions {
+  /**
+   * The addressee this prompt reads for, in the same vocabulary `NextLineOptions.addressee` uses.
+   *
+   * OPTIONAL here where it is required on `nextLine`, and the asymmetry is the point rather than
+   * an oversight. A relabel that names none changes the words on the row and nothing else, and
+   * that is now safe by construction: the reader rides on the line, not on the row, so repainting
+   * the row moves nothing. Supplied and DIFFERENT from the addressee the draft was typed under,
+   * the draft is returned to the Commander's queue and the composer is cleared — see the header.
+   */
+  readonly addressee?: string;
+}
+
+/** What an aborted read does with input the human typed for somebody else. */
+export interface AbortLineOptions {
+  /**
+   * Leave queued type-ahead alone.
+   *
+   * The default discards it, which is right for the exit it was written for: replaying a queued
+   * line into a session that is closing would run a turn nobody is watching. It is wrong for a
+   * Ctrl-C that only cancels a `{ fresh: true }` read — the session is not ending, and the lines
+   * in the queue were addressed to the Commander, which is still there.
+   */
+  readonly keepQueued?: boolean;
+}
+
 export interface ChatIo {
   /** Write to the conversation. No trailing newline is added. */
   write(text: string): void;
@@ -88,11 +237,61 @@ export interface ChatIo {
    * half-prompt on every keystroke.
    *
    * `null` means there will be no more input — end of stream, or `abortLine()`. The caller treats
-   * both as "leave", which is why Ctrl-D and a second Ctrl-C land in the same branch.
+   * both as "leave", which is why Ctrl-D and a second Ctrl-C land in the same branch. A read that
+   * is not the session's own loop (an answer prompt, a confirmation) reads it as "nothing was
+   * typed at THIS prompt" and carries on.
+   *
+   * ONLY LINES ADDRESSED TO `options.addressee` are consumed. Anything the human typed for another
+   * reader stays queued, in order, for the reader it was meant for — see the header.
    */
-  nextLine(prompt: string): Promise<string | null>;
+  nextLine(prompt: string, options: NextLineOptions): Promise<string | null>;
+  /**
+   * Change what the PENDING read's prompt says, without ending it.
+   *
+   * ## Why this exists rather than "abort the read and open a new one"
+   *
+   * A question inbox has to be able to tell a reader that what they type now goes somewhere else
+   * the composer's own row is the only surface that can say it while it is true. But a question
+   * arrives from a worker, on a worker's schedule, while a human is mid-word; and the way to
+   * re-prompt without this method is `abortLine` plus a second `nextLine`, which on the raw path
+   * clears `editor` and drops whatever was half-typed. That is precisely the thing this UI is not
+   * allowed to do: **nothing seizes the composer mid-keystroke.**
+   *
+   * So the buffer, the cursor and any open continuation are untouched. Only the prompt changes,
+   * and the row is repainted where it stands.
+   *
+   * SINGLE-LINE. Anything before the last `\n` is dropped rather than printed: the lead is
+   * ordinary output belonging to the moment the read BEGAN, and re-emitting it here would put a
+   * blank separator in the middle of a line the human is typing on. A no-op when no read is
+   * pending, because there is no row to relabel.
+   *
+   * ## The one thing it does NOT leave untouched
+   *
+   * A relabel that names a different `addressee` is not a relabel, it is a rerouting, and a draft
+   * typed under the old addressee may not be delivered to the new one. That draft is returned to
+   * the Commander's queue and the composer is cleared. RETURNS the displaced text so the caller
+   * can print an account of where it went, or `null` when nothing was displaced — which is every
+   * call that names no addressee, names the same one, or finds an empty composer.
+   */
+  setPrompt(prompt: string, options?: SetPromptOptions): string | null;
+  /**
+   * Hand a line BACK to the type-ahead queue, RE-ADDRESSED to the Commander, at the end of it.
+   *
+   * The dispatch console reads for itself while a campaign runs, so a line typed at that moment
+   * reaches the console rather than the queue, and when it turns out to be neither an answer nor a
+   * command, it was the Commander's after all. This is how it gets there: appended, so it keeps
+   * its place behind anything typed before the dispatch, and never offered to the read that just
+   * returned it.
+   *
+   * NOT a general "unread". It is the one direction that is safe: the line is re-addressed to
+   * `COMMANDER_ADDRESSEE`, so nothing but the Commander's own prompt can pick it up, whatever
+   * reader it started under. Handed-back lines are also marked as already announced — the caller
+   * that hands one back has printed its own account of where it went, and two accounts of one line
+   * is one account too many.
+   */
+  queueLine(line: string): void;
   /** Unblock a pending `nextLine` with `null`. What a confirmed exit uses to get out of a read. */
-  abortLine(): void;
+  abortLine(options?: AbortLineOptions): void;
   /** Register a Ctrl-C handler. Returns the unsubscribe. */
   onInterrupt(handler: () => void): () => void;
   close(): void;
@@ -107,6 +306,16 @@ export interface ChatIo {
    * for a width can be given.
    */
   readonly width: number;
+  /**
+   * Terminal rows, live, or 0 when the stream does not report any.
+   *
+   * A getter for the same reason `width` is, and read for one decision only: how many rows a
+   * caller may ask the status block for. `statusRows` already REFUSES to draw a block that does
+   * not leave the conversation two rows, so a renderer that does not know the height cannot
+   * choose between a shorter block and no block at all: it just vanishes, and the reader is
+   * given no way to tell a suppressed block from a broken one. 0 means unknown, never zero rows.
+   */
+  readonly rows: number;
   /**
    * The session is waiting on the model, with nothing to show yet. On a TTY this animates
    * `<spinner> <label> …` appended to the current line — the label so the reader knows WHOSE
@@ -139,14 +348,59 @@ export interface ChatIo {
  * and the failure is silent — they see their own characters echoed and then nothing happens.
  */
 interface LineQueue {
-  push(line: string): void;
+  /**
+   * A line the human has just finished. Delivered to a pending read, or held for `addressee`.
+   *
+   * Delivered to whoever is waiting, whether or not there is a backlog behind it, and that is
+   * consistent rather than an exception: a line typed while a read is pending was typed AT that
+   * read's prompt, so the read's addressee is exactly the addressee in force.
+   */
+  push(line: string, addressee: string | null): void;
+  /**
+   * Put a line at the BACK of the backlog, addressed, without offering it to a pending read.
+   *
+   * `push` delivers to a waiter, which is right for a keystroke: it arrived now, so it belongs to
+   * whoever is reading now. This is the other direction: a line that was read by the wrong reader
+   * and is being handed back to the queue the Commander drains. Delivering it would hand it
+   * straight back to the reader that just returned it, which is a loop.
+   */
+  queue(line: string, addressee: string | null): void;
   end(): void;
-  take(): Promise<string | null>;
-  abort(): void;
+  /**
+   * Only lines addressed to `addressee`, or to nobody at all. Order preserved.
+   *
+   * `onSettle` runs SYNCHRONOUSLY, immediately before the read resolves, and that is not a style
+   * choice. It is this path's `settlePending`, and it puts the composer back in the Commander's
+   * hands the instant the prompt is gone. Hung off a `.then` instead, it costs a microtask hop —
+   * enough for the caller's own continuation to be queued behind a test's, so a line fed one tick
+   * later found no waiter and was stamped with a reader that had already moved on. Measured: a
+   * `/stop` confirmation and the sentence typed at it ended up addressed to two different readers.
+   */
+  take(addressee: string, onSettle: () => void): Promise<string | null>;
+  /**
+   * How many queued lines this read is stepping over that nobody has been told about yet.
+   *
+   * Marks them told, so the count is what a reader has not already seen rather than a running
+   * total re-announced by every read of a loop that re-prompts after each line.
+   */
+  claimHeld(addressee: string): number;
+  abort(options?: AbortLineOptions): void;
+}
+
+/** A finished line and the reader it was typed for. `null` is "typed before any reader existed". */
+interface QueuedLine {
+  readonly text: string;
+  readonly addressee: string | null;
+  announced: boolean;
+}
+
+/** A queued line this read may consume: its own, or one typed before any reader was named. */
+function addressedTo(entry: QueuedLine, addressee: string): boolean {
+  return entry.addressee === null || entry.addressee === addressee;
 }
 
 function createLineQueue(): LineQueue {
-  const buffered: string[] = [];
+  const buffered: QueuedLine[] = [];
   let waiter: ((value: string | null) => void) | null = null;
   let ended = false;
 
@@ -159,25 +413,55 @@ function createLineQueue(): LineQueue {
   };
 
   return {
-    push(line: string): void {
-      if (!deliver(line)) buffered.push(line);
+    push(line: string, addressee: string | null): void {
+      if (!deliver(line)) buffered.push({ text: line, addressee, announced: false });
+    },
+    queue(line: string, addressee: string | null): void {
+      // Pre-announced: `queueLine`'s callers print their own account of where the line went.
+      buffered.push({ text: line, addressee, announced: true });
     },
     end(): void {
       ended = true;
       deliver(null);
     },
-    abort(): void {
+    abort(options?: AbortLineOptions): void {
       // Buffered type-ahead is discarded on the way out. Replaying a queued line into a session
-      // that is closing would run a turn nobody is watching.
-      buffered.length = 0;
+      // that is closing would run a turn nobody is watching. `keepQueued` is the case where the
+      // session is NOT closing — see `AbortLineOptions`.
+      if (options?.keepQueued !== true) buffered.length = 0;
       deliver(null);
     },
-    take(): Promise<string | null> {
-      const next = buffered.shift();
-      if (next !== undefined) return Promise.resolve(next);
-      if (ended) return Promise.resolve(null);
+    claimHeld(addressee: string): number {
+      let count = 0;
+      for (const entry of buffered) {
+        if (entry.announced || addressedTo(entry, addressee)) continue;
+        entry.announced = true;
+        count += 1;
+      }
+      return count;
+    },
+    take(addressee: string, onSettle: () => void): Promise<string | null> {
+      // The FIRST line this read may have, which is not always the first line in the queue: a
+      // line addressed elsewhere is stepped over and keeps both its place and its destination.
+      const at = buffered.findIndex((entry) => addressedTo(entry, addressee));
+      if (at !== -1) {
+        const text = (buffered.splice(at, 1)[0] as QueuedLine).text;
+        onSettle();
+        return Promise.resolve(text);
+      }
+      // END OF INPUT still ends any read, and only end of input does. `ended` is not queued text,
+      // it is "there will never be any more", which is the one honest answer to "what did the
+      // human type at this prompt". Without it a Ctrl-D during a dispatch would leave an answer
+      // prompt parked on a stream that is over: a hang with no message.
+      if (ended) {
+        onSettle();
+        return Promise.resolve(null);
+      }
       return new Promise<string | null>((resolve) => {
-        waiter = resolve;
+        waiter = (value): void => {
+          onSettle();
+          resolve(value);
+        };
       });
     },
   };
@@ -221,6 +505,13 @@ export interface EditorState {
 export type EditorAction =
   | { kind: 'state'; state: EditorState }
   | { kind: 'submit'; line: string }
+  /**
+   * A line break that ends a row WITHOUT ending the entry — what a newline inside a paste means.
+   * Deliberately a separate action from `submit` rather than a flag on it: the two differ in
+   * whether a turn is delivered, which is the single most consequential branch in this file, and
+   * a caller that forgets to read a boolean sends a half-written message to an agent.
+   */
+  | { kind: 'newline'; line: string }
   | { kind: 'eof' }
   | { kind: 'interrupt' }
   | { kind: 'ignore' };
@@ -278,14 +569,43 @@ function deleteWordLeft(state: EditorState): EditorAction {
   return stateAction(state, buffer, start);
 }
 
+/** What `applyKey` needs to know that a single keystroke cannot tell it. */
+export interface ApplyKeyOptions {
+  /**
+   * This keystroke arrived as part of a paste rather than from a finger.
+   *
+   * It changes two things and nothing else. A newline breaks the row instead of delivering the
+   * turn, and every control key is inert — a pasted 0x03 must not fire the interrupt that a
+   * typed Ctrl-C does, because "text I copied happened to contain a control byte" is not a
+   * gesture. Printable text inserts exactly as it always did.
+   */
+  readonly pasting?: boolean;
+}
+
 /**
  * One keystroke in, one action out.
  *
  * History (Up/Down) is deliberately absent: this function has no session to remember, only the
  * buffer in front of it, and `createRawTerminalIo` intercepts those two names before a keystroke
  * ever reaches here — see `historyUp`/`historyDown` below.
+ *
+ * Paste is the same story one level up. Whether a keystroke is part of a paste is a property of
+ * the byte stream, not of the key, so the terminal glue decides it and feeds it back in — the
+ * third piece of state this pure function is told rather than keeps, alongside history and the
+ * continuation segments.
  */
-export function applyKey(state: EditorState, key: Key): EditorAction {
+export function applyKey(state: EditorState, key: Key, options: ApplyKeyOptions = {}): EditorAction {
+  if (options.pasting === true) {
+    if (key.name === 'return' || key.name === 'enter') return { kind: 'newline', line: state.buffer };
+    // Not just Ctrl-C: no control combination means anything inside pasted text, and neither do
+    // the arrows or Backspace, which a paste has no way to have intended.
+    if (key.ctrl === true || key.meta === true) return { kind: 'ignore' };
+    const pasted = printableText(key.sequence ?? '');
+    if (pasted === '') return { kind: 'ignore' };
+    const grown = state.buffer.slice(0, state.cursor) + pasted + state.buffer.slice(state.cursor);
+    return stateAction(state, grown, state.cursor + pasted.length);
+  }
+
   if (key.ctrl === true && key.name === 'c') return { kind: 'interrupt' };
   if (key.name === 'return' || key.name === 'enter') return { kind: 'submit', line: state.buffer };
   if (key.ctrl === true && key.name === 'd') {
@@ -558,6 +878,17 @@ function slidingWindow(
  * painted if and only if a `nextLine` is pending. Everywhere else, keystrokes update `editor`
  * silently and never touch `output`.
  */
+/**
+ * Ask the terminal to wrap pasted text in `ESC[200~` … `ESC[201~`.
+ *
+ * Turned OFF again on the way out, and that half matters more than it looks: the mode is a
+ * property of the TERMINAL, not of this process, so a session that exits without clearing it
+ * hands the mode to whatever runs next. Most shells set their own state on each prompt and would
+ * paper over it; `cat` would not.
+ */
+const BRACKETED_PASTE_ON = '[?2004h';
+const BRACKETED_PASTE_OFF = '[?2004l';
+
 function createRawTerminalIo(
   input: NonNullable<TerminalIoOptions['input']>,
   output: NonNullable<TerminalIoOptions['output']>,
@@ -591,8 +922,39 @@ function createRawTerminalIo(
   let editor: EditorState = { buffer: '', cursor: 0 };
   let history: EditorHistory = historyInit();
   let resolveLine: ((value: string | null) => void) | null = null;
-  /** Fully Enter-terminated lines typed while nobody was reading — delivered whole, in order. */
-  const committed: string[] = [];
+  /**
+   * Fully Enter-terminated lines typed while nobody was reading — delivered whole, in order, and
+   * each stamped with the reader it was typed for. See the header.
+   */
+  const committed: QueuedLine[] = [];
+  /**
+   * The half-written entry a read for somebody else is holding aside, or null.
+   *
+   * `committed` is only half the type-ahead. Keystrokes update `editor` whether or not anybody is
+   * reading, and a backslash continuation can leave rows in `pendingSegments` too — so a human
+   * who was mid-sentence to the Commander when a worker's question arrived would find their own
+   * unfinished words sitting in the answer composer, one Enter away from being a worker's
+   * decision. The draft is put down for the duration of that read and picked up after it,
+   * unchanged, exactly like the queued lines behind it — and it keeps its own addressee, so the
+   * read that follows can tell it apart from a draft typed at the new prompt.
+   */
+  let stashedDraft: { segments: string[]; editor: EditorState; addressee: string } | null = null;
+  /**
+   * Who the composer currently reads for, in the caller's vocabulary.
+   *
+   * The pending read's addressee while there is one, and `COMMANDER_ADDRESSEE` whenever there is
+   * not — which is what the row itself says: a prompt on the composer names a reader, and an
+   * erased composer is the session's own, whose reader is the Commander.
+   *
+   * IT REVERTS RATHER THAN PERSISTING, and that half is load-bearing. A reader that outlived its
+   * prompt would strand every line typed after it: `/work cpt-01`, typed once a dispatch is over,
+   * would still be addressed to the dispatch console that is never going to read again, and no
+   * later prompt could take it. The Commander is the reader that is always there, which is the
+   * same reason it is the default at startup — see the header.
+   */
+  let inForce: string = COMMANDER_ADDRESSEE;
+  /** Who the half-written entry in the composer was typed for. Meaningless when it is empty. */
+  let draftAddressee: string = COMMANDER_ADDRESSEE;
   let ended = false;
   let closed = false;
 
@@ -603,6 +965,70 @@ function createRawTerminalIo(
   let busyLabel = '';
   /** A `\r\n` paste sends two keypress events; the LF half is swallowed so no phantom line lands. */
   let pendingCrlf = false;
+
+  // ===========================================================================================
+  // Paste
+  // ===========================================================================================
+  //
+  // A newline arriving in pasted text is a line break. A newline arriving from a finger is
+  // "send it". They are the same byte, so the difference has to come from somewhere other than
+  // the byte, and there are two sources — one the terminal gives us, one we infer.
+  //
+  // 1. **Bracketed paste.** `ESC[?2004h` asks the terminal to wrap pastes in `ESC[200~` …
+  //    `ESC[201~`, which `node:readline` already decodes for us as the key names `paste-start`
+  //    and `paste-end`. Between them we KNOW, and no inference is involved. Every terminal worth
+  //    naming supports it, so this is the mechanism and the next one is the net.
+  //
+  // 2. **Where the break falls in its read.** In raw mode a typed key is its own read: a human
+  //    pressing Enter delivers a chunk that is exactly `\r`. So a line break with more bytes
+  //    AFTER it in the same chunk cannot have been typed, and is a break. A chunk's LAST break
+  //    still submits, which is what keeps `printf 'a line\n' | …` and the pty harness in
+  //    `test/` behaving as they always have.
+  //
+  // The residual gap, stated rather than papered over: a paste with no bracketing, large enough
+  // for the tty to split it, can put a lone `\n` at the head of a chunk, and that submits early.
+  // Enabling bracketed paste is what closes it; a timer that treats "another chunk within N ms"
+  // as one paste would close it for unbracketed terminals too, and is not worth a clock in this
+  // file until somebody reports hitting it.
+
+  /** Between `paste-start` and `paste-end`. The terminal's own answer, trusted over the inference. */
+  let bracketedPaste = false;
+  /** Line breaks in the chunk being decoded, how many have surfaced, and whether it ends on one. */
+  let chunkBreaks = 0;
+  let chunkEndsOnBreak = false;
+  let breaksSeen = 0;
+
+  /** `\r\n` counts once: the LF half is swallowed by `pendingCrlf` and never surfaces as a key. */
+  const LINE_BREAKS = /\r\n|\r|\n/gu;
+
+  /**
+   * Read a chunk's shape before `readline` decodes it into keystrokes.
+   *
+   * Registered ahead of `emitKeypressEvents`, which attaches its own `data` listener only when
+   * the `keypress` listener below is added — so this runs first, and every keypress event for
+   * the chunk is emitted synchronously between this call and the next one.
+   */
+  const openChunk = (chunk: unknown): void => {
+    const text = typeof chunk === 'string' ? chunk : String(chunk);
+    chunkBreaks = (text.match(LINE_BREAKS) ?? []).length;
+    chunkEndsOnBreak = /(?:\r\n|\r|\n)$/u.test(text);
+    breaksSeen = 0;
+  };
+
+  /**
+   * Is this line break the end of the entry, or just the end of a row?
+   *
+   * `chunkBreaks === 0` means no chunk was ever read — a stream that feeds keypress events
+   * directly, which the tests do. Answering "submit" there is the deliberate fail-safe: an
+   * unrecognised source behaves exactly as it did before any of this existed.
+   */
+  const breakSubmits = (): boolean => {
+    // Counted even inside brackets, so a chunk carrying a paste AND a keystroke after it still
+    // knows which break is its last.
+    breaksSeen += 1;
+    if (bracketedPaste) return false;
+    return chunkBreaks === 0 || (chunkEndsOnBreak && breaksSeen === chunkBreaks);
+  };
 
   /** The status block's source, its animation frame, and what is currently on screen below. */
   let statusRender: StatusRenderer | null = null;
@@ -762,6 +1188,25 @@ function createRawTerminalIo(
   const settlePending = (value: string | null): void => {
     const resolve = resolveLine;
     resolveLine = null;
+    // The draft comes back the moment the read that displaced it is over, however it ended —
+    // submitted, aborted by a Ctrl-C at the answer prompt, or closed out. Restored BEFORE the
+    // resolve, so the caller's next `nextLine` already finds the composer as the human left it.
+    //
+    // The addressee comes back WITH it, and that is what stops the very next read from displacing
+    // it again: the composer reverts to the reader it was reading for before this read opened, so
+    // a Commander draft put down for `send a scout? [y/N]` is a Commander draft again the instant
+    // the keystroke lands, and the Commander's own prompt finds it exactly where it was left.
+    if (stashedDraft !== null) {
+      pendingSegments = stashedDraft.segments;
+      editor = stashedDraft.editor;
+      inForce = stashedDraft.addressee;
+      draftAddressee = stashedDraft.addressee;
+      stashedDraft = null;
+    } else {
+      // No prompt is on the row any more, so the composer is the session's own again — see
+      // `inForce`. Without this the reader outlives its prompt and strands everything typed next.
+      inForce = COMMANDER_ADDRESSEE;
+    }
     if (resolve !== null) resolve(value);
   };
 
@@ -814,11 +1259,73 @@ function createRawTerminalIo(
     emit(`${paintEntry([line])}\n`);
   };
 
-  const takeCommitted = (): string | null | undefined => {
-    if (committed.length > 0) return committed.shift() as string;
+  /**
+   * Take the half-written entry out of the composer and hand it back to the Commander's queue.
+   *
+   * BOTH HALVES OF A DRAFT, exactly as the fresh read's stash takes them: the rows already held by
+   * a backslash continuation and the live buffer, joined the way `submitLine` would have joined
+   * them, so what is returned is the entry the human was building rather than its last row.
+   *
+   * The Commander's queue is the destination whatever the old addressee was, and that is the
+   * point rather than an approximation of one. `queueLine` is documented as the ONE safe
+   * direction — the queue's only consumer that is not `{ fresh: true }` is the Commander's own
+   * prompt — so a draft returned here can never be picked up by a third party's read, including
+   * the read that displaced it or the next one after that. A draft written for a worker whose
+   * question has already gone is in the same position: the worker cannot have it, and no other
+   * worker may.
+   */
+  const displaceDraft = (): string | null => {
+    const text = [...pendingSegments, editor.buffer].join('\n');
+    pendingSegments = [];
+    editor = { buffer: '', cursor: 0 };
+    if (text.trim() === '') return null;
+    // Pre-announced for the same reason `queueLine` is: `setPrompt` returns this text so its
+    // caller can say where it went, and a second account of the same line is noise.
+    committed.push({ text, addressee: COMMANDER_ADDRESSEE, announced: true });
+    return text;
+  };
+
+  /** True when the composer holds anything at all — the live row or a continuation's held rows. */
+  const hasDraft = (): boolean => pendingSegments.length > 0 || editor.buffer !== '';
+
+  /**
+   * Point the composer at a new reader, taking the draft with the reader it was typed for.
+   *
+   * The `nextLine` half of the rule the header states. A draft typed under a DIFFERENT addressee
+   * is put down rather than repainted under a prompt it was not written for, and `settlePending`
+   * gives it back when this read is over. Returns whether anything was put down, so the caller can
+   * say so on the row above the prompt.
+   */
+  const adopt = (reader: string): boolean => {
+    const held = hasDraft();
+    inForce = reader;
+    if (!held || draftAddressee === reader) return false;
+    stashedDraft = { segments: pendingSegments, editor, addressee: draftAddressee };
+    pendingSegments = [];
+    editor = { buffer: '', cursor: 0 };
+    return true;
+  };
+
+  /** Queued lines this read is stepping over that the human has not been told about yet. */
+  const claimHeld = (reader: string): number => {
+    let count = 0;
+    for (const entry of committed) {
+      if (entry.announced || addressedTo(entry, reader)) continue;
+      entry.announced = true;
+      count += 1;
+    }
+    return count;
+  };
+
+  const takeCommitted = (reader: string): string | null | undefined => {
+    const at = committed.findIndex((entry) => addressedTo(entry, reader));
+    if (at !== -1) return (committed.splice(at, 1)[0] as QueuedLine).text;
     if (ended) return null;
     return undefined;
   };
+
+  /** A notice this file writes on its own account, folded like every other row it paints. */
+  const notice = (text: string): string => (charset === 'ascii' ? asciiFoldBlock(text) : text);
 
   const applyHistoryMove = (
     move: (h: EditorHistory, buf: string) => { history: EditorHistory; buffer: string },
@@ -841,6 +1348,17 @@ function createRawTerminalIo(
       shift: raw?.shift,
     };
 
+    // The markers are consumed here and never reach `applyKey`, which would strip the ESC off
+    // `ESC[200~` and insert the `[200~` that remains as text.
+    if (key.name === 'paste-start') {
+      bracketedPaste = true;
+      return;
+    }
+    if (key.name === 'paste-end') {
+      bracketedPaste = false;
+      return;
+    }
+
     if (pendingCrlf) {
       pendingCrlf = false;
       // The `\n` half of a `\r\n` paste line — already accounted for by the `\r` above it.
@@ -857,7 +1375,11 @@ function createRawTerminalIo(
       return;
     }
 
-    const action = applyKey(editor, key);
+    const isBreak = key.name === 'return' || key.name === 'enter';
+    // A break asks where it fell in its chunk; everything else takes the terminal's word for it.
+    const pasting = isBreak ? !breakSubmits() : bracketedPaste;
+
+    const action = applyKey(editor, key, { pasting });
     switch (action.kind) {
       case 'interrupt':
         // Ctrl-C with a continuation open abandons the pending entry, painted or not. It is the
@@ -882,10 +1404,43 @@ function createRawTerminalIo(
           ended = true;
         }
         return;
-      case 'submit': {
-        const step = continuationStep(pendingSegments, action.line);
+      case 'newline': {
+        // Every action below leaves something in the composer, and what is in the composer was
+        // typed for whoever the composer is currently reading for. Stamped here, at the keystroke,
+        // because that is the only moment at which the answer is known — see `adopt`.
+        draftAddressee = inForce;
+        // A row break inside a paste, handled by the machinery a backslash continuation already
+        // built: the finished row is echoed into scrollback, the composer keeps owning exactly
+        // one physical row, and the entry stays open. Nothing is delivered — a paste never
+        // sends a turn, which is the whole point. The human's own Enter does that.
         if (painted) {
           echoEntryLine(action.line);
+          editor = { buffer: '', cursor: 0 };
+          pendingSegments.push(action.line);
+          painted = true;
+          repaint();
+          return;
+        }
+        // Pasted past a busy prompt: hold the rows silently and let the eventual Enter commit
+        // them as ONE entry. This is the case that hurt — every break used to queue a turn of
+        // its own, so a dictated paragraph reached the commander as five separate messages, the
+        // first of which it had already started answering.
+        editor = { buffer: '', cursor: 0 };
+        pendingSegments.push(action.line);
+        return;
+      }
+      case 'submit': {
+        draftAddressee = inForce;
+        // A paste ending in a newline leaves an empty live row. Enter there delivers the rows
+        // above it, and echoes nothing, rather than appending a blank last line to the turn and
+        // painting a bare prompt for it.
+        const trailingBlank = action.line === '' && pendingSegments.length > 0;
+        const step: ContinuationStep = trailingBlank
+          ? { kind: 'submit', line: pendingSegments.join('\n') }
+          : continuationStep(pendingSegments, action.line);
+        if (painted) {
+          if (trailingBlank) eraseInputLine();
+          else echoEntryLine(action.line);
           editor = { buffer: '', cursor: 0 };
           if (step.kind === 'continue') {
             // The entry is still open: hold the segment, repaint a fresh continuation row, and
@@ -913,10 +1468,13 @@ function createRawTerminalIo(
           return;
         }
         pendingSegments = [];
-        committed.push(step.line);
+        // THE STAMP. The entry is finished and carries the reader it was typed for from here on;
+        // no later read can talk it into being addressed to somebody else.
+        committed.push({ text: step.line, addressee: inForce, announced: false });
         return;
       }
       case 'state':
+        draftAddressee = inForce;
         editor = action.state;
         if (painted) repaint();
         return;
@@ -925,8 +1483,14 @@ function createRawTerminalIo(
     }
   };
 
+  // BEFORE `emitKeypressEvents`, and that is the whole reason this line is here rather than next
+  // to the `keypress` listener below: readline attaches its own `data` handler when the first
+  // `keypress` listener arrives, so registering ours first is what puts `openChunk` ahead of the
+  // decode and lets a break know what it arrived with.
+  input.on('data', openChunk);
   emitKeypressEvents(input);
   if (typeof input.setRawMode === 'function') input.setRawMode(true);
+  output.write(BRACKETED_PASTE_ON);
   if (typeof (input as { resume?: () => void }).resume === 'function') {
     (input as { resume: () => void }).resume();
   }
@@ -937,6 +1501,10 @@ function createRawTerminalIo(
     isTTY: true,
     get width(): number {
       return widthOf();
+    },
+    get rows(): number {
+      const count = output.rows;
+      return typeof count === 'number' && count > 0 ? count : 0;
     },
 
     write(text: string): void {
@@ -953,7 +1521,8 @@ function createRawTerminalIo(
       }
     },
 
-    nextLine(prompt: string): Promise<string | null> {
+    nextLine(prompt: string, options: NextLineOptions): Promise<string | null> {
+      const reader = options.addressee;
       // Only the final line of the prompt is live — see `splitPromptLead` for the bug this kills.
       const { lead, line } = splitPromptLead(prompt);
       // Folded HERE rather than at every call site. A prompt is decoration like any other row,
@@ -969,8 +1538,13 @@ function createRawTerminalIo(
         if (lead !== '') emit(lead);
         if (tail !== '') emit('\n');
       };
-      const queued = takeCommitted();
+      // THE ONLY LINES THIS READ MAY HAVE. Anything typed for another reader is stepped over and
+      // keeps both its place and its destination; `null` here is end of input and nothing else.
+      const queued = takeCommitted(reader);
       if (queued !== undefined) {
+        // Neither the composer nor `inForce` is touched on this branch: the read is over before it
+        // began, no prompt is left on the row, and the next read that parks adopts the draft
+        // properly. Naming this reader here would leave it in force with nothing to read.
         if (queued !== null) {
           freshLine();
           // A queued entry may be multiline (typed with backslash continuations while a turn
@@ -979,7 +1553,20 @@ function createRawTerminalIo(
         }
         return Promise.resolve(queued);
       }
+      // A draft typed for somebody else is put down rather than painted under a prompt it was not
+      // written for, and comes back when this read is over — see `adopt` and `settlePending`.
+      const putDown = adopt(reader);
       freshLine();
+      if (putDown) emit(notice(HELD_DRAFT_NOTICE));
+      // …and the same account for the finished lines this read just stepped over, so a `yes` that
+      // appears to do nothing is a `yes` the screen has explained.
+      const held = claimHeld(reader);
+      if (held > 0) emit(notice(heldLinesNotice(held)));
+      // Rows pasted PAST a busy prompt were held with nothing painted to echo them onto. They go
+      // up now, as the same block a live entry gets, so the composer's live row continues
+      // something the reader can see instead of trailing three invisible rows. Without this a
+      // paste that arrives while the commander is answering looks like it went nowhere.
+      if (pendingSegments.length > 0) emit(`${paintEntry(pendingSegments)}\n`);
       painted = true;
       repaint();
       return new Promise<string | null>((resolve) => {
@@ -987,10 +1574,50 @@ function createRawTerminalIo(
       });
     },
 
-    abortLine(): void {
-      committed.length = 0;
-      pendingSegments = [];
-      editor = { buffer: '', cursor: 0 };
+    setPrompt(prompt: string, options?: SetPromptOptions): string | null {
+      // Only a PENDING read has a row to relabel. Off a read the composer is not painted at all,
+      // and setting `plainPrompt` here would leave a prompt behind for the next `nextLine` to
+      // overwrite, leaving a value with no reader and one more way for the two to disagree.
+      if (resolveLine === null) return null;
+      // BEFORE the repaint, so the row this call paints is the row the human is left looking at:
+      // the new prompt with an empty composer, rather than the new prompt with somebody else's
+      // sentence still under the cursor for the length of one frame.
+      let displaced: string | null = null;
+      const next = options?.addressee;
+      if (next !== undefined && next !== inForce) {
+        inForce = next;
+        // Displaced rather than put down, because the read this relabels is still running: there
+        // is no "afterwards" at which to give the draft back, so it goes the one safe direction.
+        if (hasDraft() && draftAddressee !== next) displaced = displaceDraft();
+      }
+      const { line } = splitPromptLead(prompt);
+      // Folded and coloured exactly as `nextLine` does it, because this IS the same assignment;
+      // a second spelling of it is a second thing to change when the fold moves.
+      plainPrompt = charset === 'ascii' ? asciiFold(line) : line;
+      colouredPrompt = colourizePrompt(plainPrompt);
+      // The buffer and the cursor are untouched unless the ADDRESSEE changed above, which is the
+      // whole point of the method, and `repaint` redraws the one physical row the composer owns,
+      // which is where the prompt lives.
+      if (painted) repaint();
+      return displaced;
+    },
+
+    queueLine(line: string): void {
+      committed.push({ text: line, addressee: COMMANDER_ADDRESSEE, announced: true });
+    },
+
+    abortLine(options?: AbortLineOptions): void {
+      // With `keepQueued`, the composer state is not cleared either: `settlePending` puts the
+      // stashed draft back, and clearing here would throw away the very thing it is restoring.
+      if (options?.keepQueued !== true) {
+        committed.length = 0;
+        pendingSegments = [];
+        editor = { buffer: '', cursor: 0 };
+        // And the put-down draft with them, or `settlePending` below would hand back the very
+        // thing this branch exists to discard. Type-ahead replayed into a closing session runs a
+        // turn nobody is watching, and a draft is type-ahead that has not reached Enter yet.
+        stashedDraft = null;
+      }
       if (spinnerActive) stopSpinnerTimer();
       if (painted) eraseInputLine();
       settlePending(null);
@@ -1050,12 +1677,17 @@ function createRawTerminalIo(
       if (hadOverlay) output.write(`${ERASE_LINE}${tail}`);
       if (tail !== '') output.write('\n');
       tail = '';
+      // Before `setRawMode(false)`, so the sequence goes out while this process still owns the
+      // terminal's modes rather than racing whatever the shell does on the way back in.
+      bracketedPaste = false;
+      output.write(BRACKETED_PASTE_OFF);
       try {
         if (typeof input.setRawMode === 'function') input.setRawMode(false);
       } catch {
         /* best effort — a dead stream cannot un-raw itself, and that is not this call's problem */
       }
       input.removeListener('keypress', onKeypress as (chunk: string, key: unknown) => void);
+      input.removeListener('data', openChunk);
       // The mirror of the `resume()` at construction, and the line the process's exit hangs on:
       // a resumed stdin holds a ref that keeps the event loop alive, so without this a session
       // that failed preflight printed its refusal and then sat until Ctrl-C. Guarded the same
@@ -1111,11 +1743,22 @@ function createPipedTerminalIo(
   });
   rl.setPrompt('');
 
+  /**
+   * Who the pipe is currently reading for, or null before anything has asked.
+   *
+   * NULL rather than the Commander, and that is the one place the piped path differs from the
+   * terminal. A pipe has no composer: `readline` hands over lines that were finished before this
+   * process asked for anything, so "the prompt it was typed at" has no answer for them and they
+   * are unaddressed — any read may take them. Once a read has named a reader, everything that
+   * arrives after it is addressed exactly as a keystroke would be. See the header.
+   */
+  let inForce: string | null = null;
+
   // The fold, not a bare push: `first \` then `second` must reach the session as one two-line
   // turn on a pipe exactly as it does on a raw terminal, or the scripted stand-in below tests a
   // behaviour the real piped path does not have.
   const foldLine = continuationFold((entry) => {
-    queue.push(entry);
+    queue.push(entry, inForce);
   });
   rl.on('line', foldLine);
   rl.on('close', () => {
@@ -1133,15 +1776,41 @@ function createPipedTerminalIo(
     // program defaults to (`detectWidth`), so a renderer handed this one lays out the same way a
     // redirected `army view` does.
     width: 80,
+    // A pipe has no height either. 0 is "unknown", which is what it is.
+    rows: 0,
     write(text: string): void {
       output.write(text);
     },
-    nextLine(prompt: string): Promise<string | null> {
+    nextLine(prompt: string, options: NextLineOptions): Promise<string | null> {
+      inForce = options.addressee;
       if (prompt !== '') output.write(prompt);
-      return queue.take();
+      const held = queue.claimHeld(options.addressee);
+      if (held > 0) output.write(heldLinesNotice(held));
+      // The read is over and no prompt is outstanding, so anything that arrives next belongs to
+      // the Commander. Same rule as the terminal's `settlePending`, for the same reason.
+      return queue.take(options.addressee, () => {
+        inForce = COMMANDER_ADDRESSEE;
+      });
     },
-    abortLine(): void {
-      queue.abort();
+    setPrompt(prompt: string, options?: SetPromptOptions): string | null {
+      // A pipe has no row to repaint, so the honest equivalent is to WRITE the new prompt: the
+      // transcript then records that the destination of the next line changed, which is the fact
+      // the raw path conveys by repainting. The lead is dropped for the same reason it is there.
+      const { line } = splitPromptLead(prompt);
+      if (line !== '') output.write(line);
+      // The reader still moves, so a line that arrives AFTER this call is addressed to it.
+      if (options?.addressee !== undefined) inForce = options.addressee;
+      // Always null, and not because the property does not apply here: `readline` owns the line
+      // being edited on a pipe and delivers it whole on its newline, so there is no half-written
+      // entry in this file to displace. Nothing is typed under an addressee here until it is
+      // already a finished line.
+      return null;
+    },
+    queueLine(line: string): void {
+      queue.queue(line, COMMANDER_ADDRESSEE);
+    },
+    abortLine(options?: AbortLineOptions): void {
+      queue.abort(options);
     },
     onInterrupt: hub.onInterrupt,
     close(): void {
@@ -1188,6 +1857,15 @@ export interface ScriptedIo extends ChatIo {
   sendInterrupt(): void;
   /** Queue another line, e.g. from inside a handler. */
   feed(line: string): void;
+  /**
+   * Put a HALF-TYPED entry in the composer: characters with no Enter behind them.
+   *
+   * `feed` is a finished line and this is the other half of what a human can be doing when a
+   * worker's question arrives. Without it the property that a draft belongs to the addressee it
+   * was typed under is only testable on the raw path, and the routing that has to honour it lives
+   * in `runChat`, which every test drives through this stand-in. Replaces any draft already held.
+   */
+  typeDraft(text: string): void;
   /** Prompts shown, in order. */
   readonly prompts: readonly string[];
   /** `busy:<label>` / `idle`, in order — the record `setBusy`/`setIdle` leave for an assertion. */
@@ -1201,6 +1879,8 @@ export interface ScriptedIo extends ChatIo {
    * over a tick and a width, so calling it is safe and deterministic.
    */
   readonly status: StatusRenderer | null;
+  /** Lines handed back to the Commander's queue by `queueLine`, in order. */
+  readonly requeued: readonly string[];
 }
 
 export interface ScriptedIoOptions {
@@ -1221,6 +1901,14 @@ export interface ScriptedIoOptions {
    * `ScriptedIo` records what it is TOLD, and the block is painted by the raw terminal alone.
    */
   isTTY?: boolean;
+  /**
+   * Terminal height to claim. Default 24, the conventional one.
+   *
+   * A script is not a terminal and this number changes nothing it draws. It exists because the
+   * status block's row budget is now computed FROM a height, and a stand-in that reported none
+   * would test the unknown-height branch and never the ordinary one.
+   */
+  rows?: number;
 }
 
 export function createScriptedIo(
@@ -1231,23 +1919,56 @@ export function createScriptedIo(
   // The same fold the piped path applies, so a scripted `['first \\', 'second']` drives the
   // exact multiline entry a human would have typed. An entry left open by the script is dropped
   // at end of input, the same way a half-typed line dies with its terminal.
+  /**
+   * Who the script is currently reading for, or null before anything has asked.
+   *
+   * The seeded `lines` are pushed through the fold below while this is still null, which is what
+   * makes them a SCRIPT rather than type-ahead: a list of answers to whatever is asked, in order,
+   * standing in for a human who is present. `feed` after a read has opened is the other thing —
+   * a line typed at a moment, carrying the addressee in force at that moment, exactly as a
+   * keystroke on the raw path does. See the header.
+   */
+  let inForce: string | null = null;
+
   const foldLine = continuationFold((entry) => {
-    queue.push(entry);
+    queue.push(entry, inForce);
   });
   for (const line of lines) foldLine(line);
   if (options.open !== true) queue.end();
   const chunks: string[] = [];
   const prompts: string[] = [];
   const states: string[] = [];
+  const requeued: string[] = [];
   const handlers = new Set<() => void>();
   let ended = false;
   let status: StatusRenderer | null = null;
+  /** The half-typed entry `typeDraft` put in the composer, and who it was typed under. */
+  let draft: string | null = null;
+  let draftAddressee: string | null = null;
+  /** The draft a read for somebody else is holding aside — the raw path's `stashedDraft`. */
+  let stashedDraft: { text: string; addressee: string | null } | null = null;
+
+  /** The stand-in's `settlePending`: the read is over, so the composer is the Commander's again. */
+  const endRead = (): void => {
+    if (stashedDraft === null) {
+      inForce = COMMANDER_ADDRESSEE;
+      return;
+    }
+    draft = stashedDraft.text;
+    draftAddressee = stashedDraft.addressee;
+    inForce = stashedDraft.addressee;
+    stashedDraft = null;
+  };
 
   return {
     isTTY: options.isTTY === true,
     width: 80,
+    rows: options.rows ?? 24,
     get transcript(): string {
       return chunks.join('');
+    },
+    get requeued(): readonly string[] {
+      return requeued;
     },
     get status(): StatusRenderer | null {
       return status;
@@ -1261,15 +1982,57 @@ export function createScriptedIo(
     write(text: string): void {
       chunks.push(text);
     },
-    nextLine(prompt: string): Promise<string | null> {
+    nextLine(prompt: string, options: NextLineOptions): Promise<string | null> {
       prompts.push(prompt);
-      return queue.take();
+      const reader = options.addressee;
+      // The raw path's `adopt`, with the same three outcomes: no draft, a draft that was typed for
+      // this very reader and stays, or a draft for somebody else that is put down and given back.
+      const held = draft !== null && draft.trim() !== '';
+      const previous = inForce;
+      inForce = reader;
+      if (held && draftAddressee !== reader) {
+        stashedDraft = { text: draft as string, addressee: draftAddressee ?? previous };
+        draft = null;
+        draftAddressee = null;
+        chunks.push(HELD_DRAFT_NOTICE);
+      }
+      const stepped = queue.claimHeld(reader);
+      if (stepped > 0) chunks.push(heldLinesNotice(stepped));
+      // Settled when the read ends, however it ends — the stand-in's `settlePending`.
+      return queue.take(reader, endRead);
     },
-    abortLine(): void {
-      queue.abort();
+    setPrompt(prompt: string, options?: SetPromptOptions): string | null {
+      // Recorded in `prompts` exactly as `nextLine` records one, and that is deliberate: a test
+      // asks "was this prompt ever shown", and a prompt that replaced another mid-read was shown.
+      prompts.push(prompt);
+      const next = options?.addressee;
+      if (next === undefined || next === inForce) return null;
+      const under = draftAddressee ?? inForce;
+      inForce = next;
+      if (under === next) return null;
+      const displaced = draft;
+      draft = null;
+      draftAddressee = null;
+      if (displaced === null || displaced.trim() === '') return null;
+      // The same return the raw path performs, through the same door: appended to the Commander's
+      // backlog, never offered to the read that displaced it.
+      requeued.push(displaced);
+      queue.queue(displaced, COMMANDER_ADDRESSEE);
+      return displaced;
+    },
+    queueLine(line: string): void {
+      requeued.push(line);
+      queue.queue(line, COMMANDER_ADDRESSEE);
+    },
+    abortLine(options?: AbortLineOptions): void {
+      queue.abort(options);
     },
     feed(line: string): void {
       foldLine(line);
+    },
+    typeDraft(text: string): void {
+      draft = text;
+      draftAddressee = inForce;
     },
     onInterrupt(handler: () => void): () => void {
       handlers.add(handler);

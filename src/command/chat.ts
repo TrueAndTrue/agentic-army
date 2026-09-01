@@ -39,11 +39,32 @@ army chat — a live session with a commanding officer
   request — it is what keeps the window that holds your objective from being
   spent one source file at a time.
 
+  When it needs to know something neither of you can answer from memory, it
+  proposes a CPT·SCOUT: a reader that holds Read, Grep, Glob and the web, writes
+  nothing, and holds no worktree, because a lease exists to isolate changes and a
+  scout makes none. It has its own [y/N]. It may field a few subordinates inside
+  its own process and no deeper; that count is measured off its event stream and
+  crossing it stops the recce. What it found is carried into the plan of anything
+  dispatched afterwards.
+
   When something needs changing it proposes a one-line objective. You approve it,
   and a CPT·ENGINEER is raised in a leased worktree, reviewed by an independent
   CPT·INSPECTOR briefed from that objective and the branch — never from the
   Engineer's account of what it did — and delivered up to the project ceiling.
   It is the same gate \`${invokedAs()} campaign\` runs, because it is the same code.
+
+  Between the two sits the alignment gate, and it is mechanical rather than a
+  judgement. A dispatch that carries a spec begins phase 2 only when every
+  required field is answered, every verification command EXECUTES against the
+  base commit, and you confirm with a keystroke — in that order, with the
+  keystroke last, because it confirms a gate that already passed. A command that
+  runs and FAILS passes: a red test is where work starts, and its reading is
+  banked so nothing can argue later that a failure was already there. A command a
+  shell cannot execute, one that returns no result, or one still running at the
+  deadline does not pass, and no keystroke is offered. The settled spec and the
+  whole interrogation are written to the campaign archive; \`planning.spec_to_repo\`
+  in config.toml also writes them into the repository, and is off by default
+  because a rejected branch should not strand design documents in your checkout.
 
   Chat needs no setup first. On the way in it creates ~/.agentic-army and the
   default config where they are missing, turns a bare directory into a git
@@ -64,6 +85,13 @@ OPTIONS
                        the top; the units below it are dispatched by role.
   --provider <id>      Worktree provider for anything dispatched.
   --id <campaign-id>   Override the generated archive id for the conversation.
+  --overseer           Put a MAJ·OVERSEER over each dispatch: it segments the feature into
+                       workstreams and runs an Engineer on each, concurrently. Off by
+                       default, because an overseer is a whole model session spent before any
+                       engineer starts, and a two-line objective does not need one.
+  --concurrency <n>    How many workstreams run at once, with an overseer. This is the whole
+                       of the budget control on fan-out, and the status block shows it next
+                       to the agent count from the first spawn.
   --no-init            Outside a repository, refuse instead of running the
                        auto-init \`${invokedAs()} enlist\` runs: git init plus one empty
                        commit, never in your home directory or a filesystem root.
@@ -83,14 +111,34 @@ IN THE SESSION
                        With a continued entry open, it discards the draft instead.
   Ctrl-D, /exit        Leave.
   /status              The header again, with the working copy re-read.
+  /work <id>           One agent or workstream, printed into scrollback: its orders,
+                       its branch, its last activity, its diffstat. It prints rather
+                       than opens, because a pager needs an alternate screen this
+                       interface deliberately does not use.
+  /stop                End the running campaign. It confirms first, because every
+                       worktree in flight has to be settled rather than dropped.
+                       Ctrl-C never means this: it stops the answer in flight.
+  /next                With several questions open, move to the next one.
   /help                The same, from inside.
+
+WHILE A DISPATCH RUNS
+  The prompt is still yours. A worker's question arrives as a block in scrollback
+  under its own marker, naming the agent and the workstream that raised it, and
+  the count of what is open sits on the status block. Nothing seizes what you were
+  typing. With one question open, typing answers it and the prompt says so; with
+  several, the prompt names the one you are answering. /stop, /work, /next and
+  /help answer there and then. Anything else (/status, /exit, a sentence for the
+  Commander) is queued and runs the moment the dispatch settles.
 
 WHAT THE STATUS BLOCK SAYS
   Pinned under the prompt, repainted in place: the branch you are on and whether
   it is dirty, the project, the commander's model, the rung a dispatch will ask
-  for, what the session has spent — and, while a dispatch runs, a row per unit in
-  flight with its own clock. It steps aside while an answer streams, where the
-  spinner on the answer's own line is already saying the same thing.
+  for, what the session has spent and, while a dispatch runs, the campaign's
+  live tree, read from its archive and drawn by the same renderer \`${invokedAs()} view\`
+  uses, plus how many agents are up against the concurrency cap. When the tree is
+  taller than the block is allowed, running units are kept over finished ones and
+  one row accounts for what was dropped. It steps aside while an answer streams,
+  where the spinner on the answer's own line is already saying the same thing.
 
 WHAT PERSISTS
   Every turn is a signal row and every event is a line in stream.jsonl, written
@@ -132,6 +180,10 @@ export interface ChatArgs {
   model?: string;
   provider?: WorktreeProviderId;
   campaignId?: string;
+  /** True when `--overseer` was passed. Segments a dispatch into concurrent workstreams. */
+  overseer?: boolean;
+  /** `--concurrency <n>`. Only in force with an overseer; the status block shows what is. */
+  maxConcurrentWorkstreams?: number;
   /** False when `--no-init` was passed — mirrors `enlist`, which grew the flag first. */
   init: boolean;
   /** False when `--plain` was passed. Never true off a terminal — `runChat` clamps it. */
@@ -200,6 +252,17 @@ export function parseChatArgs(argv: readonly string[]): ChatArgs {
         args.campaignId = value;
         break;
       }
+      case '--overseer':
+        args.overseer = true;
+        break;
+      case '--concurrency': {
+        const value = Number(next());
+        if (!Number.isInteger(value) || value < 1) {
+          throw new UsageError('--concurrency expects a positive integer');
+        }
+        args.maxConcurrentWorkstreams = value;
+        break;
+      }
       case '--no-init':
         args.init = false;
         break;
@@ -257,6 +320,10 @@ export async function chatCommand(
     ...(args.maxAttempts === undefined ? {} : { maxAttempts: args.maxAttempts }),
     ...(args.provider === undefined ? {} : { worktreeProvider: args.provider }),
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
+    ...(args.overseer === undefined ? {} : { overseer: args.overseer }),
+    ...(args.maxConcurrentWorkstreams === undefined
+      ? {}
+      : { maxConcurrentWorkstreams: args.maxConcurrentWorkstreams }),
     ...(args.model === undefined ? {} : { model: args.model }),
     ...(args.init ? {} : { init: false }),
     ...(args.chrome ? {} : { chrome: false }),

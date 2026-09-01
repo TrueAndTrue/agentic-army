@@ -2815,6 +2815,11 @@ describe('no source file hardcodes a command the reader may not be able to run',
       why: 'a pull-request TITLE prefix. The product’s name on a PR someone else will read, not a command anyone types.',
     },
     {
+      file: 'command/campaign.ts',
+      contains: 'tests written by',
+      why: 'a git COMMIT MESSAGE prefix, the same case as the pull-request title in delivery/ladder.ts: the product’s name on a commit someone else will read in `git log`, not a command anyone types. The commit is made by the supervisor for a reviewer that holds no git, and the prefix is what makes it findable next to the branches this system cuts.',
+    },
+    {
       file: 'command/permissions.ts',
       contains: 'is satisfiable by anything that can spawn a pty',
       why: 'names the command as the SUBJECT of a sentence about what its TTY gate is worth. Not an instruction.',
@@ -2848,6 +2853,11 @@ describe('no source file hardcodes a command the reader may not be able to run',
       file: 'setup/init.ts',
       contains: 'The TTY test stops the naive',
       why: 'the same persisted config.toml template.',
+    },
+    {
+      file: 'setup/init.ts',
+      contains: 'interrogates you until it can fill a',
+      why: 'the same persisted config.toml template, in the [planning] block. It names the command as the SUBJECT of a sentence explaining what the section governs, in a file read from any shell long after this process is gone.',
     },
     // ---------------------------------------------------------------------------------------
     // `src/view/live.ts` used to hold the last two entries in this list, both marked DEFECT: a

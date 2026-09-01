@@ -64,48 +64,90 @@
  *    closed pipe must never be the reason a lease goes unsettled.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { CampaignArchive, campaignIdFor, createCampaign, listCampaignIds } from '../archive/archive.ts';
 import type { ArchiveConfig } from '../archive/archive.ts';
-import { GENERAL_AGENT_ID, buildSoldierSpec, resolveProjectRootOrInit } from '../command/campaign.ts';
+import {
+  GENERAL_AGENT_ID,
+  UNSPECIFIED_BRIEF_EFFORT,
+  buildSoldierSpec,
+  dispatchFor,
+  resolveProjectRootOrInit,
+  runSoldier,
+} from '../command/campaign.ts';
 import type { CampaignResult } from '../command/campaign.ts';
+import { renderScoutBrief } from '../command/orders.ts';
+import { describeFanOutHalt, fanOutHaltLine, runRecce, watchFanOut } from '../command/scout.ts';
+import type { RecceOutcome, ScoutSpawn } from '../command/scout.ts';
 import { loadConfig } from '../config/load.ts';
 import { armyHome } from '../config/paths.ts';
 import type { Env } from '../config/paths.ts';
 import { RUNG_LABEL, effectiveRung } from '../contracts/delivery.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import type { TaskRow } from '../contracts/archive.ts';
-import type { HarnessAdapter, HarnessId, SoldierEvent, SoldierSpec } from '../contracts/harness.ts';
+import type { HarnessAdapter, HarnessId, Soldier, SoldierEvent, SoldierSpec } from '../contracts/harness.ts';
+import type { PendingQuestion } from '../contracts/question.ts';
+import { renderPendingQuestion } from '../contracts/question.ts';
 import { codePointLength } from '../contracts/report.ts';
+import type { CommandRunner } from '../contracts/verify.ts';
+import {
+  SCOUT_MAX_SUBAGENTS,
+  SCOUT_MODEL_SESSION_USD,
+  SCOUT_TIMEOUT_MS,
+  scoutFindingLines,
+} from '../contracts/scout.ts';
 import { renderTechnicalSpec } from '../contracts/spec.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import type { DeliveryConfig } from '../delivery/ladder.ts';
 import { projectCeiling } from '../delivery/ladder.ts';
 import type { GhStatus } from '../delivery/git.ts';
 import { createClaudeAdapter } from '../harness/claude.ts';
+import { killSoldierTree } from '../harness/kill.ts';
 import { invokedAs } from '../setup/checks.ts';
 import { registerProjectIfAbsent } from '../setup/enlist.ts';
 import { ensureConfig } from '../setup/init.ts';
+import { DEFAULT_MAX_CONCURRENT_WORKSTREAMS } from '../contracts/workstream.ts';
 import { detectCharset, detectColor } from '../view/index.ts';
 import type { Charset } from '../view/render.ts';
+import { displayWidth, glyphsFor, wrapPlain } from '../view/render.ts';
 import {
+  DEFAULT_TREE_ROWS,
   REPO_UNKNOWN,
   describeRepo,
   renderHeader,
   renderStatusBar,
 } from '../view/chrome.ts';
-import type { ChromeStyle, RepoState, RosterUnit, StatusModel } from '../view/chrome.ts';
-import { createProgressSink, renderProgressEvent } from '../view/progress.ts';
+import type {
+  BudgetModel,
+  ChromeStyle,
+  RepoState,
+  RosterUnit,
+  StatusModel,
+} from '../view/chrome.ts';
+import { openCampaignReader } from '../view/live.ts';
+import type { CampaignReader } from '../view/live.ts';
+import { buildTree, walkTree } from '../view/tree.ts';
+import type { TreeModel } from '../view/tree.ts';
+import { createProgressSink, dispositionOf, renderProgressEvent } from '../view/progress.ts';
 import { createProseStream } from '../view/prose.ts';
 import type { ProgressEvent, ProgressListener, ProgressStyle } from '../view/progress.ts';
 
+import { alignmentRefusals, renderAlignment, runAlignmentGate } from './align.ts';
+import type { AlignmentResult } from './align.ts';
 import { factsFrom, guardedProgress, runDispatch } from './dispatch.ts';
+import { createInbox, inboxPrompt, renderQuestionMarker } from './inbox.ts';
+import type { InboxEntry } from './inbox.ts';
 import type { ChatIo, StatusRenderer } from './io.ts';
+import { COMMANDER_ADDRESSEE } from './io.ts';
 import { readRepoState } from './repo.ts';
 import { renderStandingOrders } from './orders.ts';
-import type { DispatchRequest } from './protocol.ts';
+import { captureTurn, planningDocuments, writeSpecToRepo } from './planning.ts';
+import type { InterrogationTurn, PlanningRecord } from './planning.ts';
+import type { DispatchRequest, ScoutRequest } from './protocol.ts';
 import { ChatSession } from './session.ts';
+import { renderWorkSnapshot } from './snapshot.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Options and result
@@ -174,6 +216,38 @@ export interface ChatOptions {
   nowMs?: () => number;
   /** Repository state for the chrome. Injected by tests; production reads the working copy. */
   readRepo?: (dir: string) => Promise<RepoState>;
+  /**
+   * Put a `MAJ·OVERSEER` over anything this session dispatches, so the feature is segmented into
+   * concurrent workstreams. Off by default, exactly as `army campaign` has it.
+   */
+  overseer?: boolean;
+  /**
+   * The concurrency cap a dispatch runs under, and the number the status block draws.
+   *
+   * ONE VARIABLE for both, because a cap on screen that the pool is not enforcing would be worse
+   * than no cap on screen: the whole reason it is up there is that a reader can see how far the
+   * fan-out may go before the bill arrives.
+   */
+  maxConcurrentWorkstreams?: number;
+  /**
+   * The process runner the alignment gate uses to read the spec's verification commands.
+   *
+   * Injected so a test never spawns a shell, exactly as `CampaignOptions.verifyRun` is. It is NOT
+   * threaded onward into the dispatch: the campaign takes its own baseline inside the leased
+   * worktree, which is a different tree at the same base commit, and one seam feeding both would
+   * make a test that stubs the gate silently stub the campaign too.
+   */
+  verifyRun?: CommandRunner;
+  /**
+   * How often the status block re-reads the running campaign's archive, in milliseconds.
+   *
+   * The tree in the block is built by `buildTree` from a real `CampaignSnapshot`, read off the
+   * campaign's own files, by the same path `army view --follow` polls, at the same rate, for
+   * the same reason: the archive is truth, and a model rebuilt from the narration would be a
+   * second derivation of the thing the block exists to show. Injected so a test does not have to
+   * wait on a real second.
+   */
+  treePollMs?: number;
 }
 
 export interface ChatDispatchRecord {
@@ -183,6 +257,29 @@ export interface ChatDispatchRecord {
   outcome: string | null;
   verdict: 'pass' | 'fail' | null;
   deliveredRung: Rung | null;
+  /**
+   * What the mechanical alignment gate did with this proposal.
+   *
+   * `passed` — every required spec field answered and every verification command executed against
+   * the base commit, so the keystroke was offered. `refused` — one of those failed and no
+   * keystroke was ever offered, which is the state where `approved` is false for a reason nobody
+   * typed. `no-spec` — the proposal carried no spec, so there was no phase 1 to be aligned with;
+   * see the block that prints for that case in the loop below.
+   */
+  gate: 'passed' | 'refused' | 'no-spec';
+}
+
+/** One recce this conversation asked for, whether or not it happened. */
+export interface ChatRecceRecord {
+  question: string;
+  approved: boolean;
+  agentId: string | null;
+  /** How many subordinates it fielded. MEASURED off the event stream, never self-reported. */
+  subagentsFielded: number;
+  /** True when this process stopped it for crossing the fan-out ceiling. */
+  haltedForFanOut: boolean;
+  /** The scout's own cost, as the harness reported it. Null when it reported none. */
+  costUsd: number | null;
 }
 
 export const CHAT_EXIT_REASONS = ['eof', 'interrupt', 'command', 'commander-ended'] as const;
@@ -198,7 +295,9 @@ export interface ChatResult {
   /** Human turns. The opening standing-orders turn is not one. */
   turns: number;
   dispatches: ChatDispatchRecord[];
-  /** Every dispatch block that was parsed and not honoured, with the reason. */
+  /** Every recce this session proposed, in order. */
+  recces: ChatRecceRecord[];
+  /** Every dispatch or recce block that was parsed and not honoured, with the reason. */
   refusals: string[];
   exitReason: ChatExitReason;
   costUsd: number | null;
@@ -242,11 +341,114 @@ function uniqueCampaignId(archiveRoot: string, title: string): string {
  */
 export const PROMPT = '\n▌ ';
 export const CONFIRM_PROMPT = '  ◇ dispatch this? [y/N] ';
+/**
+ * The prompt a parked question is answered at.
+ *
+ * Deliberately NOT the ordinary composer prompt. Everything typed at `PROMPT` goes to the
+ * commander; this line goes to a worker that is holding a worktree and waiting, and the two must
+ * not look the same. Exported for the same reason `PROMPT` is: a test that spells its own prompt
+ * is a test of a prompt nobody uses.
+ *
+ * SHORT, and the guidance it used to carry now sits on `ANSWER_HINT` above it. The prompt is
+ * repainted down every wrapped row of the entry the human types — that is `paintEntry`, and for
+ * the two-column `▌` it is a rule marking a region. At forty-four columns it stopped being a rule
+ * and became the same sentence printed twice, with the wrapping budget cut to 35 columns on an
+ * 80-column terminal. Found by typing a one-line answer on a real pty, not by reading.
+ */
+export const ANSWER_PROMPT = '  ◇ your answer  ';
+/** The two ways out, stated where a reader meets them, since one of them is a keystroke. */
+export const ANSWER_HINT = '    a blank answer, or Ctrl-C, leaves the question unanswered.';
+
+/**
+ * The composer's prompt while a dispatch runs and nothing is asking.
+ *
+ * There IS a prompt now, where before there was none, and that is the change that makes `/stop`
+ * and `/work` reachable at all: a command nobody can type while the thing it acts on is running is
+ * not a command. Deliberately not `PROMPT`: a line typed here does not reach the Commander on
+ * this turn; it is queued for it, and the two must not look the same.
+ *
+ * Short for the reason every prompt in this file is short: it is repainted per keystroke, charged
+ * against the width the buffer gets, and repeated down every wrapped row of the entry. What it
+ * does not say is on the status block, which has room and repaints for nothing.
+ */
+export const DISPATCH_PROMPT = '\n  ▪ ';
+/** `/stop` confirms, because every worktree in flight has to be settled rather than dropped. */
+export const STOP_CONFIRM_PROMPT = '  ◇ stop the campaign? [y/N] ';
+
+/**
+ * The keystroke that sends a scout.
+ *
+ * A SECOND prompt, not a reuse of `CONFIRM_PROMPT`, and the wording says which of the two things
+ * is about to happen. A human who typed `y` at "dispatch this?" has agreed to an Engineer with an
+ * editor in a leased worktree; a human who typed `y` here has agreed to a reader. Those are
+ * different decisions with different bills, and one prompt for both would be a prompt that means
+ * whatever the last block happened to be.
+ */
+export const SCOUT_CONFIRM_PROMPT = '  ◇ send a scout? [y/N] ';
+
+/**
+ * Who the dispatch console reads for, and why it is not the Commander.
+ *
+ * The console is a READER IN ITS OWN RIGHT. A line typed at it is routed by this file — as a
+ * command, as an answer to a parked worker, or handed back — and is never sent to the Commander
+ * as a turn without passing through that routing. So a line typed at the COMMANDER's prompt before
+ * a dispatch began is addressed to somebody else and this loop cannot take it, which is exactly
+ * the property `{ fresh: true }` used to buy one call site at a time. Naming the reader honestly
+ * is what makes it structural: `src/chat/io.ts` compares addressees for equality and nothing else.
+ */
+export const DISPATCH_CONSOLE_ADDRESSEE = 'dispatch-console';
+
+/**
+ * How many interrogation rounds the durable transcript keeps, newest last.
+ *
+ * The spec is settled at the END of an interrogation, so when a conversation runs longer than
+ * this the rounds worth keeping are the recent ones. Over the cap `renderInterrogationDocument`
+ * says how many were dropped rather than quietly beginning in the middle — a transcript that
+ * starts at round 61 and does not say so is a transcript that misrepresents when a decision was
+ * taken. It works that out from the first surviving round's own number, so nothing here has to
+ * hand it a count that could disagree.
+ */
+export const MAX_INTERROGATION_ROUNDS = 60;
+
+/**
+ * Per-half cap on one recorded round, in characters.
+ *
+ * A commander's reply is prose with no upper bound anybody has promised, and this document is
+ * written to the archive and sometimes into a repository. Truncation is marked in the text.
+ */
+export const INTERROGATION_HALF_MAX_CHARS = 4000;
+
+
+
+/**
+ * The largest archive file `/work` will open.
+ *
+ * An `orders.md` is kilobytes; a `diff.patch` is a worker's entire branch and has no upper bound
+ * anybody has promised. This command runs inside a live conversation, on the same thread as the
+ * composer, so it reads to count and must not be able to pull a hundred megabytes into memory to
+ * do it. Over the cap the field says so rather than lying about a file it did not read.
+ */
+export const WORK_FILE_MAX_BYTES = 4 * 1024 * 1024;
 
 /** `y` / `yes`, and nothing else. Anything ambiguous is a no — the default must be the safe one. */
 export function isApproval(line: string): boolean {
   const answer = line.trim().toLowerCase();
   return answer === 'y' || answer === 'yes';
+}
+
+/**
+ * `n` / `no` / nothing, and nothing else. The EXPLICIT half of "anything else is a no".
+ *
+ * Not the complement of `isApproval`, and the difference is the whole reason it exists. At a y/N
+ * prompt "anything ambiguous is a no" decides whether the dangerous thing happens; it does not
+ * decide what becomes of the words the human typed. `n` is an answer to the question that was
+ * asked and is consumed by it. `where is cpt-03?` is not — it is a sentence for somebody else that
+ * happens to have been typed while a confirmation was on the row, and swallowing it as a decline
+ * is how a line the human typed disappears with a message that does not mention it.
+ */
+export function isDecline(line: string): boolean {
+  const answer = line.trim().toLowerCase();
+  return answer === '' || answer === 'n' || answer === 'no';
 }
 
 export interface BannerFacts {
@@ -514,6 +716,9 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   const campaignId = options.campaignId ?? uniqueCampaignId(archiveRoot, 'chat');
   const archiveConfig: ArchiveConfig = {
     archiveRoot,
+    // So the schema refusal on an index written by an older release names a command this reader
+    // can paste. `src/archive/**` cannot resolve it; this layer already has.
+    self: invokedAs(),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.dbFactory === undefined ? {} : { dbFactory: options.dbFactory }),
   };
@@ -747,6 +952,13 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   });
   /** True while a dispatch campaign is running. A campaign holds a lease; only it may settle one. */
   let dispatchInFlight = false;
+  /**
+   * The running alignment gate's way out, or null when no gate is running.
+   *
+   * Non-null for exactly the window in which a human can be waiting on commands with nothing
+   * spawned and no lease held, which is why Ctrl-C is allowed to end it outright.
+   */
+  let gateAbort: AbortController | null = null;
   /** Armed by the first Ctrl-C; the second one leaves. Reset whenever the human speaks again. */
   let exitArmed = false;
   let interruptBusy = false;
@@ -766,8 +978,38 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   let narrate: ProgressListener = () => {};
 
   const dispatches: ChatDispatchRecord[] = [];
+  const recces: ChatRecceRecord[] = [];
   const refusals: string[] = [];
   let humanTurns = 0;
+
+  // ---- phase 1: the interrogation, the recce, and what they leave behind ---------------------
+  //
+  // Three pieces of session state, all written by the loop and read by the dispatch branch.
+  //
+  // The transcript is a pairing rather than a log. A round is the COMMANDER's question and the
+  // human's answer TO it, which is what an interrogation is; recording a log of turns would put
+  // each answer next to the reply it provoked instead of next to the question it answered, and a
+  // reader six weeks later cannot tell those apart. `pendingQuestion` is what makes the pairing
+  // possible: it holds the last thing the commander said until the human answers it.
+  const interrogation: InterrogationTurn[] = [];
+  let pendingQuestion = '';
+  let interrogationRounds = 0;
+
+  /**
+   * Every scout finding this conversation has gathered, flattened.
+   *
+   * Threaded into the dispatch as `scoutFindings`, which reaches `renderSegmentationBrief` and
+   * becomes the `## WHAT THE SCOUT FOUND` section a `MAJ·OVERSEER` plans from. Until this wave
+   * that field was declared, rendered and populated by nothing at all.
+   *
+   * ACCUMULATED ACROSS THE SESSION rather than per dispatch: two recces answering two halves of
+   * one question are two halves of one briefing, and dropping the earlier one would make the
+   * order in which a human asked things decide what the planner is told.
+   */
+  const scoutFindings: string[] = [];
+  /** Cumulative recce spend, for `refuseOnBudget`. See `SCOUT_SESSION_BUDGET_USD`. */
+  let recceSpendUsd = 0;
+  let scoutCounter = 0;
 
   // ---- the status block ---------------------------------------------------------------------
   //
@@ -800,7 +1042,45 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   /** How many units stay on the bar. The Engineer is worth keeping while the Inspector reads it. */
   const ROSTER_MAX = 4;
   /** True while the human is being asked to approve a dispatch — the one blocking keystroke. */
-  let awaitingApproval = false;
+  /**
+   * Which confirmation prompt is up, or null.
+   *
+   * NOT A BOOLEAN, and it used to be. The status bar's hint reads this to say what the next
+   * keystroke does, and with one flag for two prompts a human at `send a scout? [y/N]` was told
+   * `approve to dispatch, anything else declines` on the row underneath it. Found by driving the
+   * real binary under a pty and reading the bar; every unit test in this file asserts on the
+   * prompt, which was correct, and none of them looks at the row below it.
+   */
+  let awaitingApproval: 'dispatch' | 'scout' | null = null;
+  /**
+   * Questions parked on this human, oldest first.
+   *
+   * Replaces the `awaitingAnswer` boolean, which was correct while a campaign could only have one
+   * blocked worker. Wave 3 made a campaign a fan-out of up to eight engineers, and a boolean
+   * cannot say which of three is being answered, nor stop a second `nextLine` from orphaning the
+   * first worker's promise. See `src/chat/inbox.ts`.
+   *
+   * `inbox.size > 0` reads exactly where `awaitingAnswer` used to, and means the same thing: a
+   * worker has stopped and the reason is this person.
+   */
+  const inbox = createInbox();
+  /**
+   * The dispatch console: one read, owned by one loop, for the whole of a dispatch.
+   *
+   * `active` is what tells that loop to keep reading and what tells `askHuman` there is anybody
+   * there to read at all: a question raised after the console has stopped (end of input, a dead
+   * terminal) must be resolved immediately rather than parked on a prompt nobody will answer.
+   * `interrupted` is set by the Ctrl-C handler before it aborts the read, so the loop can tell
+   * "the human pressed Ctrl-C at this question" from "there will never be any more input", which
+   * arrive as the same `null`.
+   */
+  let consoleActive = false;
+  let consoleInterrupted = false;
+  let consoleLoop: Promise<void> = Promise.resolve();
+  /** True between `/stop` and the y/N that answers it. */
+  let stopArmed = false;
+  /** The dispatch's own abort, or null when nothing is running. See `CampaignOptions.abortSignal`. */
+  let stopController: AbortController | null = null;
 
   const rosterUpdate = (agentId: string, change: Partial<RosterRow>): void => {
     const row = roster.find((entry) => entry.agentId === agentId);
@@ -841,7 +1121,17 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
    */
   const rosterObserve = (event: ProgressEvent): void => {
     switch (event.kind) {
+      case 'campaign-opened':
+        // The one event that names the archive this dispatch is writing to, and therefore the
+        // earliest moment the block can start reading a real tree out of it.
+        openTree(event.campaignId);
+        return;
+
       case 'unit-dispatched':
+        // Counted from the EVENT and not from the polled tree, so the budget row moves on the
+        // first spawn rather than on the first poll after it. A fan-out that appears a second
+        // late is a fan-out somebody has already stopped watching for.
+        agentsSpawned.add(event.agentId);
         roster.push({
           agentId: event.agentId,
           rank: event.rank,
@@ -928,8 +1218,143 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         });
         return;
       default:
+        // AN UNKNOWN KIND DEGRADES TO NOTHING, and that is a deliberate contract rather than a
+        // missing case. `ProgressEvent` belongs to its emitter and gains kinds as the campaign
+        // gains moments to report; this switch is one consumer of it. An unrecognised kind leaves
+        // the roster, the budget and the tree exactly as they were. The narration still prints
+        // it (that is `renderProgressEvent`'s job, and its switch is exhaustive so a new kind
+        // cannot be added without a line for it), and the tree still shows it, because the tree is
+        // read from the archive rather than accumulated from these events. So the cost of a kind
+        // this file has never heard of is one clock that does not restart, and never a throw from
+        // inside a listener that runs while a worktree lease is held.
         return;
     }
+  };
+
+  // ---- the live tree ------------------------------------------------------------------------
+  //
+  // The block draws the SAME `TreeModel` `army view` draws, built by the same `buildTree` from a
+  // real `CampaignSnapshot` read off the running campaign's own files. Not a model reconstructed
+  // from the narration: that would be a second derivation of the thing the block exists to show,
+  // and the two would disagree the first time an event was added on one path and not the other.
+  // The reader is the one `army view --follow` polls with, at its default rate, and it re-reads
+  // only the bytes appended since the last poll.
+
+  const treePollMs = Math.max(50, options.treePollMs ?? 1000);
+  let treeReader: CampaignReader | null = null;
+  let treeTimer: ReturnType<typeof setInterval> | null = null;
+  /** The last good model. Kept after a dispatch ends so `/work` still has something to answer. */
+  let tree: TreeModel | null = null;
+  /** True only while a campaign is actually running. It decides whether the BLOCK draws it. */
+  let treeLive = false;
+  /** The running (or last) campaign's directory, for `/work`'s orders and diff. */
+  let dispatchRoot: string | null = null;
+  /**
+   * What the RUNNING campaign has spent, as its own archive reports it, or null when nothing has.
+   *
+   * Null and not 0: a harness that reports no cost and a campaign that has spent nothing are
+   * different facts, and the bar may not merge them. It is the rule `RosterUnit.thinkingTokens`
+   * states one layer down.
+   */
+  let campaignCostUsd: number | null = null;
+  /**
+   * What the campaigns this session has ALREADY finished spent, folded in as each one ends.
+   *
+   * Separate from the live figure because the live one is rebuilt per dispatch from a fresh
+   * reader, and a session's second dispatch would otherwise reset the bar to that dispatch's
+   * spend alone, and a bill that goes DOWN as more work is done is the one number on this bar
+   * would be worse than absent.
+   */
+  let finishedCampaignsUsd: number | null = null;
+  /** Agents this dispatch has raised. From the events, so the bar moves on the FIRST spawn. */
+  let agentsSpawned = new Set<string>();
+  const concurrencyCap =
+    options.overseer === true
+      ? Math.max(1, options.maxConcurrentWorkstreams ?? DEFAULT_MAX_CONCURRENT_WORKSTREAMS)
+      : // Without an overseer a campaign runs ONE workstream over the whole objective, whatever
+        // the cap says. Printing 3 there would be a number the pool is not enforcing.
+        1;
+
+  const refreshTree = (): void => {
+    const reader = treeReader;
+    if (reader === null) return;
+    try {
+      tree = buildTree(reader.read(false), { now: new Date(nowMs()) });
+      let spent = 0;
+      let reported = false;
+      for (const row of walkTree(tree)) {
+        if (row.node.kind !== 'unit' || row.node.costUsd === null) continue;
+        spent += row.node.costUsd;
+        reported = true;
+      }
+      // Null, not 0, when nothing has reported a cost. A harness that reports none and a campaign
+      // that has spent nothing are different facts, and the bar may not merge them. It is the rule
+      // `RosterUnit.thinkingTokens` states one layer down.
+      campaignCostUsd = reported ? spent : null;
+    } catch {
+      // The archive is being appended to by another process as this reads it. A torn read costs
+      // the block one frame of freshness, never a session: it keeps the last good model.
+    }
+  };
+
+  const openTree = (id: string): void => {
+    try {
+      treeReader = openCampaignReader({ archiveRoot, campaignId: id, source: 'files', self });
+      dispatchRoot = treeReader.campaignRoot;
+      treeLive = true;
+      refreshTree();
+      treeTimer = setInterval(refreshTree, treePollMs);
+      if (typeof treeTimer.unref === 'function') treeTimer.unref();
+    } catch {
+      // No readable archive means no tree, and the roster answers instead. A decoration is never
+      // a reason to fail a dispatch.
+      treeReader = null;
+    }
+  };
+
+  const closeTree = (): void => {
+    if (treeTimer !== null) {
+      clearInterval(treeTimer);
+      treeTimer = null;
+    }
+    // One last read, so the tree `/work` answers from is the campaign's ENDING rather than its
+    // last poll, which on a fast campaign can be several units out of date.
+    refreshTree();
+    treeLive = false;
+    try {
+      treeReader?.close();
+    } catch {
+      /* nothing is held open; this is the seam's own contract, not a promise about the future */
+    }
+    treeReader = null;
+  };
+
+  /**
+   * How many rows the block may spend on the tree.
+   *
+   * `statusRows` in `src/chat/io.ts` REFUSES to draw a block that does not leave the conversation
+   * two rows, so a renderer that asked for one row too many would not be trimmed: it would
+   * vanish, and a reader has no way to tell a suppressed block from a broken one. The arithmetic
+   * is therefore done here, against the terminal's real height: two rows for that rule, one for
+   * the context row the block always ends with, and never more than a third of the window, because
+   * the window is for the conversation.
+   */
+  const treeBudget = (): number => {
+    const rows = io.rows;
+    if (rows <= 0) return DEFAULT_TREE_ROWS;
+    return Math.max(0, Math.min(DEFAULT_TREE_ROWS, rows - 3, Math.max(1, Math.floor(rows / 3))));
+  };
+
+  /** Session and campaigns together. Two costs on one bar, differing, is a bar arguing with itself. */
+  const totalCostUsd = (): number | null => {
+    const parts = [session.costUsd, finishedCampaignsUsd, campaignCostUsd];
+    if (parts.every((part) => part === null)) return null;
+    return parts.reduce((total: number, part) => total + (part ?? 0), 0);
+  };
+
+  const budgetModel = (): BudgetModel | null => {
+    if (!dispatchInFlight || agentsSpawned.size === 0) return null;
+    return { agents: agentsSpawned.size, cap: concurrencyCap, costUsd: totalCostUsd() };
   };
 
   /**
@@ -943,10 +1368,23 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
    * surface that can say it while it is true.
    */
   const statusModel = (): StatusModel => {
-    const hint = dispatchInFlight
-      ? 'dispatch in flight — Ctrl-C lets it settle'
-      : awaitingApproval
-        ? 'approve to dispatch, anything else declines'
+    // Before the dispatch-in-flight branch, because a parked question is ALSO a dispatch in
+    // flight and the reader is the reason it is parked. "Ctrl-C lets it settle" is true and
+    // useless when what the campaign is waiting for is this person typing.
+    const hint = stopArmed
+      ? 'y stops the campaign and settles every worktree; anything else carries on'
+      : inbox.size > 0
+      ? // Cut to a third of its length after a pty run at 100 columns, twice. The seventy-column
+        // version pushed the agent count and the spend clean off the row; making the budget
+        // reserved then pushed the HINT off instead. The count of what is open is its own segment
+        // now, so this no longer has to carry it, and what is left is the only thing a hint has
+        // ever been for: what the next keystroke does. The full sentence still prints in
+        // scrollback under the question, where there is room for it. That is `ANSWER_HINT`.
+        'asking: type to answer, Ctrl-C to skip'
+      : dispatchInFlight
+      ? 'dispatch in flight — Ctrl-C lets it settle, /stop ends it'
+      : awaitingApproval !== null
+        ? `approve to ${awaitingApproval === 'scout' ? 'send the scout' : 'dispatch'}, anything else declines`
         : exitArmed
           ? 'Ctrl-C again to leave'
           : null;
@@ -958,7 +1396,11 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       rung: `rung ${String(requestedRung)} (${RUNG_LABEL[requestedRung]})`,
       turns: humanTurns,
       dispatches: dispatches.filter((record) => record.approved).length,
-      costUsd: session.costUsd,
+      costUsd: totalCostUsd(),
+      tree: treeLive ? tree : null,
+      treeRows: treeBudget(),
+      questions: inbox.size,
+      budget: budgetModel(),
       // Every clock is computed HERE, at paint time, from a timestamp the loop stored — which is
       // what keeps `src/view/chrome.ts` free of a clock and therefore unit-testable at a fixed
       // instant. `detailAgeMs` stays null until something has actually been reported: a row that
@@ -999,6 +1441,32 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
    * `finally` that closes the commander's session and writes the archive's final row, so a closed
    * pipe would leave a live subprocess and a campaign row that never says how it ended.
    */
+  /**
+   * A block of prose, wrapped to the terminal and indented, ready for `io.write`.
+   *
+   * FOUND BY DRIVING THE REAL BINARY, not by a unit test: the recce description and the finding's
+   * attribution line each went out as one `write`, and at 100 columns the terminal hard-broke them
+   * at its right edge, mid-word — `may field a / t most 4`, `2 subordinate(s) cont / ributed`. The
+   * commander's own prose has been wrapped since `src/view/prose.ts` was built precisely to end
+   * that, and a screen where one speaker's paragraphs wrap and this process's shatter reads as
+   * broken rendering rather than as two speakers.
+   *
+   * `io.width` is read AT WRITE TIME rather than captured, for the same reason `StatusRenderer`
+   * takes a width: somebody drags a window and a captured number starts producing rows that wrap.
+   *
+   * The MARKER goes on the first row only and continuation rows are padded to the same width, so
+   * a wrapped finding reads as one finding. Repeating the marker down every row was the first
+   * spelling and it turns a two-row bullet into two bullets, which is the same class of lie as
+   * the hard break it replaced.
+   */
+  const wrapBlock = (marker: string, text: string): string => {
+    const room = Math.max(20, io.width - displayWidth(marker));
+    const pad = ' '.repeat(displayWidth(marker));
+    return wrapPlain(text, room)
+      .map((row, index) => `${index === 0 ? marker : pad}${row}\n`)
+      .join('');
+  };
+
   const guardedWrite = (text: string): void => {
     try {
       io.write(text);
@@ -1009,6 +1477,51 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
 
   const onInterrupt = (): void => {
     void (async (): Promise<void> => {
+      // BEFORE the dispatch branch, and that order is the fix.
+      //
+      // A parked question is also a dispatch in flight, so this used to fall into the branch
+      // below, which returns early — `io.abortLine()` was unreachable and `exitArmed` was never
+      // set, and the only ways out of an answer prompt anybody could find were Enter and `kill
+      // -9`. The narration was false as well: it said the dispatch was "settling" when nothing was
+      // settling, because the campaign was blocked on the very keystroke that had just been
+      // pressed.
+      //
+      // A blank answer already means "unanswered" and the campaign already treats it as silence —
+      // the attempt ends and the lease is settled by the campaign's own cleanup, exactly as it
+      // would have been with no way to ask at all. So the outcome already existed and only the
+      // path to it was missing. This press takes it: the question goes unanswered, the dispatch
+      // keeps running and keeps its lease, and control comes back. It does NOT arm the exit — one
+      // gesture, one meaning — so a press after this one lands in the branch below, where the
+      // "letting it settle" line is now true.
+      if (inbox.size > 0) {
+        guardedWrite('\n  ^C  leaving the question unanswered — the dispatch keeps its worktree.\n');
+        // Set BEFORE the abort, and that order is load-bearing: `abortLine` resolves the console's
+        // read, and the console has to be able to tell this press from end of input, which arrives
+        // as the same `null`. State a later reader depends on never sits downstream of a call that
+        // can hand control to it.
+        consoleInterrupted = true;
+        // `keepQueued`, because the session is not ending: the lines behind this read were typed
+        // for the Commander and it is still there to receive them.
+        io.abortLine({ keepQueued: true });
+        return;
+      }
+      // AFTER the inbox and BEFORE the dispatch, because a gate is neither. Nothing has been
+      // spawned and nothing holds a lease — the whole point of the gate is that it runs before any
+      // of that — so this press can simply stop it, which is the one gesture that used to reach
+      // nothing at all: the loop is inside `runAlignmentGate` rather than on a read, so
+      // `abortLine` had no read to unblock and the session sat through every command's deadline.
+      //
+      // It does NOT arm the exit. One gesture, one meaning: this press stopped the gate, and the
+      // press after it lands wherever the session is by then.
+      const gate = gateAbort;
+      if (gate !== null) {
+        guardedWrite(
+          '\n  ^C  stopping the alignment gate. Nothing has been dispatched, and every command it ' +
+            'did not reach is recorded as unrun rather than as passed.\n',
+        );
+        gate.abort();
+        return;
+      }
       if (dispatchInFlight) {
         // Killing here leaks a worktree lease: the pool slot is held by a process that is no
         // longer coming back, and the branch inside it has not been made durable yet. The
@@ -1024,7 +1537,8 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           level: 'warn',
           message:
             'a dispatch is in flight and holds a worktree lease. Letting it settle — ' +
-            'interrupting here would strand the tree and the branch inside it.',
+            'interrupting here would strand the tree and the branch inside it. ' +
+            'Type /stop to end the campaign; it confirms, and settles every tree on the way out.',
         });
         return;
       }
@@ -1129,6 +1643,570 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     );
   };
 
+  // ---- the dispatch console -------------------------------------------------------------------
+  //
+  // While a campaign runs there is now a prompt, and one loop owns it. That is the whole of what
+  // makes this wave's four commands reachable: a `/stop` nobody can type while sixteen agents are
+  // running is not a way to stop them.
+  //
+  // IT IS ITS OWN READER. `DISPATCH_CONSOLE_ADDRESSEE` is not `COMMANDER_ADDRESSEE`, and that one
+  // fact is the whole of what used to be `{ fresh: true }`: a line typed at the Commander's prompt
+  // before the dispatch began is addressed to the Commander, so this loop cannot consume it, and no
+  // flag has to be remembered to keep that true. A line typed AT this console is addressed to this
+  // console, is routed here, and — when it turns out to have been the Commander's after all — goes
+  // back through `io.queueLine`, re-addressed, reaching the Commander after the dispatch exactly as
+  // it did when nothing was reading at all.
+
+  /**
+   * What the composer should say right now, in ONE place.
+   *
+   * The confirmation outranks the inbox, and it has to be decided here rather than at the point
+   * `/stop` is typed: the console re-issues its read after every line, and a prompt set inside a
+   * handler was overwritten by the very next `nextLine`, so the y/N that ends a campaign was
+   * painted as the ordinary dispatch prompt. Caught on a pty, where the echoed entry read
+   * `▪ y` instead of naming what the `y` was answering.
+   */
+  const promptNow = (): string =>
+    stopArmed ? STOP_CONFIRM_PROMPT : inboxPrompt(inbox, ANSWER_PROMPT, DISPATCH_PROMPT);
+
+  /**
+   * WHO the composer is reading for right now, which is a different question from what it says.
+   *
+   * Two prompts can carry the same words and reach different readers — `inboxPrompt` names the
+   * agent once several are open — and one reader can be shown two spellings. The routing in
+   * `handleConsoleLine` is the authority on where a line goes, and this is that routing's own
+   * answer, written once so the composer cannot disagree with it. `src/chat/io.ts` compares it
+   * for equality and nothing else.
+   */
+  const addresseeNow = (): string => {
+    if (stopArmed) return 'stop-confirmation';
+    const current = inbox.current;
+    return current === null ? DISPATCH_CONSOLE_ADDRESSEE : `question:${String(current.id)}`;
+  };
+
+  /**
+   * A draft the composer gave back because the reader under it changed.
+   *
+   * The human sees it, always. `io.setPrompt` puts the half-typed entry on the Commander's queue
+   * rather than letting a worker's question inherit it, and a draft that vanished from under the
+   * cursor with no account of where it went would be the same defect wearing the other hat.
+   */
+  const announceDisplaced = (draft: string | null): void => {
+    if (draft === null) return;
+    guardedWrite(
+      '  ◇ the line you were typing was addressed to the prompt that just changed. It is queued ' +
+        'for the Commander rather than sent to this one:\n' +
+        `  ▪ ${draft.replace(/\s+/gu, ' ').trim()}\n`,
+    );
+  };
+
+  /**
+   * A line typed at a y/N prompt that is neither a yes nor a no.
+   *
+   * `isDecline` is what makes this possible and it is why it is not the complement of `isApproval`:
+   * `n`, `no` and a blank line ARE answers to the question that was asked and are consumed by it,
+   * and `where is cpt-03?` is not. The `/stop` confirmation has routed the difference since wave 2
+   * and the two other y/N prompts in this file swallowed it — printed `no scout sent` and dropped
+   * the sentence, which is a line the human typed disappearing under a message that does not
+   * mention it.
+   *
+   * It goes to the COMMANDER rather than to whatever the prompt was about, which is the same rule
+   * the whole addressee property states: the line was typed at this session's own confirmation, so
+   * it belongs to this session, and a sentence typed at `send a scout? [y/N]` may not become a
+   * scout's question or an Engineer's decision. `io.queueLine` re-addresses it, so nothing else
+   * can pick it up.
+   */
+  const keepUnansweredLine = (answer: string): void => {
+    if (isDecline(answer)) return;
+    io.queueLine(answer);
+    guardedWrite(
+      '  ◇ that was not a yes or a no, so it was not read as one. It is queued for the Commander ' +
+        `as your next turn:\n  ▪ ${answer.replace(/\s+/gu, ' ').trim()}\n`,
+    );
+  };
+
+  /** Relabel the composer under the read that is already pending. Never ends it. */
+  const refreshPrompt = (): void => {
+    let displaced: string | null = null;
+    try {
+      displaced = io.setPrompt(promptNow(), { addressee: addresseeNow() });
+    } catch {
+      /* a dead terminal cannot be relabelled, and a prompt is never load-bearing */
+    }
+    announceDisplaced(displaced);
+  };
+
+  const sayNextQuestion = (): void => {
+    const current = inbox.current;
+    if (current === null) return;
+    guardedWrite(
+      `  ◇ ${String(inbox.size)} still open. answering ${current.question.agentId} ` +
+        `(question ${String(current.id)}). /next moves on without answering.\n`,
+    );
+  };
+
+  /**
+   * One question ended with nothing.
+   *
+   * The sentence is the one the previous wave printed, word for word, because it means exactly
+   * what it meant then: the campaign already treats silence as an answer, ends the attempt on it,
+   * and settles the lease through its own cleanup. What is new is the address in front of it:
+   * with three questions on screen, "no answer" without a name is a fact nobody can act on.
+   */
+  const NO_ANSWER = 'no answer. the campaign carries on without one.';
+  const sayUnanswered = (entry: InboxEntry): void => {
+    guardedWrite(`  ◇ ${entry.question.agentId} (question ${String(entry.id)}): ${NO_ANSWER}\n`);
+  };
+
+  /** The prompt follows the inbox, never the other way round. */
+  const leaveUnanswered = (): void => {
+    const left = inbox.skip();
+    if (left === null) return;
+    sayUnanswered(left);
+    refreshPrompt();
+    sayNextQuestion();
+  };
+
+  const printWork = (id: string): void => {
+    guardedWrite(
+      renderWorkSnapshot(
+        {
+          id,
+          model: tree,
+          campaignRoot: dispatchRoot,
+          charset,
+          width: io.width,
+        },
+        {
+          read(file: string): string | null {
+            try {
+              // Read whole, then cap. An `orders.md` is kilobytes and a `diff.patch` can be a
+              // worker's entire branch, so the cap is what keeps a command that prints into a
+              // conversation from loading a hundred megabytes to count its lines.
+              const stat = fs.statSync(file);
+              if (stat.size > WORK_FILE_MAX_BYTES) return null;
+              return fs.readFileSync(file, 'utf8');
+            } catch {
+              return null;
+            }
+          },
+        },
+      ),
+    );
+  };
+
+  /**
+   * `/stop`, the campaign's own abort path, reached by a typed command.
+   *
+   * It does NOT settle anything itself, and that is the point. `runCampaign` already kills the
+   * soldiers' process trees, records the abort, makes whatever was committed durable and releases
+   * every lease through the one `finally` that knows how; a second implementation of that here
+   * would be a second thing that can strand a worktree. All this does is ask.
+   */
+  const requestStop = (): void => {
+    const controller = stopController;
+    if (controller === null) {
+      guardedWrite('  ◇ nothing is running.\n');
+      return;
+    }
+    guardedWrite(
+      '  ◇ stopping. The campaign kills its workers, makes whatever is committed durable, ' +
+        'and settles every worktree on the way out.\n',
+    );
+    // BEFORE the abort. A campaign parked on `askHuman` cannot reach the checkpoint that unwinds
+    // it until that promise resolves, so a stop that left a question outstanding would be a stop
+    // that hangs, waiting on the person who just asked for it.
+    for (const left of inbox.drain()) sayUnanswered(left);
+    refreshPrompt();
+    controller.abort();
+  };
+
+  /**
+   * One line typed while a dispatch runs.
+   *
+   * The order of these branches is what the line MEANS, most specific first: a confirmation the
+   * session asked for, then a command, then an answer to a parked worker, then, as the default,
+   * words for the Commander, which are handed back to its queue rather than consumed here.
+   */
+  const handleConsoleLine = (line: string): void => {
+    const text = line.trim();
+    if (stopArmed) {
+      stopArmed = false;
+      if (isApproval(text)) {
+        requestStop();
+        return;
+      }
+      guardedWrite('  ◇ not stopped. the campaign carries on.\n');
+      // The confirmation is over either way, so the composer goes back to whatever it was.
+      refreshPrompt();
+      // `n`, `no` and a blank line ARE the answer to `[y/N]` and are consumed by it.
+      if (isDecline(text)) return;
+      // Anything else was never a confirmation. It is a line the human typed, and this branch used
+      // to swallow it whole — printed "not stopped" and dropped the words, so a `/work cpt-03`
+      // typed one keystroke after `/stop` ran nothing and reached nobody. Same family as the
+      // draft that a relabel used to hand to a worker, and the same property answers it: the line
+      // belongs to the reader it was typed under, and that reader was the confirmation, not a
+      // parked worker. So it is routed — as a command, or to the Commander — and `mayAnswer` is
+      // FALSE, because a sentence typed at `stop the campaign? [y/N]` was addressed to this
+      // session and may not become a decision in somebody's worktree.
+      routeConsoleLine(text, { mayAnswer: false });
+      return;
+    }
+    routeConsoleLine(text, { mayAnswer: true });
+  };
+
+  /**
+   * Where a line typed at the dispatch console goes, once it is known not to be a confirmation.
+   *
+   * `mayAnswer` is the one caller-visible knob, and it is the wave-2 property in one word: a line
+   * may answer a parked worker only when the composer it was typed at was reading FOR that worker.
+   */
+  const routeConsoleLine = (text: string, options: { mayAnswer: boolean }): void => {
+    if (text === '') {
+      // A blank line at a question is the documented way to leave it unanswered; anywhere else it
+      // is nothing at all, exactly as it is at the Commander's prompt. `mayAnswer` gates it for
+      // the same reason it gates the answer below: a blank line typed at `[y/N]` was a decline,
+      // and it has already been consumed as one.
+      if (options.mayAnswer && inbox.current !== null) leaveUnanswered();
+      return;
+    }
+    const verb = text.split(/\s+/u)[0] as string;
+    const rest = text.slice(verb.length).trim();
+    switch (verb) {
+      case '/stop':
+        if (stopController === null) {
+          guardedWrite('  ◇ nothing is running.\n');
+          return;
+        }
+        stopArmed = true;
+        guardedWrite(
+          `  ◇ /stop ends the campaign: ${String(agentsSpawned.size)} agent(s) raised so far, ` +
+            'and every worktree in flight is settled rather than dropped.\n',
+        );
+        // Its own prompt, because y/N here is not the y/N that approves a dispatch and the two
+        // must not look the same on the row where the difference is decided. `promptNow` is what
+        // chooses it, so the console's next read cannot paint over the choice.
+        refreshPrompt();
+        return;
+      case '/next': {
+        if (inbox.size === 0) {
+          guardedWrite('  ◇ no questions are open.\n');
+          return;
+        }
+        const moved = inbox.next();
+        refreshPrompt();
+        if (moved !== null) {
+          guardedWrite(
+            `  ◇ now answering ${moved.question.agentId} (question ${String(moved.id)}) ` +
+              `of ${String(inbox.size)}.\n`,
+          );
+        }
+        return;
+      }
+      case '/work':
+        if (rest === '') {
+          guardedWrite('  ◇ /work <agent-id or workstream-id>\n');
+          return;
+        }
+        printWork(rest);
+        return;
+      case '/help':
+        guardedWrite(SLASH_HELP);
+        return;
+      case '/exit':
+      case '/quit':
+        // Handed BACK rather than obeyed. Leaving now would abandon a campaign holding worktree
+        // leases that only its own cleanup may settle, and the human did not ask to abandon it:
+        // they asked to leave. So the command reaches the loop that can honour it safely, one
+        // dispatch later, which is exactly where it landed before anything was reading here.
+        io.queueLine(text);
+        guardedWrite('  ◇ leaving when the dispatch settles. /stop ends it now.\n');
+        return;
+      default:
+        break;
+    }
+    if (options.mayAnswer && inbox.current !== null) {
+      const answered = inbox.answer(text);
+      refreshPrompt();
+      if (answered !== null) {
+        guardedWrite(
+          `  ◇ answered ${answered.question.agentId}: the workstream resumes with it.\n`,
+        );
+      }
+      sayNextQuestion();
+      return;
+    }
+    io.queueLine(text);
+    guardedWrite('  ◇ the Commander is busy with this dispatch; queued for it.\n');
+  };
+
+  /**
+   * The loop. One read at a time, for the life of one dispatch.
+   *
+   * It CANNOT throw and it cannot end without resolving what it was holding. Both are load-bearing
+   * in the same way: this promise is awaited in a `finally` that runs while a campaign may still
+   * hold a worktree lease, and a question left parked is a workstream that never finishes.
+   */
+  const dispatchConsole = async (): Promise<void> => {
+    try {
+      while (consoleActive) {
+        const line = await io.nextLine(promptNow(), { addressee: addresseeNow() });
+        // The dispatch finished while this read was parked, and the `finally` aborted it to get
+        // here. Nothing was typed; there is nothing to route.
+        if (!consoleActive) return;
+        if (line === null) {
+          if (consoleInterrupted) {
+            consoleInterrupted = false;
+            leaveUnanswered();
+            continue;
+          }
+          // End of input, a closed terminal, or a commander death that aborted every read. Nothing
+          // more will ever be typed here, so the loop stops, and everything it was holding is let
+          // go on the way out, because a promise nobody will ever resolve is a parked worktree.
+          return;
+        }
+        handleConsoleLine(line);
+      }
+    } catch {
+      /* a console that cannot read is never a reason to end a campaign holding a lease */
+    } finally {
+      consoleActive = false;
+      for (const left of inbox.drain()) sayUnanswered(left);
+    }
+  };
+
+  // ---- phase 1: the scout ---------------------------------------------------------------------
+  //
+  // THE SUPERVISING PROCESS SPAWNS. A model never does. The commander's reply may carry a recce
+  // block; this process reads it, prints the question, waits for a keystroke, and only then builds
+  // a spec and starts a process. That is the same rule the dispatch path follows, and a recce does
+  // not get an exception for reading rather than writing — it costs money and it reaches the
+  // network.
+  //
+  // Shaped like `spawnOverseer` in `campaign.ts` and for the same reason: `src/command/scout.ts`
+  // holds the decisions and spawns nothing, so this is the only place a `CPT·SCOUT` is built and
+  // it goes through `buildSoldierSpec` like every other worker. There is no second spawn path
+  // where a worker could be assembled without the global deny-list.
+  /** The last thing the human typed, for the scout's `## WHAT IS ALREADY SETTLED` section. */
+  let pendingHumanContext = '';
+
+  /** Glyphs for the gate block. One charset decision, made once, where the session made it. */
+  const glyph = glyphsFor(charset);
+
+  /**
+   * What the gate did with a proposal, for the session's record.
+   *
+   * `null` means the gate was never entered because the proposal carried no spec — a state the
+   * record has to be able to state, because "the gate did not refuse it" and "there was no gate"
+   * are different facts and a boolean would collapse them.
+   */
+  const gateOf = (result: AlignmentResult | null): ChatDispatchRecord['gate'] =>
+    result === null ? 'no-spec' : result.passed ? 'passed' : 'refused';
+
+  /** Cap one half of a recorded round, marking the cut rather than hiding it. */
+  const capHalf = (raw: string): string =>
+    codePointLength(raw) <= INTERROGATION_HALF_MAX_CHARS
+      ? raw
+      : `${[...raw].slice(0, INTERROGATION_HALF_MAX_CHARS).join('')}\n\n_[truncated at ${String(
+          INTERROGATION_HALF_MAX_CHARS,
+        )} characters]_`;
+
+  /**
+   * Bank one round of the interrogation: the commander's last question and the answer to it.
+   *
+   * Neutralised at capture by `captureTurn` — both halves, the human's included. The human's is
+   * not neutralised because a human is untrusted; it is neutralised because this document is read
+   * with `cat` and `less`, which obey an escape byte whoever typed it, and a filter with an
+   * exception is a filter with a hole shaped like the exception.
+   */
+  const recordRound = (answer: string): void => {
+    interrogationRounds += 1;
+    interrogation.push(
+      captureTurn({
+        round: interrogationRounds,
+        at: options.now === undefined ? new Date().toISOString() : options.now(),
+        commander: capHalf(pendingQuestion),
+        human: capHalf(answer),
+      }),
+    );
+    // Newest last. A spec is settled at the END of an interrogation, so the rounds worth keeping
+    // when a conversation runs long are the recent ones; `renderInterrogationDocument` numbers
+    // them with the round they actually were, so a document beginning at 61 says so.
+    while (interrogation.length > MAX_INTERROGATION_ROUNDS) interrogation.shift();
+  };
+
+  const spawnScout: ScoutSpawn = async (input) => {
+    scoutCounter += 1;
+    const agentId = `cpt-${String(scoutCounter).padStart(2, '0')}`;
+    // The vendor and the model come from the user's config, exactly as every other worker's do.
+    // The EFFORT does not, and the override is the same judgement `dispatchFor` makes for a
+    // spec-less ENGINEER: the configured `low` is a measured default for a worker whose thinking
+    // was done above it, and a scout by definition has none — it is being sent to produce the
+    // information a spec would have carried. Escalating here rather than widening `dispatchFor`
+    // keeps the decision at the one call site it applies to.
+    const target = dispatchFor(config, 'SCOUT', false);
+    const scoutSpec = buildSoldierSpec({
+      agentId,
+      rank: 'CAPTAIN',
+      role: 'SCOUT',
+      harness: 'claude',
+      ...(target.model === undefined ? {} : { model: target.model }),
+      effort: UNSPECIFIED_BRIEF_EFFORT,
+      // The primary checkout. A SCOUT HOLDS NO WORKTREE: a lease exists to isolate and recover a
+      // writing worker's changes, and `ROLE_WRITES_FILES.SCOUT` is false, so there is nothing to
+      // isolate. Nothing below leases one and nothing releases one.
+      cwd: project,
+      orders: input.orders,
+      outputSchemaPath: input.outputSchemaPath,
+      home,
+      posture: config.permissions.mode,
+      // The roster. `buildSoldierSpec` builds it from the rank table, refuses one whose
+      // subordinates would hold a tool their parent does not, and the claude adapter pins the
+      // nesting cap to `maxSubagentDepth('CAPTAIN')` — which is 1. That is the DEPTH ceiling, and
+      // none of it is this call site's to get right. The COUNT ceiling is below.
+      fanOut: true,
+    });
+
+    const scoutTask = archive.createTask({
+      parentTaskId: task.id,
+      title: `scout: ${cap(input.question, 100)}`,
+      status: 'in_flight',
+    });
+    archive.recordAgentAttempt({
+      id: agentId,
+      taskId: scoutTask.id,
+      parentAgentId: COMMANDER_AGENT_ID,
+      rank: 'CAPTAIN',
+      role: 'SCOUT',
+      harness: 'claude',
+      model: scoutSpec.model ?? null,
+      effort: scoutSpec.effort ?? null,
+      sessionId: scoutSpec.sessionId,
+      depth: 2,
+      status: 'running',
+      // Null, and it is the honest value rather than a placeholder: this unit has no tree.
+      worktreePath: null,
+      leaseId: null,
+      orders: input.orders,
+      attempt: 1,
+    });
+    archive.appendSignal({
+      fromAgent: GENERAL_AGENT_ID,
+      toAgent: agentId,
+      kind: 'order',
+      body: cap(`recce: ${input.question}`),
+      artifact: `agents/${agentId}/orders.md`,
+    });
+
+    // The adapter is built here rather than taken from the registry so the recce's own wall clock
+    // rides on it. `closeGraceMs` IS a one-shot worker's whole working time — `runSoldier` closes
+    // stdin straight after the orders — so this is the ceiling that stops a running recce on the
+    // clock, and the adapter's own 300s default would be the wrong one in both directions.
+    const adapter =
+      options.adapters?.claude ??
+      createClaudeAdapter({
+        closeGraceMs: SCOUT_TIMEOUT_MS,
+        ...(options.claudeBin === undefined ? {} : { bin: options.claudeBin }),
+      });
+
+    // ---- the COUNT ceiling, which is the half the harness does not enforce ------------------
+    //
+    // The roster says WHO may be fielded and has no position for HOW MANY. `watchFanOut` counts
+    // distinct subordinates off the normalised stream and reports the crossing exactly once.
+    //
+    // THE HALT IS A KILL, and the first version of this was not. It tried `interrupt()` first, on
+    // the reasoning that the scout's answer so far survives an interrupt and does not survive a
+    // kill — and that reasoning is sound and the code was dead. MEASURED by driving a scout that
+    // fans out past the ceiling under a real pipe: `runSoldier` closes stdin immediately after
+    // sending the orders, so by the time any event reaches this listener the claude adapter's
+    // `interrupt()` rejects with `soldier … is not running` and every crossing fell through to the
+    // kill anyway. A graceful halt would need a duplex path this one-shot worker does not have.
+    //
+    // What that costs is worth stating rather than hiding: a scout killed at the crossing usually
+    // returns NOTHING, because a unit that is still fanning out has not answered yet. When it has
+    // already emitted a finding the pump has banked the text and it survives — which is real, and
+    // is the uncommon case rather than the reassuring one.
+    const watch = watchFanOut(SCOUT_MAX_SUBAGENTS);
+    let live: Soldier | null = null;
+    const run = await runSoldier(adapter, scoutSpec, archive, {
+      onSpawn: (soldier) => {
+        live = soldier;
+      },
+      onEvent: (event) => {
+        if (!watch.observe(event)) return;
+        const soldier: Soldier | null = live;
+        if (soldier === null) return;
+        // ONE LINE here. This runs inside the loop draining the child's stdout, and the note
+        // channel clips at `PROGRESS_SUMMARY_MAX` and does not wrap — the paragraph version came
+        // out truncated mid-word across three hard-broken rows on a real pty. The full account is
+        // in the block below, where there is room for it.
+        narrate({ kind: 'note', level: 'warn', message: fanOutHaltLine(SCOUT_MAX_SUBAGENTS) });
+        // SIGKILL to the whole process group, so the subordinates go with it — they are threads of
+        // the same process, and anything it left running is a grandchild.
+        if (killSoldierTree(soldier)) return;
+        // No kill seam. Only an injected adapter reaches here (a test, a future harness), and the
+        // polite close is the only stop that exists then. Idempotent, so racing `runSoldier`'s own
+        // close is not a hazard, and guarded because a halt must never become the exception that
+        // ends the conversation.
+        void soldier.close().catch(() => {
+          /* it was already going down; that is the outcome this branch wanted */
+        });
+      },
+    });
+
+    archive.finishAgent(agentId, {
+      status: run.status === 'ok' ? 'exited' : 'failed',
+      costUsd: run.costUsd,
+    });
+    archive.updateTask(scoutTask.id, {
+      status: run.status === 'ok' && run.structured !== undefined ? 'done' : 'failed',
+    });
+
+    return {
+      agentId,
+      structured: run.structured,
+      status: run.status,
+      errors: run.errors,
+      subagentsFielded: watch.count,
+      haltedForFanOut: watch.halted,
+      costUsd: run.costUsd,
+    };
+  };
+
+  /**
+   * Send one scout and print what it found. Returns the finding's lines, or null.
+   *
+   * Everything worker-authored on this path has already been through `sanitize` at capture in
+   * `src/command/scout.ts`, so what is printed here and what reaches the overseer's brief are the
+   * same neutralised strings — and the block says whose words they are, on the line above them,
+   * because a finding printed under this process's own glyphs and nothing else is a finding a
+   * reader will attribute to this process.
+   */
+  const sendScout = async (question: string): Promise<RecceOutcome> => {
+    const outcome = await runRecce({
+      spawn: spawnScout,
+      question,
+      spentUsd: recceSpendUsd,
+      renderBrief: () =>
+        renderScoutBrief({
+          question,
+          project,
+          campaignId,
+          maxSubagents: SCOUT_MAX_SUBAGENTS,
+          timeoutMs: SCOUT_TIMEOUT_MS,
+          // Supervisor-held: the objective as the human typed it, never a subordinate's account.
+          ...(pendingHumanContext === '' ? {} : { context: pendingHumanContext }),
+        }),
+    });
+    // `chargedUsd`, never `costUsd`. The old line was `if (costUsd !== null)`, which added nothing
+    // for a HALTED recce — SIGKILLed before the `result` event that carries the cost — so the
+    // single most expensive thing this conversation can do (five model sessions) was free to the
+    // budget `refuseOnBudget` guards, while a one-subordinate recce that finished properly was
+    // charged $0.11. See `unreportedRecceUsd`.
+    recceSpendUsd += outcome.chargedUsd;
+    return outcome;
+  };
+
   // After the interrupt handler is wired, so a Ctrl-C during the opening turn already finds a bar
   // that knows how to say what that key will do.
   if (chrome) io.setStatus(statusRenderer);
@@ -1152,7 +2230,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         commanderDeathCloseOut();
         break;
       }
-      const line = await io.nextLine(PROMPT);
+      const line = await io.nextLine(PROMPT, { addressee: COMMANDER_ADDRESSEE });
       if (line === null) {
         // `onEnded` aborts a parked read, so a null line is how a death at the prompt arrives
         // here. An exit the human asked for keeps its own reason.
@@ -1171,6 +2249,24 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       }
       if (text === '/help') {
         io.write(SLASH_HELP);
+        continue;
+      }
+      // The three campaign commands answer HERE too, rather than being unknown outside a
+      // dispatch. A command that exists only while something is running is a command whose error
+      // message is "the commander did not understand that", which is the wrong answer twice: it
+      // blames the reader, and it spends a turn asking a model about a word this loop owns.
+      if (text === '/stop') {
+        io.write('  ◇ nothing is running.\n');
+        continue;
+      }
+      if (text === '/next') {
+        io.write('  ◇ no questions are open.\n');
+        continue;
+      }
+      if (text === '/work' || text.startsWith('/work ')) {
+        const id = text.slice('/work'.length).trim();
+        if (id === '') io.write('  ◇ /work <agent-id or workstream-id>\n');
+        else printWork(id);
         continue;
       }
       if (text === '/status') {
@@ -1197,6 +2293,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       }
 
       humanTurns += 1;
+      pendingHumanContext = text;
       archive.appendSignal({
         fromAgent: GENERAL_AGENT_ID,
         toAgent: COMMANDER_AGENT_ID,
@@ -1211,6 +2308,10 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       endAnswer();
       io.write('\n');
       recordCommanderTurn(turn.text, turn.refusals);
+      // The round the human just closed, banked before anything else can consume the turn. The
+      // pairing is the commander's LAST question and this answer to it — see `interrogation`.
+      recordRound(text);
+      pendingQuestion = turn.text;
       // Not when the commander died: the close-out at the top of the loop prints the same
       // message with its consequence attached, and the same sentence twice is noise.
       if (turn.status === 'error' && turn.errors.length > 0 && !commanderGone) {
@@ -1222,6 +2323,257 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       if (commanderGone) continue;
 
       const proposal: DispatchRequest | null = turn.proposal;
+      const scoutProposal: ScoutRequest | null = turn.scoutProposal;
+
+      // =====================================================================================
+      // ONE REPLY ASKS FOR ONE THING.
+      //
+      // A turn carrying both a dispatch block and a recce block has asked for two different
+      // things at once, and honouring either would be this process choosing which. Refused as a
+      // pair, on the same reasoning `parseDispatchDirective` refuses two dispatch blocks:
+      // picking one is the supervisor inventing intent, and it would be inventing it at the one
+      // prompt where a keystroke is supposed to mean something specific.
+      // =====================================================================================
+      if (proposal !== null && scoutProposal !== null) {
+        const reason =
+          'this reply asks for a dispatch AND a recce. One turn asks for one thing; nothing was ' +
+          'started. Send the scout, read what it found, and then propose the work — or propose ' +
+          'the work if you already know enough to.';
+        refusals.push(reason);
+        io.write(`\n  ◇ ${reason}\n`);
+        archive.appendSignal({
+          fromAgent: GENERAL_AGENT_ID,
+          kind: 'status',
+          body: cap(`refused: ${reason}`),
+        });
+        if (commanderGone) continue;
+        beginAnswer(true);
+        io.setBusy('commander');
+        const reaction = await session.scoutDeclinedTurn(scoutProposal.question, reason);
+        settle();
+        endAnswer();
+        io.write('\n');
+        recordCommanderTurn(reaction.text, reaction.refusals);
+        continue;
+      }
+
+      // ---- the recce ------------------------------------------------------------------------
+      //
+      // Its own keystroke, on its own prompt. A scout reads rather than writes, which makes it
+      // cheaper to be wrong about and does not make it free: it is a metered model session that
+      // reaches the network, and the rule that a model never spawns anything has no exception for
+      // reading.
+      if (scoutProposal !== null) {
+        const question = scoutProposal.question;
+        const query = archive.appendSignal({
+          fromAgent: COMMANDER_AGENT_ID,
+          toAgent: GENERAL_AGENT_ID,
+          kind: 'query',
+          body: cap(`requests a recce: ${question}`),
+        });
+        io.write(`\n  ◇ proposed recce\n${wrapBlock('     ', question)}`);
+        io.write(
+          wrapBlock(
+            '     ',
+            'a CPT·SCOUT reads the repository and the web. It writes nothing, holds no worktree, ' +
+              `may field at most ${String(SCOUT_MAX_SUBAGENTS)} subordinates and none of them may ` +
+              `field any, and has ${String(Math.round(SCOUT_TIMEOUT_MS / 60_000))} minutes.`,
+          ),
+        );
+        awaitingApproval = 'scout';
+        const answer = await io.nextLine(SCOUT_CONFIRM_PROMPT, { addressee: 'scout-approval' });
+        awaitingApproval = null;
+        if (answer === null) {
+          archive.appendSignal({
+            fromAgent: GENERAL_AGENT_ID,
+            toAgent: COMMANDER_AGENT_ID,
+            kind: 'answer',
+            inReplyTo: query.seq,
+            body: 'the session ended before the recce was approved; nothing was sent',
+          });
+          recces.push({
+            question,
+            approved: false,
+            agentId: null,
+            subagentsFielded: 0,
+            haltedForFanOut: false,
+            costUsd: null,
+          });
+          if (!exitRequested) {
+            if (commanderGone) commanderDeathCloseOut();
+            else exitReason = 'eof';
+          }
+          break;
+        }
+        if (!isApproval(answer)) {
+          io.write('  ◇ no scout sent.\n');
+          keepUnansweredLine(answer);
+          archive.appendSignal({
+            fromAgent: GENERAL_AGENT_ID,
+            toAgent: COMMANDER_AGENT_ID,
+            kind: 'answer',
+            inReplyTo: query.seq,
+            body: cap(`declined: ${question}`),
+          });
+          recces.push({
+            question,
+            approved: false,
+            agentId: null,
+            subagentsFielded: 0,
+            haltedForFanOut: false,
+            costUsd: null,
+          });
+          if (commanderGone) continue;
+          beginAnswer(true);
+          io.setBusy('commander');
+          const reaction = await session.scoutDeclinedTurn(
+            question,
+            'the Commander did not approve it',
+          );
+          settle();
+          endAnswer();
+          io.write('\n');
+          recordCommanderTurn(reaction.text, reaction.refusals);
+          continue;
+        }
+
+        io.write('  ◇ scouting — one CPT·SCOUT, reading only.\n');
+        // The same narration sink a dispatch uses, built and closed with the recce, for the same
+        // reason: a session-long sink is one whose ticker can outlive the thing that started it.
+        const scoutSink = createProgressSink({
+          stream: io,
+          self,
+          charset,
+          live: io.isTTY && !chrome,
+        });
+        narrate = guardedProgress((event) => {
+          scoutSink.emit(event);
+        });
+        let outcome: RecceOutcome;
+        try {
+          outcome = await sendScout(question);
+        } catch (error) {
+          outcome = {
+            kind: 'unavailable',
+            reason: `the recce could not be run: ${error instanceof Error ? error.message : String(error)}`,
+            agentId: null,
+            costUsd: null,
+            // ONE SESSION, not zero. `runRecce` threw, so `runSoldier` never returned and there is
+            // no measurement to price — but the throw can land after a process was spawned and a
+            // model session opened, and the ledger's failure mode is undercharging. A floor of one
+            // session is what this branch knows for certain it might have spent.
+            chargedUsd: SCOUT_MODEL_SESSION_USD,
+          };
+        } finally {
+          narrate = () => {};
+          try {
+            scoutSink.close();
+          } catch {
+            /* narration is never load-bearing */
+          }
+        }
+
+        if (outcome.kind === 'unavailable') {
+          io.write(`  ✗ ${outcome.reason}\n`);
+          archive.appendSignal({
+            fromAgent: GENERAL_AGENT_ID,
+            toAgent: COMMANDER_AGENT_ID,
+            kind: 'answer',
+            inReplyTo: query.seq,
+            body: cap(`no finding: ${outcome.reason}`),
+          });
+          recces.push({
+            question,
+            approved: true,
+            agentId: outcome.agentId,
+            subagentsFielded: 0,
+            haltedForFanOut: false,
+            costUsd: outcome.costUsd,
+          });
+          if (commanderGone) continue;
+          beginAnswer(true);
+          io.setBusy('commander');
+          // The declined envelope, whose only strings are the question the human approved and a
+          // sentence this process wrote. Nothing a scout said crosses on this path, which is what
+          // makes it safe to use after a run whose output could not be trusted enough to parse.
+          const reaction = await session.scoutDeclinedTurn(question, cap(outcome.reason, 400));
+          settle();
+          endAnswer();
+          io.write('\n');
+          recordCommanderTurn(reaction.text, reaction.refusals);
+          continue;
+        }
+
+        const finding = outcome.finding;
+        const lines = scoutFindingLines(finding);
+        scoutFindings.push(...lines);
+        recces.push({
+          question,
+          approved: true,
+          agentId: outcome.agentId,
+          subagentsFielded: outcome.subagentsFielded,
+          haltedForFanOut: outcome.haltedForFanOut,
+          costUsd: outcome.costUsd,
+        });
+        // WHOSE WORDS THESE ARE, on the line above them. Every string below has been through
+        // `sanitize` at capture in `src/command/scout.ts`; what this line adds is attribution,
+        // because a finding printed under this process's own glyphs and nothing else is a finding
+        // a reader will attribute to this process.
+        io.write('\n');
+        io.write(
+          wrapBlock(
+            '  ◇ ',
+            `${outcome.agentId} reported — the words below are the SCOUT'S, not this process's` +
+              `${
+                outcome.subagentsFielded === 0
+                  ? ''
+                  : `, and ${String(outcome.subagentsFielded)} subordinate(s) contributed to them`
+              }.`,
+          ),
+        );
+        io.write(wrapBlock('     ', finding.summary));
+        for (const entry of finding.findings) io.write(wrapBlock('     · ', entry));
+        for (const entry of finding.unknowns) {
+          io.write(wrapBlock('     ? ', `could not determine: ${entry}`));
+        }
+        io.write(
+          wrapBlock('     ', 'it is carried into the segmentation of anything dispatched from here.'),
+        );
+        // LAST, so the finding reads as one block and the caveat is the last word about it rather
+        // than a paragraph wedged into the middle of somebody's evidence.
+        if (outcome.haltedForFanOut) {
+          io.write(
+            wrapBlock('  ! ', describeFanOutHalt(outcome.subagentsFielded, SCOUT_MAX_SUBAGENTS)),
+          );
+        }
+        archive.appendSignal({
+          fromAgent: outcome.agentId,
+          toAgent: GENERAL_AGENT_ID,
+          kind: 'report',
+          inReplyTo: query.seq,
+          body: cap(finding.summary),
+          artifact: `agents/${outcome.agentId}/orders.md`,
+        });
+
+        if (commanderGone) continue;
+        beginAnswer(true);
+        io.setBusy('commander');
+        const reaction = await session.scoutFindingTurn({
+          agentId: outcome.agentId,
+          question,
+          summary: finding.summary,
+          findings: [...finding.findings],
+          unknowns: [...finding.unknowns],
+          subagentsFielded: outcome.subagentsFielded,
+          haltedForFanOut: outcome.haltedForFanOut,
+        });
+        settle();
+        endAnswer();
+        io.write('\n');
+        recordCommanderTurn(reaction.text, reaction.refusals);
+        continue;
+      }
+
       if (proposal === null) continue;
 
       // =====================================================================================
@@ -1247,9 +2599,120 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       if (proposal.spec !== undefined) {
         io.write(`\n${renderTechnicalSpec(proposal.spec)}\n`);
       }
-      awaitingApproval = true;
-      const answer = await io.nextLine(CONFIRM_PROMPT);
-      awaitingApproval = false;
+
+      // =====================================================================================
+      // THE MECHANICAL ALIGNMENT GATE.
+      //
+      // Phase 2 begins only when every required spec field is answered, every verification
+      // command EXECUTES against the base commit — even if it fails — and a human confirms with
+      // a keystroke. This is the first two; the keystroke below is the third, and it is LAST on
+      // purpose: it confirms a gate that already passed rather than being the whole gate, which
+      // is exactly what it used to be.
+      //
+      // A PROPOSAL WITH NO SPEC DOES NOT ENTER THE GATE, and that is a statement about what the
+      // gate is rather than a hole in it. Condition 1 is a question about a spec; a dispatch that
+      // carries none has had no interrogation, nothing was aligned, and there is nothing to check
+      // it against. It stays the supported degraded path `army campaign "fix the thing"` also
+      // takes — and it is visibly the worse deal rather than the cheaper one, because
+      // `dispatchFor` escalates a spec-less brief to the most expensive reasoning class there is
+      // and no mechanical criterion runs at any point. The block below says so in as many words.
+      // =====================================================================================
+      let alignment: AlignmentResult | null = null;
+      if (proposal.spec === undefined) {
+        io.write(`\n  ${glyph.ranks.CAPTAIN} alignment gate — NOT RUN\n`);
+        io.write(
+          wrapBlock(
+            '     ',
+            'This proposal carries no spec, so there is nothing to align: none of the six ' +
+              'questions was asked, no verification command exists to run against the base ' +
+              'commit, and phase 3 will have no baseline to compare against. The Engineer is ' +
+              'escalated to the highest reasoning class to make up for it, which is the most ' +
+              'expensive way to answer a question a sentence would have settled.',
+          ),
+        );
+      } else {
+        io.write(
+          wrapBlock(
+            `  ${glyph.ranks.CAPTAIN} `,
+            "running the spec's verification commands against the base commit…",
+          ),
+        );
+        gateAbort = new AbortController();
+        try {
+          alignment = await runAlignmentGate({
+            spec: proposal.spec,
+            cwd: project,
+            signal: gateAbort.signal,
+            ...(options.verifyRun === undefined ? {} : { run: options.verifyRun }),
+            onProgress: (line) => {
+              try {
+                // WRAPPED, like the block these lines are the live half of. Unwrapped they
+                // measured 133 and 116 columns on a 60-column terminal, hard-broken mid-word by
+                // the terminal while the gate block three rows below them wrapped properly — one
+                // surface of one gate rendering two different ways.
+                io.write(wrapBlock('      ', line));
+              } catch {
+                /* a dead pipe is never a reason a gate does not finish running */
+              }
+            },
+          });
+        } finally {
+          // Cleared before anything below can run, so a Ctrl-C after the gate is over cannot try
+          // to abort a controller nobody is listening to and swallow a press that meant something
+          // else. `runAlignmentGate` never throws, so this only ever runs on the ordinary path —
+          // it is here because "never throws" is a promise this file should not have to re-check.
+          gateAbort = null;
+        }
+        io.write(renderAlignment(alignment, charset, io.width));
+
+        if (!alignment.passed) {
+          // NO KEYSTROKE IS OFFERED. A gate that failed and then asked anyway would be a gate
+          // whose whole content is the question, which is the shape this replaces.
+          //
+          // The reasons are NOT reprinted here, and the first version of this did print them. On a
+          // pty the same paragraph appeared twice three rows apart — once under the command it
+          // belongs to, in the block above, and once again as a refusal. The block is where a
+          // reader is already looking; this line says what happened to the dispatch. The full
+          // sentences still go to the archive and to the commander, which are the two readers who
+          // do not see the block.
+          io.write('  ◇ not dispatched — the alignment gate did not pass.\n');
+          const summary = alignmentRefusals(alignment).join(' ');
+          archive.appendSignal({
+            fromAgent: GENERAL_AGENT_ID,
+            toAgent: COMMANDER_AGENT_ID,
+            kind: 'answer',
+            inReplyTo: query.seq,
+            body: cap(`alignment gate refused: ${summary}`),
+          });
+          dispatches.push({
+            objective: proposal.objective,
+            approved: false,
+            campaignId: null,
+            outcome: null,
+            verdict: null,
+            deliveredRung: null,
+            gate: 'refused',
+          });
+          if (commanderGone) continue;
+          beginAnswer(true);
+          io.setBusy('commander');
+          // The declined envelope: its only strings are the objective the human approved and a
+          // sentence this process wrote from its own readings. No command output crosses.
+          const reaction = await session.dispatchDeclinedTurn(
+            proposal.objective,
+            `the alignment gate did not pass. ${cap(summary, 400)}`,
+          );
+          settle();
+          endAnswer();
+          io.write('\n');
+          recordCommanderTurn(reaction.text, reaction.refusals);
+          continue;
+        }
+      }
+
+      awaitingApproval = 'dispatch';
+      const answer = await io.nextLine(CONFIRM_PROMPT, { addressee: 'dispatch-approval' });
+      awaitingApproval = null;
       if (answer === null) {
         archive.appendSignal({
           fromAgent: GENERAL_AGENT_ID,
@@ -1265,6 +2728,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           outcome: null,
           verdict: null,
           deliveredRung: null,
+          gate: gateOf(alignment),
         });
         if (!exitRequested) {
           if (commanderGone) commanderDeathCloseOut();
@@ -1275,6 +2739,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       if (!isApproval(answer)) {
         const reason = 'the Commander did not approve it';
         io.write('  ◇ not dispatched.\n');
+        keepUnansweredLine(answer);
         archive.appendSignal({
           fromAgent: GENERAL_AGENT_ID,
           toAgent: COMMANDER_AGENT_ID,
@@ -1289,6 +2754,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           outcome: null,
           verdict: null,
           deliveredRung: null,
+          gate: gateOf(alignment),
         });
         // A commander that died while the human was deciding cannot be told the decision — the
         // loop's own close-out says why the session is over. Same guard on the two turns below.
@@ -1301,6 +2767,57 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         io.write('\n');
         recordCommanderTurn(reaction.text, reaction.refusals);
         continue;
+      }
+
+      // ---- the durable spec --------------------------------------------------------------
+      //
+      // WRITTEN AFTER THE KEYSTROKE AND BEFORE THE FIRST SPAWN. After, because a document
+      // describing work nobody approved is a document about nothing; before, because the campaign
+      // that follows can fail, be interrupted, or take its worktree with it, and the record of
+      // what was agreed has to survive all three.
+      //
+      // The archive copy is unconditional. The repository copy is `planning.spec_to_repo`, off by
+      // default, because a rejected branch should not strand design documents in the repo — see
+      // `src/chat/planning.ts`.
+      if (proposal.spec !== undefined && alignment !== null) {
+        const record: PlanningRecord = {
+          campaignId,
+          project,
+          spec: proposal.spec,
+          interrogation,
+          alignment,
+          at: options.now === undefined ? new Date().toISOString() : options.now(),
+        };
+        const documents = planningDocuments(record);
+        for (const doc of documents) {
+          try {
+            archive.writeAgentText(COMMANDER_AGENT_ID, doc.filename, doc.contents);
+          } catch (error) {
+            // The archive said no. Said out loud rather than swallowed, and never a reason the
+            // dispatch does not happen: the human approved work, not a filing system.
+            io.write(
+              `  ! could not write ${doc.filename} to the archive: ` +
+                `${error instanceof Error ? error.message : String(error)}\n`,
+            );
+          }
+        }
+        archive.appendSignal({
+          fromAgent: GENERAL_AGENT_ID,
+          kind: 'status',
+          body: cap(
+            `the settled spec and ${String(interrogation.length)} interrogation round(s) are in ` +
+              'the archive',
+          ),
+          artifact: `agents/${COMMANDER_AGENT_ID}/spec.md`,
+        });
+        if (config.planning.specToRepo) {
+          const written = writeSpecToRepo(record, documents);
+          if (written.failure === null) {
+            io.write(`  ◇ spec written to ${path.relative(project, written.written[0] ?? '')}\n`);
+          } else {
+            io.write(`  ! could not write the spec into the repository: ${written.failure}\n`);
+          }
+        }
       }
 
       // ---- the dispatch ---------------------------------------------------------------
@@ -1337,22 +2854,114 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         // while the campaign is running, and a dead pipe must not be the reason it goes blank.
         // `sink.emit` is the throwing half; the bookkeeping above it cannot throw at all.
         rosterObserve(event);
+        // The tree re-reads on a LIFECYCLE event as well as on its timer, and the timer is the
+        // backstop rather than the mechanism. Polling alone made the block up to a poll interval
+        // behind the narration: a reader watched `cpt-01 dispatched` print and then looked down at
+        // a tree that still said the task had no agent yet. The disposition is asked for rather
+        // than a list of kinds spelled here, so a kind added upstream is classified by the module
+        // that owns the vocabulary, and an unknown kind lands in `lifecycle`, which costs one
+        // cheap incremental read and can never be wrong about what is on screen.
+        if (dispositionOf(event) === 'lifecycle') refreshTree();
         sink.emit(event);
       });
+
+      /**
+       * The human rung of the question ladder.
+       *
+       * ## What this is not
+       *
+       * It is not a turn. The commander is not told, is not asked, and does not reply: the
+       * question is printed on this terminal and the answer is the next line the human types,
+       * handed straight back to the campaign. That is deliberate and it is the reason this seam
+       * does not go through `ChatSession` at all. `session.ts` guarantees that a dispatch proposal
+       * survives only out of a turn whose authority is the human's, and it enforces that by
+       * DELETING a directive parsed from any other turn. Routing an answer through the commander
+       * would put a model between a human's words and the worker waiting on them, and it would
+       * create a second way for work to be proposed, on a turn nobody confirmed with a keystroke.
+       * There is one source of new intent in this file and it is the approval prompt above.
+       *
+       * ## Why the whole question is printed
+       *
+       * `renderPendingQuestion` marks which half a worker wrote. Nothing is summarised here,
+       * because the person answering has to be able to answer WITHOUT going and reading a
+       * transcript, and a question they have to research is one this rung cannot serve.
+       *
+       * ## Why it no longer reads
+       *
+       * It used to print the question and then `io.nextLine(ANSWER_PROMPT, { fresh: true })` on the
+       * spot. That is correct for ONE blocked worker and wrong for eight: `ChatIo` has a single
+       * pending read, so a second question would replace the first worker's resolver and park a
+       * workstream on a promise nothing would ever settle, with its worktree lease held. And a
+       * read that opens on a worker's schedule opens in the middle of a word somebody is typing.
+       *
+       * So it prints and PARKS. The dispatch console above owns the one read, the inbox owns the
+       * queue, and the composer is relabelled in place rather than seized. The `{ fresh: true }`
+       * rule is unchanged and is now the console's: a line typed for the Commander still cannot
+       * become a worker's decision, because the queue holding those lines is never drained here.
+       */
+      const askHuman = async (question: PendingQuestion): Promise<string> => {
+        // The narration ticker owns the current line while a campaign runs; a block painted over
+        // it would be repainted away. `setIdle` is idempotent and takes it down.
+        try {
+          io.setIdle();
+        } catch {
+          /* a dead terminal cannot be tidied, and a question is worth more than a tidy line */
+        }
+        const answer = inbox.ask(question);
+        const entry = inbox.entries[inbox.entries.length - 1] as InboxEntry;
+        guardedWrite(
+          `\n${renderQuestionMarker(entry, inbox.size, charset)}\n` +
+            `${renderPendingQuestion(question)}${ANSWER_HINT}\n`,
+        );
+        // The composer says where a line goes, under the read that is already open. It is the only
+        // surface that can say it while it is true, and `setPrompt` is the one way to change it
+        // without seizing a composer somebody is mid-word in. What it does take is the DRAFT: a
+        // half-typed line written under the dispatch prompt was written for the Commander, and it
+        // goes back to the Commander's queue with a line on screen saying so, rather than sitting
+        // under the new prompt one Enter away from becoming this worker's decision.
+        refreshPrompt();
+        // Nobody is reading: end of input, or a terminal that went away. A question parked on a
+        // prompt that will never be shown is a workstream parked on a lease forever, so this ends
+        // it now with the answer the campaign already knows how to treat.
+        if (!consoleActive) {
+          for (const left of inbox.drain()) sayUnanswered(left);
+        }
+        return answer;
+      };
+
       roster = [];
+      agentsSpawned = new Set<string>();
+      campaignCostUsd = null;
       dispatchInFlight = true;
+      stopController = new AbortController();
+      consoleActive = true;
+      consoleInterrupted = false;
+      stopArmed = false;
+      // Started BEFORE the campaign, so a `/stop` typed in the first second of a dispatch has
+      // somewhere to land. Never awaited here: it is a reader, and the dispatch is the work.
+      consoleLoop = dispatchConsole();
       let result: CampaignResult | null = null;
       let failure: string | null = null;
       try {
         result = await runDispatch({
           onProgress: narrate,
+          askHuman,
+          abortSignal: stopController.signal,
           objective: proposal.objective,
           ...(proposal.spec === undefined ? {} : { spec: proposal.spec }),
+          // Everything every scout in this conversation found, so a MAJ·OVERSEER segments the
+          // feature knowing what was already looked up rather than sending an engineer to
+          // rediscover it.
+          ...(scoutFindings.length === 0 ? {} : { scoutFindings }),
           cwd: project,
           env,
           home,
           requestedRung,
           maxAttempts,
+          ...(options.overseer === undefined ? {} : { overseer: options.overseer }),
+          ...(options.maxConcurrentWorkstreams === undefined
+            ? {}
+            : { maxConcurrentWorkstreams: options.maxConcurrentWorkstreams }),
           ...(options.worktreeProvider === undefined ? {} : { worktreeProvider: options.worktreeProvider }),
           ...(options.worktreeRoot === undefined ? {} : { worktreeRoot: options.worktreeRoot }),
           ...(options.claudeBin === undefined ? {} : { claudeBin: options.claudeBin }),
@@ -1366,6 +2975,31 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         failure = error instanceof Error ? error.message : String(error);
       } finally {
         dispatchInFlight = false;
+        stopController = null;
+        stopArmed = false;
+        // The console goes down FIRST and is waited for, because it is holding the terminal's one
+        // read and the close-out below writes to that terminal. Its own `finally` resolves every
+        // question still parked, so nothing downstream of here can be waiting on this human.
+        consoleActive = false;
+        try {
+          io.abortLine({ keepQueued: true });
+        } catch {
+          /* the read is already over, or the terminal is gone; either way there is nothing to end */
+        }
+        try {
+          await consoleLoop;
+        } catch {
+          /* `dispatchConsole` does not throw; this is the belt on top of its own braces */
+        }
+        // The tree stops being LIVE the moment the campaign does, and one last read is taken on
+        // the way down so `/work` answers from the ending rather than from the last poll.
+        closeTree();
+        // Folded in AFTER that last read, so what is banked is the campaign's final figure and
+        // not whatever the last poll happened to catch.
+        if (campaignCostUsd !== null) {
+          finishedCampaignsUsd = (finishedCampaignsUsd ?? 0) + campaignCostUsd;
+        }
+        campaignCostUsd = null;
         // `close` writes — it erases the ticker's line — so it is an emission like any other and
         // is guarded like one. A throw from a `finally` replaces whatever the block was doing,
         // and what this block is doing is returning a session to a human.
@@ -1407,6 +3041,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           outcome: 'aborted',
           verdict: null,
           deliveredRung: null,
+          gate: gateOf(alignment),
         });
         if (commanderGone) continue;
         beginAnswer(true);
@@ -1434,6 +3069,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
         outcome: result.outcome,
         verdict: facts.verdict,
         deliveredRung: result.deliveredRung,
+        gate: gateOf(alignment),
       });
       archive.appendSignal({
         fromAgent: GENERAL_AGENT_ID,
@@ -1458,6 +3094,14 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   } finally {
     disarmSpill();
     unsubscribe();
+    // A poll timer that outlived its session would keep re-reading an archive nobody is watching,
+    // once a second, for as long as the process lived. Idempotent, and a no-op when no dispatch
+    // ever opened one.
+    try {
+      closeTree();
+    } catch {
+      /* a reader that will not close is not a reason to lose the archive rows below */
+    }
     // First, and guarded like everything else here: the block is rows of chrome pinned under the
     // conversation, and the close-out below writes the archive path into the same region. A bar
     // still installed would be repainted over the last thing this command says.
@@ -1519,6 +3163,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     requestedRung,
     turns: humanTurns,
     dispatches,
+    recces,
     refusals,
     exitReason,
     costUsd: session.costUsd,
@@ -1533,14 +3178,36 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
 export const SLASH_HELP = `
   /exit  /quit   leave the session
   /status        the header again, with the working copy re-read
+  /work <id>     one agent or workstream, printed: orders, branch, last activity, diffstat.
+                 It prints rather than opens: a pager needs an alternate screen this does not use.
+  /stop          end the running campaign. It confirms first, because every worktree in flight
+                 has to be settled rather than dropped.
+  /next          with several questions open, move to the next one without answering this one
   /help          this
-  Ctrl-C         stop the answer in flight; again to leave
+  Ctrl-C         stop the answer in flight; again to leave. At a question it leaves that question
+                 unanswered and the dispatch keeps running. It never ends a campaign.
   Ctrl-D         leave
   Up / Down      the lines you have already typed
+
+  While a dispatch runs the prompt is still yours. /stop, /work, /next and /help answer there and
+  then; a question that reaches you is answered by typing; and anything else (/status, /exit, a
+  sentence for the Commander) is queued and runs the moment the dispatch settles.
 
   The commander's whole loadout is one inert tool, TodoWrite. It is one rather than none
   because an emptied allow-list makes the launcher omit --allowedTools altogether, and the
   process then inherits claude's own default loadout — the most permissive configuration
   this program can start. To change a file it proposes an objective, you approve it, and an
   Engineer is raised in a leased worktree and reviewed by an independent Inspector.
+
+  BEFORE THAT it may propose a CPT·SCOUT — a reader that goes and finds something out.
+  It has its own [y/N], because a reader and a writer are different decisions. A scout
+  holds Read, Grep, Glob and the web, writes nothing, and holds no worktree at all. What
+  it finds is carried into the plan of anything you dispatch afterwards.
+
+  A dispatch carrying a spec then meets the alignment gate: every required field must be
+  answered and every verification command must EXECUTE against the base commit. A command
+  that runs and FAILS passes the gate — a red test is where work starts, and its reading is
+  recorded so nothing can later claim the failure was already there. What fails the gate is
+  a command a shell cannot run, one that returns no result, or one still going at the
+  deadline. Only then are you asked to confirm.
 `;

@@ -37,6 +37,7 @@ import type { Rung } from '../contracts/delivery.ts';
 import type { TechnicalSpec } from '../contracts/spec.ts';
 import type { GhStatus } from '../delivery/git.ts';
 import type { HarnessAdapter, HarnessId } from '../contracts/harness.ts';
+import type { PendingQuestion } from '../contracts/question.ts';
 import type { WorktreeProviderId } from '../contracts/worktree.ts';
 import type { ProgressListener } from '../view/progress.ts';
 
@@ -85,6 +86,52 @@ export interface DispatchInput {
    * is what `src/chat/run.ts` wraps its terminal sink in before it gets here.
    */
   onProgress?: ProgressListener;
+  /**
+   * How a blocked worker's question reaches the human, and how their answer gets back.
+   *
+   * A pass-through, exactly like `onProgress`: the ladder is `runCampaign`'s and chat's only job
+   * is to own the terminal at the end of it. Absent, a dispatch behaves as it always has and a
+   * blocked report ends the attempt.
+   *
+   * THE ANSWER IS READ OFF THE TERMINAL AND GOES NOWHERE ELSE. It never becomes a turn, so the
+   * commander is not asked, does not reply, and cannot propose a dispatch out of it. That is the
+   * property `src/chat/session.ts` documents and enforces by deleting a directive parsed from a
+   * non-human turn, and the reason this seam bypasses the session entirely rather than borrowing
+   * it: a path where answering a question is a way to get work proposed would be a second source
+   * of intent, which the keystroke gate in `run.ts` exists to be the only one of.
+   */
+  askHuman?: (question: PendingQuestion) => Promise<string>;
+  /**
+   * What a `CPT·SCOUT` found, when this conversation sent one.
+   *
+   * A pass-through to `CampaignOptions.scoutFindings`, which reaches `renderSegmentationBrief` and
+   * becomes the `## WHAT THE SCOUT FOUND` section a `MAJ·OVERSEER` plans from. That field has been
+   * declared and rendered since wave 3 and populated by nothing at all; this is what fills it.
+   *
+   * Every string here is SCOUT-AUTHORED and has been through `sanitize` at capture in
+   * `src/command/scout.ts`. That is what makes it safe to render into a document whose `##`
+   * headings carry supervisor authority — the same treatment a workstream's `slice` gets, for the
+   * same reason.
+   */
+  scoutFindings?: readonly string[];
+  /**
+   * How many workstreams may run at once, threaded straight through.
+   *
+   * Chat carries it for one reason beyond passing it on: the status block SHOWS it, from the first
+   * spawn, and a cap on screen that the campaign is not actually running under would be worse than
+   * no cap on screen at all. So the number the bar draws and the number the pool enforces are the
+   * same variable rather than two that agree today.
+   */
+  maxConcurrentWorkstreams?: number;
+  /**
+   * `/stop`, as an abort the campaign performs on itself. A pass-through like the two above.
+   *
+   * The chat session owns Ctrl-C, which means "stop this answer", so a campaign raised from here
+   * must never be given `handleSignals`, and stopping it is a typed command with no signal behind
+   * it. `CampaignOptions.abortSignal` is the door that lets that command reach the campaign's own
+   * settle-everything path instead of chat growing a second one.
+   */
+  abortSignal?: AbortSignal;
 }
 
 /**
@@ -110,8 +157,16 @@ export function guardedProgress(listener: ProgressListener): ProgressListener {
   };
 }
 
-/** Raise an Engineer, review it, deliver it — the campaign machinery, unmodified. */
-export function runDispatch(input: DispatchInput): Promise<CampaignResult> {
+/**
+ * The `DispatchInput` -> `CampaignOptions` projection, on its own.
+ *
+ * Split out and exported for the reason `soldierAdapterSettings` in `campaign.ts` was: a
+ * field-by-field mapping is exactly the shape that silently drops one, and the bug that argument
+ * comes from lived precisely in the gap a spawning test cannot cover cheaply — `timeoutMs` reached
+ * one branch and died on the way to three others, with nothing red. Every field here can now be
+ * asserted without a worktree, a git repository or a model.
+ */
+export function campaignOptionsFor(input: DispatchInput): CampaignOptions {
   const options: CampaignOptions = {
     objective: input.objective,
     cwd: input.cwd,
@@ -129,8 +184,21 @@ export function runDispatch(input: DispatchInput): Promise<CampaignResult> {
     ...(input.dbFactory === undefined ? {} : { dbFactory: input.dbFactory }),
     ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
     ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
+    ...(input.askHuman === undefined ? {} : { askHuman: input.askHuman }),
+    ...(input.scoutFindings === undefined || input.scoutFindings.length === 0
+      ? {}
+      : { scoutFindings: input.scoutFindings }),
+    ...(input.maxConcurrentWorkstreams === undefined
+      ? {}
+      : { maxConcurrentWorkstreams: input.maxConcurrentWorkstreams }),
+    ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
   };
-  return runCampaign(options);
+  return options;
+}
+
+/** Raise an Engineer, review it, deliver it — the campaign machinery, unmodified. */
+export function runDispatch(input: DispatchInput): Promise<CampaignResult> {
+  return runCampaign(campaignOptionsFor(input));
 }
 
 /**

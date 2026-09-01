@@ -60,6 +60,7 @@ import {
   padTo,
   renderJson,
   renderTree,
+  renderTreeRows,
 } from '../src/view/render.ts';
 import { describeToolUse, formatToolAction } from '../src/view/activity.ts';
 import {
@@ -76,6 +77,10 @@ import {
   formatElapsed,
   formatRepo,
   renderHeader,
+  DEFAULT_TREE_ROWS,
+  MIN_TREE_WIDTH,
+  fitTreeRows,
+  fitRosterRows,
   renderRoster,
   renderStatusBar,
 } from '../src/view/chrome.ts';
@@ -198,14 +203,17 @@ test('a Captain at depth 1 is normal: a General may detach one directly', () => 
   const unit = unitFor(built, 'cpt-03');
 
   assert.equal(unit.depth, 1, 'depth comes off the row and is never derived from rank');
-  assert.equal(unit.rankSeniority, 2);
-  assert.equal(unit.rankDepthGap, -1);
+  // Seniority is an index into RANK_ORDER, so inserting MAJOR moved CAPTAIN from 2 to 3 and the
+  // gap on this chain from -1 to -2. The number changed and the diagnostic did not: a General
+  // reaching past COLONEL and MAJOR to detach a Captain skipped two ranks, and skipping is legal.
+  assert.equal(unit.rankSeniority, 3);
+  assert.equal(unit.rankDepthGap, -2);
   assert.equal(unit.gapAnomalous, false);
   assert.deepEqual(built.summary.anomalies, []);
 });
 
-test('a Captain at depth 4 is an anomaly: the chain outran its ranks', () => {
-  const built = model({ agents: [agentRow('cpt-09', 'CAPTAIN', 4)] });
+test('a Captain at depth 5 is an anomaly: the chain outran its ranks', () => {
+  const built = model({ agents: [agentRow('cpt-09', 'CAPTAIN', 5)] });
   const unit = unitFor(built, 'cpt-09');
 
   assert.equal(unit.rankDepthGap, 2);
@@ -213,16 +221,17 @@ test('a Captain at depth 4 is an anomaly: the chain outran its ranks', () => {
   assert.equal(built.summary.anomalies.length, 1);
   assert.equal(built.summary.anomalies[0]?.kind, 'rank-depth-gap');
   assert.equal(built.summary.anomalies[0]?.subject, 'cpt-09');
-  assert.match(built.summary.anomalies[0]?.message ?? '', /depth 4 \(\+2\)/);
+  assert.match(built.summary.anomalies[0]?.message ?? '', /depth 5 \(\+2\)/);
 });
 
-test('a ceremonial GEN>COL>CPT>SGT>PVT chain has a gap of 0 at every level', () => {
+test('a ceremonial GEN>COL>MAJ>CPT>SGT>PVT chain has a gap of 0 at every level', () => {
   const chain: [string, Rank, number][] = [
     ['gen-01', 'GENERAL', 0],
     ['col-01', 'COLONEL', 1],
-    ['cpt-01', 'CAPTAIN', 2],
-    ['sgt-01', 'SERGEANT', 3],
-    ['pvt-01', 'PRIVATE', 4],
+    ['maj-01', 'MAJOR', 2],
+    ['cpt-01', 'CAPTAIN', 3],
+    ['sgt-01', 'SERGEANT', 4],
+    ['pvt-01', 'PRIVATE', 5],
   ];
   const built = model({ agents: chain.map(([id, rank, depth]) => agentRow(id, rank, depth)) });
   for (const [id] of chain) {
@@ -232,15 +241,15 @@ test('a ceremonial GEN>COL>CPT>SGT>PVT chain has a gap of 0 at every level', () 
 });
 
 test('the gap is rendered so the reader never has to subtract', () => {
-  const built = model({ agents: [agentRow('cpt-01', 'CAPTAIN', 1), agentRow('cpt-09', 'CAPTAIN', 4)] });
+  const built = model({ agents: [agentRow('cpt-01', 'CAPTAIN', 1), agentRow('cpt-09', 'CAPTAIN', 5)] });
   const text = renderTree(built, { width: 120, charset: 'ascii' });
   const normal = lineFor(text, 'cpt-01');
   const anomalous = lineFor(text, 'cpt-09');
 
   assert.match(normal, /\bCPT\b/);
-  assert.match(normal, /\s1\s+-1\s/, 'depth 1 and gap -1 sit in their own columns');
+  assert.match(normal, /\s1\s+-2\s/, 'depth 1 and gap -2 sit in their own columns');
   assert.ok(!normal.includes('!'), 'a negative gap is legal and must not be flagged');
-  assert.match(anomalous, /\s4\s+\+2!\s/, 'depth 4, gap +2, flagged');
+  assert.match(anomalous, /\s5\s+\+2!\s/, 'depth 5, gap +2, flagged');
 });
 
 test('when the terminal is too narrow for a gap column the marker moves onto depth', () => {
@@ -569,7 +578,7 @@ test('the ASCII fallback emits nothing a codepage-437 console cannot draw', () =
 test('asciiFold transliterates decoration and refuses to pass unknown bytes through', () => {
   assert.equal(asciiFold('CPT·ENGINEER'), 'CPT.ENGINEER');
   assert.equal(asciiFold('a→b'), 'a->b');
-  assert.equal(asciiFold('☆◆◇▪'), '*#o+');
+  assert.equal(asciiFold('☆◆◈◇▪'), '*#%o+');
   assert.equal(asciiFold('naïve 🙂'), 'na?ve ?', 'user text is folded too — that is where surprises live');
 });
 
@@ -1043,9 +1052,11 @@ test('the real archive renders the whole story: queued work, retries, depth and 
     const text = out.text();
 
     assert.match(lineFor(text, 'rotate secrets'), /queued/, 'unstarted work is visible');
-    assert.match(unitLine(text, 'cpt-03'), /CPT\s+1\s+-1\s+dead\s+agent-row:failed/);
-    assert.match(unitLine(text, 'cpt-07'), /CPT\s+1\s+-1\s+busy\s+stream:open-tool/);
-    assert.match(unitLine(text, 'cpt-09'), /CPT\s+4\s+\+2!\s+unknown\s+stream:missing/);
+    assert.match(unitLine(text, 'cpt-03'), /CPT\s+1\s+-2\s+dead\s+agent-row:failed/);
+    assert.match(unitLine(text, 'cpt-07'), /CPT\s+1\s+-2\s+busy\s+stream:open-tool/);
+    // Depth 4 on a CAPTAIN is +1 rather than +2 now that MAJOR sits above CAPTAIN. Still a
+    // positive gap, still flagged: the chain has more nesting levels than it consumed ranks.
+    assert.match(unitLine(text, 'cpt-09'), /CPT\s+4\s+\+1!\s+unknown\s+stream:missing/);
     assert.match(text, /partially written record/, 'the torn tail is reported, not swallowed');
     assert.match(text, /1 unanswered query/);
     assert.match(text, /read-only/);
@@ -1850,7 +1861,12 @@ const CHROME_HEADER: HeaderModel = {
 
 /** Columns a row occupies once the SGR is taken off. */
 function chromeColumns(line: string): number {
-  return line.replace(/\[[0-9;]*m/gu, '').length;
+  // `displayWidth`, not `.length`. This helper measures the one invariant this whole file is
+  // about — no row wider than `width - 1`, because a wrapped row puts every `ESC[nA` count under
+  // it out by one — and it measured it in UTF-16 code units, which is the SAME mistake
+  // `fitSegments` was making. A checker that shares its subject's bug cannot fail on it: a CJK
+  // branch name overran every width tested and this function reported it as fitting.
+  return displayWidth(line.replace(/\[[0-9;]*m/gu, ''));
 }
 
   const widths = [24, 40, 62, 80, 100, 200];
@@ -2974,4 +2990,328 @@ test('highlight state does not leak between fences: a block comment left open di
     s.push('```js\nreturn 1;\n```\n');
   });
   assert.ok(out.includes(`${CYAN}return${RESET}`), `the second fence inherited comment state:\n${out}`);
+});
+
+// ===============================================================================================
+// THE LIVE TREE IN THE STATUS BLOCK
+//
+// The block draws the campaign tree, and it draws it with `renderTreeRows`, the same function
+// `renderTree` builds `army view` out of. That is not an aesthetic preference: a second renderer
+// is a second layout to keep in step, and the two would disagree the first time a column moved.
+// What is NEW here is only the frame: no header, no footer, and a hard row budget, because this
+// one is pinned under a live conversation and `statusRows` in src/chat/io.ts refuses to draw a
+// block that does not leave the conversation room to breathe.
+// ===============================================================================================
+
+/** A campaign of `busy` engineers under one task, deep enough to overflow any sane block. */
+function fanOut(count: number, busy: number): TreeModel {
+  const agents = [];
+  const streams: Record<string, ReturnType<typeof digestStream>> = {};
+  for (let n = 1; n <= count; n += 1) {
+    const id = `cpt-${String(n).padStart(2, '0')}`;
+    agents.push(agentRow(id, 'CAPTAIN', 1, { task_id: 't-1', attempt: n }));
+    // The first `busy` of them have just spoken; the rest went quiet long enough to read as idle.
+    streams[id] = digestStream(id, [event('assistant_text', n <= busy ? 1795 : 100)]);
+  }
+  return buildTree(
+    snapshot({
+      tasks: [taskRow('t-1', { status: 'in_flight', attempts: count, branch: 'army/t-1' })],
+      agents,
+      streams,
+    }),
+    { now: NOW },
+  );
+}
+
+test('the block draws the SAME rows army view draws: one renderer, two frames', () => {
+  const built = fanOut(3, 3);
+  const options = { charset: 'unicode' as const, color: false, width: 100 };
+  const body = renderTreeRows(built, options);
+  const whole = renderTree(built, options);
+
+  assert.ok(body.rows.length > 0, 'the body came back empty for a campaign with three attempts');
+  for (const row of body.rows) {
+    assert.ok(whole.includes(row), `a block row is not in the full view verbatim:\n${row}`);
+  }
+  // And the frame is the only difference: the full view has a header, a column header and a
+  // footer around exactly these rows.
+  assert.ok(whole.includes(body.header), 'the column header the body reports is not the one drawn');
+  assert.ok(whole.includes('read-only'), 'the full view lost its footer');
+});
+
+test('a tree that fits is drawn whole, and one that does not keeps the busy units', () => {
+  const built = fanOut(9, 4);
+  // 120 rather than 100, and the difference is measured rather than arbitrary: the full column
+  // set costs 76 columns, so at 100 the label is squeezed to 24 and the agent id, the argument
+  // `/work <id>` takes, is the first thing clipped. That is `renderTree`'s own long-standing
+  // trade at 90-107 columns and not something the block introduces; it is called out here so a
+  // reader of this test knows the width was chosen and not assumed.
+  const style = { charset: 'unicode' as const, color: false, width: 120 };
+  const rows = renderTreeRows(built, style).rows;
+  assert.equal(rows.length, 10, 'nine attempts under one task should walk to ten rows');
+  assert.match(rows[1] ?? '', /cpt-01/u, `the agent id was clipped out of the row:\n${rows[1] ?? ''}`);
+
+  assert.deepEqual(fitTreeRows(built, rows, 10, style), rows, 'a tree that fits was truncated');
+
+  const cut = fitTreeRows(built, rows, 6, style);
+  assert.equal(cut.length, 6, `the budget was not honoured: ${String(cut.length)} rows`);
+  // Every busy unit survived. That is the rule: a running unit is never dropped to keep a
+  // finished one, because the running ones are what the block exists to show.
+  const text = cut.join('\n');
+  for (const id of ['cpt-01', 'cpt-02', 'cpt-03', 'cpt-04']) {
+    assert.ok(text.includes(id), `a busy unit was dropped to keep a settled one:\n${text}`);
+  }
+  // And what went is accounted for on one row rather than vanishing. A block quietly missing
+  // five engineers is worse than one that says five are missing.
+  assert.match(cut[cut.length - 1] ?? '', /more rows/u, text);
+  assert.match(cut[cut.length - 1] ?? '', /settled/u, text);
+});
+
+test('a budget of zero draws no tree at all, and never a partial row', () => {
+  const built = fanOut(3, 3);
+  const style = { charset: 'unicode' as const, color: false, width: 100 };
+  const rows = renderTreeRows(built, style).rows;
+  assert.deepEqual(fitTreeRows(built, rows, 0, style), []);
+  // One row is the account of the nine that did not fit: the marker is worth more than one row
+  // of a tree the reader cannot trust to be complete.
+  assert.equal(fitTreeRows(built, rows, 1, style).length, 1);
+  assert.match(fitTreeRows(built, rows, 1, style)[0] ?? '', /more rows/u);
+});
+
+test('the block puts the tree where the roster was, and the roster answers when it cannot', () => {
+  const built = fanOut(2, 2);
+  const withTree: StatusModel = { ...CHROME_STATUS, tree: built, treeRows: DEFAULT_TREE_ROWS };
+  const rows = renderStatusBar(withTree, 0, { charset: 'unicode', color: false, width: 120 });
+  const body = rows.slice(0, -1).join('\n');
+  assert.ok(body.includes('cpt-01'), `the tree is not in the block:\n${body}`);
+  // The roster is NOT also drawn. Two spellings of "this unit is working" on one screen is the
+  // bug the ticker already stands down for.
+  assert.ok(!body.includes('working'), `the roster was drawn alongside the tree:\n${body}`);
+
+  // Below the width the tree's own layout fits in, the roster answers instead: it clips every
+  // row to the width itself, and a row that runs past the edge wraps, which breaks the ESC[nA
+  // count for every row under it.
+  const narrow = renderStatusBar(withTree, 0, {
+    charset: 'unicode',
+    color: false,
+    width: MIN_TREE_WIDTH - 1,
+  });
+  for (const row of narrow) {
+    assert.ok(
+      chromeColumns(row) <= MIN_TREE_WIDTH - 2,
+      `a row ran past a ${String(MIN_TREE_WIDTH - 1)}-column window: ${JSON.stringify(row)}`,
+    );
+  }
+});
+
+test('every tree row fits the width it was given, at every width the block is drawn at', () => {
+  const built = fanOut(6, 3);
+  for (const width of [MIN_TREE_WIDTH, 46, 60, 80, 100, 160]) {
+    const model: StatusModel = { ...CHROME_STATUS, tree: built, treeRows: 6 };
+    for (const row of renderStatusBar(model, 0, { charset: 'unicode', color: false, width })) {
+      assert.ok(
+        chromeColumns(row) <= width - 1,
+        `at width ${String(width)} a row was ${String(chromeColumns(row))} columns: ` +
+          JSON.stringify(row),
+      );
+    }
+  }
+});
+
+test('the open-question count and the budget survive a hint that displaces the counters', () => {
+  const model: StatusModel = {
+    ...CHROME_STATUS,
+    hint: 'a worker is asking, and your answer resumes it',
+    questions: 2,
+    budget: { agents: 5, cap: 3, costUsd: 1.25 },
+  };
+  const bar = renderStatusBar(model, 0, { charset: 'unicode', color: false, width: 160 }).at(-1) ?? '';
+  assert.match(bar, /2 questions open/u, bar);
+  // From the first spawn and never displaced: the hint costs the turn count, not the bill.
+  assert.match(bar, /5\/3 agents/u, bar);
+  assert.match(bar, /\$1\.25/u, bar);
+  // And exactly one cost, not two. The budget's total INCLUDES the session's, so both would be
+  // a bar arguing with itself.
+  assert.equal(bar.match(/\$/gu)?.length, 1, bar);
+});
+
+test('one question reads as one, and no questions leaves the segment off entirely', () => {
+  const style = { charset: 'unicode' as const, color: false, width: 160 };
+  const one = renderStatusBar({ ...CHROME_STATUS, questions: 1 }, 0, style).at(-1) ?? '';
+  assert.match(one, /1 question open/u, one);
+  const none = renderStatusBar({ ...CHROME_STATUS, questions: 0 }, 0, style).at(-1) ?? '';
+  assert.ok(!none.includes('question'), `a zero count was drawn as a segment: ${none}`);
+});
+
+/** The realistic fan-out: N workstreams, one engineer each, one attempt apiece. */
+function fanOutWorkstreams(count: number): TreeModel {
+  const tasks = [];
+  const agents = [];
+  const streams: Record<string, ReturnType<typeof digestStream>> = {};
+  for (let n = 1; n <= count; n += 1) {
+    const id = `cpt-${String(n).padStart(2, '0')}`;
+    tasks.push(taskRow(`t-${String(n)}`, { status: 'in_flight', attempts: 1, agent_id: id }));
+    agents.push(agentRow(id, 'CAPTAIN', 1, { task_id: `t-${String(n)}` }));
+    streams[id] = digestStream(id, [event('assistant_text', 1795)]);
+  }
+  return buildTree(snapshot({ tasks, agents, streams }), { now: NOW });
+}
+
+test('the agent id survives the column budget at every width a terminal actually is', () => {
+  // FOUND ON A PTY, not in a unit test. At 80 and at 100 columns the fixed columns took
+  // everything and the label was left with 20, so both `army view` and the status block drew
+  // `◇ CPT·ENGINEER ·…` and no agent id: the one field `/work <id>` takes as an argument, and
+  // the primary key of every row on the screen.
+  const built = fanOutWorkstreams(2);
+  for (const width of [80, 100, 120, 160]) {
+    const rows = renderTreeRows(built, { charset: 'unicode', color: false, width }).rows;
+    const unit = rows.find((row) => row.includes('CPT·ENGINEER'));
+    assert.ok(unit !== undefined, `no unit row at width ${String(width)}`);
+    assert.match(unit, /cpt-0\d/u, `the agent id was clipped at width ${String(width)}:\n${unit}`);
+    assert.ok(
+      unit.length <= width,
+      `width ${String(width)}: the row is ${String(unit.length)} columns:\n${unit}`,
+    );
+  }
+});
+
+test('borrowing for the label never widens the row, and never empties a column it borrowed from', () => {
+  const built = fanOut(2, 2);
+  for (const width of [40, 52, 60, 80, 100, 140]) {
+    const options = { charset: 'ascii' as const, color: false, width };
+    const rows = renderTreeRows(built, options).rows;
+    for (const row of rows) {
+      assert.ok(row.length <= width, `width ${String(width)}: ${String(row.length)} columns: ${row}`);
+    }
+    // The prose columns still say something at every width that has them at all.
+    const whole = renderTree(built, options);
+    assert.ok(!whole.includes('undefined'), whole);
+  }
+});
+
+
+// ===============================================================================================
+// THE BLOCK HAS ONE ROW BUDGET, AND BOTH RENDERERS SPEND IT
+//
+// `treeRows` used to reach `fitTreeRows` only. The roster branch — taken when the tree reader
+// failed or the window is under `MIN_TREE_WIDTH` — returned one row per unit and never looked at
+// the number. `statusRows` in `src/chat/io.ts` REFUSES rather than trims, so on a short terminal
+// the whole block vanished while the arithmetic that would have prevented it had already run.
+// ===============================================================================================
+
+/** N working units, newest last, as a live dispatch would have them. */
+function busyRoster(n: number): RosterUnit[] {
+  return Array.from({ length: n }, (_, i) => ({
+    agentId: `cpt-0${String(i + 1)}`,
+    rank: 'CAPTAIN' as const,
+    role: 'ENGINEER' as const,
+    harness: 'claude',
+    attempt: 1,
+    state: 'working' as const,
+    elapsedMs: 12_000,
+    detail: null,
+    detailAgeMs: null,
+    thinkingTokens: null,
+    silentMs: null,
+  }));
+}
+
+test('fitRosterRows spends the budget it is given, and never drops a working unit for a finished one', () => {
+  const style = { charset: 'unicode' as const, color: false, width: 60 };
+  const units: RosterUnit[] = [
+    { ...busyRoster(1)[0] as RosterUnit, agentId: 'cpt-01', state: 'returned' },
+    { ...busyRoster(1)[0] as RosterUnit, agentId: 'cpt-02', state: 'passed' },
+    { ...busyRoster(1)[0] as RosterUnit, agentId: 'cpt-03', state: 'working' },
+    { ...busyRoster(1)[0] as RosterUnit, agentId: 'cpt-04', state: 'working' },
+  ];
+  const rows = renderRoster(units, 0, style);
+  assert.equal(rows.length, 4, 'the renderer itself still draws one row per unit');
+
+  // Under budget, untouched.
+  assert.deepEqual(fitRosterRows(units, rows, 9, style), rows);
+  // Zero is zero rows, not one.
+  assert.deepEqual(fitRosterRows(units, rows, 0, style), []);
+
+  // Three rows: two real ones plus the account of what went. Both WORKING units survive and the
+  // two settled ones are the ones dropped, which is the rule `fitTreeRows` already follows.
+  const three = fitRosterRows(units, rows, 3, style);
+  assert.equal(three.length, 3);
+  assert.ok(three.some((row) => row.includes('cpt-03')), three.join('|'));
+  assert.ok(three.some((row) => row.includes('cpt-04')), three.join('|'));
+  assert.match(three[2] as string, /2 more units/u, three.join('|'));
+  assert.match(three[2] as string, /2 settled/u, three.join('|'));
+
+  // One row: nothing but the account, and it says how many are working, because a reader whose
+  // block has shrunk to a single row still has to know the campaign is alive.
+  const one = fitRosterRows(units, rows, 1, style);
+  assert.equal(one.length, 1);
+  assert.match(one[0] as string, /4 more units/u);
+  assert.match(one[0] as string, /2 working/u);
+  // And it fits the window like every other row this file returns.
+  for (const row of [...three, ...one]) assert.ok(chromeColumns(row) <= style.width - 1, row);
+});
+
+test('the block honours its row budget on the ROSTER branch, not only on the tree branch', () => {
+  const style = { charset: 'unicode' as const, color: false, width: 36 };
+  const roster = busyRoster(3);
+  // Under `MIN_TREE_WIDTH`, so the roster answers even though a tree is present. That is the
+  // branch the budget used to be dropped on, and 36 columns is inside a real terminal's range.
+  assert.ok(style.width < MIN_TREE_WIDTH);
+  const withTree: StatusModel = { ...CHROME_STATUS, roster, tree: fanOut(3, 1), treeRows: 2 };
+  const rows = renderStatusBar(withTree, 0, style);
+  // Two unit rows plus the context row this block always ends with. Before the fix this was four,
+  // and `statusRows` refuses a block that does not leave the conversation two rows — so at a
+  // window height of five it was not a taller block, it was no block at all.
+  assert.equal(rows.length, 3, rows.join('\n'));
+  assert.match(rows[1] as string, /more units/u, rows.join('\n'));
+
+  // The tree branch is unchanged by this: same model, a width that fits a tree.
+  const wide = renderStatusBar({ ...withTree, treeRows: 2 }, 0, { ...style, width: 100 });
+  assert.equal(wide.length, 3, wide.join('\n'));
+
+  // Every budget from 0 up produces at most `budget + 1` rows, whichever renderer answered.
+  for (const budget of [0, 1, 2, 3, 8]) {
+    for (const width of [30, 36, 100]) {
+      const out = renderStatusBar({ ...withTree, treeRows: budget }, 0, { ...style, width });
+      assert.ok(
+        out.length <= budget + 1,
+        `budget ${String(budget)} at width ${String(width)} produced ${String(out.length)} rows`,
+      );
+    }
+  }
+});
+
+test('the context row is budgeted in COLUMNS — a CJK branch name does not overrun the window', () => {
+  // The bug this is for: `fitSegments` charged `segment.text.length` against a budget measured in
+  // display columns, so every double-width glyph was undercounted by one. A branch name is the one
+  // segment a repository controls, and the row it sits on is the row every `ESC[nA` under it
+  // counts from — one wrap and the cursor is adrift for the rest of the session.
+  // Both halves of `fitSegments` are charged: the RESERVED pass, which the branch is in, and the
+  // pass that fits everything else. A wide glyph in a droppable segment is just as capable of
+  // overrunning the row as one in the branch, so the project name is varied too.
+  const wide = [
+    '機能/日本語のブランチ名前',
+    '世界世界世界世界世界世界世界世界世界世界',
+    'feature/🔥🔥🔥-hot-path',
+    'main',
+  ];
+  for (const [branch, project] of wide.flatMap((b) => wide.map((p) => [b, p] as const))) {
+    const model: StatusModel = {
+      ...CHROME_STATUS,
+      repo: { ...CHROME_REPO, branch },
+      project,
+      questions: 2,
+      budget: { agents: 5, cap: 3, costUsd: 1.25 },
+      hint: 'a worker is asking, and your answer resumes it',
+    };
+    for (const width of [40, 60, 80, 100, 160]) {
+      const rows = renderStatusBar(model, 0, { charset: 'unicode', color: false, width });
+      const context = rows[rows.length - 1] as string;
+      assert.ok(
+        chromeColumns(context) <= width - 1,
+        `branch ${branch} / project ${project} at width ${String(width)}: ` +
+          `${String(chromeColumns(context))} columns — ${JSON.stringify(context)}`,
+      );
+    }
+  }
 });

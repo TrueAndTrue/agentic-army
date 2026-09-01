@@ -43,13 +43,24 @@
  * is that the parsed objective is printed and must be confirmed by a keystroke before anything is
  * spawned — see `src/chat/session.ts` and `src/command/chat.ts`. The layers are named where they
  * are, with their scope, because a guard that overstates itself is worse than no guard.
+ *
+ * ## `ScoutRequest` is the same shape, one field wide
+ *
+ * Phase 1 lets the commander ask for a `CPT·SCOUT` before the interrogation. That is a second
+ * thing a reply can request, so it gets the same treatment rather than a lighter one: its own
+ * fence tag, its own `?: never` list naming the fan-out depth, the subagent count and the budget,
+ * its own strict parser, and its own keystroke. A recce reads the repository and the network
+ * rather than writing, which makes it cheaper to be wrong about and not free — and the rule that
+ * a model never spawns anything does not have an exception for reading.
  */
 
 import type { Rung } from '../contracts/delivery.ts';
 import type { Finding, Severity } from '../contracts/report.ts';
 import { MAX_FINDINGS, SUMMARY_MAX_CHARS, codePointLength } from '../contracts/report.ts';
+import { SCOUT_QUESTION_MAX_CHARS } from '../contracts/scout.ts';
 import type { TechnicalSpec } from '../contracts/spec.ts';
-import { validateTechnicalSpec } from '../contracts/spec.ts';
+import { SPEC_LIST_FIELDS, validateTechnicalSpec } from '../contracts/spec.ts';
+import { sanitize } from '../view/progress.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Caps
@@ -68,6 +79,17 @@ export const OBJECTIVE_MAX_CHARS = 500;
 
 /** The fence tag the commander wraps a dispatch request in. */
 export const DISPATCH_FENCE = 'army-dispatch';
+
+/**
+ * The fence tag the commander wraps a RECCE request in.
+ *
+ * A separate tag rather than a key inside the dispatch block, and the separation is the point. A
+ * dispatch spawns something that writes; a recce spawns something that reads. They are approved
+ * separately, they cost differently, and a human who typed `y` at one of them has not agreed to
+ * the other. Two tags means the two can never be confused by a parser, by a reader of a
+ * transcript, or by a future edit that adds a field to the wrong one.
+ */
+export const SCOUT_FENCE = 'army-scout';
 
 /** Bump when the envelope shape changes; the commander is told which version it is reading. */
 export const CHAT_PROTOCOL_VERSION = 1;
@@ -141,14 +163,14 @@ export type DirectiveParse =
  * wrong place, and the JSON either fails to parse or parses to the wrong thing. A line scanner
  * has the state the grammar actually has: outside a block, or inside one.
  */
-export function dispatchBlocksIn(reply: string): string[] {
+export function fencedBlocksIn(reply: string, tag: string): string[] {
   const blocks: string[] = [];
   let current: string[] | null = null;
   for (const rawLine of reply.split('\n')) {
     const line = rawLine.replace(/\r$/, '');
     const trimmed = line.trim();
     if (current === null) {
-      if (/^`{3,}\s*/.test(trimmed) && trimmed.replace(/^`+/, '').trim() === DISPATCH_FENCE) {
+      if (/^`{3,}\s*/.test(trimmed) && trimmed.replace(/^`+/, '').trim() === tag) {
         current = [];
       }
       continue;
@@ -164,6 +186,63 @@ export function dispatchBlocksIn(reply: string): string[] {
   // that was cut off mid-directive has not asked for anything, and completing the request on the
   // model's behalf is how a half-typed objective becomes a spawned process.
   return blocks;
+}
+
+export function dispatchBlocksIn(reply: string): string[] {
+  return fencedBlocksIn(reply, DISPATCH_FENCE);
+}
+
+/** The same scanner, over the recce tag. One scanner, so the two grammars cannot diverge. */
+export function scoutBlocksIn(reply: string): string[] {
+  return fencedBlocksIn(reply, SCOUT_FENCE);
+}
+
+/**
+ * Neutralise model-authored text AT CAPTURE, which for a directive is the parser.
+ *
+ * ## Why here rather than at each place it is printed
+ *
+ * `sanitize` is the discipline waves 2, 3 and 4 each settled on independently: one call, at the
+ * moment untrusted text enters this process, so that every reader downstream — the terminal, the
+ * archive's `signals.jsonl`, an `orders.md`, a durable `spec.md` a human later reads with `cat` —
+ * gets the same neutralised bytes without any of them having to remember. Sanitising at each
+ * render site covers whichever ones somebody thought of, and this file has now watched three
+ * separate routes carry ESC, U+009B and U+202E through intact because they were not on that list.
+ *
+ * ## Why it runs AFTER validation and not before
+ *
+ * `sanitize` deletes characters, so a string that is over its cap can be brought under it by
+ * filtering. Validating the raw text and neutralising what survives keeps the cap a cap.
+ *
+ * ## Why the whole spec goes through it
+ *
+ * `renderTechnicalSpec` writes these fields onto the terminal a human approves at, into the
+ * Engineer's orders, into the reviewers' briefs, and into `spec.md` and `spec.json` in the archive
+ * and (optionally) the repository. Measured on the durable copies before this existed: 6 ESC, 4 C1
+ * and 4 bidi bytes in `spec.md`, so `cat spec.md` cleared the screen and reversed a path;
+ * `spec.json` escaped the ESC through `JSON.stringify` and passed U+009B and U+202E straight
+ * through, because `JSON.stringify` escapes C0 and neither of those is C0.
+ */
+function neutraliseSpec(spec: TechnicalSpec): TechnicalSpec {
+  const out: TechnicalSpec = {
+    objective: sanitize(spec.objective),
+    filesInScope: spec.filesInScope.map((entry) => sanitize(entry)),
+    acceptance: spec.acceptance.map((entry) => sanitize(entry)),
+    behaviours: spec.behaviours.map((entry) => sanitize(entry)),
+    decisions: spec.decisions.map((entry) => sanitize(entry)),
+    constraints: spec.constraints.map((entry) => sanitize(entry)),
+  };
+  // `verify` is the optional seventh, and a spread would put `verify: undefined` on a spec that
+  // named none — which `exactOptionalPropertyTypes` refuses and a JSON round trip would keep.
+  if (spec.verify !== undefined) out.verify = spec.verify.map((entry) => sanitize(entry));
+  // A field added to `TechnicalSpec` and not to the list above would be carried raw, which is the
+  // failure this whole comment is about, so the list is checked against the contract rather than
+  // trusted. `SPEC_LIST_FIELDS` is the same source `runAlignmentGate` derives its required fields
+  // from, so a seventh required field joins both by existing.
+  for (const field of SPEC_LIST_FIELDS) {
+    if (out[field] === undefined) throw new Error(`neutraliseSpec does not cover ${field}`);
+  }
+  return out;
 }
 
 /**
@@ -218,7 +297,9 @@ export function parseDispatchDirective(reply: string): DirectiveParse {
     return {
       ok: false,
       reason:
-        `the dispatch block names ${extra.join(', ')}, which a dispatch request cannot carry. ` +
+        // The KEY NAMES are the model's own text and reach a terminal, a signal body and the
+        // commander's next turn, so they are neutralised here like every other model string.
+        `the dispatch block names ${sanitize(extra.join(', '))}, which a dispatch request cannot carry. ` +
         'The delivery rung, the project, the retry budget and the harness are settings of this ' +
         'session and were fixed before the conversation started.',
     };
@@ -247,7 +328,7 @@ export function parseDispatchDirective(reply: string): DirectiveParse {
     };
   }
 
-  if (!('spec' in record)) return { ok: true, request: { objective: trimmed } };
+  if (!('spec' in record)) return { ok: true, request: { objective: sanitize(trimmed) } };
 
   // A malformed spec is a REFUSAL carrying the validator's reason verbatim, never a dropped
   // field — see the doc comment above. `validateTechnicalSpec` is the same parser a spec file off
@@ -265,14 +346,159 @@ export function parseDispatchDirective(reply: string): DirectiveParse {
         'spellings of what is being built is the ambiguity a spec exists to remove.',
     };
   }
-  return { ok: true, request: { objective: trimmed, spec: specResult.spec } };
+  // The two agree by the check above, so they are neutralised the same way and stay agreeing.
+  const spec = neutraliseSpec(specResult.spec);
+  return { ok: true, request: { objective: spec.objective, spec } };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Out of the commander: a recce request
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Everything the commander may decide about a recce — and, by construction, everything it CAN.
+ *
+ * ONE FIELD. A recce is a question, and the question is the whole of what a conversation
+ * contributes. Everything else about a `CPT·SCOUT` — how many subordinates it may field, how long
+ * it may run, what it costs before this session stops paying for reconnaissance, which harness it
+ * lands on, which repository it reads — is a ceiling set outside the conversation, in
+ * `src/contracts/scout.ts` and in the session's own settings.
+ *
+ * The `?: never` fields are the encoded version of that, exactly as they are on `DispatchRequest`.
+ * TypeScript's excess-property check catches an object literal with a stray key and says nothing
+ * about a wider variable assigned into the parameter, which is how a settings bag would actually
+ * arrive; declaring the plausible spellings as `never` makes each of them a compile error. The
+ * runtime half is `parseScoutDirective`, which refuses any key it does not know rather than
+ * dropping it — because dropping `"maxSubagents": 40` teaches the model that asking is free, and
+ * the whole reason the ceiling exists is that asking is not.
+ *
+ * `depth`, `subagents` and `budgetUsd` are named here specifically. They are the three the design
+ * says to bound, they are the three a model reaching for more capability would reach for, and a
+ * ceiling a model can name is not a ceiling.
+ */
+export interface ScoutRequest {
+  /** One line. What the scout is being sent to find out. */
+  question: string;
+
+  // ---- structurally unreachable, on purpose -------------------------------------------------
+  /** @deprecated Never. Nesting depth is the rank table's, enforced by the harness. */
+  depth?: never;
+  /** @deprecated Never. The fan-out ceiling is measured, not negotiated. */
+  subagents?: never;
+  /** @deprecated Never. Same ceiling, the other spelling. */
+  maxSubagents?: never;
+  /** @deprecated Never. What a conversation may spend on reconnaissance is not its own to set. */
+  budgetUsd?: never;
+  /** @deprecated Never. The wall clock is a constant, not a request. */
+  timeoutMs?: never;
+  /** @deprecated Never. The project is where the human started the session. */
+  cwd?: never;
+  /** @deprecated Never. */
+  project?: never;
+  /** @deprecated Never. Vendor split is config, not conversation. */
+  harness?: never;
+  /** @deprecated Never. */
+  model?: never;
+  /** @deprecated Never. */
+  effort?: never;
+  /** @deprecated Never. The army home is not addressable from inside a conversation. */
+  home?: never;
+}
+
+export type ScoutParse =
+  | { ok: true; request: ScoutRequest }
+  | { ok: false; reason: string };
+
+/**
+ * The single recce request in a reply, or a refusal saying why there is none.
+ *
+ * Strict in the same three directions `parseDispatchDirective` is, and for the same reasons: two
+ * blocks is a refusal rather than "take the first", an unknown key is a refusal rather than a
+ * field to drop, and a multi-line question is a refusal because it is read back verbatim into an
+ * `orders.md` and a line that can open a `##` section can forge an instruction from the rank
+ * above.
+ */
+export function parseScoutDirective(reply: string): ScoutParse {
+  const blocks = scoutBlocksIn(reply);
+  if (blocks.length === 0) return { ok: false, reason: 'no recce was requested' };
+  if (blocks.length > 1) {
+    return {
+      ok: false,
+      reason:
+        `this reply carries ${String(blocks.length)} recce blocks. One turn asks for at most one ` +
+        'scout; nothing was sent.',
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(blocks[0] as string);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `the recce block is not JSON: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: 'the recce block must be a JSON object' };
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const extra = Object.keys(record).filter((key) => key !== 'question');
+  if (extra.length > 0) {
+    return {
+      ok: false,
+      reason:
+        // Neutralised for the same reason the dispatch block's key names are: this sentence is
+        // printed, archived, and read back to the commander, and the names in it are the model's.
+        `the recce block names ${sanitize(extra.join(', '))}, which a recce request cannot carry. How far a ` +
+        'scout may fan out, how long it may run and what this session will spend on ' +
+        'reconnaissance are ceilings set outside this conversation, and a ceiling that can be ' +
+        'named from inside one is not a ceiling.',
+    };
+  }
+
+  const question = record['question'];
+  if (typeof question !== 'string') {
+    return { ok: false, reason: 'the recce block has no `question` string' };
+  }
+  const trimmed = question.trim();
+  if (trimmed === '') return { ok: false, reason: 'the question is empty' };
+  if (/[\r\n]/.test(trimmed)) {
+    return {
+      ok: false,
+      reason:
+        'the question spans more than one line. It is read back verbatim into the scout\'s ' +
+        'orders, so it may not carry structure of its own.',
+    };
+  }
+  const length = codePointLength(trimmed);
+  if (length > SCOUT_QUESTION_MAX_CHARS) {
+    return {
+      ok: false,
+      reason: `the question is ${String(length)} characters; the cap is ${String(SCOUT_QUESTION_MAX_CHARS)}`,
+    };
+  }
+  // NEUTRALISED AT CAPTURE. This string is printed through `wrapBlock` — which wraps and does not
+  // sanitise — immediately above `send a scout? [y/N]`, and the same bytes go into `signals.jsonl`
+  // and into the scout's own `orders.md`. Driven on a pty with erase-display, colour, C1 and a
+  // bidi override in the question, the terminal received all four verbatim: a commander could
+  // clear the human's screen and repaint the two rows above an approval keystroke.
+  return { ok: true, request: { question: sanitize(trimmed) } };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Into the commander: the turn envelopes
 // ---------------------------------------------------------------------------------------------
 
-export const TURN_KINDS = ['standing-orders', 'human', 'dispatch-result', 'dispatch-declined'] as const;
+export const TURN_KINDS = [
+  'standing-orders',
+  'human',
+  'dispatch-result',
+  'dispatch-declined',
+  'scout-finding',
+  'scout-declined',
+] as const;
 export type TurnKind = (typeof TURN_KINDS)[number];
 
 /**
@@ -287,6 +513,11 @@ export const TURN_AUTHORITY: Record<TurnKind, 'human' | 'session'> = {
   human: 'human',
   'dispatch-result': 'session',
   'dispatch-declined': 'session',
+  // A scout is a subordinate and its finding is a report. It reads the repository and the web,
+  // which is a wider surface than anything a dispatch result carries, so if either of these two
+  // were ever going to be the one that let a proposal out it would be this one. It does not.
+  'scout-finding': 'session',
+  'scout-declined': 'session',
 };
 
 /** Flatten and cap. Subordinate strings arrive schema-capped; this is the second, local bound. */
@@ -421,4 +652,80 @@ export function renderDispatchResult(facts: DispatchOutcomeFacts): string {
 /** The human declined a proposed dispatch. Nothing but the objective it declined crosses. */
 export function renderDispatchDeclined(objective: string, reason: string): string {
   return envelope('dispatch-declined', { objective, reason });
+}
+
+/**
+ * What the commander is told about a recce it asked for.
+ *
+ * ## This type is the whitelist, exactly as `DispatchOutcomeFacts` is
+ *
+ * `renderScoutFinding` cannot be handed a `RecceOutcome` or a `ScoutRun`. Every field is either
+ * supervisor-owned (the agent id this process minted, the question the HUMAN confirmed, the
+ * measured subagent count, whether this process halted the recce) or a scout-authored string that
+ * has been explicitly classified, sanitised at capture in `src/command/scout.ts`, and capped
+ * again here. There is no `events`, no `structured`, no `run`.
+ *
+ * `subagentsFielded` and `haltedForFanOut` cross deliberately. A commander that asks for a recce
+ * and gets a thin answer should be able to tell "it looked and there was nothing there" from "it
+ * was stopped at the ceiling before it finished looking", and only one of those is a reason to ask
+ * a narrower question next.
+ */
+export interface ScoutOutcomeFacts {
+  /** The agent id this process minted. Never read back from anything the scout said. */
+  agentId: string;
+  /** The question the HUMAN approved, echoed from this process's own memory of it. */
+  question: string;
+  /** SUBORDINATE TEXT. The scout's one-line answer. */
+  summary: string;
+  /** SUBORDINATE TEXT, capped in count and in length. */
+  findings: string[];
+  /** SUBORDINATE TEXT, capped in count and in length. What it could not determine. */
+  unknowns: string[];
+  /** MEASURED by the supervisor off the event stream. Never a number the scout reported. */
+  subagentsFielded: number;
+  /** True when this process stopped the recce for crossing the fan-out ceiling. */
+  haltedForFanOut: boolean;
+
+  // ---- structurally unreachable, on purpose -------------------------------------------------
+  /** @deprecated Never. Handing the whole run over is how a whitelist stops being one. */
+  run?: never;
+  /** @deprecated Never. */
+  structured?: never;
+  /** @deprecated Never. */
+  events?: never;
+  /** @deprecated Never. */
+  transcript?: never;
+}
+
+/**
+ * A scout's finding, as the commander will read it.
+ *
+ * Capped in COUNT as well as in length, and the count cap is the one that matters here: the
+ * schema already bounds each list at `FINDING_MAX_ENTRIES`, and this is the second, local bound —
+ * the same belt-and-braces `cappedFindings` applies to a verdict's findings, for the same reason.
+ * A commanding agent's window is the scarce thing this whole hierarchy exists to protect.
+ */
+export function renderScoutFinding(facts: ScoutOutcomeFacts): string {
+  return envelope('scout-finding', {
+    agentId: facts.agentId,
+    question: facts.question,
+    summary: cap(facts.summary),
+    findings: facts.findings.slice(0, MAX_FINDINGS).map((entry) => cap(entry)),
+    unknowns: facts.unknowns.slice(0, MAX_FINDINGS).map((entry) => cap(entry)),
+    subagentsFielded: facts.subagentsFielded,
+    haltedForFanOut: facts.haltedForFanOut,
+  });
+}
+
+/**
+ * The recce did not happen, or produced nothing usable. Nothing but this process's own words
+ * crosses.
+ *
+ * `reason` is SUPERVISOR-WRITTEN in every case — a human's decline, a budget refusal, a validator
+ * error listing the schema fields that were wrong. There is no path by which a scout's own prose
+ * reaches the commander through this envelope, which is what makes it safe to send after a run
+ * whose output could not be trusted enough to parse.
+ */
+export function renderScoutDeclined(question: string, reason: string): string {
+  return envelope('scout-declined', { question, reason });
 }

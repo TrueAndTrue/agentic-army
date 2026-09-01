@@ -52,7 +52,10 @@ import {
   glyphsFor,
   padTo,
   paintInk,
+  renderTreeRows,
 } from './render.ts';
+import type { TreeModel } from './tree.ts';
+import { walkTree } from './tree.ts';
 
 /**
  * How long a reported action may stand before the row starts dating it.
@@ -382,8 +385,167 @@ function liveness(unit: RosterUnit, ctx: Ctx, roomForDetail: number): string {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The live tree, truncated to the rows the block is allowed
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * How many tree rows the block draws when nobody says. Small on purpose: the block is pinned under
+ * a conversation, and the conversation is what the window is for.
+ */
+export const DEFAULT_TREE_ROWS = 8;
+
+/**
+ * The narrowest terminal the tree may be drawn in.
+ *
+ * `renderTree`'s smallest column set (rank, depth, state) is 24 columns and its minimum label is
+ * 14, so 38 is the width below which its rows stop fitting. Measured against that layout rather
+ * than chosen: `chooseColumns` falls back to the smallest set instead of refusing, so under 38 the
+ * rows overflow rather than clip.
+ */
+export const MIN_TREE_WIDTH = 38;
+
+/**
+ * Which rows survive when the tree is taller than the block is allowed to be.
+ *
+ * The rule, in one sentence: **a running unit is never dropped to keep a finished one.** Rows are
+ * scored (busy units first, then the task spine, then units in an unknown state, then everything
+ * settled), and within a score the NEWEST rows are kept, because the bottom of this tree is where
+ * the campaign currently is. Whatever is dropped is accounted for on one final row rather than
+ * silently vanishing, since a tree that is quietly missing three engineers is worse than a tree
+ * that says so.
+ *
+ * The rows arrive already painted, from the same `renderTreeRows` `army view` draws with, so the
+ * scoring reads the model in the SAME order `walkTree` produced them in. That shared order is the
+ * one coupling between this function and the renderer, and it is the reason the two cannot drift:
+ * neither of them owns a layout.
+ */
+export function fitTreeRows(
+  model: TreeModel,
+  rows: readonly string[],
+  budget: number,
+  style: ChromeStyle,
+): string[] {
+  if (budget <= 0) return [];
+  if (rows.length <= budget) return [...rows];
+  const ctx = contextOf(style);
+  const walked = walkTree(model);
+  const score = (index: number): number => {
+    const node = walked[index]?.node;
+    if (node === undefined) return 0;
+    if (node.kind === 'task') return 2;
+    if (node.state.state === 'busy') return 3;
+    if (node.state.state === 'unknown') return 1;
+    return 0;
+  };
+  // One row is spent on the account of what was dropped, so the budget for real rows is one less.
+  const keepCount = Math.max(0, budget - 1);
+  const ranked = rows
+    .map((_, index) => ({ index, score: score(index) }))
+    // Highest score first; within a score the newest first, which is where the work is.
+    .sort((a, b) => b.score - a.score || b.index - a.index)
+    .slice(0, keepCount);
+  const kept = new Set(ranked.map((entry) => entry.index));
+  const out = rows.filter((_, index) => kept.has(index));
+
+  let busy = 0;
+  let settled = 0;
+  let tasks = 0;
+  for (let index = 0; index < rows.length; index += 1) {
+    if (kept.has(index)) continue;
+    const node = walked[index]?.node;
+    if (node === undefined || node.kind === 'task') tasks += 1;
+    else if (node.state.state === 'busy') busy += 1;
+    else settled += 1;
+  }
+  const hidden = rows.length - out.length;
+  const parts: string[] = [];
+  if (busy > 0) parts.push(`${String(busy)} busy`);
+  if (tasks > 0) parts.push(`${String(tasks)} task${tasks === 1 ? '' : 's'}`);
+  if (settled > 0) parts.push(`${String(settled)} settled`);
+  const tail = parts.length === 0 ? '' : ` ${ctx.g.dash} ${parts.join(', ')}`;
+  out.push(
+    row(
+      ctx,
+      'grey',
+      `  ${ctx.g.ellipsis} ${String(hidden)} more row${hidden === 1 ? '' : 's'}${tail}` +
+        ` ${ctx.g.bullet} the whole tree is in \`view\``,
+    ),
+  );
+  return out;
+}
+
+/**
+ * The roster's half of the same arithmetic, and it exists because the block has ONE row budget.
+ *
+ * `fitTreeRows` is taken when the archive is readable and the window is at least `MIN_TREE_WIDTH`.
+ * The roster is taken in exactly the cases a short window is most likely — a tree reader that
+ * failed, or fewer than 38 columns — and it used to return one row per unit with no reference to
+ * the budget at all. That is not "a slightly tall block": `statusRows` in `src/chat/io.ts` REFUSES
+ * rather than trims, so the whole block vanished. Measured with the real renderer at three roster
+ * units: nothing was painted at six rows and below, while `treeBudget` had correctly computed
+ * 2, 1, 1, 0 and had the number thrown away one call later.
+ *
+ * The rule is the tree's, one score simpler because a roster has no spine: **a working unit is
+ * never dropped to keep a finished one**, newest first within a state, and whatever goes is
+ * accounted for on one final row rather than silently vanishing.
+ */
+export function fitRosterRows(
+  units: readonly RosterUnit[],
+  rows: readonly string[],
+  budget: number,
+  style: ChromeStyle,
+): string[] {
+  if (budget <= 0) return [];
+  if (rows.length <= budget) return [...rows];
+  const ctx = contextOf(style);
+  // One row is spent on the account of what was dropped, so the budget for real rows is one less.
+  const keepCount = Math.max(0, budget - 1);
+  const kept = new Set(
+    rows
+      .map((_, index) => ({ index, score: units[index]?.state === 'working' ? 1 : 0 }))
+      // Highest score first; within a score the newest first, which is where the work is.
+      .sort((a, b) => b.score - a.score || b.index - a.index)
+      .slice(0, keepCount)
+      .map((entry) => entry.index),
+  );
+  const out = rows.filter((_, index) => kept.has(index));
+  let working = 0;
+  let settled = 0;
+  for (let index = 0; index < rows.length; index += 1) {
+    if (kept.has(index)) continue;
+    if (units[index]?.state === 'working') working += 1;
+    else settled += 1;
+  }
+  const hidden = rows.length - out.length;
+  const parts: string[] = [];
+  if (working > 0) parts.push(`${String(working)} working`);
+  if (settled > 0) parts.push(`${String(settled)} settled`);
+  const tail = parts.length === 0 ? '' : ` ${ctx.g.dash} ${parts.join(', ')}`;
+  out.push(
+    row(ctx, 'grey', `  ${ctx.g.ellipsis} ${String(hidden)} more unit${hidden === 1 ? '' : 's'}${tail}`),
+  );
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // The status bar
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * What a campaign is spending while it runs.
+ *
+ * On the bar FROM THE FIRST SPAWN, and never displaced by a hint, which is the difference between
+ * this and the session counters below it. A tree that can grow to a dozen agents is a bill, and a
+ * bill that only appears once the wall clock is over is a bill nobody checked.
+ */
+export interface BudgetModel {
+  /** Agents this campaign has raised so far, at any rank. */
+  agents: number;
+  /** The concurrency cap in force, or null when nothing has said what it is. */
+  cap: number | null;
+  /** Everything spent so far, the session AND the campaign under it, or null when unreported. */
+  costUsd: number | null;
+}
 
 export interface StatusModel {
   repo: RepoState;
@@ -403,6 +565,29 @@ export interface StatusModel {
   roster: readonly RosterUnit[];
   /** Shown instead of the counters while something is blocking on a keystroke. */
   hint: string | null;
+  /**
+   * The live campaign tree, or null when nothing is running or the archive is not readable yet.
+   *
+   * When it is present it REPLACES the roster rather than joining it. The two draw one fact,
+   * that this unit is working and for how long, and two spellings of it on one screen is the bug
+   * this whole layer's `live` flag already stands down for elsewhere. The tree is the better of
+   * the two (every unit, the task spine, the rank/depth gap, the state's own provenance), and the
+   * roster stays as the answer for the seconds before the archive has anything to read.
+   */
+  tree?: TreeModel | null;
+  /**
+   * Rows the block may spend on UNITS, whichever renderer draws them. Defaults to
+   * `DEFAULT_TREE_ROWS`.
+   *
+   * Named for the tree because the tree is the usual answer, and read by the roster too: the
+   * budget is a fact about the window's height, and the window does not get taller because the
+   * archive stopped being readable.
+   */
+  treeRows?: number;
+  /** Questions waiting on this human. Zero, and the segment is absent rather than `0 open`. */
+  questions?: number;
+  /** Agents, cap and spend, from the first spawn. Null between dispatches. */
+  budget?: BudgetModel | null;
 }
 
 /** `$0.41`, and never `$0.00` for a session that has spent something too small to show. */
@@ -419,6 +604,17 @@ function countLabel(n: number, one: string, many: string): string {
 interface Segment {
   text: string;
   ink: Ink;
+  /**
+   * Charged against the width BEFORE anything droppable, wherever it sits in the row.
+   *
+   * "Fit in order and drop the rest" is the right rule for facts that are always true (the
+   * project, the model, the rung), and the wrong one for a fact with a deadline sitting behind a
+   * long one. Found on a real pty at 100 columns: the hint while a worker was asking is seventy
+   * columns, and it pushed the agent count and the spend off the row entirely. The design says
+   * the budget is on the bar FROM THE FIRST SPAWN, which is not a claim that survives being the
+   * first thing dropped.
+   */
+  keep?: boolean;
 }
 
 /**
@@ -441,17 +637,42 @@ function fitSegments(segments: readonly Segment[], ctx: Ctx): string {
   // same class of mistake `clipTo`'s own note warns about, one indirection further out.
   const separator = ` ${ctx.g.bullet} `;
   const budget = ctx.width - 2;
-  const kept: Segment[] = [];
-  let used = 0;
+
+  // Pass one: the reserved segments, charged wherever they sit. If even THEY do not fit, the
+  // youngest of them are given up from the end. A reserved segment is a strong preference, not a
+  // licence to wrap the row, and one wrapped row puts every `ESC[nA` count under it out by one.
+  const reserved: Segment[] = segments.filter((segment) => segment.keep === true);
+  // `displayWidth`, never `.length`. A budget in COLUMNS charged in UTF-16 code units undercounts
+  // every wide glyph by one and every astral character by minus one, and this row is measured
+  // against a terminal width. Found by putting a CJK branch name on the bar: the row overran the
+  // window at every width tested (+13 at 100 columns, +15 at 80, +19 at 60), wrapped, and put
+  // every `ESC[nA` under it out by one for the rest of the session — which is the exact failure
+  // the one-physical-row model in `src/chat/io.ts` exists to prevent, and the reason the header
+  // above says every row here is clipped to `width - 1`.
+  const costOf = (list: readonly Segment[]): number =>
+    list.reduce(
+      (total, segment, index) =>
+        total + displayWidth(segment.text) + (index === 0 ? 0 : displayWidth(separator)),
+      0,
+    );
+  while (reserved.length > 1 && costOf(reserved) > budget) reserved.pop();
+
+  const kept = new Set<Segment>(reserved);
+  let used = costOf(reserved);
+  // Pass two: everything else, in order, taking what is left.
   for (const segment of segments) {
-    const cost = (kept.length === 0 ? 0 : separator.length) + segment.text.length;
-    if (kept.length > 0 && used + cost > budget) continue;
-    kept.push(segment);
+    if (kept.has(segment)) continue;
+    const cost = (kept.size === 0 ? 0 : displayWidth(separator)) + displayWidth(segment.text);
+    if (kept.size > 0 && used + cost > budget) continue;
+    kept.add(segment);
     used += cost;
   }
-  const first = kept[0];
+  // Painted in the ROW's order, never in the order they were charged: the reader's eye learns
+  // where a fact sits, and a bar that reshuffles itself as the window narrows has thrown that away.
+  const ordered = segments.filter((segment) => kept.has(segment));
+  const first = ordered[0];
   if (first !== undefined) first.text = clipTo(first.text, budget, ctx.g.ellipsis);
-  return `  ${kept
+  return `  ${ordered
     .map((segment) => paint(ctx, segment.ink, segment.text))
     .join(paint(ctx, 'grey', separator))}`;
 }
@@ -471,12 +692,34 @@ export function renderStatusBar(model: StatusModel, tick: number, style: ChromeS
   // The branch is the one segment that is not grey. It is the fact this bar was added for, it is
   // the fact that changes without the reader doing anything, and a row of uniform dim text has no
   // way to say which of its six facts is the one to look at.
-  const segments: Segment[] = [{ text: fold(ctx, formatRepo(model.repo, g)), ink: 'cyan' }];
+  const segments: Segment[] = [
+    { text: fold(ctx, formatRepo(model.repo, g)), ink: 'cyan', keep: true },
+  ];
   // SECOND, ahead of every standing fact, and yellow. A hint is a rule about the key the reader
   // is about to press, true for the next few seconds rather than for the session — and it was
   // last here until an 80-column terminal showed what that costs: `Ctrl-C lets the dispatch
   // settle` is the one row on this bar with a deadline, and it was the first thing dropped.
   if (model.hint !== null) segments.push({ text: fold(ctx, model.hint), ink: 'yellow' });
+  // THIRD, and magenta rather than grey: an unanswered question is work that has stopped and is
+  // waiting on the person reading this row. It outranks every standing fact for the same reason
+  // the hint does: it has a deadline, and it is the one thing on the bar the reader can end.
+  const questions = model.questions ?? 0;
+  if (questions > 0) {
+    segments.push({
+      text: `${countLabel(questions, 'question', 'questions')} open`,
+      ink: 'magenta',
+      keep: true,
+    });
+  }
+  // FOURTH, and never displaced by a hint. See `BudgetModel` and `Segment.keep`.
+  const budget = model.budget ?? null;
+  if (budget !== null) {
+    const cap = budget.cap === null ? '' : `/${String(budget.cap)}`;
+    segments.push({ text: `${String(budget.agents)}${cap} agents`, ink: 'cyan', keep: true });
+    if (budget.costUsd !== null) {
+      segments.push({ text: formatCost(budget.costUsd), ink: 'yellow', keep: true });
+    }
+  }
   segments.push({ text: fold(ctx, model.project), ink: 'grey' });
   if (model.model !== '') segments.push({ text: fold(ctx, model.model), ink: 'grey' });
   segments.push({ text: fold(ctx, model.rung), ink: 'grey' });
@@ -489,8 +732,34 @@ export function renderStatusBar(model: StatusModel, tick: number, style: ChromeS
     if (model.dispatches > 0) {
       segments.push({ text: countLabel(model.dispatches, 'dispatch', 'dispatches'), ink: 'grey' });
     }
-    if (model.costUsd !== null) segments.push({ text: formatCost(model.costUsd), ink: 'grey' });
+    // Suppressed when the budget row is up, which already carries a total that INCLUDES this one.
+    // Two costs on one row, differing by whatever a campaign has spent, is a bar arguing with
+    // itself.
+    if (model.costUsd !== null && budget === null) {
+      segments.push({ text: formatCost(model.costUsd), ink: 'grey' });
+    }
   }
 
-  return [...renderRoster(model.roster, tick, style), fitSegments(segments, ctx)];
+  // The tree is drawn only where it FITS. `renderTree`'s narrowest column set plus its minimum
+  // label is 38 columns, and below that its rows run past the edge. Harmless in a full-screen
+  // view that scrolls, fatal in a pinned block, where one wrapped row puts every `ESC[nA` count
+  // under it out by one. Narrower than that, the roster answers instead: it clips every row to
+  // the width itself and has always been the narrow-terminal renderer.
+  // ONE budget, spent by whichever renderer answers. Which of the two draws is a question about
+  // the archive and the width; how many rows the block may take is a question about the window,
+  // and the second answer does not change with the first. Passing it to one branch only is how
+  // the block came to vanish entirely on a short terminal — see `fitRosterRows`.
+  const rowBudget = model.treeRows ?? DEFAULT_TREE_ROWS;
+  const tree = model.tree ?? null;
+  const units =
+    tree === null || ctx.width < MIN_TREE_WIDTH
+      ? fitRosterRows(model.roster, renderRoster(model.roster, tick, style), rowBudget, style)
+      : fitTreeRows(
+          tree,
+          renderTreeRows(tree, { charset: style.charset, color: style.color, width: ctx.width }).rows,
+          rowBudget,
+          style,
+        );
+
+  return [...units, fitSegments(segments, ctx)];
 }

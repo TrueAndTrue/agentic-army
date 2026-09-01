@@ -34,6 +34,14 @@
  * turn — nothing at this layer can, which is why the objective is printed and confirmed by a
  * keystroke one layer up in `src/command/chat.ts`.
  *
+ * **The same sentence, with `scoutProposal` substituted, is also true.** Phase 1 lets the
+ * commander ask for a `CPT·SCOUT`, which is a second thing a reply can request and therefore a
+ * second thing this gate has to hold for. Both are deleted on the same branch of the same
+ * function, and both are absent from the object `dispatchResultTurn` and `scoutFindingTurn`
+ * return. The recce half is the one worth watching: a scout is sent precisely because nobody knows
+ * enough to dispatch, so the turn on which its finding arrives is the turn a model most wants to
+ * start work on — and the human has not typed anything since they approved a question.
+ *
  * ## Interrupt
  *
  * Claude's interrupt is a stdin control message, not a signal. The soldier survives it and
@@ -52,13 +60,22 @@ import type {
   SoldierStatus,
 } from '../contracts/harness.ts';
 
-import type { DispatchOutcomeFacts, DispatchRequest, TurnKind } from './protocol.ts';
+import type {
+  DispatchOutcomeFacts,
+  DispatchRequest,
+  ScoutOutcomeFacts,
+  ScoutRequest,
+  TurnKind,
+} from './protocol.ts';
 import {
   TURN_AUTHORITY,
   parseDispatchDirective,
+  parseScoutDirective,
   renderDispatchDeclined,
   renderDispatchResult,
   renderHumanTurn,
+  renderScoutDeclined,
+  renderScoutFinding,
   renderStandingOrdersTurn,
 } from './protocol.ts';
 
@@ -108,6 +125,14 @@ export interface TurnResult {
 /** A human turn, which is the only kind that can carry a proposal out. */
 export interface HumanTurnResult extends TurnResult {
   proposal: DispatchRequest | null;
+  /**
+   * A recce the commander asked for, on the same terms as `proposal`.
+   *
+   * Deleted, not merely undeclared, on every turn whose authority is not the human's — see
+   * `runTurn`. A scout reads the repository and the network, and "the report I just read asked me
+   * to go and look at something" is precisely the route the authority gate exists to close.
+   */
+  scoutProposal: ScoutRequest | null;
 }
 
 interface PendingTurn {
@@ -236,7 +261,9 @@ export class ChatSession {
   private async runTurn(
     payload: string,
     kind: TurnKind,
-  ): Promise<TurnResult & { proposal: DispatchRequest | null }> {
+  ): Promise<
+    TurnResult & { proposal: DispatchRequest | null; scoutProposal: ScoutRequest | null }
+  > {
     const soldier = this.soldier;
     if (soldier === null) throw new Error('this chat session has not been opened');
     if (this.streamEnded || this.closeResult !== null) {
@@ -272,6 +299,7 @@ export class ChatSession {
         refusals: [],
         errors: [`send failed: ${message}`],
         proposal: null,
+        scoutProposal: null,
       };
     }
 
@@ -279,12 +307,18 @@ export class ChatSession {
     const text = turn.chunks.join('');
     const refusals: string[] = [];
     let proposal: DispatchRequest | null = null;
+    let scoutProposal: ScoutRequest | null = null;
 
     const parsed = parseDispatchDirective(text);
     if (parsed.ok) {
       if (TURN_AUTHORITY[kind] === 'human') {
         proposal = parsed.request;
       } else {
+        // `JSON.stringify` is not a neutraliser and was being used as one. It escapes C0 — so the
+        // ESC that starts a CSI sequence does come out as `` — and leaves U+009B (the C1
+        // form of CSI, which a terminal obeys on its own) and U+202E (a bidi override, which
+        // reverses the rendered order of everything after it) exactly as they were. The quoting
+        // here is for readability; `parseDispatchDirective` is what makes the string safe.
         refusals.push(
           `a dispatch block was written in answer to a \`${kind}\` turn and was DROPPED. New ` +
             'intent comes from the Commander typing, never from a report a subordinate wrote. ' +
@@ -293,6 +327,26 @@ export class ChatSession {
       }
     } else if (parsed.reason !== 'no dispatch was requested') {
       refusals.push(parsed.reason);
+    }
+
+    // THE SAME GATE, over the second directive. Written out rather than folded into a loop over
+    // two parsers: the refusal sentences differ, the values are differently typed, and a gate
+    // whose two halves are one generic call is a gate somebody can widen by editing the generic.
+    const scouted = parseScoutDirective(text);
+    if (scouted.ok) {
+      if (TURN_AUTHORITY[kind] === 'human') {
+        scoutProposal = scouted.request;
+      } else {
+        // Neutralised by `parseScoutDirective`, not by the `JSON.stringify` below — see the
+        // dispatch half above for what that call does and does not escape.
+        refusals.push(
+          `a recce block was written in answer to a \`${kind}\` turn and was DROPPED. A scout is ` +
+            'raised because the Commander asked for one, never because a report suggested it. ' +
+            `The question it named was: ${JSON.stringify(scouted.request.question.slice(0, 160))}`,
+        );
+      }
+    } else if (scouted.reason !== 'no recce was requested') {
+      refusals.push(scouted.reason);
     }
 
     return {
@@ -304,12 +358,13 @@ export class ChatSession {
       refusals,
       errors: turn.errors,
       proposal,
+      scoutProposal,
     };
   }
 
   /** The opening turn. Carries session authority, so its reply cannot dispatch. */
   async openingTurn(orders: string): Promise<TurnResult> {
-    const { proposal: _dropped, ...turn } = await this.runTurn(
+    const { proposal: _dropped, scoutProposal: _alsoDropped, ...turn } = await this.runTurn(
       renderStandingOrdersTurn(orders),
       'standing-orders',
     );
@@ -329,7 +384,7 @@ export class ChatSession {
    * rather than at every call site.
    */
   async dispatchResultTurn(facts: DispatchOutcomeFacts): Promise<TurnResult> {
-    const { proposal: _dropped, ...turn } = await this.runTurn(
+    const { proposal: _dropped, scoutProposal: _alsoDropped, ...turn } = await this.runTurn(
       renderDispatchResult(facts),
       'dispatch-result',
     );
@@ -338,9 +393,38 @@ export class ChatSession {
 
   /** Tell the commander its proposal was not approved. */
   async dispatchDeclinedTurn(objective: string, reason: string): Promise<TurnResult> {
-    const { proposal: _dropped, ...turn } = await this.runTurn(
+    const { proposal: _dropped, scoutProposal: _alsoDropped, ...turn } = await this.runTurn(
       renderDispatchDeclined(objective, reason),
       'dispatch-declined',
+    );
+    return turn;
+  }
+
+  /**
+   * Hand a scout's finding back to the commander.
+   *
+   * Takes `ScoutOutcomeFacts`, which is a whitelist — see `protocol.ts`. There is no overload that
+   * accepts a `RecceOutcome` or a `ScoutRun`, so what crosses is classified once, in a type.
+   *
+   * Session authority, so a commander that reads a finding and immediately writes a dispatch block
+   * has its proposal DELETED and the refusal recorded. That is the interesting case rather than an
+   * edge: a scout is sent precisely when nobody knows enough to dispatch, so the turn after one
+   * comes back is exactly the turn on which a model most wants to start work — and the human has
+   * not typed anything since they approved a question.
+   */
+  async scoutFindingTurn(facts: ScoutOutcomeFacts): Promise<TurnResult> {
+    const { proposal: _dropped, scoutProposal: _alsoDropped, ...turn } = await this.runTurn(
+      renderScoutFinding(facts),
+      'scout-finding',
+    );
+    return turn;
+  }
+
+  /** Tell the commander its recce did not happen. `reason` is this process's own words. */
+  async scoutDeclinedTurn(question: string, reason: string): Promise<TurnResult> {
+    const { proposal: _dropped, scoutProposal: _alsoDropped, ...turn } = await this.runTurn(
+      renderScoutDeclined(question, reason),
+      'scout-declined',
     );
     return turn;
   }
