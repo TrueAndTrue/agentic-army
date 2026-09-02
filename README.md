@@ -1305,6 +1305,12 @@ refused by it for the rung it could not reach; and, driven under a pty on a real
 mode, the `army chat` surface — the scout proposal and its finding, the alignment gate passing and
 refusing, a worker's question arriving and being answered, a half-typed line being displaced to the
 Commander rather than sent to a worker, and the pinned status block with the live tree in it.
+Added on the same footing after those runs: a sentence typed during a dispatch reaching the
+Commander as a `human-in-flight` turn with the campaign's state, its answer printing whole before
+the lease came back, Ctrl-C stopping that answer while the campaign kept its lease, and
+`campaign --recce` sending a scout whose finding reached the overseer's brief and every engineer's
+orders. Those transcripts are from the test rig's scripted terminal rather than a pty, which is a
+real run of the loop and not a real picture of one.
 
 **Implemented but NOT exercised end to end at all, so take the description and not a
 demonstration:**
