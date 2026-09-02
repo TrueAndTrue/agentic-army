@@ -112,7 +112,7 @@ import { ensureConfig } from '../setup/init.ts';
 import { DEFAULT_MAX_CONCURRENT_WORKSTREAMS } from '../contracts/workstream.ts';
 import { detectCharset, detectColor } from '../view/index.ts';
 import type { Charset } from '../view/render.ts';
-import { displayWidth, glyphsFor, wrapPlain } from '../view/render.ts';
+import { displayWidth, glyphsFor, renderTreeRows, wrapPlain } from '../view/render.ts';
 import {
   DEFAULT_TREE_ROWS,
   REPO_UNKNOWN,
@@ -131,7 +131,7 @@ import { openCampaignReader } from '../view/live.ts';
 import type { CampaignReader } from '../view/live.ts';
 import { buildTree, walkTree } from '../view/tree.ts';
 import type { TreeModel } from '../view/tree.ts';
-import { createProgressSink, dispositionOf, renderProgressEvent } from '../view/progress.ts';
+import { createProgressSink, dispositionOf, renderProgressEvent, sanitize } from '../view/progress.ts';
 import { createProseStream } from '../view/prose.ts';
 import type { ProgressEvent, ProgressListener, ProgressStyle } from '../view/progress.ts';
 
@@ -146,8 +146,9 @@ import { readRepoState } from './repo.ts';
 import { renderStandingOrders } from './orders.ts';
 import { captureTurn, planningDocuments, writeSpecToRepo } from './planning.ts';
 import type { InterrogationTurn, PlanningRecord } from './planning.ts';
-import type { DispatchRequest, ScoutRequest } from './protocol.ts';
+import type { DispatchRequest, ScoutRequest, SituationFacts } from './protocol.ts';
 import { ChatSession } from './session.ts';
+import type { TurnResult } from './session.ts';
 import { renderWorkSnapshot } from './snapshot.ts';
 import type { SnapshotFile } from './snapshot.ts';
 
@@ -366,8 +367,9 @@ export const ANSWER_HINT = '    a blank answer, or Ctrl-C, leaves the question u
  *
  * There IS a prompt now, where before there was none, and that is the change that makes `/stop`
  * and `/work` reachable at all: a command nobody can type while the thing it acts on is running is
- * not a command. Deliberately not `PROMPT`: a line typed here does not reach the Commander on
- * this turn; it is queued for it, and the two must not look the same.
+ * not a command. Deliberately not `PROMPT`: a line typed here is routed by the console first,
+ * and what reaches the Commander is a `human-in-flight` turn with the campaign's state alongside
+ * it rather than the bare line, and the two must not look the same.
  *
  * Short for the reason every prompt in this file is short: it is repainted per keystroke, charged
  * against the width the buffer gets, and repeated down every wrapped row of the entry. What it
@@ -392,8 +394,8 @@ export const SCOUT_CONFIRM_PROMPT = '  ◇ send a scout? [y/N] ';
  * Who the dispatch console reads for, and why it is not the Commander.
  *
  * The console is a READER IN ITS OWN RIGHT. A line typed at it is routed by this file — as a
- * command, as an answer to a parked worker, or handed back — and is never sent to the Commander
- * as a turn without passing through that routing. So a line typed at the COMMANDER's prompt before
+ * command, as an answer to a parked worker, or as a `human-in-flight` turn for the Commander —
+ * and is never sent to the Commander as a turn without passing through that routing. So a line typed at the COMMANDER's prompt before
  * a dispatch began is addressed to somebody else and this loop cannot take it, which is exactly
  * the property `{ fresh: true }` used to buy one call site at a time. Naming the reader honestly
  * is what makes it structural: `src/chat/io.ts` compares addressees for equality and nothing else.
@@ -432,6 +434,22 @@ export const INTERROGATION_HALF_MAX_CHARS = 4000;
  * size and the path, rather than "none recorded" about a file that is there.
  */
 export const WORK_FILE_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * How many narration lines a `human-in-flight` turn carries to the Commander, newest last.
+ *
+ * The tree says where every unit IS; these say what just HAPPENED, which the tree cannot: a
+ * verdict that landed, a merge that conflicted, a question that climbed. A dozen is the last
+ * minute or two of a campaign and is the part a "what is going on?" is usually asking about.
+ */
+export const RECENT_NARRATION_MAX = 12;
+
+/**
+ * How many tree rows a `human-in-flight` turn carries. Over the cap the situation says how many
+ * were dropped and where to read them, because a model told about forty units and not about the
+ * forty-first will answer as if there were forty.
+ */
+export const SITUATION_TREE_MAX_ROWS = 40;
 
 /** `y` / `yes`, and nothing else. Anything ambiguous is a no — the default must be the safe one. */
 export function isApproval(line: string): boolean {
@@ -940,10 +958,21 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
     io.setIdle();
   };
 
+  /**
+   * True while a `human-in-flight` turn is running and its text is being HELD rather than streamed.
+   *
+   * During a dispatch the terminal's live thing is the campaign: narration lines land whenever a
+   * worker does something, and a Commander answer streamed a word at a time through the prose
+   * gutter would have `cpt-02 dispatched` printed into the middle of one of its paragraphs. So
+   * an in-flight answer arrives as a block, printed whole once the turn settles, the same way a
+   * worker's question does. The chunks are dropped here and `turn.text` is what gets printed.
+   */
+  let holdAnswer = false;
   const session = new ChatSession({
     adapter: commanderAdapter,
     spec,
     onText: (chunk) => {
+      if (holdAnswer) return;
       if (prose === null) {
         io.write(chunk);
         return;
@@ -1088,6 +1117,22 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   let consoleActive = false;
   let consoleInterrupted = false;
   let consoleLoop: Promise<void> = Promise.resolve();
+  /**
+   * Commander turns taken WHILE A DISPATCH RUNS, one after another.
+   *
+   * The console's read must never wait on a Commander answer, or `/stop` is unreachable for as
+   * long as the model takes, so a line for the Commander is chained here and the console goes
+   * straight back to reading. One chain, because `ChatSession` runs one turn at a time. Awaited
+   * in the dispatch's `finally`, after the console, so an answer in flight finishes printing
+   * before the outcome does, and reset at each dispatch.
+   */
+  let commanderChain: Promise<void> = Promise.resolve();
+  /** When the running dispatch was approved. For the situation's elapsed reading. */
+  let dispatchStartedAt = 0;
+  /** The objective the human approved for the running dispatch, from this process's memory. */
+  let dispatchObjective = '';
+  /** The last narration lines, plain, oldest first. Cleared per dispatch. */
+  const recentNarration: string[] = [];
   /** True between `/stop` and the y/N that answers it. */
   let stopArmed = false;
   /** The dispatch's own abort, or null when nothing is running. See `CampaignOptions.abortSignal`. */
@@ -1260,6 +1305,8 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   let treeLive = false;
   /** The running (or last) campaign's directory, for `/work`'s orders and diff. */
   let dispatchRoot: string | null = null;
+  /** The running dispatch's campaign id, for the pointer a situation gives the Commander. */
+  let dispatchCampaignId = '';
   /**
    * What the RUNNING campaign has spent, as its own archive reports it, or null when nothing has.
    *
@@ -1309,6 +1356,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
   };
 
   const openTree = (id: string): void => {
+    dispatchCampaignId = id;
     try {
       treeReader = openCampaignReader({ archiveRoot, campaignId: id, source: 'files', self });
       dispatchRoot = treeReader.campaignRoot;
@@ -1531,6 +1579,25 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
             'did not reach is recorded as unrun rather than as passed.\n',
         );
         gate.abort();
+        return;
+      }
+      if (dispatchInFlight && session.busy) {
+        // A Commander answer in flight DURING a dispatch. Ctrl-C keeps meaning "stop this
+        // answer", which is what it means everywhere else in the session, and it must not mean
+        // "kill the campaign" here any more than it does below. It does NOT arm the exit: one
+        // gesture, one meaning, and a press after this one lands in the branch below, where the
+        // "letting it settle" line is true.
+        if (interruptBusy) return;
+        interruptBusy = true;
+        guardedWrite("\n  ^C  stopping the Commander's answer. The dispatch carries on.\n");
+        try {
+          const stopped = await session.interrupt();
+          if (!stopped) {
+            guardedWrite('  ◇ the Commander did not stop; its answer prints when it is whole.\n');
+          }
+        } finally {
+          interruptBusy = false;
+        }
         return;
       }
       if (dispatchInFlight) {
@@ -1924,6 +1991,28 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       case '/help':
         guardedWrite(SLASH_HELP);
         return;
+      case '/status':
+        // The header, with the working copy as it was last read. Not re-read here: the console
+        // routes synchronously so its read is back up before the next keystroke, and a git probe
+        // in the middle of a campaign that is committing into worktrees answers for the primary
+        // checkout only, which is what was last read anyway.
+        guardedWrite(
+          chatBanner(
+            {
+              self,
+              project,
+              repo,
+              ceiling,
+              rung: requestedRung,
+              model: spec.model ?? '',
+              posture: config.permissions.mode,
+              campaignId,
+              archiveRoot: archive.root,
+            },
+            chromeStyle(),
+          ),
+        );
+        return;
       case '/exit':
       case '/quit':
         // Handed BACK rather than obeyed. Leaving now would abandon a campaign holding worktree
@@ -1947,8 +2036,128 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       sayNextQuestion();
       return;
     }
-    io.queueLine(text);
-    guardedWrite('  ◇ the Commander is busy with this dispatch; queued for it.\n');
+    askCommanderInFlight(text);
+  };
+
+  /**
+   * What the Commander is told about the running campaign, built from the ARCHIVE.
+   *
+   * The same `TreeModel` the status block draws and `army view` prints, rendered by the same
+   * function at a width nothing will clip, and the roster only when no archive could be opened.
+   * Nothing here reads a stream a worker is writing to; the Commander "answers from the archive"
+   * because the archive is the only thing this function looks at.
+   */
+  const situationFacts = (): SituationFacts => {
+    let rows: string[];
+    if (tree !== null) {
+      const rendered = renderTreeRows(tree, { charset: 'ascii', color: false, width: 120 });
+      rows = [rendered.header, ...rendered.rows];
+      if (rows.length > SITUATION_TREE_MAX_ROWS + 1) {
+        const dropped = rows.length - (SITUATION_TREE_MAX_ROWS + 1);
+        rows = [
+          ...rows.slice(0, SITUATION_TREE_MAX_ROWS + 1),
+          `... ${String(dropped)} more row(s) not shown; \`${self} view ${dispatchCampaignId}\` has all of them`,
+        ];
+      }
+    } else {
+      rows = roster.map(
+        (row) =>
+          `${row.agentId} ${row.rank}·${row.role} ${row.state}` +
+          (row.detail === null ? '' : ` ${row.detail}`),
+      );
+    }
+    return {
+      objective: dispatchObjective,
+      elapsedMs: Math.max(0, nowMs() - dispatchStartedAt),
+      agentsSpawned: agentsSpawned.size,
+      concurrency: concurrencyCap,
+      costUsd: campaignCostUsd,
+      questionsOpen: inbox.size,
+      tree: rows.map(sanitize),
+      recent: [...recentNarration],
+      archive: dispatchRoot ?? '',
+    };
+  };
+
+  /**
+   * One Commander turn taken while a dispatch runs. Runs on `commanderChain`, never awaited by
+   * the console.
+   *
+   * If the dispatch settled before this turn's place in the chain came up, the line goes back to
+   * the ordinary queue and the main loop takes it as an ordinary turn: a situation describing a
+   * campaign that is over would be a turn built on a stale fact, and the `dispatch-result` turn
+   * that follows is the one that should describe how it ended.
+   */
+  const commanderTurnInFlight = async (text: string): Promise<void> => {
+    if (!dispatchInFlight) {
+      io.queueLine(text);
+      guardedWrite('  ◇ the dispatch settled first; that line reaches the Commander next.\n');
+      return;
+    }
+    if (session.ended) {
+      guardedWrite('  ◇ the Commander is gone, so nothing can answer that. The dispatch carries on.\n');
+      return;
+    }
+    humanTurns += 1;
+    archive.appendSignal({
+      fromAgent: GENERAL_AGENT_ID,
+      toAgent: COMMANDER_AGENT_ID,
+      kind: 'order',
+      body: cap(text),
+    });
+    holdAnswer = true;
+    let turn: TurnResult;
+    try {
+      turn = await session.humanTurnInFlight(text, situationFacts());
+    } catch (error) {
+      holdAnswer = false;
+      const message = error instanceof Error ? error.message : String(error);
+      guardedWrite(`  ✗ the Commander could not be asked: ${message}\n`);
+      return;
+    }
+    holdAnswer = false;
+    try {
+      // The narration ticker owns the current line while a campaign runs, exactly as it does
+      // when a worker's question arrives; `setIdle` is idempotent and takes it down.
+      io.setIdle();
+      // Whole, as one block, through the same gutter every other answer uses.
+      beginAnswer(true);
+      if (prose === null) io.write(turn.text);
+      else prose.push(turn.text);
+      endAnswer();
+      io.write('\n');
+      recordCommanderTurn(turn.text, turn.refusals);
+      if (turn.status === 'error' && turn.errors.length > 0 && !commanderGone) {
+        io.write(`\n  ✗ ${turn.errors[0] as string}\n`);
+      }
+    } catch {
+      /* the reader is gone; that is never a reason to end a campaign holding a lease */
+    }
+    refreshPrompt();
+  };
+
+  /**
+   * A line typed for the Commander while a dispatch runs.
+   *
+   * It USED to be queued for the moment the dispatch settled, which made the Commander the one
+   * party in the session that could not be spoken to while the thing it started was running. Now
+   * it is a turn, taken as soon as the Commander is free, briefed from the archive, and the
+   * console keeps reading throughout, so `/stop` is one line away the whole time.
+   */
+  const askCommanderInFlight = (text: string): void => {
+    if (session.ended) {
+      guardedWrite('  ◇ the Commander is gone, so nothing can answer that. The dispatch carries on.\n');
+      return;
+    }
+    guardedWrite(
+      session.busy
+        ? '  ◇ the Commander is still answering; this reaches it next.\n'
+        : '  ◇ asked the Commander, with the campaign\'s state from the archive. Its answer prints ' +
+            'whole; Ctrl-C stops it, and the dispatch carries on either way.\n',
+    );
+    commanderChain = commanderChain
+      .then(() => commanderTurnInFlight(text))
+      .catch(() => undefined);
   };
 
   /**
@@ -2862,6 +3071,13 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       const narratedNotes = new Set<string>();
       narrate = guardedProgress((event) => {
         if (event.kind === 'note') narratedNotes.add(event.message);
+        // What a `human-in-flight` turn carries as "recent". Plain and ascii: it is read by a
+        // model, not painted, and it goes through `sanitize` like every other subordinate line.
+        const line = renderProgressEvent(event, { self, charset: 'ascii' });
+        if (line !== '') {
+          recentNarration.push(sanitize(line));
+          if (recentNarration.length > RECENT_NARRATION_MAX) recentNarration.shift();
+        }
         // Before the emit, and inside the guard: the roster is what the reader sees a unit in
         // while the campaign is running, and a dead pipe must not be the reason it goes blank.
         // `sink.emit` is the throwing half; the bookkeeping above it cannot throw at all.
@@ -2949,6 +3165,10 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
       consoleActive = true;
       consoleInterrupted = false;
       stopArmed = false;
+      dispatchStartedAt = nowMs();
+      dispatchObjective = proposal.objective;
+      recentNarration.length = 0;
+      commanderChain = Promise.resolve();
       // Started BEFORE the campaign, so a `/stop` typed in the first second of a dispatch has
       // somewhere to land. Never awaited here: it is a reader, and the dispatch is the work.
       consoleLoop = dispatchConsole();
@@ -3002,6 +3222,14 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           await consoleLoop;
         } catch {
           /* `dispatchConsole` does not throw; this is the belt on top of its own braces */
+        }
+        // Then any Commander answer the console started, so it finishes printing before the
+        // outcome does and the `dispatch-result` turn below never races a turn still in flight.
+        // A line chained but not yet started sees `dispatchInFlight` false and requeues itself.
+        try {
+          await commanderChain;
+        } catch {
+          /* every link of the chain catches; this is the belt on top of its own braces */
         }
         // The tree stops being LIVE the moment the campaign does, and one last read is taken on
         // the way down so `/work` answers from the ending rather than from the last poll.
@@ -3201,9 +3429,11 @@ export const SLASH_HELP = `
   Ctrl-D         leave
   Up / Down      the lines you have already typed
 
-  While a dispatch runs the prompt is still yours. /stop, /work, /next and /help answer there and
-  then; a question that reaches you is answered by typing; and anything else (/status, /exit, a
-  sentence for the Commander) is queued and runs the moment the dispatch settles.
+  While a dispatch runs the prompt is still yours. /stop, /work, /next, /status and /help answer
+  there and then; a question that reaches you is answered by typing; a sentence for the Commander
+  reaches it now, with the campaign's state read from the archive, and its answer prints whole
+  when it is done (Ctrl-C stops the answer, never the campaign); /exit is queued and runs the
+  moment the dispatch settles.
 
   The commander's whole loadout is one inert tool, TodoWrite. It is one rather than none
   because an emptied allow-list makes the launcher omit --allowedTools altogether, and the

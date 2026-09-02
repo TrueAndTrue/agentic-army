@@ -2636,11 +2636,13 @@ describe('a worker\'s question reaches the human and the answer resumes the work
     assert.match(io.transcript, /worktree released/, io.transcript);
   });
 
-  it('A LINE TYPED FOR THE COMMANDER IS NOT AN ANSWER — it stays queued, and is delivered later', async () => {
+  it('A LINE TYPED FOR THE COMMANDER IS NOT AN ANSWER — it reaches the Commander, never the worker', async () => {
     // THE DEFECT, end to end. `how long is this going to take?` is typed at the composer while
-    // the dispatch runs; it is queued, as designed. The answer prompt then came up and drained
-    // the queue straight into it, so an idle question became a design decision written into the
-    // resumed Engineer's orders.md under "This is a DECISION TAKEN ABOVE YOU".
+    // the dispatch runs. When such lines were queued for the settle, the answer prompt came up
+    // and drained the queue straight into it, so an idle question became a design decision
+    // written into the resumed Engineer's orders.md under "This is a DECISION TAKEN ABOVE YOU".
+    // The line now reaches the Commander as a turn while the dispatch runs; the property is the
+    // same: it must never reach a worker.
     const rig = LADDER_RIG('ladder-typeahead');
     const io = createScriptedIo(['we need multiply', 'y'], { open: true });
     const running = chat(rig, io, { maxAttempts: 1 });
@@ -2672,12 +2674,11 @@ describe('a worker\'s question reaches the human and the answer resumes the work
       'the queued line resumed the work as though it were a decision',
     );
     // And it was not thrown away either — it reached the person it was addressed to, unchanged,
-    // as an ordinary turn once the dispatch was over.
+    // as a `human-in-flight` turn while the dispatch was still running.
     const turns = readNulSeparated(rig.commanderTurnLog);
-    assert.ok(
-      turns.some((turn) => turn.includes('how long is this going to take?')),
-      `the queued line never reached the Commander:\n${turns.join('\n---\n')}`,
-    );
+    const carried = turns.find((turn) => turn.includes('how long is this going to take?'));
+    assert.ok(carried !== undefined, `the line never reached the Commander:\n${turns.join('\n---\n')}`);
+    assert.match(carried, /"kind":"human-in-flight"/u, carried);
     assert.equal(result.dispatches[0]?.outcome, 'engineer-failed');
   });
 
@@ -2747,7 +2748,11 @@ describe('a worker\'s question reaches the human and the answer resumes the work
       io.feed('/stop');
       await waitFor(() => io.transcript.includes('/stop ends the campaign'), 20000, 're-arming');
       io.feed('coerce it, and say so in the README');
-      await waitFor(() => io.requeued.length > 0, 20000, 'the line to reach the queue');
+      await waitFor(
+        () => readNulSeparated(rig.commanderTurnLog).some((turn) => turn.includes('coerce it')),
+        20000,
+        'the line to reach the Commander',
+      );
       io.sendInterrupt();
       await waitFor(
         () => io.transcript.includes('no answer. the campaign carries on without one.'),
@@ -2765,7 +2770,11 @@ describe('a worker\'s question reaches the human and the answer resumes the work
       );
     }
     assert.equal(readNulSeparated(rig.engineerOrdersLog).length, 1);
-    assert.deepEqual([...io.requeued], ['coerce it, and say so in the README']);
+    // It reached the Commander as an in-flight turn, DURING the dispatch, not as a queued line
+    // afterwards: the turn that carries it also carries a situation.
+    const carried = readNulSeparated(rig.commanderTurnLog).find((turn) => turn.includes('coerce it'));
+    assert.ok(carried !== undefined);
+    assert.match(carried, /"kind":"human-in-flight"/u, carried);
     // And the campaign was NOT stopped by any of it.
     assert.ok(!io.transcript.includes('stopping. The campaign kills its workers'), io.transcript);
   });
@@ -5319,6 +5328,181 @@ describe('a question reaches the human as a block, not as an interruption', () =
       );
     });
     assert.match(io.transcript, /answered cpt-01: the workstream resumes with it\./u, io.transcript);
+  });
+});
+
+// -----------------------------------------------------------------------------------------------
+// THE COMMANDER STAYS AVAILABLE WHILE A CAMPAIGN RUNS.
+//
+// The design's largest interface consequence of a non-blocking campaign, and the reason to have
+// one: a sentence typed during a dispatch reaches the Commander NOW, with the campaign's state
+// read from the archive, and the answer prints whole. What it does not do is propose work, and
+// what Ctrl-C does to it is stop the answer and nothing else.
+// -----------------------------------------------------------------------------------------------
+
+describe('the Commander stays available while a campaign runs', () => {
+  const IN_FLIGHT_RIG = (
+    label: string,
+    inFlightReply: string,
+    options: { slowTurns?: number[]; engineerDelayMs?: number } = {},
+  ): Rig =>
+    makeRig(
+      label,
+      [
+        'at your orders.',
+        `on it.\n\n${dispatchBlock('add a multiply function to calc.js')}`,
+        inFlightReply,
+        'it landed.',
+      ],
+      { engineerDelayMs: options.engineerDelayMs ?? 1500, ...(options.slowTurns === undefined ? {} : { slowTurns: options.slowTurns }) },
+    );
+
+  it('a sentence typed during a dispatch is answered before the dispatch settles, from the archive', async () => {
+    const rig = IN_FLIGHT_RIG('in-flight-answer', 'the engineer is cutting the branch; nothing to decide yet.');
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true });
+    const running = chat(rig, io);
+
+    const result = await settling(running, io, async () => {
+      await waitFor(() => io.transcript.includes('dispatched (claude'), 20000, 'the Engineer');
+      io.feed('what is happening?');
+      await waitFor(() => io.transcript.includes('nothing to decide yet.'), 20000, 'the answer');
+      await waitFor(() => io.transcript.includes('worktree released'), 25000, 'the dispatch');
+    });
+
+    const shown = io.transcript;
+    // Answered WHILE the dispatch ran: the answer is on screen before the lease came back.
+    assert.ok(
+      shown.indexOf('nothing to decide yet.') < shown.indexOf('worktree released'),
+      `the answer waited for the dispatch to settle:\n${shown}`,
+    );
+    assert.match(shown, /asked the Commander, with the campaign's state from the archive/u, shown);
+    // The turn it arrived on says what it is and carries the situation, whitelisted.
+    const turns = readNulSeparated(rig.commanderTurnLog);
+    const raw = turns.find((turn) => turn.includes('what is happening?'));
+    assert.ok(raw !== undefined, `the line never reached the Commander:\n${turns.join('\n---\n')}`);
+    const envelope = JSON.parse(raw) as {
+      kind: string;
+      authority: string;
+      text: string;
+      situation: {
+        objective: string;
+        elapsedMs: number;
+        agentsSpawned: number;
+        concurrency: number;
+        questionsOpen: number;
+        tree: string[];
+        recent: string[];
+        archive: string;
+      };
+    };
+    assert.equal(envelope.kind, 'human-in-flight');
+    assert.equal(envelope.authority, 'session');
+    assert.equal(envelope.text, 'what is happening?');
+    assert.equal(envelope.situation.objective, 'add a multiply function to calc.js');
+    assert.ok(envelope.situation.elapsedMs >= 0);
+    assert.equal(envelope.situation.agentsSpawned, 1);
+    assert.equal(envelope.situation.concurrency, 1);
+    assert.equal(envelope.situation.questionsOpen, 0);
+    // The tree is the archive's, through the same model the status block draws: the unit is in
+    // it, with the task it belongs to.
+    assert.ok(
+      envelope.situation.tree.some((row) => row.includes('cpt-01')),
+      `the tree does not name the unit:\n${envelope.situation.tree.join('\n')}`,
+    );
+    assert.ok(
+      envelope.situation.recent.some((line) => line.includes('cpt-01 dispatched')),
+      `recent narration is missing the dispatch line:\n${envelope.situation.recent.join('\n')}`,
+    );
+    assert.ok(envelope.situation.archive.endsWith(result.dispatches[0]?.campaignId ?? '\u0000'));
+    // The whitelist holds: nothing but the named keys crosses.
+    assert.deepEqual(
+      Object.keys(envelope.situation).sort(),
+      ['agentsSpawned', 'archive', 'concurrency', 'costUsd', 'elapsedMs', 'objective', 'questionsOpen', 'recent', 'tree'],
+    );
+    assert.equal(result.dispatches[0]?.outcome, 'delivered');
+  });
+
+  it('a dispatch block in an in-flight answer is dropped and recorded, and the campaign is untouched', async () => {
+    const rig = IN_FLIGHT_RIG(
+      'in-flight-proposal',
+      `while we wait, let me also do this.\n\n${dispatchBlock('add a divide function to calc.js')}`,
+    );
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true });
+    const running = chat(rig, io);
+
+    const result = await settling(running, io, async () => {
+      await waitFor(() => io.transcript.includes('dispatched (claude'), 20000, 'the Engineer');
+      io.feed('can you add divide too?');
+      await waitFor(() => io.transcript.includes('was DROPPED'), 20000, 'the refusal');
+      await waitFor(() => io.transcript.includes('worktree released'), 25000, 'the dispatch');
+    });
+
+    assert.match(io.transcript, /while a campaign is in flight and was DROPPED/u, io.transcript);
+    assert.match(io.transcript, /One campaign at a time/u, io.transcript);
+    // Exactly one dispatch ran. The second objective never became a prompt, let alone a process.
+    assert.equal(result.dispatches.length, 1);
+    assert.equal(io.prompts.filter((prompt) => prompt === CONFIRM_PROMPT).length, 1, 'a second [y/N] was shown');
+    // The objective is named ONCE, inside the refusal, so a reader knows what was dropped. It is
+    // never shown as a proposal.
+    assert.equal(io.transcript.split('proposed objective').length - 1, 1, io.transcript);
+    assert.equal(result.dispatches[0]?.outcome, 'delivered');
+  });
+
+  it('Ctrl-C during an in-flight answer stops the answer, and the campaign keeps its lease', async () => {
+    // Turn 3 is slow: it says `thinking about it — ` and then stalls for five seconds, which is
+    // the window a person reaches for Ctrl-C in.
+    const rig = IN_FLIGHT_RIG('in-flight-interrupt', 'here is the long answer you will never see.', {
+      slowTurns: [3],
+      engineerDelayMs: 2500,
+    });
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true });
+    const running = chat(rig, io);
+
+    const result = await settling(running, io, async () => {
+      await waitFor(() => io.transcript.includes('dispatched (claude'), 20000, 'the Engineer');
+      io.feed('what is happening?');
+      await waitFor(() => io.transcript.includes('asked the Commander'), 20000, 'the turn to start');
+      io.sendInterrupt();
+      await waitFor(
+        () => io.transcript.includes("stopping the Commander's answer"),
+        20000,
+        'the interrupt to reach the answer',
+      );
+      await waitFor(() => io.transcript.includes('worktree released'), 30000, 'the dispatch');
+    });
+
+    const shown = io.transcript;
+    // The answer was stopped: what printed is the opening line and not the reply behind the stall.
+    assert.ok(!shown.includes('here is the long answer'), shown);
+    assert.match(shown, /thinking about it/u, shown);
+    // The campaign was NOT the thing stopped, and Ctrl-C did not arm an exit either.
+    assert.ok(!shown.includes('holds a worktree lease'), 'the press was refused as if no answer were in flight');
+    assert.ok(!shown.includes('Ctrl-C again to leave'), shown);
+    assert.ok(!shown.includes('leaving.'), shown);
+    assert.equal(result.dispatches[0]?.outcome, 'delivered');
+    assert.equal(result.exitReason, 'eof');
+  });
+
+  it('/status during a dispatch prints the header there and then', async () => {
+    const rig = IN_FLIGHT_RIG('in-flight-status', 'still going.');
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true });
+    const running = chat(rig, io);
+
+    await settling(running, io, async () => {
+      await waitFor(() => io.transcript.includes('dispatched (claude'), 20000, 'the Engineer');
+      const before = io.transcript.split('COL·COMMANDER — a live session').length;
+      io.feed('/status');
+      await waitFor(
+        () => io.transcript.split('COL·COMMANDER — a live session').length > before,
+        20000,
+        'the header',
+      );
+      await waitFor(() => io.transcript.includes('worktree released'), 25000, 'the dispatch');
+    });
+    // The header printed DURING the dispatch, not after it settled.
+    const shown = io.transcript;
+    const second = shown.indexOf('COL·COMMANDER — a live session', shown.indexOf('COL·COMMANDER — a live session') + 1);
+    assert.ok(second !== -1 && second < shown.indexOf('worktree released'), shown);
   });
 });
 

@@ -903,9 +903,9 @@ Three commands exist because a campaign is no longer something you sit and watch
 be settled rather than dropped. It tells you how many agents it is about to end before it asks.
 Ctrl-C never means this. A line typed while the confirmation is armed and which is not a yes or a
 no is not swallowed as a decline — it is re-routed, so it can still be another slash command, and
-otherwise it is queued for the Commander as your next turn. It is explicitly *not* eligible to
-become a parked worker's answer: a sentence typed at `stop the campaign? [y/N]` was not typed for
-an engineer.
+otherwise it goes to the Commander as an in-flight turn. It is explicitly *not* eligible to become
+a parked worker's answer: a sentence typed at `stop the campaign? [y/N]` was not typed for an
+engineer.
 
 **`/work <id>`** prints one agent or workstream into scrollback: its rank and state and why, its
 task, its harness and model, its worktree, its cost, its branch read off the task rather than off
@@ -919,6 +919,38 @@ anything.
 The session's own budget is on the status block from the first spawn: agents raised against the
 concurrency cap, and what has been spent. A tree that can grow to dozens of agents should never be
 a surprise on a bill.
+
+### The Commander answers while a campaign runs
+
+A sentence typed at the dispatch prompt reaches the Commander then and there. It used to be queued
+until the dispatch settled, which made the Commander the one party in the session you could not
+talk to while the thing it started was running. This is `what is happening?` typed one line after
+the Engineer went out, from a run of the test rig:
+
+```
+  ◇ CPT·ENGINEER · cpt-01 dispatched (claude, attempt 1)
+  ◇ asked the Commander, with the campaign's state from the archive. Its answer prints whole; Ctrl-C stops it, and the dispatch carries on either way.
+
+◆ the engineer is cutting the branch; nothing to decide yet.
+  ◇ CPT·ENGINEER · cpt-01 returned ok – cut army/t-ef7f3ea6530d and committed attempt 1
+```
+
+The turn it arrives on is `human-in-flight`, and it carries a `situation` this process wrote from
+the campaign's archive: the approved objective, how long the campaign has run, agents raised
+against the concurrency cap, spend, open questions, the live tree as `army view` prints it, and
+the last dozen narration lines. The Commander holds no `Read` and no shell, so that block is the
+whole of what it knows about the campaign, and its standing orders tell it to answer from it and
+to say so when the block does not say.
+
+Three rules hold around it. The answer prints **whole**, once the turn settles, because a reply
+streamed a word at a time through the gutter would have `cpt-02 dispatched` printed into the
+middle of one of its paragraphs. **Ctrl-C stops that answer** and nothing else: the campaign keeps
+its lease, and the press does not arm an exit. And the turn carries **session authority**, so a
+dispatch or recce block written in it is dropped and recorded with the reason (one campaign at a
+time; the `[y/N]` that approves one cannot be shown while the console holds the read). The
+console keeps reading throughout, so `/stop` is one line away for as long as the Commander takes.
+`/status` prints the header there and then. `/exit` is still queued, because leaving while a
+campaign holds worktree leases is the one thing the console must not do on its own.
 
 ### The session tells you where you are
 

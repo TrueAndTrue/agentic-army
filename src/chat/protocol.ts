@@ -494,6 +494,7 @@ export function parseScoutDirective(reply: string): ScoutParse {
 export const TURN_KINDS = [
   'standing-orders',
   'human',
+  'human-in-flight',
   'dispatch-result',
   'dispatch-declined',
   'scout-finding',
@@ -511,6 +512,12 @@ export type TurnKind = (typeof TURN_KINDS)[number];
 export const TURN_AUTHORITY: Record<TurnKind, 'human' | 'session'> = {
   'standing-orders': 'session',
   human: 'human',
+  // The words are the human's, and the authority is still the session's, because authority here
+  // is about whether a proposal can be APPROVED and not about who typed. While a campaign runs
+  // the dispatch console holds the terminal's one read, so the `[y/N]` that approves new work
+  // cannot be shown; a proposal out of this turn would be one nobody can answer. It is deleted
+  // and recorded like any other, and the commander is told so in its standing orders.
+  'human-in-flight': 'session',
   'dispatch-result': 'session',
   'dispatch-declined': 'session',
   // A scout is a subordinate and its finding is a report. It reads the repository and the web,
@@ -617,6 +624,70 @@ function envelope(kind: TurnKind, body: Record<string, unknown>): string {
 /** The human's words, verbatim, as a string value inside an envelope this process labelled. */
 export function renderHumanTurn(text: string): string {
   return envelope('human', { text });
+}
+
+/**
+ * What the commander is told about a campaign that is running, alongside a line the human typed
+ * while it runs.
+ *
+ * ## This type is the whitelist, exactly as `DispatchOutcomeFacts` is
+ *
+ * The commander holds no `Read` and no shell, so what it knows about a running campaign is what
+ * this process tells it, and this is the whole of that. It is built from the ARCHIVE, through the
+ * same `TreeModel` the status block and `army view` draw, and never from a stream anybody is
+ * holding open. Every field is a number this process counted, a string it wrote, or SUBORDINATE
+ * TEXT named as such, and the subordinate text has been through `sanitize` before it gets here.
+ */
+export interface SituationFacts {
+  /** The objective the HUMAN approved, from this process's own memory of it. */
+  objective: string;
+  /** Milliseconds since the dispatch was approved. */
+  elapsedMs: number;
+  /** Units raised so far. */
+  agentsSpawned: number;
+  /** How many workstreams may run at once. */
+  concurrency: number;
+  /** Spend reported so far, or null when no harness has reported one. */
+  costUsd: number | null;
+  /** Worker questions waiting on the human right now. */
+  questionsOpen: number;
+  /**
+   * SUBORDINATE TEXT in part. The live tree, one row per line, as `army view` prints it. A unit's
+   * `doing` cell is its own account of itself.
+   */
+  tree: string[];
+  /** SUBORDINATE TEXT in part. The most recent narration lines, oldest first. */
+  recent: string[];
+  /** Where the whole thing can be read back. A pointer, not the thing. */
+  archive: string;
+
+  // ---- structurally unreachable, on purpose -------------------------------------------------
+  /** @deprecated Never. */
+  result?: never;
+  /** @deprecated Never. */
+  report?: never;
+  /** @deprecated Never. */
+  events?: never;
+  /** @deprecated Never. */
+  transcript?: never;
+}
+
+/** The human's words, with this process's account of the campaign they were typed during. */
+export function renderHumanTurnInFlight(text: string, situation: SituationFacts): string {
+  return envelope('human-in-flight', {
+    text,
+    situation: {
+      objective: situation.objective,
+      elapsedMs: situation.elapsedMs,
+      agentsSpawned: situation.agentsSpawned,
+      concurrency: situation.concurrency,
+      costUsd: situation.costUsd,
+      questionsOpen: situation.questionsOpen,
+      tree: situation.tree,
+      recent: situation.recent,
+      archive: situation.archive,
+    },
+  });
 }
 
 /** The opening turn: the commander's standing orders. */

@@ -14,7 +14,7 @@ true and lends the stale half its credibility. So the two are separated here and
 
 - **Part 1 is the design.** It does not change when code lands. If the code disagrees with it, one
   of the two is wrong and that is worth an argument.
-- **Part 2 is what is built**, as of `d40e1fa`, with the measurements taken along the way that are
+- **Part 2 is what is built**, wave by wave, with the measurements taken along the way that are
   worth keeping.
 - **Part 3 is what is not built.** Short, current, and the only section that should ever need
   editing when something ships.
@@ -521,6 +521,46 @@ unconditionally. `planning.spec_to_repo` also writes them into the checkout and 
 because a rejected branch should not strand design documents in the repo. One builder renders both
 copies, so they are byte-identical by construction rather than by a test.
 
+## Wave 6 — the Commander during a campaign
+
+Part 1's "the Commander stays available while a campaign runs" is now what happens, and the
+mechanism is smaller than the gap it closed. A sentence typed at the dispatch console becomes a
+`human-in-flight` turn as soon as the Commander is free. The console never waits on it: the turn is
+chained on a promise the console does not await, so `/stop` is one line away for as long as the
+model takes, and the dispatch's `finally` waits for the chain after the console so an answer in
+flight finishes printing before the outcome does.
+
+"Answers from the archive" is literal. The turn carries `SituationFacts`, a whitelist type in the
+same family as `DispatchOutcomeFacts`, built from the same `TreeModel` the status block draws and
+`army view` prints, rendered by the same function at a width nothing clips, plus the last dozen
+narration lines, the approved objective, elapsed time, agents against the cap, spend and open
+questions. Nothing in it reads a stream a worker is writing to. The Commander's standing orders say
+that this block is the whole of what it knows and to say so when the block does not say.
+
+Three decisions are worth stating.
+
+**The answer prints whole.** During a dispatch the terminal's live thing is the campaign; narration
+lines land whenever a worker does something. A reply streamed through the prose gutter would have
+`cpt-02 dispatched` printed into the middle of a paragraph, so the chunks are held and `turn.text`
+is printed as one block when the turn settles, the same way a worker's question arrives.
+
+**The turn carries session authority, and the reason is timing.** Authority in this protocol is
+about whether a proposal can be APPROVED, and the `[y/N]` that approves one cannot be shown while
+the console holds the terminal's one read. A dispatch or recce block in an in-flight reply is
+deleted and recorded with a reason that says so, rather than the report-shaped reason the other
+session-authority turns use, because the words were the human's.
+
+**Ctrl-C keeps meaning "stop this answer".** A new branch in the interrupt handler sits between the
+gate and the lease refusal: a Commander answer in flight during a dispatch is interrupted, the
+campaign keeps its lease, and the press does not arm an exit. The pin is a test that sends the
+interrupt during a stalled in-flight turn and asserts the lease refusal never printed, the exit was
+never armed, and the dispatch delivered.
+
+The property from wave 5 held without a change: a line typed for the Commander still cannot become
+a worker's decision, because the console's routing is what decides where a line goes, and the
+in-flight turn is one more destination that routing hands to. The two tests that pinned "it reaches
+the Commander, never the worker" pass with the delivery moved from after the dispatch to during it.
+
 ## One property, broken three times, now structural
 
 A line typed for one reader must never be delivered to a different one. It broke through the
@@ -537,13 +577,12 @@ compile error rather than a missing guard.
 Five things. Each is a design intent above that the code does not yet meet, and each is stated as
 what a reader would find rather than as a plan.
 
-**A campaign is still a blocking call, so the Commander is not available while one runs.**
-`runDispatch` calls `runCampaign` and waits for one JSON envelope. What wave 4 added is a dispatch
-*console*, which is not the same thing: a question, `/stop`, `/work`, `/next` and `/help` are
-answered there and then, and **anything else — including a sentence for the Commander — is queued
-and reaches it the moment the dispatch settles**. Part 1's "you can ask what is happening, and the
-Commander answers from the archive" is not what happens. This is the largest remaining gap between
-the design and the code, and it is the one the design called the reason to do the rest.
+**One campaign at a time.** `runDispatch` still calls `runCampaign` and waits for one JSON
+envelope; what changed in wave 6 is that the Commander takes turns while it waits. A second
+dispatch cannot be approved until the first settles, and a proposal written during one is dropped
+and recorded rather than parked. The design does not ask for concurrent campaigns and this document
+does not promise them; it is recorded here because "the Commander stays available" could be read as
+"the Commander can start more work", and it cannot.
 
 **A scout on the `army campaign` path.** That command takes an objective off a command line and has
 no conversation in which to have asked for a recce, so `CampaignOptions.scoutFindings` is empty

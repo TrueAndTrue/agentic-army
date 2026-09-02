@@ -66,6 +66,7 @@ import type {
   ScoutOutcomeFacts,
   ScoutRequest,
   TurnKind,
+  SituationFacts,
 } from './protocol.ts';
 import {
   TURN_AUTHORITY,
@@ -74,6 +75,7 @@ import {
   renderDispatchDeclined,
   renderDispatchResult,
   renderHumanTurn,
+  renderHumanTurnInFlight,
   renderScoutDeclined,
   renderScoutFinding,
   renderStandingOrdersTurn,
@@ -320,9 +322,14 @@ export class ChatSession {
         // reverses the rendered order of everything after it) exactly as they were. The quoting
         // here is for readability; `parseDispatchDirective` is what makes the string safe.
         refusals.push(
-          `a dispatch block was written in answer to a \`${kind}\` turn and was DROPPED. New ` +
-            'intent comes from the Commander typing, never from a report a subordinate wrote. ' +
-            `The objective it named was: ${JSON.stringify(parsed.request.objective.slice(0, 160))}`,
+          kind === 'human-in-flight'
+            ? 'a dispatch block was written while a campaign is in flight and was DROPPED. One ' +
+                'campaign at a time: nothing can be approved until this one settles, so say what ' +
+                'you would propose and propose it when the result arrives. The objective it ' +
+                `named was: ${JSON.stringify(parsed.request.objective.slice(0, 160))}`
+            : `a dispatch block was written in answer to a \`${kind}\` turn and was DROPPED. New ` +
+                'intent comes from the Commander typing, never from a report a subordinate wrote. ' +
+                `The objective it named was: ${JSON.stringify(parsed.request.objective.slice(0, 160))}`,
         );
       }
     } else if (parsed.reason !== 'no dispatch was requested') {
@@ -340,9 +347,13 @@ export class ChatSession {
         // Neutralised by `parseScoutDirective`, not by the `JSON.stringify` below — see the
         // dispatch half above for what that call does and does not escape.
         refusals.push(
-          `a recce block was written in answer to a \`${kind}\` turn and was DROPPED. A scout is ` +
-            'raised because the Commander asked for one, never because a report suggested it. ' +
-            `The question it named was: ${JSON.stringify(scouted.request.question.slice(0, 160))}`,
+          kind === 'human-in-flight'
+            ? 'a recce block was written while a campaign is in flight and was DROPPED. The ' +
+                'prompt that sends a scout cannot be shown until the campaign settles; ask then. ' +
+                `The question it named was: ${JSON.stringify(scouted.request.question.slice(0, 160))}`
+            : `a recce block was written in answer to a \`${kind}\` turn and was DROPPED. A scout is ` +
+                'raised because the Commander asked for one, never because a report suggested it. ' +
+                `The question it named was: ${JSON.stringify(scouted.request.question.slice(0, 160))}`,
         );
       }
     } else if (scouted.reason !== 'no recce was requested') {
@@ -374,6 +385,27 @@ export class ChatSession {
   /** A turn the human typed. The only kind that can produce a proposal. */
   async humanTurn(text: string): Promise<HumanTurnResult> {
     return this.runTurn(renderHumanTurn(text), 'human');
+  }
+
+  /**
+   * A turn the human typed WHILE A CAMPAIGN RUNS, with this process's account of the campaign
+   * alongside it.
+   *
+   * Session authority, and the reason is timing rather than source: the words are the human's,
+   * but the one place new work is approved is the `[y/N]` prompt, and that prompt cannot be
+   * shown while the dispatch console holds the terminal's one read. A proposal out of this turn
+   * is one nobody can answer, so it is deleted and recorded, exactly as it is on a report.
+   *
+   * Takes `SituationFacts`, which is a whitelist. There is no overload that accepts a tree model,
+   * a roster or a campaign result, so what the commander is told about a running campaign is
+   * classified once, in a type.
+   */
+  async humanTurnInFlight(text: string, situation: SituationFacts): Promise<TurnResult> {
+    const { proposal: _dropped, scoutProposal: _alsoDropped, ...turn } = await this.runTurn(
+      renderHumanTurnInFlight(text, situation),
+      'human-in-flight',
+    );
+    return turn;
   }
 
   /**

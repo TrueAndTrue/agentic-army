@@ -389,6 +389,24 @@ export function renderStandingOrders(input: StandingOrdersInput): string {
       'follow-up work, say what you would do next and wait to be asked.',
   );
   lines.push('');
+  lines.push('## WHILE A CAMPAIGN RUNS');
+  lines.push('');
+  lines.push(
+    'A line the Commander types while a dispatch is running reaches you as a `human-in-flight` ' +
+      'turn. It carries a `situation` this process wrote from the campaign\'s archive: the ' +
+      'objective, how long it has run, the live tree of units with what each is doing, open ' +
+      'questions, spend, and the last narration lines. ANSWER FROM IT. You are not holding a ' +
+      'stream open and nothing else will arrive; what the situation says is what is known, and ' +
+      'if it does not say, say that.',
+  );
+  lines.push('');
+  lines.push(
+    'That turn carries `authority: "session"`. A dispatch or recce block written in it is ' +
+      'dropped and recorded, because the [y/N] prompt that approves one cannot be shown while ' +
+      'the campaign holds the terminal. If the Commander asks for more work, say what you would ' +
+      'propose and propose it when the `dispatch-result` turn arrives.',
+  );
+  lines.push('');
   lines.push('## THIS SESSION');
   lines.push('');
   lines.push(`- Project: \`${project}\``);
