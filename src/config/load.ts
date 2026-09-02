@@ -279,9 +279,20 @@ function parsePermissions(raw: unknown, warnings: string[]): PermissionsConfig {
 }
 
 /**
- * The one sentence a reader needs about the posture this run is operating under. Exported so the
- * campaign note, the chat banner and the test that pins the wording all say the same thing.
+ * The one sentence a reader needs about the posture this run is operating under.
+ *
+ * Two lengths, one set of facts. `postureNotice` is the paragraph the campaign prints as a note
+ * before its first spawn. `postureSummary` is the row the chat banner carries, cut to fit one
+ * fact line at 80 columns. `test/contracts.test.ts` pins that both name the same posture and that
+ * the unguarded forms both say what still holds, so the two cannot drift into describing
+ * different runs.
  */
+export function postureSummary(mode: PermissionPosture): string {
+  return mode === 'unguarded'
+    ? 'unguarded · any command; rank narrowing, denies, sandbox hold'
+    : 'guarded · every command must match the allow-list verbatim';
+}
+
 export function postureNotice(mode: PermissionPosture): string {
   return mode === 'unguarded'
     ? 'permissions: unguarded — workers hold their tools unscoped, so an Engineer runs any ' +

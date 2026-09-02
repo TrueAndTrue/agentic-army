@@ -33,10 +33,23 @@ import { clipTo, formatAge, glyphsFor } from '../view/render.ts';
 import type { TaskNodeView, TreeModel, UnitNode } from '../view/tree.ts';
 import { walkTree } from '../view/tree.ts';
 
+/**
+ * What a read of one archive file found.
+ *
+ * Three outcomes and not two, because `/work` prints into a conversation and "no diff was ever
+ * written" and "a diff exists and is bigger than this command will open" send a reader to
+ * different places: the first to wait, the second to the path.
+ */
+export type SnapshotFile =
+  | { kind: 'content'; text: string }
+  /** Absent or unreadable. */
+  | { kind: 'absent' }
+  /** Present, and larger than the reader's cap. `bytes` is its size on disk. */
+  | { kind: 'too-large'; bytes: number };
+
 /** File access, injected so the renderer stays testable without an archive on disk. */
 export interface SnapshotFiles {
-  /** File contents, or null when it is absent, unreadable, or larger than this reader will take. */
-  read(file: string): string | null;
+  read(file: string): SnapshotFile;
 }
 
 export interface WorkSnapshotInput {
@@ -116,6 +129,13 @@ function knownIds(model: TreeModel): { agents: string[]; tasks: string[] } {
     else tasks.push(row.node.taskId);
   }
   return { agents, tasks };
+}
+
+/** `4.2 MiB`, `812 KiB`, `310 B`. For a size that is the whole message. */
+export function describeBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${String(Math.round(bytes / 1024))} KiB`;
+  return `${String(bytes)} B`;
 }
 
 export function renderWorkSnapshot(input: WorkSnapshotInput, files: SnapshotFiles): string {
@@ -199,10 +219,12 @@ function appendFiles(
   if (root === null) return;
   const ordersFile = ordersPath(root, agentId);
   const orders = files.read(ordersFile);
-  if (orders === null) {
+  if (orders.kind === 'absent') {
     field('orders', `not written yet ${g.bullet} ${ordersFile}`);
+  } else if (orders.kind === 'too-large') {
+    field('orders', `${describeBytes(orders.bytes)}, over what /work opens ${g.bullet} ${ordersFile}`);
   } else {
-    const rows = orders.split('\n');
+    const rows = orders.text.split('\n');
     const shown = rows.slice(0, ORDERS_PREVIEW_LINES);
     field(
       'orders',
@@ -213,12 +235,17 @@ function appendFiles(
       push(`      ${g.boxV} ${g.ellipsis} ${String(rows.length - shown.length)} more lines`);
     }
   }
-  const patch = files.read(diffPath(root, agentId));
-  if (patch === null) {
+  const patchFile = diffPath(root, agentId);
+  const patch = files.read(patchFile);
+  if (patch.kind === 'absent') {
     field('diff', `none recorded ${g.bullet} the attempt has not been read back yet`);
     return;
   }
-  const stat = diffStat(patch);
+  if (patch.kind === 'too-large') {
+    field('diff', `${describeBytes(patch.bytes)}, over what /work opens ${g.bullet} ${patchFile}`);
+    return;
+  }
+  const stat = diffStat(patch.text);
   field(
     'diff',
     `${String(stat.files)} file${stat.files === 1 ? '' : 's'} ${g.bullet} ` +

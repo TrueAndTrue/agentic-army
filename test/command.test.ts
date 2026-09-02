@@ -10248,6 +10248,15 @@ describe("the INSPECTOR's test write — granted, and contained by construction 
     assert.match(validator.orders, /TESTS A REVIEWER WROTE/);
     assert.match(validator.orders, /- `test\/parser\.test\.js`/);
     assert.match(validator.orders, /- `test\/renderer\.test\.js`/);
+    // WHAT THE BRIEFS SAY MATCHES WHAT THE TREES SHOW. Both used to describe the tests as
+    // committed on the branch the reader stood in, and the ls-tree assertions below are what made
+    // that false. A model acting on a wrong fact about where its work lands is the class of
+    // defect a briefing exists to prevent, so the wording is pinned to the mechanism.
+    const permanentInspector = rig.inspectorSpecs.find((s) => s.role === 'INSPECTOR') as SoldierSpec;
+    assert.match(permanentInspector.orders, /Tests you write here are HELD, not committed here/);
+    assert.ok(!permanentInspector.orders.includes('commits the test paths onto this branch'));
+    assert.match(validator.orders, /they are NOT committed/);
+    assert.ok(!validator.orders.includes('are committed on this branch'));
     for (const ws of result.workstreams) {
       const tree = git(repo, 'ls-tree', '-r', '--name-only', ws.branch);
       for (const written of ['test/parser.test.js', 'test/renderer.test.js']) {

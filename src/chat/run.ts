@@ -81,10 +81,11 @@ import type { CampaignResult } from '../command/campaign.ts';
 import { renderScoutBrief } from '../command/orders.ts';
 import { describeFanOutHalt, fanOutHaltLine, runRecce, watchFanOut } from '../command/scout.ts';
 import type { RecceOutcome, ScoutSpawn } from '../command/scout.ts';
-import { loadConfig } from '../config/load.ts';
+import { loadConfig, postureSummary } from '../config/load.ts';
 import { armyHome } from '../config/paths.ts';
 import type { Env } from '../config/paths.ts';
 import { RUNG_LABEL, effectiveRung } from '../contracts/delivery.ts';
+import type { PermissionPosture } from '../contracts/config.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import type { TaskRow } from '../contracts/archive.ts';
 import type { HarnessAdapter, HarnessId, Soldier, SoldierEvent, SoldierSpec } from '../contracts/harness.ts';
@@ -148,6 +149,7 @@ import type { InterrogationTurn, PlanningRecord } from './planning.ts';
 import type { DispatchRequest, ScoutRequest } from './protocol.ts';
 import { ChatSession } from './session.ts';
 import { renderWorkSnapshot } from './snapshot.ts';
+import type { SnapshotFile } from './snapshot.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Options and result
@@ -426,7 +428,8 @@ export const INTERROGATION_HALF_MAX_CHARS = 4000;
  * An `orders.md` is kilobytes; a `diff.patch` is a worker's entire branch and has no upper bound
  * anybody has promised. This command runs inside a live conversation, on the same thread as the
  * composer, so it reads to count and must not be able to pull a hundred megabytes into memory to
- * do it. Over the cap the field says so rather than lying about a file it did not read.
+ * do it. Over the cap the reader returns `too-large` with the size, and the field prints that
+ * size and the path, rather than "none recorded" about a file that is there.
  */
 export const WORK_FILE_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -459,6 +462,12 @@ export interface BannerFacts {
   rung: Rung;
   /** The commander's model id, or empty when the harness was left to pick its own. */
   model: string;
+  /**
+   * The permission posture every worker this session dispatches is built under. On the banner
+   * because the banner is the one surface a person looks at for an hour, and under `unguarded`,
+   * which is what `army init` writes, an Engineer runs any command rather than a listed one.
+   */
+  posture: PermissionPosture;
   campaignId: string;
   archiveRoot: string;
 }
@@ -492,6 +501,7 @@ export function chatBanner(facts: BannerFacts, style: ChromeStyle): string {
         { key: 'path', value: facts.project },
         { key: 'branch', value: repo },
         { key: 'commander', value: facts.model === '' ? 'claude' : `claude · ${facts.model}` },
+        { key: 'permissions', value: postureSummary(facts.posture) },
         {
           key: 'ceiling',
           value:
@@ -829,6 +839,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
             ceiling,
             rung: requestedRung,
             model: commanderSpec.model ?? '',
+            posture: config.permissions.mode,
             campaignId,
             archiveRoot: archive.root,
           },
@@ -1778,16 +1789,16 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
           width: io.width,
         },
         {
-          read(file: string): string | null {
+          read(file: string): SnapshotFile {
             try {
-              // Read whole, then cap. An `orders.md` is kilobytes and a `diff.patch` can be a
+              // Stat first, then read. An `orders.md` is kilobytes and a `diff.patch` can be a
               // worker's entire branch, so the cap is what keeps a command that prints into a
               // conversation from loading a hundred megabytes to count its lines.
               const stat = fs.statSync(file);
-              if (stat.size > WORK_FILE_MAX_BYTES) return null;
-              return fs.readFileSync(file, 'utf8');
+              if (stat.size > WORK_FILE_MAX_BYTES) return { kind: 'too-large', bytes: stat.size };
+              return { kind: 'content', text: fs.readFileSync(file, 'utf8') };
             } catch {
-              return null;
+              return { kind: 'absent' };
             }
           },
         },
@@ -2283,6 +2294,7 @@ export async function runChat(options: ChatOptions): Promise<ChatResult> {
               ceiling,
               rung: requestedRung,
               model: spec.model ?? '',
+              posture: config.permissions.mode,
               campaignId,
               archiveRoot: archive.root,
             },

@@ -928,22 +928,29 @@ repository, on a branch, with or without uncommitted changes — and the one com
 where that place was never named was the one that dispatches Engineers into it.
 
 ```
+
 ╭───────────────────────────────────────────────────────╮
 │ ◆ COL·COMMANDER — a live session                      │
 │ it holds the objective, and one inert tool: TodoWrite │
 ╰───────────────────────────────────────────────────────╯
 
-  project    calc
-  path       /Users/you/code/calc
-  branch     main · bbaf74f · 3 uncommitted · 2 ahead
-  commander  claude · claude-opus-5
-  ceiling    0 (commit)   dispatches ask for at most 0 (commit)
-  archive    /Users/you/.agentic-army/campaigns/2026-08-07-chat
+  project      calc
+  path         /Users/you/code/calc
+  branch       main · bbaf74f · 3 uncommitted · 2 ahead
+  commander    claude · claude-opus-5
+  permissions  unguarded · any command; rank narrowing, denies, sandbox hold
+  ceiling      0 (commit)   dispatches ask for at most 0 (commit)
+  archive      /Users/you/.agentic-army/campaigns/2026-08-07-chat
 
   every dispatch is reviewed by an independent Inspector
   Ctrl-C stops the answer in flight · a second one leaves · /help for the rest
   army view 2026-08-07-chat   reads this conversation back
 ```
+
+The `permissions` row is the posture every worker this session dispatches is built under, and it
+is on the header because the header is what a person looks at for an hour. `army init` writes
+`unguarded`, under which an Engineer runs any command rather than a listed one; the row says so,
+and says what still holds.
 
 The block under the prompt is repainted in place rather than scrolled, so it is still there an
 hour later. Its last row is the context row and never moves, so the eye learns one position: the

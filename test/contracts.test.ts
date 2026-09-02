@@ -119,6 +119,8 @@ import {
   loadConfig,
   missingConfigWarning,
   parseConfig,
+  postureNotice,
+  postureSummary,
   readProjectCeiling,
   upsertProjectEntry,
   writeProjectCeiling,
@@ -3174,4 +3176,25 @@ test('planning.spec_to_repo is readable when set, and a malformed value warns ra
   const notATable = parseConfig('planning = 3\n', '/tmp/h/config.toml');
   assert.equal(notATable.config.planning.specToRepo, false);
   assert.ok(notATable.warnings.some((w) => w.startsWith('planning:')));
+});
+
+test('the posture note and the banner row describe the same run', () => {
+  // The campaign prints `postureNotice` before its first spawn; the chat banner carries
+  // `postureSummary` for the hour a person spends looking at it. Two lengths of one fact, and
+  // this is what keeps them from drifting into two facts.
+  for (const mode of ['guarded', 'unguarded'] as const) {
+    assert.ok(postureNotice(mode).startsWith(`permissions: ${mode}`), mode);
+    assert.ok(postureSummary(mode).startsWith(`${mode} `), mode);
+    // The banner indents two, pads the key to eleven and adds two more before the value, so a
+    // value over 64 characters is clipped with an ellipsis at 80 columns.
+    assert.ok(postureSummary(mode).length <= 64, `a banner row must fit 80 columns: ${postureSummary(mode)}`);
+  }
+  // Under unguarded, both say what STILL holds, because that is the sentence a reader who has
+  // just seen "any command" needs next.
+  for (const still of ['rank narrowing', 'sandbox']) {
+    assert.ok(postureNotice('unguarded').includes(still), still);
+    assert.ok(postureSummary('unguarded').includes(still), still);
+  }
+  assert.ok(postureNotice('guarded').includes('allow-list verbatim'));
+  assert.ok(postureSummary('guarded').includes('allow-list verbatim'));
 });

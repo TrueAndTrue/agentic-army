@@ -18,9 +18,9 @@ true and lends the stale half its credibility. So the two are separated here and
   worth keeping.
 - **Part 3 is what is not built.** Short, current, and the only section that should ever need
   editing when something ships.
-- **Part 4 is where the code disagrees with its own prose** — sentences a model or a reader is
-  handed that stopped being true. Found while writing the README; recorded here rather than fixed,
-  because fixing them is a code change and this is a document.
+- **Part 4 is where the code disagreed with its own prose** — sentences a model or a reader was
+  handed that had stopped being true. Found while writing the README, fixed afterwards, and kept
+  here as a list of the shapes that failure took, because each one will be written again.
 
 ---
 
@@ -576,42 +576,51 @@ is what climbs the ladder.
 
 ---
 
-# Part 4 — where the code disagrees with its own prose
+# Part 4 — where the code disagreed with its own prose
 
-Six sentences that a reader or a model is handed and that stopped being true — or were never true —
-as the mechanism moved underneath them. None is a behaviour defect; all six are documentation
-defects inside the code, which is the kind this project treats as a defect rather than as
-untidiness — two of them are handed to a model as fact. Recorded, not fixed, because fixing them
-is a code change and this is a document.
+Seven sentences a reader or a model was handed that had stopped being true, or were never true, as
+the mechanism moved underneath them. None was a behaviour defect. All seven were documentation
+defects inside the code, which this project treats as defects, and three of them were handed to a
+model as fact. All seven are fixed, and the three that reach a model are pinned by tests that
+assert the wording against the mechanism, so the sentence and the tree it describes cannot drift
+apart again without a red test.
 
-1. **`renderTestWriteSection`, permanent mode, tells an inspector "the supervisor commits the test
-   paths onto this branch, they merge with it".** Since wave 4's fourth precondition it does not:
-   the tests are lifted out of the workstream tree, the tree is put back as if they were temporary,
-   and they are applied to the integration tree instead. Nothing is committed where it was written.
+The shapes are worth more than the instances, because each will recur.
 
-2. **`renderValidatorBrief` tells the validator the reviewer's tests "are committed on this
-   branch".** They are not — `campaign.ts` says so explicitly at the call site four lines above
-   where the brief is built: "They are NOT on the branch yet: whether they ever are is decided a few
-   lines below, by whether this agent came back with a verdict at all."
+**A brief that describes where work lands, written before the landing moved.** Three of the seven.
+`renderTestWriteSection` told a permanent-mode inspector the supervisor commits its tests onto the
+branch it stood in. `renderValidatorBrief` told the validator the reviewer's tests were committed on
+the branch it was validating. Both were true in wave 4's first draft and false from its fourth
+precondition onwards: the tests are lifted out, held in memory, applied uncommitted to the
+integration tree, and committed only after a validator returns a verdict. The briefs now say
+exactly that, and the campaign test that asserts the test files are absent from every workstream
+branch also asserts the two briefs say they are held and not committed. The third was the engineer's
+`blocked` rule, which said a report without a `question` "is a schema error and ends the attempt
+with nothing gained". `Report.question` says, a file away, that the schema deliberately does not
+require it and that such a report is legal and terminal with its summary and findings kept. The
+brief now says the true consequence, which is a stronger reason to ask than the false one was.
 
-3. **`--plain`'s help text says "No session chrome: no boxed header, and no status block pinned
-   under the prompt".** `--plain` suppresses the pinned block only. `io.write(chatBanner(...))` is
-   unconditional, so the boxed header still prints, which is arguably the right behaviour — a header
-   is ordinary output and the README says so — but the flag's own description claims otherwise.
+**A flag's help text describing the flag as first written.** `--plain` said "no boxed header, and
+no status block". It suppresses the block only. The header is ordinary output and the README has
+said so for a wave. The help text now says what the flag does.
 
-4. **`ROLES` in `src/contracts/ranks.ts` still says of `OVERSEER` and `VALIDATOR`: "Neither is
-   spawned by anything in this build."** Both are spawned by `src/command/campaign.ts` — the
-   overseer for segmentation, questions and adjudication, the validator on the integrated branch.
-   The sentence was true when the vocabulary landed in wave 1 and stopped being true in wave 3.
+**A table's commentary written when the table was ahead of the code.** `ROLES` said of `OVERSEER`
+and `VALIDATOR` that neither is spawned by anything in this build. Both have been spawned since wave
+3. The sentence now names the one role that still is not, `SENTRY`, which is the gap `army --help`
+already states.
 
-Two smaller ones:
+**A comment claiming a distinction the type could not carry.** `WORK_FILE_MAX_BYTES` promised that
+over the cap "the field says so rather than lying about a file it did not read", while the reader
+returned `null` for both an absent file and an oversized one, and `/work` rendered both as "none
+recorded, the attempt has not been read back yet". The reader now returns a three-way result, and an
+oversized diff prints its size and its path. The fix is the same one `IntegrationTree.release` got
+in wave 3: a return type that cannot say what happened is a comment waiting to become false.
 
-`WORK_FILE_MAX_BYTES`'s comment claims "Over the cap the field says so rather than lying about a
-file it did not read." The reader returns `null` for an oversized file, and a `null` diff renders
-as "none recorded — the attempt has not been read back yet", which is the lie the comment says it
-avoids.
+**A comment listing callers it wished it had.** `postureNotice` said it was exported "so the
+campaign note, the chat banner and the test that pins the wording all say the same thing". Only the
+campaign note called it, and nothing pinned it, so the one surface a person watches for an hour
+never stated the posture the run was under. The banner now carries a `permissions` row built from
+`postureSummary`, a one-line form of the same fact, and a test holds both forms to the same run.
 
-`postureNotice` says it is "exported so the campaign note, the chat banner and the test that pins
-the wording all say the same thing". Only the campaign note calls it. The chat banner does not
-mention the posture at all, and nothing pins the wording — so on the one surface a person spends an
-hour looking at, the posture the run is operating under is not stated.
+The stranded doc comment on `commitInspectorTests`, which sat above a different function and
+described the pre-wave-4 landing, went in the same pass.

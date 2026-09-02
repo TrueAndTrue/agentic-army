@@ -6676,21 +6676,6 @@ function hasTestDirectory(project: string): boolean {
 }
 
 /**
- * Commit the test paths a reviewer wrote onto the branch it reviewed. The SUPERVISOR does this.
- *
- * ## Why the supervisor and not the reviewer
- *
- * `ROLE_ALLOW.INSPECTOR` holds no git and never will: the branch under review is not the reviewer's
- * to move, and a reviewer that could commit could commit anything. So the reviewer writes files and
- * this process decides whether they become history — which is also the only way the "only test
- * paths" rule can be enforced at the moment it matters, because `git add <these paths>` cannot add
- * a path that is not in the list, whatever else is dirty in the tree.
- *
- * Best effort. A commit that fails leaves the tests in the worktree, which is exactly the
- * `permanent: false` outcome, and that is a degradation rather than a failure: nothing downstream
- * depends on these files existing, and the verdict that referenced them is already in the archive.
- */
-/**
  * Put back everything a reviewer left in a worktree that this process did not commit.
  *
  * ## Why a temporary test has to actually be temporary
@@ -6718,6 +6703,28 @@ async function discardWorkerWrites(worktree: string, files: readonly string[]): 
   await runGit(['clean', '-f', '-q', '--', ...files], { cwd: worktree });
 }
 
+/**
+ * Commit the test paths a reviewer wrote onto the INTEGRATION branch, after a validator ran them
+ * there. The SUPERVISOR does this.
+ *
+ * ## Why the supervisor and not the reviewer
+ *
+ * `ROLE_ALLOW.INSPECTOR` holds no git and never will: the branch under review is not the reviewer's
+ * to move, and a reviewer that could commit could commit anything. So the reviewer writes files and
+ * this process decides whether they become history, which is also the only way the "only test
+ * paths" rule can be enforced at the moment it matters, because `git add <these paths>` cannot add
+ * a path that is not in the list, whatever else is dirty in the tree.
+ *
+ * ## Why the integration branch and not the one the reviewer stood in
+ *
+ * The reviewer's tree is put back as if the tests were temporary the moment its verdict is read
+ * (`holdReviewerTests`). What lands here is the HELD content, re-written immediately before the
+ * add, so a validator that edited a file it was asked to run does not get its edit into history.
+ *
+ * Best effort past the precondition check. A commit that fails returns an empty list, and the
+ * caller withdraws the files rather than leaving the integration tree dirty, because a dirty tree
+ * is one whose merged work cannot be made durable.
+ */
 export async function commitInspectorTests(input: {
   worktree: string;
   branch: string;

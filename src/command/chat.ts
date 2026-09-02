@@ -95,12 +95,12 @@ OPTIONS
   --no-init            Outside a repository, refuse instead of running the
                        auto-init \`${invokedAs()} enlist\` runs: git init plus one empty
                        commit, never in your home directory or a filesystem root.
-  --plain              No session chrome: no boxed header, and no status block
-                       pinned under the prompt. The block is painted with cursor
-                       movement, so this is the escape hatch for a terminal that
-                       reports itself as one and does not honour it — an editor's
-                       embedded console, a CI runner with a PTY. Off a terminal
-                       it is already the default.
+  --plain              No status block pinned under the prompt. The boxed header
+                       still prints, because it is ordinary output; the block is
+                       painted with cursor movement, so this is the escape hatch
+                       for a terminal that reports itself as one and does not
+                       honour it — an editor's embedded console, a CI runner with
+                       a PTY. Off a terminal it is already the default.
   -h, --help           This.
 
 IN THE SESSION

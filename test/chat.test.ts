@@ -136,7 +136,9 @@ import {
   runChat,
 } from '../src/chat/run.ts';
 import { createInbox, inboxPrompt, renderQuestionMarker } from '../src/chat/inbox.ts';
-import { diffStat } from '../src/chat/snapshot.ts';
+import { WORK_FILE_MAX_BYTES } from '../src/chat/run.ts';
+import { describeBytes, diffStat } from '../src/chat/snapshot.ts';
+import { diffPath } from '../src/archive/paths.ts';
 import type { PendingQuestion } from '../src/contracts/question.ts';
 import type { ChatOptions, ChatResult } from '../src/chat/run.ts';
 import type { CampaignResult } from '../src/command/campaign.ts';
@@ -1923,6 +1925,16 @@ describe('Ctrl-C interrupts the turn, not the session', () => {
       fs.readFileSync(path.join(result.campaignRoot, 'campaign.json'), 'utf8'),
     ) as { status: string };
     assert.equal(campaign.status, 'done', 'the archive was left open');
+  });
+
+  it('the banner states the permission posture every dispatch is built under', async () => {
+    // `army init` writes `unguarded`, under which an Engineer runs any command rather than a
+    // listed one. That fact was printed by the campaign as a note and by the chat nowhere, so on
+    // the one surface a person watches for an hour the posture of the run was never stated.
+    const rig = makeRig('banner-posture', ['at your orders.']);
+    const io = createScriptedIo(['/exit']);
+    await chat(rig, io);
+    assert.match(io.transcript, /permissions {2}unguarded · any command; rank narrowing/u, io.transcript);
   });
 
   it('/exit and end-of-input both leave cleanly', async () => {
@@ -5424,12 +5436,50 @@ describe('/work prints one agent into scrollback', () => {
 
     const shown = io.transcript;
     assert.match(shown, /cpt-01/u, shown);
+    assert.match(shown, /permissions {2}unguarded/u, `the banner must state the posture:\n${shown}`);
     // The four facts the design asks for, from the tree and the agent's own archive directory.
     assert.match(shown, /branch {4}army\/t-[0-9a-f]+/u, `no branch in the snapshot:\n${shown}`);
     assert.match(shown, /orders {4}\d+ lines/u, `no orders in the snapshot:\n${shown}`);
     assert.match(shown, /diff {6}\d+ files? · \+\d+/u, `no diffstat in the snapshot:\n${shown}`);
     // The branch is read off the TASK, never off the worker's own account of what it did.
     assert.ok(!shown.includes('army/unknown'), shown);
+  });
+
+  it('a diff over the cap is named by its size and path, not reported as never read back', async () => {
+    // "none recorded — the attempt has not been read back yet" is what an ABSENT diff says. A
+    // diff that exists and is bigger than this command will open used to say the same thing,
+    // which sent the reader to wait for a file that was already there.
+    const rig = makeRig('work-oversized', [
+      'at your orders.',
+      `on it.\n\n${dispatchBlock('add a multiply function to calc.js')}`,
+      'it landed.',
+    ]);
+    const io = createScriptedIo(['we need multiply', 'y'], { open: true });
+    const running = chat(rig, io);
+    await settling(running, io, async () => {
+      await waitFor(() => io.transcript.includes('worktree released'), 25000, 'the dispatch');
+      const root = fs
+        .readdirSync(path.join(rig.home, 'campaigns'))
+        .map((id) => path.join(rig.home, 'campaigns', id))
+        .find((dir) => fs.existsSync(diffPath(dir, 'cpt-01')));
+      assert.ok(root !== undefined, 'the dispatch wrote no diff for cpt-01');
+      // Sparse, so the test writes no 4 MiB to disk; `statSync` reports the size either way.
+      fs.truncateSync(diffPath(root, 'cpt-01'), WORK_FILE_MAX_BYTES + 1);
+      io.feed('/work cpt-01');
+      await waitFor(() => io.transcript.includes('over what /work opens'), 15000, 'the snapshot');
+      io.feed('/exit');
+    });
+    const shown = io.transcript;
+    // The path is clipped to the row like every other path this command prints, so what is
+    // pinned is the size and that a path follows, not the file name at its end.
+    assert.match(shown, /diff {6}4\.0 MiB, over what \/work opens · \//u, shown);
+    assert.ok(!shown.includes('has not been read back yet'), shown);
+  });
+
+  it('sizes read as a person would say them', () => {
+    assert.equal(describeBytes(310), '310 B');
+    assert.equal(describeBytes(812 * 1024), '812 KiB');
+    assert.equal(describeBytes(WORK_FILE_MAX_BYTES + 1), '4.0 MiB');
   });
 
   it('an id nobody has heard of is answered with the ids that exist', async () => {

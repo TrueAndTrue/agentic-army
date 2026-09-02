@@ -774,16 +774,18 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
       'means you tried and it did not work.',
   );
   lines.push('');
-  // The half of `blocked` that was missing until the ladder existed. A worker that reports blocked
-  // without a question is refused by the schema, and it costs it the whole attempt for nothing,
-  // so the brief says what the field buys rather than leaving it to be discovered by rejection,
-  // which is the same lesson the loadout section above was written from.
+  // The half of `blocked` that was missing until the ladder existed. The schema does NOT require
+  // the question (`Report.question` says why: a conditional it cannot express, and a rejected
+  // report loses the worker's whole account), so a `blocked` without one is legal and TERMINAL.
+  // The brief says what the field buys and what its absence costs, both truthfully, rather than
+  // threatening a rejection that does not happen.
   lines.push(
-    '- **`blocked` REQUIRES `question`.** It is the one field that gets you an answer: your ' +
-      'question is put in front of a human, and a fresh attempt is started in THIS worktree, ' +
-      'briefed with your question and their answer. One line, no newlines. State the decision and ' +
-      'the options you can see. A `blocked` report with no question is a schema error and ends ' +
-      'the attempt with nothing gained, so if you are going to stop, ask.',
+    '- **`blocked` is answered only if it carries a `question`.** That field is what gets you ' +
+      'an answer: your question is put in front of a human, and a fresh attempt is started in ' +
+      'THIS worktree, briefed with your question and their answer. One line, no newlines. State ' +
+      'the decision and the options you can see. A `blocked` report with no question is ' +
+      'accepted and is FINAL: nothing climbs, no further attempt starts, and only your ' +
+      '`summary` and `findings` survive. So if you are going to stop, ask.',
   );
   lines.push(`- \`branch\` must be \`${branch}\`.`);
   lines.push('- `summary` is one line. `findings` is at most five items.');
@@ -1070,9 +1072,12 @@ function renderTestWriteSection(write: InspectorTestWrite): string[] {
   lines.push('');
   lines.push(
     write.permanent
-      ? 'Tests you write here are PERMANENT: the supervisor commits the test paths onto this ' +
-        'branch, they merge with it, and a `CPT·VALIDATOR` runs them afterwards in a process you ' +
-        'do not own. Write them to be read by someone who was not here.'
+      ? 'Tests you write here are HELD, not committed here. Nothing is committed in this tree. ' +
+        'After you exit, the supervisor lifts the test files out of this worktree, puts the tree ' +
+        'back as if you had written nothing, and applies them to the integrated branch, where the ' +
+        'acceptance gate and a `CPT·VALIDATOR` run them in a process you do not own. They become ' +
+        'history on that branch only after the validator returns a verdict; if none ever does, they ' +
+        'are withdrawn. Write them to be read by someone who was not here.'
       : 'Tests you write here are TEMPORARY: this repository named no verification commands or has ' +
         'no test directory, so nothing will commit them and they go with the worktree. Write them ' +
         'anyway — running one is how you find out — and put what they proved in your findings, ' +
@@ -1317,11 +1322,14 @@ export interface ValidatorBrief {
    */
   acceptance: AcceptanceResult | null;
   /**
-   * Test files a `CPT·INSPECTOR` wrote and the supervisor committed onto a workstream branch.
+   * Test files a `CPT·INSPECTOR` wrote while reviewing a workstream, which the supervisor lifted
+   * out of that tree and applied, UNCOMMITTED, to the tree this validator stands in.
    *
    * Precondition 4 on `INSPECTOR_TEST_WRITE_RULES`, made an instruction rather than a hope: a test
    * written by a reviewer has been run by exactly one process, and that process was the reviewer's
-   * own. Naming the files is what turns "they get re-run eventually" into "run these".
+   * own. Naming the files is what turns "they get re-run eventually" into "run these". They are
+   * not on any branch yet: `commitInspectorTests` runs after this validator returns a verdict, and
+   * only then.
    */
   inspectorTests: readonly string[];
 }
@@ -1427,9 +1435,10 @@ export function renderValidatorBrief(brief: ValidatorBrief): string {
     lines.push('## TESTS A REVIEWER WROTE, WHICH NOTHING BUT THE REVIEWER HAS RUN');
     lines.push('');
     lines.push(
-      'A `CPT·INSPECTOR` wrote these while reviewing a workstream, and they are committed on this ' +
-        'branch. The process that wrote them is the only process that has ever executed them, ' +
-        'which is exactly one process too few:',
+      'A `CPT·INSPECTOR` wrote these while reviewing a workstream. The supervisor applied them ' +
+        'to this tree; they are NOT committed, and whether they ever are is decided by whether you ' +
+        'return a verdict. The process that wrote them is the only process that has ever executed ' +
+        'them, which is exactly one process too few:',
     );
     lines.push('');
     for (const file of brief.inspectorTests) lines.push(`- \`${file}\``);

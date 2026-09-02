@@ -71,10 +71,10 @@ export type Rank = (typeof RANK_ORDER)[number];
  * and they are not the same one: the acceptance gate answers "do the commands pass" mechanically,
  * and the VALIDATOR answers "is this the thing that was asked for".
  *
- * Neither is spawned by anything in this build. They are declared because a permission set and a
- * rank are the vocabulary everything else in the design is written in, and because a role that
- * exists in the table but nowhere in the code is a gap that `army --help` states out loud
- * (`test/contracts.test.ts` enforces that it does).
+ * Both are spawned by `src/command/campaign.ts`: the OVERSEER for segmentation, questions and
+ * adjudication when a campaign runs with one, the VALIDATOR on the integrated branch at the end of
+ * every campaign. SENTRY is the one role declared here and spawned nowhere; `army --help` states
+ * that gap out loud, and `test/contracts.test.ts` enforces that it does.
  */
 export const ROLES = [
   'SCOUT',
