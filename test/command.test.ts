@@ -2605,6 +2605,13 @@ describe('parsing', () => {
     assert.throws(() => parseCampaignArgs(['a', 'b']), /expected one objective/);
     assert.throws(() => parseCampaignArgs(['a', '--rung', '9']), /--rung expects/);
     assert.throws(() => parseCampaignArgs(['a', '--nope']), /unknown option/);
+    // `--recce` is held to the shape a chat's recce block is: one line, not blank, under the cap.
+    assert.equal(parseCampaignArgs(['a', '--recce', ' how is auth loaded? ']).recce, 'how is auth loaded?');
+    assert.equal(parseCampaignArgs(['a']).recce, undefined);
+    assert.throws(() => parseCampaignArgs(['a', '--recce']), /--recce expects a one-line question/);
+    assert.throws(() => parseCampaignArgs(['a', '--recce', '   ']), /--recce expects a one-line question/);
+    assert.throws(() => parseCampaignArgs(['a', '--recce', 'two\nlines']), /no newlines/);
+    assert.throws(() => parseCampaignArgs(['a', '--recce', 'x'.repeat(501)]), /the cap is 500/);
     assert.equal(parseCampaignArgs(['--help']).help, true);
   });
 
@@ -5674,6 +5681,7 @@ describe('army campaign (the command)', () => {
       notes: [],
       acceptance: null,
       unverifiedBehaviours: [],
+      recce: null,
       exitCode: 0,
     };
     const verdictOf = (testsRun: boolean): Verdict => ({
@@ -5760,6 +5768,7 @@ function stubCampaignResult(): CampaignResult {
     notes: [],
     acceptance: null,
     unverifiedBehaviours: [],
+    recce: null,
     exitCode: 0,
   };
 }
@@ -6209,6 +6218,7 @@ describe('the campaign screen only names commands that exist on this machine', (
     notes: [],
     acceptance: null,
     unverifiedBehaviours: [],
+    recce: null,
     exitCode: 1,
   };
 
@@ -7950,10 +7960,18 @@ function workstreamAdapters(options: {
    * posture on every harness.
    */
   reviewerBreaksGit?: boolean;
+  /**
+   * What a `CPT·SCOUT` returns when the campaign sends one (`CampaignOptions.recce`). Anything
+   * that is not a well-formed finding makes the recce `unavailable`, which is the path the
+   * campaign has to survive.
+   */
+  scoutFinding?: unknown;
 }): {
   adapters: Partial<Record<HarnessId, HarnessAdapter>>;
   engineerSpecs: SoldierSpec[];
   overseerSpecs: SoldierSpec[];
+  /** Every scout spec, in spawn order. */
+  scoutSpecs: SoldierSpec[];
   /** Every reviewer spec, INSPECTOR and VALIDATOR alike, in spawn order. */
   inspectorSpecs: SoldierSpec[];
   /** The greatest number of engineers alive at the same instant. This is what the cap bounds. */
@@ -7961,6 +7979,7 @@ function workstreamAdapters(options: {
 } {
   const engineerSpecs: SoldierSpec[] = [];
   const overseerSpecs: SoldierSpec[] = [];
+  const scoutSpecs: SoldierSpec[] = [];
   const inspectorSpecs: SoldierSpec[] = [];
   const blocked = new Set<string>();
   let live = 0;
@@ -8018,6 +8037,19 @@ function workstreamAdapters(options: {
     id: 'claude',
     supportsDuplex: true,
     spawn(spec: SoldierSpec): Promise<Soldier> {
+      if (spec.role === 'SCOUT') {
+        scoutSpecs.push(spec);
+        const events: SoldierEvent[] = [];
+        return Promise.resolve(
+          soldier(
+            spec,
+            () => {
+              events.push(resultEvent(options.scoutFinding ?? { not: 'a finding' }));
+            },
+            events,
+          ),
+        );
+      }
       if (spec.role === 'OVERSEER') {
         overseerSpecs.push(spec);
         const events: SoldierEvent[] = [];
@@ -8234,6 +8266,7 @@ function workstreamAdapters(options: {
     adapters: { claude, codex },
     engineerSpecs,
     overseerSpecs,
+    scoutSpecs,
     inspectorSpecs,
     peakConcurrency: () => peak,
   };
@@ -8253,6 +8286,114 @@ const TWO_CLEAN_WORKSTREAMS = {
     { id: 'renderer', slice: 'render the output', expectedFiles: ['renderer.md'] },
   ],
 };
+
+// -----------------------------------------------------------------------------------------------
+// A RECCE ON THE CAMPAIGN PATH. In a chat the Commander asks for a scout and a human confirms the
+// question with its own keystroke; `army campaign --recce` is the human typing the question, which
+// is that confirmation. One scout, once, before anybody who can write is raised.
+// -----------------------------------------------------------------------------------------------
+
+describe('a recce on the campaign path', () => {
+  const FINDING = {
+    summary: 'the parser lives in parser.md and nothing else reads it',
+    findings: ['parser.md:1 is the only mention of the grammar'],
+    unknowns: ['whether renderer.md is generated'],
+  };
+
+  it('sends a CPT·SCOUT first, and what it found reaches the overseer AND every engineer', async () => {
+    const repo = makeRepo('recce-found');
+    const home = makeHome({ [repo]: 0 });
+    const rig = workstreamAdapters({ segmentation: TWO_CLEAN_WORKSTREAMS, scoutFinding: FINDING });
+    const result = await campaign({
+      objective: 'Add a parser and a renderer',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      overseer: true,
+      recce: 'where does the parser live today?',
+      adapters: rig.adapters,
+    });
+
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    // ONE scout, raised BEFORE the overseer, so the id space says so: the scout is cpt-01 and it
+    // holds no worktree.
+    assert.equal(rig.scoutSpecs.length, 1);
+    const scout = rig.scoutSpecs[0] as SoldierSpec;
+    assert.equal(scout.rank, 'CAPTAIN');
+    assert.equal(scout.agentId, 'cpt-01');
+    assert.equal(scout.cwd, repo);
+    assert.match(scout.orders, /where does the parser live today\?/u);
+    // The objective rides in the brief as context, held by the supervisor.
+    assert.match(scout.orders, /Add a parser and a renderer/u);
+    for (const tool of ['Edit', 'Write', 'Bash']) {
+      assert.ok(!scout.allow.some((rule) => toolNameOf(rule) === tool), `a scout must not hold ${tool}`);
+    }
+
+    // The finding reached the segmentation brief...
+    const overseer = rig.overseerSpecs[0] as SoldierSpec;
+    assert.match(overseer.orders, /## WHAT THE SCOUT FOUND/u);
+    assert.match(overseer.orders, /parser\.md:1 is the only mention/u);
+    // ...and EVERY engineer's orders, attributed as a reader's report and not as a decision.
+    assert.ok(rig.engineerSpecs.length >= 2);
+    for (const engineer of rig.engineerSpecs) {
+      assert.match(engineer.orders, /## WHAT A SCOUT FOUND/u, engineer.agentId);
+      assert.match(engineer.orders, /the parser lives in parser\.md/u, engineer.agentId);
+      assert.match(engineer.orders, /could not determine: whether renderer\.md is generated/u);
+      assert.match(engineer.orders, /reader's findings, not decisions/u);
+    }
+
+    // The result says what the scout did, in the scout's own words, and the archive has the row.
+    assert.ok(result.recce !== null);
+    assert.equal(result.recce.kind, 'found');
+    assert.equal(result.recce.agentId, 'cpt-01');
+    assert.equal(result.recce.summary, FINDING.summary);
+    assert.equal(result.recce.question, 'where does the parser live today?');
+    assert.ok(result.notes.some((n) => n.code === 'recce' && n.level === 'info' && n.message.includes('cpt-01 found')));
+    assert.match(renderCampaignResult(result), /recce {5}cpt-01 found: the parser lives in parser\.md/u);
+    const tasks = fs.readFileSync(path.join(result.campaignRoot, 'tasks.jsonl'), 'utf8');
+    assert.match(tasks, /"title":"scout: where does the parser live today\?"/u);
+    assertReadableArchive(result);
+  });
+
+  it('a scout that returns nothing usable is a warning, and the campaign carries on without one', async () => {
+    const repo = makeRepo('recce-unavailable');
+    const home = makeHome({ [repo]: 0 });
+    const rig = workstreamAdapters({ segmentation: TWO_CLEAN_WORKSTREAMS, scoutFinding: { not: 'a finding' } });
+    const result = await campaign({
+      objective: 'Add a parser',
+      cwd: repo,
+      home,
+      requestedRung: 0,
+      recce: 'where does the parser live today?',
+      adapters: rig.adapters,
+    });
+
+    assert.equal(result.outcome, 'delivered', renderCampaignResult(result));
+    assert.equal(rig.scoutSpecs.length, 1, 'one scout, once, and no retry');
+    assert.ok(result.recce !== null);
+    assert.equal(result.recce.kind, 'unavailable');
+    assert.equal(result.recce.agentId, 'cpt-01');
+    assert.match(result.recce.summary, /returned no usable finding/u);
+    assert.ok(result.notes.some((n) => n.code === 'recce' && n.level === 'warn'));
+    assert.match(renderCampaignResult(result), /recce {5}none — cpt-01 returned no usable finding/u);
+    // Nothing reached the engineer, and the section that would have carried it is absent.
+    for (const engineer of rig.engineerSpecs) {
+      assert.ok(!engineer.orders.includes('## WHAT A SCOUT FOUND'), engineer.agentId);
+    }
+    // The campaign's own exit is unaffected: a missing recce is not a failed campaign.
+    assert.equal(result.exitCode, 0);
+  });
+
+  it('a campaign asked for no recce records none, and its engineer orders are unchanged', async () => {
+    const repo = makeRepo('recce-none');
+    const home = makeHome({ [repo]: 0 });
+    const rig = workstreamAdapters({ segmentation: TWO_CLEAN_WORKSTREAMS });
+    const result = await campaign({ objective: 'Add a parser', cwd: repo, home, requestedRung: 0, adapters: rig.adapters });
+    assert.equal(result.recce, null);
+    assert.equal(rig.scoutSpecs.length, 0);
+    assert.ok(!renderCampaignResult(result).split('\n').some((line) => line.startsWith('  recce ')));
+  });
+});
 
 describe('a campaign that segments into ONE workstream is the campaign that existed before', () => {
   it('same task, same branch, one lease, one Inspector on that branch, and no integration', async () => {

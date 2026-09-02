@@ -161,6 +161,15 @@ export interface EngineerOrdersInput {
    * its own work.
    */
   integrationFix?: IntegrationFixBrief;
+  /**
+   * What a `CPT·SCOUT` found, when one was sent before this engineer.
+   *
+   * SUBORDINATE TEXT, and safe to render for the mechanical reason every other subordinate
+   * string here is: `validateScoutFinding` caps each line and refuses a newline, and every line
+   * went through `sanitize` at capture in `src/command/scout.ts`, so nothing in it can open a
+   * `##` section. It is rendered as what it is, a reader's report, and the section says so.
+   */
+  scoutFindings?: readonly string[];
 }
 
 /** The integrated branch, and what merged onto it, for the engineer sent back to fix it. */
@@ -693,6 +702,19 @@ export function renderEngineerOrders(input: EngineerOrdersInput): string {
   // permission layer did exactly what it should. What was missing was telling the worker
   // what it holds — a loadout it has to discover by being refused costs a turn every time, and
   // sometimes costs the whole attempt.
+  if (input.scoutFindings !== undefined && input.scoutFindings.length > 0) {
+    lines.push('## WHAT A SCOUT FOUND');
+    lines.push('');
+    lines.push(
+      'A `CPT·SCOUT` read this repository before you were raised and reported the lines below. ' +
+        'They are a reader\'s findings, not decisions: use them to start in the right place, and ' +
+        'verify anything you build on.',
+    );
+    lines.push('');
+    for (const finding of input.scoutFindings) lines.push(`- ${finding}`);
+    lines.push('');
+  }
+
   lines.push('## YOUR TOOLS — read this before your first Bash call');
   lines.push('');
   lines.push(

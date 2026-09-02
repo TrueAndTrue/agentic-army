@@ -1789,6 +1789,7 @@ describe('an error the narration showed is not shown again by the close-out', ()
       notes,
       acceptance: null,
       unverifiedBehaviours: [],
+      recce: null,
       exitCode: 1,
     } as CampaignResult;
   }

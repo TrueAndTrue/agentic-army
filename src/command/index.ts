@@ -11,6 +11,7 @@ import * as path from 'node:path';
 
 import { AgentIdInUseError, archiveDurabilityNote } from '../archive/archive.ts';
 import { RUNG_LABEL, RUNGS } from '../contracts/delivery.ts';
+import { SCOUT_QUESTION_MAX_CHARS } from '../contracts/scout.ts';
 import type { Rung } from '../contracts/delivery.ts';
 import { validateTechnicalSpec } from '../contracts/spec.ts';
 import type { TechnicalSpec } from '../contracts/spec.ts';
@@ -75,6 +76,14 @@ OPTIONS
                        every merge it decides on. Off by default: an overseer is
                        a whole model session spent before an engineer starts, and
                        a small objective does not need a feature owner.
+  --recce "<question>" Send a CPT·SCOUT first, with this one-line question. It
+                       reads the checkout and the web, holds no editor and no
+                       worktree, and what it finds goes into the overseer's
+                       segmentation brief and every Engineer's orders. In a chat
+                       the Commander asks for a scout and you confirm; here you
+                       typing the question is that confirmation. One scout, once;
+                       a scout that returns nothing usable is a note, and the
+                       campaign carries on without one.
   --workstreams <n>    How many workstreams run at once. Default 3, ceiling 8.
                        Each one is another model session, another worktree and
                        another branch to merge, so this multiplies what a
@@ -126,6 +135,8 @@ export interface CampaignArgs {
   overseer?: boolean;
   /** `--workstreams N`: how many workstreams may run at once. */
   maxConcurrentWorkstreams?: number;
+  /** `--recce "<question>"`: send a CPT·SCOUT first. One line, non-empty, capped like a chat's. */
+  recce?: string;
   /** False when `--no-init` was passed — mirrors `enlist`, which grew the flag first. */
   init: boolean;
   json: boolean;
@@ -214,6 +225,24 @@ export function parseCampaignArgs(argv: readonly string[]): CampaignArgs {
       case '--overseer':
         args.overseer = true;
         break;
+      case '--recce': {
+        // The same shape a chat's recce block is held to (`parseScoutDirective`): one line, not
+        // blank, under the cap. A question the brief cannot carry is refused here rather than
+        // rendered into orders that break at the first newline.
+        const value = next();
+        if (value === undefined || value.trim() === '') {
+          throw new UsageError('--recce expects a one-line question');
+        }
+        if (/[\r\n]/u.test(value)) throw new UsageError('--recce expects one line, no newlines');
+        if (value.length > SCOUT_QUESTION_MAX_CHARS) {
+          throw new UsageError(
+            `--recce: the question is ${String(value.length)} characters; the cap is ` +
+              `${String(SCOUT_QUESTION_MAX_CHARS)}`,
+          );
+        }
+        args.recce = value.trim();
+        break;
+      }
       case '--workstreams': {
         // The concurrency cap, and the one number that decides how much a campaign may spend at
         // once. Refused rather than clamped when it is not a positive integer, for the reason
@@ -298,6 +327,16 @@ export function renderCampaignResult(result: CampaignResult, self: string = invo
   if (result.delivery !== null) {
     const durability = result.delivery.durability;
     lines.push(`  durable   ${durability.target.kind} ${durability.target.url}`);
+  }
+  // The scout, when one was sent. WHOSE WORDS: a found summary is the scout's own (sanitised at
+  // capture); an unavailable reason is this process's. The line says which by naming the unit.
+  if (result.recce !== null) {
+    lines.push(
+      result.recce.kind === 'found'
+        ? `  recce     ${result.recce.agentId ?? '?'} found: ${result.recce.summary}` +
+            (result.recce.haltedForFanOut ? ' (halted at the fan-out ceiling)' : '')
+        : `  recce     none — ${result.recce.summary}`,
+    );
   }
   // -----------------------------------------------------------------------------------------
   // THE WORKSTREAMS AND THE CAP, on the screen rather than in a config file. A campaign that can
@@ -591,6 +630,7 @@ export async function campaignCommand(
     ...(args.maxConcurrentWorkstreams === undefined
       ? {}
       : { maxConcurrentWorkstreams: args.maxConcurrentWorkstreams }),
+    ...(args.recce === undefined ? {} : { recce: args.recce }),
     ...(args.campaignId === undefined ? {} : { campaignId: args.campaignId }),
     ...(args.init ? {} : { init: false }),
     // Spread LAST, so a caller that wants its own listener — or none — wins over the default.

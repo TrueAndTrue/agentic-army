@@ -348,6 +348,26 @@ owner. **A campaign that segments into one workstream runs exactly as it did bef
 existed** — that is the same code at N = 1 rather than a compatibility path, and it has a test on
 it.
 
+### A scout first
+
+`--recce "<question>"` sends a `CPT·SCOUT` before anybody who can write is raised. In a chat the
+Commander asks for a scout and you confirm the question with its own `[y/N]`; on this path there is
+no Commander, so you typing the question is that confirmation.
+
+```sh
+army campaign "add multiply and divide to calc.js" --recce "where do the arithmetic helpers live, and what tests cover them?"
+```
+
+The scout reads the checkout and the web, holds no editor, no shell and no worktree, and may field
+subordinates under the same three ceilings a chat's recce has (depth from the rank table, count
+measured off its event stream with a kill at the crossing, and a wall clock). What it finds goes
+into the overseer's segmentation brief when there is one and into every Engineer's orders under
+"what a scout found", marked as a reader's findings and not as decisions. The result prints a
+`recce` line in the scout's own words. A scout that returns nothing usable is a warning, and the
+campaign carries on without one: one scout, once, and no retry, because re-asking the same question
+is how a campaign spends two model sessions on the same refusal before anyone has looked at a line
+of code.
+
 With several workstreams, the two gates *move* rather than multiply. The spec's `verify` commands
 and the objective both describe the whole feature, so running either against one partial branch
 would fail every workstream by construction; both run once, on the integrated branch. What does

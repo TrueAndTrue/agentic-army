@@ -238,6 +238,7 @@ import {
   renderEngineerOrders,
   renderEngineerReportMd,
   renderOverseerQuestionBrief,
+  renderScoutBrief,
   renderSegmentationBrief,
   renderVerdictMd,
 } from './orders.ts';
@@ -248,6 +249,9 @@ import type {
   WorkstreamBrief,
 } from './orders.ts';
 import { adjudicate, askOverseer, attributeOverlaps, segmentFeature } from './overseer.ts';
+import { fanOutHaltLine, runRecce, watchFanOut } from './scout.ts';
+import type { ScoutSpawn } from './scout.ts';
+import { SCOUT_MAX_SUBAGENTS, SCOUT_TIMEOUT_MS, scoutFindingLines } from '../contracts/scout.ts';
 import type { FixDecision, OverseerRun, OverseerSpawn } from './overseer.ts';
 import {
   INSPECTOR_TEST_WRITE_RULES,
@@ -301,6 +305,11 @@ export type CampaignNoteCode =
    * this code and its verdict is discarded.
    */
   | 'authorship'
+  /**
+   * The `CPT·SCOUT` a campaign sent before any engineer, when `CampaignOptions.recce` asked for
+   * one: what it found, or why nothing usable came back. The campaign continues either way.
+   */
+  | 'recce'
   | 'engineer'
   /**
    * A `spec.verify` command failed against the Engineer's own branch, mechanically, before an
@@ -583,6 +592,8 @@ export interface CampaignResult {
    * should also read how many behaviours were never actually checked.
    */
   unverifiedBehaviours: number[];
+  /** The scout this campaign sent first, when `CampaignOptions.recce` asked for one. */
+  recce: RecceRecord | null;
   /**
    * 0 only when the Inspector passed AND delivery ran without an error-level note.
    *
@@ -804,13 +815,40 @@ export interface CampaignOptions {
    */
   openIntegrationTree?: OpenIntegrationTree;
   /**
-   * A scout's findings, for the overseer's segmentation brief.
+   * Findings a scout produced BEFORE this campaign, for the briefs it writes.
    *
-   * Nothing in this build spawns a scout. The field exists because the design says the overseer is
-   * briefed with the spec AND the scout's findings, and a brief that quietly drops half of its
-   * inputs is a brief that is wrong the day the other half arrives.
+   * `army chat` fills this from every recce the conversation approved, so a `MAJ·OVERSEER`
+   * segments the feature knowing what was already looked up. Already through `sanitize` at
+   * capture in `src/command/scout.ts`. Findings from a scout this campaign sends itself
+   * (`recce` below) are added to these.
    */
   scoutFindings?: readonly string[];
+  /**
+   * A question to send a `CPT·SCOUT` with, before any engineer is raised.
+   *
+   * The `army campaign` path has no conversation in which a Commander could have asked for a
+   * recce, so the human asks for one here, and typing the question IS the confirmation that in
+   * a chat is a `[y/N]` of its own. One scout, once, on the primary checkout, with the same three
+   * ceilings a chat's recce has; what it finds reaches the overseer's segmentation brief and
+   * every engineer's orders under "what a scout found". A scout that returns nothing usable is a
+   * `recce` note and the campaign carries on without one.
+   */
+  recce?: string;
+}
+
+/** What became of the recce a campaign was asked to send. `null` on `CampaignResult` when none was. */
+export interface RecceRecord {
+  /** The question, exactly as the human typed it. */
+  question: string;
+  /** The scout's agent id, or null when nothing was spawned. */
+  agentId: string | null;
+  kind: 'found' | 'unavailable';
+  /** SUBORDINATE TEXT when found (the scout's own summary, sanitised); this process's when not. */
+  summary: string;
+  /** Measured off the event stream, never reported by the scout. */
+  subagentsFielded: number;
+  haltedForFanOut: boolean;
+  costUsd: number | null;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -2078,6 +2116,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   let retriesExhausted = false;
   /** Set only on the attempt that DELIVERS. See `CampaignResult.unverifiedBehaviours`. */
   let unverifiedBehaviours: number[] = [];
+  /** The scout this campaign sent first, or null when none was asked for. */
+  let recce: RecceRecord | null = null;
   let delivery: LadderResult | null = null;
   /** The status this campaign intends to record, then what the archive says it recorded. */
   let intendedStatus: CampaignStatus = 'aborted';
@@ -2618,6 +2658,191 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
       return { agentId, structured: run.structured, status: run.status, errors: run.errors };
     };
 
+    // ---- the recce, before anybody who can write is raised ------------------------------
+    //
+    // What every brief below calls "what the scout found". Starts as whatever the caller already
+    // knew (a chat's earlier recces) and grows by one scout when `options.recce` asks for it.
+    const scoutFindings: string[] = [...(options.scoutFindings ?? [])];
+    if (options.recce !== undefined) {
+      const question = options.recce;
+      // The same spawn every other unit goes through, so a scout cannot be built without the
+      // global deny-list, the posture, the archive rows or the narration. Mirrors the chat's
+      // `spawnScout` closure: CAPTAIN rank, `fanOut: true` for the depth ceiling the roster and
+      // the harness enforce, the primary checkout because a reader holds no worktree, and the
+      // COUNT ceiling measured off the stream by `watchFanOut` with a kill at the crossing.
+      const spawnScout: ScoutSpawn = async (input) => {
+        const agentId = nextAgentId();
+        const target = dispatchFor(config, 'SCOUT', false);
+        const spec = buildSoldierSpec({
+          agentId,
+          rank: 'CAPTAIN',
+          role: 'SCOUT',
+          harness: 'claude',
+          ...(target.model === undefined ? {} : { model: target.model }),
+          // A scout by definition has no spec above it: it is sent to produce what one would
+          // have carried. The same escalation `dispatchFor` makes for a spec-less ENGINEER.
+          effort: UNSPECIFIED_BRIEF_EFFORT,
+          cwd: project,
+          orders: input.orders,
+          outputSchemaPath: input.outputSchemaPath,
+          home,
+          posture,
+          fanOut: true,
+        });
+        const scoutTask = archive.createTask({
+          parentTaskId: task.id,
+          title: `scout: ${cap(input.question, 100)}`,
+          status: 'in_flight',
+        });
+        archive.recordAgentAttempt({
+          id: agentId,
+          taskId: scoutTask.id,
+          parentAgentId: null,
+          rank: 'CAPTAIN',
+          role: 'SCOUT',
+          harness: 'claude',
+          model: spec.model ?? null,
+          effort: spec.effort ?? null,
+          sessionId: spec.sessionId,
+          depth: 1,
+          status: 'running',
+          // Null, and it is the honest value rather than a placeholder: this unit has no tree.
+          worktreePath: null,
+          leaseId: null,
+          orders: input.orders,
+          attempt: 1,
+        });
+        archive.appendSignal({
+          fromAgent: GENERAL_AGENT_ID,
+          toAgent: agentId,
+          kind: 'order',
+          body: cap(`recce: ${input.question}`),
+          artifact: `agents/${agentId}/orders.md`,
+        });
+        progress({
+          kind: 'unit-dispatched',
+          agentId,
+          rank: 'CAPTAIN',
+          role: 'SCOUT',
+          harness: 'claude',
+          attempt: 1,
+        });
+        // The recce's own wall clock rides on the adapter: `closeGraceMs` IS a one-shot worker's
+        // whole working time, and the campaign's soldier ceiling is the wrong number for a reader
+        // in both directions. An injected adapter (a test, a future harness) is used as given.
+        const adapter =
+          options.adapters?.claude ??
+          createClaudeAdapter({
+            closeGraceMs: SCOUT_TIMEOUT_MS,
+            ...(options.claudeBin === undefined ? {} : { bin: options.claudeBin }),
+          });
+        const watch = watchFanOut(SCOUT_MAX_SUBAGENTS);
+        const tracked = trackSoldier();
+        let live: Soldier | null = null;
+        const activity = activityFor(agentId, spec.cwd);
+        const run = await runSoldier(adapter, spec, archive, {
+          onSpawn: (soldier) => {
+            live = soldier;
+            tracked.onSpawn(soldier);
+          },
+          onEvent: (event) => {
+            activity(event);
+            if (!watch.observe(event)) return;
+            const soldier: Soldier | null = live;
+            if (soldier === null) return;
+            note('warn', 'recce', fanOutHaltLine(SCOUT_MAX_SUBAGENTS));
+            if (killSoldierTree(soldier)) return;
+            void soldier.close().catch(() => {
+              /* it was already going down; that is the outcome this branch wanted */
+            });
+          },
+        });
+        tracked.release();
+        recordDenials(archive, agentId, run.denials, note);
+        archive.finishAgent(agentId, {
+          status: interruptedBy !== null ? 'interrupted' : run.status === 'ok' ? 'exited' : 'failed',
+          exitCode: run.exitCode,
+          costUsd: run.costUsd,
+          durationMs: run.durationMs,
+        });
+        archive.updateTask(scoutTask.id, {
+          status: run.status === 'ok' && run.structured !== undefined ? 'done' : 'failed',
+        });
+        progress({
+          kind: 'unit-returned',
+          agentId,
+          rank: 'CAPTAIN',
+          role: 'SCOUT',
+          status: run.status,
+          summary: null,
+        });
+        return {
+          agentId,
+          structured: run.structured,
+          status: run.status,
+          errors: run.errors,
+          subagentsFielded: watch.count,
+          haltedForFanOut: watch.halted,
+          costUsd: run.costUsd,
+        };
+      };
+      const outcome = await runRecce({
+        spawn: spawnScout,
+        question,
+        renderBrief: () =>
+          renderScoutBrief({
+            question,
+            project,
+            campaignId,
+            maxSubagents: SCOUT_MAX_SUBAGENTS,
+            timeoutMs: SCOUT_TIMEOUT_MS,
+            // Supervisor-held: the objective as the human typed it.
+            context: options.objective,
+          }),
+        checkpoint: throwIfInterrupted,
+      });
+      if (outcome.kind === 'found') {
+        const lines = scoutFindingLines(outcome.finding);
+        scoutFindings.push(...lines);
+        recce = {
+          question,
+          agentId: outcome.agentId,
+          kind: 'found',
+          summary: outcome.finding.summary,
+          subagentsFielded: outcome.subagentsFielded,
+          haltedForFanOut: outcome.haltedForFanOut,
+          costUsd: outcome.costUsd,
+        };
+        archive.appendSignal({
+          fromAgent: outcome.agentId,
+          toAgent: GENERAL_AGENT_ID,
+          kind: 'report',
+          body: cap(`recce: ${outcome.finding.summary}`),
+        });
+        note(
+          'info',
+          'recce',
+          `${outcome.agentId} found: ${cap(outcome.finding.summary, 160)}` +
+            (outcome.haltedForFanOut ? ' (halted at the fan-out ceiling; the search was cut short)' : ''),
+        );
+      } else {
+        recce = {
+          question,
+          agentId: outcome.agentId,
+          kind: 'unavailable',
+          summary: outcome.reason,
+          subagentsFielded: 0,
+          haltedForFanOut: false,
+          costUsd: outcome.costUsd,
+        };
+        note(
+          'warn',
+          'recce',
+          `no finding: ${cap(outcome.reason, 200)}. The campaign carries on without one.`,
+        );
+      }
+    }
+
     // ---- how many workstreams, and how many at once ------------------------------------
     const maxConcurrent = maxConcurrentReported;
 
@@ -2665,7 +2890,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           renderSegmentationBrief({
             orders,
             ...(options.spec === undefined ? {} : { spec: options.spec }),
-            ...(options.scoutFindings === undefined ? {} : { scoutFindings: options.scoutFindings }),
+            ...(scoutFindings.length === 0 ? {} : { scoutFindings }),
             maxWorkstreams: MAX_WORKSTREAMS,
             maxConcurrent,
             ...(previousRejection === undefined ? {} : { previousRejection }),
@@ -3227,6 +3452,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           ...(previousFailure === undefined ? {} : { previousFailure }),
           ...(answeredQuestion === undefined ? {} : { answeredQuestion }),
           ...(options.spec === undefined ? {} : { spec: options.spec }),
+          ...(scoutFindings.length === 0 ? {} : { scoutFindings }),
           // ABSENT for an unsegmented campaign, which is what keeps its orders.md byte-identical
           // to the document it produced before workstreams existed.
           ...(segmented ? { workstream: workstreamBrief(ws) } : {}),
@@ -4609,6 +4835,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
           ? { previousAcceptance: input.acceptance }
           : {}),
         ...(options.spec === undefined ? {} : { spec: options.spec }),
+        ...(scoutFindings.length === 0 ? {} : { scoutFindings }),
         integrationFix: { workstreams: input.merged },
       });
       const engineerTarget = dispatchFor(config, 'ENGINEER', options.spec !== undefined);
@@ -5956,6 +6183,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     notes,
     acceptance,
     unverifiedBehaviours,
+    recce,
     exitCode,
   };
 }

@@ -561,6 +561,23 @@ a worker's decision, because the console's routing is what decides where a line 
 in-flight turn is one more destination that routing hands to. The two tests that pinned "it reaches
 the Commander, never the worker" pass with the delivery moved from after the dispatch to during it.
 
+## Wave 7 — a scout on the campaign path
+
+`army campaign --recce "<question>"` sends a `CPT·SCOUT` before anybody who can write is raised.
+The design has a human confirm a scout's question with a keystroke of its own; on a command line the
+human typing the question is that keystroke, so no prompt was added. The spawn goes through the same
+`buildSoldierSpec` and `runSoldier` every other unit does, inside the campaign, so the scout gets the
+global deny-list, the posture, the archive rows and the narration, and the sweep test that counts
+spawn sites in `campaign.ts` now declares six.
+
+What it finds is threaded into two briefs. The overseer's segmentation brief already had a "what
+the scout found" section, fed by a chat's earlier recces; the engineer's orders did not, because in
+a chat the Commander absorbs a finding into the spec. On the campaign path there is no Commander to
+absorb it, so `renderEngineerOrders` gained a section that renders the lines as a reader's
+findings and says they are not decisions. `CampaignResult.recce` records what happened, and the
+result screen prints it in the scout's own words when there are any. One scout, once, no retry, for
+the reason `runRecce` states.
+
 ## One property, broken three times, now structural
 
 A line typed for one reader must never be delivered to a different one. It broke through the
@@ -574,7 +591,7 @@ compile error rather than a missing guard.
 
 # Part 3 — what is not built
 
-Five things. Each is a design intent above that the code does not yet meet, and each is stated as
+Four things. Each is a design intent above that the code does not yet meet, and each is stated as
 what a reader would find rather than as a plan.
 
 **One campaign at a time.** `runDispatch` still calls `runCampaign` and waits for one JSON
@@ -583,10 +600,6 @@ dispatch cannot be approved until the first settles, and a proposal written duri
 and recorded rather than parked. The design does not ask for concurrent campaigns and this document
 does not promise them; it is recorded here because "the Commander stays available" could be read as
 "the Commander can start more work", and it cannot.
-
-**A scout on the `army campaign` path.** That command takes an objective off a command line and has
-no conversation in which to have asked for a recce, so `CampaignOptions.scoutFindings` is empty
-there and the field says so rather than pretending otherwise.
 
 **Reviewer independence on a one-provider machine.** The campaign continues and records the
 downgrade, which is honest and is not the same thing as having it.

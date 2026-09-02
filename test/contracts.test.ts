@@ -2554,16 +2554,18 @@ test('the worktree contract describes one shared writable lease, not an attenuat
   );
 
   const specs = [...campaign.matchAll(/buildSoldierSpec\(\{[\s\S]{0,1600}?\}\);/g)].map((m) => m[0]);
-  // FIVE, and each is named below. The count went 3 -> 5 when phase 3 landed: a `CPT·VALIDATOR`
+  // SIX, and each is named below. The count went 3 -> 5 when phase 3 landed: a `CPT·VALIDATOR`
   // against the integrated branch, and a second ENGINEER call site for the fix loop that a
-  // validator's refusal re-enters. The number is asserted rather than derived so a SIXTH spawn
+  // validator's refusal re-enters. It went 5 -> 6 when `army campaign --recce` gave the campaign
+  // path a `CPT·SCOUT` of its own. The number is asserted rather than derived so a SEVENTH spawn
   // appearing has to be declared here, which is the whole point of counting them.
   assert.equal(
     specs.length,
-    5,
-    'today exactly five spawns build a spec: the Overseer, the Engineer, the Engineer sent back ' +
-      'to fix the integrated branch, the Inspector and the Validator',
+    6,
+    'today exactly six spawns build a spec: the Scout, the Overseer, the Engineer, the Engineer ' +
+      'sent back to fix the integrated branch, the Inspector and the Validator',
   );
+  const scoutSpec = specs.find((s) => s.includes("role: 'SCOUT'"));
   const engineerSpecs = specs.filter((s) => s.includes("role: 'ENGINEER'"));
   const engineerSpec = engineerSpecs.find((s) => s.includes('cwd: worktree,'));
   const integrationFixSpec = engineerSpecs.find((s) => s.includes('cwd: input.tree.path,'));
@@ -2576,6 +2578,7 @@ test('the worktree contract describes one shared writable lease, not an attenuat
   assert.ok(inspectorSpec !== undefined, 'one of them is the Inspector');
   assert.ok(validatorSpec !== undefined, 'one of them is the Validator');
   assert.ok(overseerSpec !== undefined, 'one of them is the Overseer');
+  assert.ok(scoutSpec !== undefined, 'one of them is the Scout');
   // The VALIDATOR and the engineer sent back to fix its refusal both stand in the INTEGRATION tree,
   // which is not leased from the pool — so neither adds an `.acquire(` and the one-lease claim in
   // `src/contracts/worktree.ts` is still about the only lease there is.
@@ -2604,6 +2607,10 @@ test('the worktree contract describes one shared writable lease, not an attenuat
     /cwd: project,/,
     'a MAJ·OVERSEER must stand in the primary checkout, not in a leased worktree',
   );
+  // And so does the Scout, for the same reason, and it is the one spawn that fans out: the depth
+  // ceiling is the roster's and the harness's, and the count ceiling is measured beside it.
+  assert.match(scoutSpec, /cwd: project,/, 'a CPT·SCOUT holds no worktree');
+  assert.match(scoutSpec, /fanOut: true,/, 'a CPT·SCOUT may field subordinates, under the ceilings');
 
   // And the half that IS true: the Inspector's harmlessness is its loadout. Scanned by tool NAME
   // rather than by exact string, so a rule of any shape is caught: bare, path-scoped, or a
