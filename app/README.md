@@ -89,9 +89,21 @@ or only the listed ones.
 
 ### Models at each stage
 
-Settings lists every model a node can use; add one when a vendor ships a new model. "Models at each
-stage" says which model each role gets when a node does not name its own. Change the Reviewer stage
-to a different model and every flow that uses the default follows.
+Settings lists every model a node can use. The claude models (Opus 5.5, Fable 5.1, Sonnet 5, Haiku
+4.5) are built in. The codex models come from codex's own list in `~/.codex/models_cache.json`,
+which codex refreshes itself, so GPT-6-Astra, GPT-5.6-Sol, GPT-5.6-Terra, GPT-5.6-Luna and GPT-5.5
+all show up, and a model OpenAI ships later appears once codex has seen it. The app reads the list
+at startup and when you press "Check for new models". A model you remove stays removed. You can
+still add a model by hand.
+
+Each model takes its own effort levels. codex lists them per model: Astra, Sol and Terra go up to
+`ultra`, Luna to `max`, and GPT-5.5 stops at `xhigh` (codex rejects `max` on it). claude models take
+`low` through `max`. The pickers offer only what the chosen model takes. If a saved level is above
+what a model takes, the app sends the model's highest level, because a level the model does not
+take fails the turn.
+
+"Models at each stage" says which model each role gets when a node does not name its own. Change
+the Reviewer stage to a different model and every flow that uses the default follows.
 
 ### Workspaces
 
@@ -137,9 +149,9 @@ A flow that uses Jev will not start without a key, rather than fail halfway thro
 ## Testing
 
 ```sh
-npm test           # the flow engine, Jev client, browser pilot and permissions: 29 tests, no network
-npm run e2e        # builds, then drives the real app window with Playwright: 7 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 7 against the built .app
+npm test           # the flow engine, Jev client, browser pilot, permissions and models: 39 tests, no network
+npm run e2e        # builds, then drives the real app window with Playwright: 8 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 8 against the built .app
 ```
 
 The end-to-end tests launch the app against a throwaway home and project, the engine's fake
@@ -151,7 +163,7 @@ refusing to start without a key, and a flow drawn on the canvas by dragging conn
 `e2e/live/` holds the runs against the real tools. They cost money and need you logged in:
 
 ```sh
-npm run live:chat                       # two turns with claude; MODEL="GPT-5.5" for codex
+npm run live:chat                       # two turns with claude; MODEL="GPT-6-Astra" EFFORT=ultra for codex
 TYPESAFE_API_KEY=... npm run live:flow  # Quick fix with claude, codex and Jev, then merge and npm test
 TYPESAFE_API_KEY=... npm run live:jev   # the browser guard on a local shop page, and Auto routing
 ```
@@ -168,6 +180,8 @@ What those showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
   at 93%, and the refusal ended the run without clicking.
 - Auto kept "What does the README say?" as a chat and sent "Add a CONTRIBUTING.md ... and have it
   reviewed" to Quick fix at 0.79.
+- A chat on GPT-6-Astra at `ultra` answered in 12 s, and its second turn quoted the first question
+  back.
 - The packaged app, started with PATH set to `/usr/bin:/bin` as the Dock would, found claude and
   completed two turns.
 

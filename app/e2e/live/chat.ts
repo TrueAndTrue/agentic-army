@@ -24,7 +24,7 @@ page.on('pageerror', (e) => console.log('[pageerror]', e.message));
 const p = await page.evaluate((path) => window.api.addProject(path), project);
 await page.getByRole('button', { name: `New session in ${p!.name}` }).click();
 if (process.env['MODEL'] !== undefined) await page.getByLabel('Model').selectOption({ label: process.env['MODEL'] });
-await page.getByLabel('Effort').selectOption('low');
+await page.getByLabel('Effort').selectOption(process.env['EFFORT'] ?? 'low');
 const box = page.getByRole('textbox', { name: 'Message' });
 await box.fill('What does calc.js export? One sentence.');
 await page.keyboard.press('Enter');

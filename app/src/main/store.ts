@@ -7,15 +7,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { join } from 'node:path';
 
 import type { Flow, Project, Run, Session, Settings } from '../shared/types.ts';
+import { CLAUDE_MODELS } from './models.ts';
 
 export const DEFAULT_SETTINGS: Settings = {
-  models: [
-    { id: 'claude-opus', harness: 'claude', model: 'claude-opus-5-5', label: 'Opus 5.5' },
-    { id: 'claude-sonnet', harness: 'claude', model: 'claude-sonnet-5', label: 'Sonnet 5' },
-    { id: 'claude-fable', harness: 'claude', model: 'claude-fable-5-1', label: 'Fable 5.1' },
-    { id: 'claude-haiku', harness: 'claude', model: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
-    { id: 'codex-gpt55', harness: 'codex', model: 'gpt-5.5', label: 'GPT-5.5' },
-  ],
+  // codex's current models join these from its own list when the app starts; see models.ts.
+  models: [...CLAUDE_MODELS, { id: 'codex-gpt55', harness: 'codex', model: 'gpt-5.5', label: 'GPT-5.5', efforts: ['low', 'medium', 'high', 'xhigh'], source: 'codex' }],
   stageDefaults: {
     scout: { modelId: 'claude-sonnet', effort: 'high' },
     planner: { modelId: 'claude-opus', effort: 'high' },

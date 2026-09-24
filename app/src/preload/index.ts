@@ -27,6 +27,7 @@ const api: Api = {
   deleteFlow: call('deleteFlow') as Api['deleteFlow'],
   saveSettings: call('saveSettings') as Api['saveSettings'],
   doctor: call('doctor') as Api['doctor'],
+  refreshModels: call('refreshModels') as Api['refreshModels'],
   testJev: call('testJev') as Api['testJev'],
   onEvent(listener) {
     const fn = (_e: unknown, ev: AppEvent) => listener(ev);

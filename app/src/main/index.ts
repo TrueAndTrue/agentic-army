@@ -105,6 +105,7 @@ void app.whenReady().then(async () => {
     return c.saveSettings(s);
   });
   handle('doctor', () => c.doctor());
+  handle('refreshModels', () => c.refreshModels());
   handle('testJev', () => c.testJev());
 
   // macOS naps a background app and the agents it started with it: a claude turn stalled mid-request

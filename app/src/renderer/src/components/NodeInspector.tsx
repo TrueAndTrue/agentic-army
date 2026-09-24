@@ -1,9 +1,10 @@
 import { Plus, Trash2 } from 'lucide-react';
 
 import { slug } from '../../../shared/flow.ts';
-import { AGENT_ROLES, EFFORTS, ROLE_INFO, type Flow, type FlowNode, type NodeConfigs, type Settings } from '../../../shared/types.ts';
+import { fitEffort } from '../../../shared/models.ts';
+import { AGENT_ROLES, ROLE_INFO, type Flow, type FlowNode, type NodeConfigs, type Settings } from '../../../shared/types.ts';
 import { TYPE_LABEL } from '../lib/format.ts';
-import { Field, IconButton, Input, Select, TextArea, Toggle, cx } from './ui.tsx';
+import { EffortOptions, Field, IconButton, Input, ModelOptions, Select, TextArea, Toggle, cx } from './ui.tsx';
 
 type Patch<T> = (p: Partial<T>) => void;
 
@@ -65,6 +66,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
       const s = set<'agent'>(d);
       const stage = settings.stageDefaults[d.role];
       const stageModel = settings.models.find((m) => m.id === stage.modelId)?.label ?? stage.modelId;
+      const model = settings.models.find((m) => m.id === (d.modelId ?? stage.modelId));
       body = (
         <>
           <Field label="Role" hint={ROLE_INFO[d.role].summary}>
@@ -78,23 +80,22 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
           </Field>
           <div className="grid grid-cols-2 gap-2">
             <Field label="Model">
-              <Select value={d.modelId ?? ''} onChange={(e) => s({ modelId: e.target.value === '' ? null : e.target.value })}>
+              <Select
+                value={d.modelId ?? ''}
+                onChange={(e) => {
+                  const modelId = e.target.value === '' ? null : e.target.value;
+                  const next = settings.models.find((m) => m.id === (modelId ?? stage.modelId));
+                  s({ modelId, effort: d.effort === null ? null : fitEffort(next, d.effort) });
+                }}
+              >
                 <option value="">Stage default ({stageModel})</option>
-                {settings.models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label} · {m.harness}
-                  </option>
-                ))}
+                <ModelOptions models={settings.models} />
               </Select>
             </Field>
             <Field label="Effort">
-              <Select value={d.effort ?? ''} onChange={(e) => s({ effort: e.target.value === '' ? null : (e.target.value as typeof d.effort) })}>
-                <option value="">Stage default ({stage.effort})</option>
-                {EFFORTS.map((x) => (
-                  <option key={x} value={x}>
-                    {x}
-                  </option>
-                ))}
+              <Select value={d.effort === null ? '' : fitEffort(model, d.effort)} onChange={(e) => s({ effort: e.target.value === '' ? null : (e.target.value as typeof d.effort) })}>
+                <option value="">Stage default ({fitEffort(model, stage.effort)})</option>
+                <EffortOptions model={model} />
               </Select>
             </Field>
           </div>

@@ -4,7 +4,7 @@
  */
 
 export type Harness = 'claude' | 'codex';
-export const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+export const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type Effort = (typeof EFFORTS)[number];
 
 /** A model you can put on a node. `id` is ours; `model` is what the vendor CLI receives. */
@@ -13,6 +13,12 @@ export interface ModelEntry {
   harness: Harness;
   model: string;
   label: string;
+  /** The effort levels this model accepts, lowest first. Absent means the harness's usual set. */
+  efforts?: Effort[];
+  /** One line on what the model is for, from the vendor's list. */
+  description?: string;
+  /** Where the entry came from: the app's claude list, codex's own model list, or you. */
+  source?: 'claude' | 'codex' | 'you';
 }
 
 /**
@@ -47,6 +53,11 @@ export interface Settings {
   claudeBin: string;
   codexBin: string;
   theme: 'system' | 'dark' | 'light';
+  /**
+   * Every model the app has offered, as `harness:model`. A listed model you removed stays in here,
+   * so it is not added back the next time the app reads the vendor lists.
+   */
+  offeredModels?: string[];
 }
 
 export interface Project {
@@ -397,6 +408,8 @@ export interface Api {
   deleteFlow(id: string): Promise<void>;
   saveSettings(settings: Settings): Promise<Settings>;
   doctor(): Promise<DoctorReport>;
+  /** Read claude's and codex's model lists again and add any model not offered before. */
+  refreshModels(): Promise<{ settings: Settings; added: string[] }>;
   testJev(): Promise<{ ok: boolean; detail: string }>;
   onEvent(listener: (event: AppEvent) => void): () => void;
 }

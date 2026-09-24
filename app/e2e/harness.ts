@@ -82,6 +82,20 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
       JSON.stringify({ typesafe: { apiKey: 'fake-key', model: 'jev-latest', baseUrl: opts.jevUrl }, theme: 'dark' }),
     );
   }
+  // codex's model list, as codex 0.154 writes it, so the models on offer do not depend on this machine.
+  const codexHome = join(root, 'codex-home');
+  mkdirSync(codexHome, { recursive: true });
+  const levels = (...e: string[]) => e.map((effort) => ({ effort }));
+  writeFileSync(
+    join(codexHome, 'models_cache.json'),
+    JSON.stringify({
+      models: [
+        { slug: 'gpt-6-astra', display_name: 'GPT-6-Astra', description: 'Frontier intelligence for the most demanding work.', visibility: 'list', priority: 1, supported_reasoning_levels: levels('low', 'medium', 'high', 'xhigh', 'max', 'ultra') },
+        { slug: 'gpt-5.6-luna', display_name: 'GPT-5.6-Luna', visibility: 'list', priority: 8, supported_reasoning_levels: levels('low', 'medium', 'high', 'xhigh', 'max') },
+        { slug: 'gpt-5.5', display_name: 'GPT-5.5', visibility: 'list', priority: 12, supported_reasoning_levels: levels('low', 'medium', 'high', 'xhigh') },
+      ],
+    }),
+  );
   const require = createRequire(import.meta.url);
   // ARMY_E2E_PACKAGED=1 runs the same tests against the built .app instead of the dev build.
   const packaged = process.env['ARMY_E2E_PACKAGED'] === '1';
@@ -102,6 +116,7 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
             ARMY_CODEX_BIN: join(FIXTURES, 'fake-codex.mjs'),
             FAKE_CLAUDE_MODE: opts.claudeMode ?? 'ok',
             TYPESAFE_API_KEY: '',
+            CODEX_HOME: codexHome,
             ...(opts.env ?? {}),
           },
   });

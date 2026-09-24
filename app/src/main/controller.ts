@@ -8,6 +8,7 @@ import { existsSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 
 import { newId, slug } from '../shared/flow.ts';
+import { fitEffort, mergeCatalog } from '../shared/models.ts';
 import type {
   AppEvent,
   DiffResult,
@@ -26,6 +27,7 @@ import { pilot, type Page } from './browser/pilot.ts';
 import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/engine.ts';
 import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, runDiff, runShell } from './git.ts';
 import { askJev, judge } from './jev.ts';
+import { modelCatalog } from './models.ts';
 import { Store } from './store.ts';
 import { BUILTIN_FLOWS } from './templates.ts';
 
@@ -57,6 +59,7 @@ export class Controller {
     this.emitRaw = opts.emit;
     this.openPage = opts.openPage;
     this.settings = this.store.loadSettings();
+    this.addListedModels();
     this.projects = this.store.loadProjects();
     this.userFlows = this.store.loadFlows();
     for (const s of this.store.loadSessions()) this.sessions.set(s.id, s);
@@ -307,7 +310,7 @@ export class Controller {
       const res = await runAgent({
         harness: model.harness,
         model: model.model,
-        effort: s.chat.effort,
+        effort: fitEffort(model, s.chat.effort),
         role: s.chat.edits ? 'engineer' : 'scout',
         cwd: project.path,
         prompt: text,
@@ -391,7 +394,7 @@ export class Controller {
         return runAgent({
           harness: model.harness,
           model: model.model,
-          effort: cfg.effort ?? stage.effort,
+          effort: fitEffort(model, cfg.effort ?? stage.effort),
           role: cfg.role,
           cwd: req.cwd,
           prompt: req.prompt,
@@ -486,6 +489,21 @@ export class Controller {
     this.store.saveSettings(next);
     this.emitRaw({ type: 'settings', settings: next });
     return next;
+  }
+
+  /** Add the models claude and codex list that you have not been offered yet. */
+  private addListedModels(): string[] {
+    const before = JSON.stringify(this.settings);
+    const { settings, added } = mergeCatalog(this.settings, modelCatalog());
+    this.settings = settings;
+    if (JSON.stringify(settings) !== before) this.store.saveSettings(settings);
+    return added.map((m) => m.label);
+  }
+
+  refreshModels(): { settings: Settings; added: string[] } {
+    const added = this.addListedModels();
+    this.emitRaw({ type: 'settings', settings: this.settings });
+    return { settings: this.settings, added };
   }
 
   async doctor(): Promise<DoctorReport> {

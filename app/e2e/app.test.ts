@@ -6,7 +6,8 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
 
@@ -108,6 +109,39 @@ describe('sessions', () => {
       await until(async () => (await agentItems(l.page)).length === 2 && fakeAgents() > 0, 10000, 'the second agent');
     });
     await until(async () => fakeAgents() === 0, 10000, 'every agent to be gone after quit');
+  });
+});
+
+describe('models', () => {
+  test("codex's own model list is on offer, and each model shows and gets only the efforts it takes", async () => {
+    const probe = join(mkdtempSync(join(tmpdir(), 'army-probe-')), 'codex-argv.json');
+    await withApp({ jevUrl, env: { FAKE_PROBE_FILE: probe } }, async (l) => {
+      await openSession(l);
+      const model = l.page.getByLabel('Model', { exact: true });
+      const effort = l.page.getByLabel('Effort', { exact: true });
+      const options = async () => effort.locator('option').allTextContents();
+      await model.selectOption({ label: 'GPT-6-Astra' });
+      assert.deepEqual(await options(), ['low effort', 'medium effort', 'high effort', 'xhigh effort', 'max effort', 'ultra effort']);
+      await effort.selectOption('ultra');
+      await send(l, 'Which file exports add?');
+      await until(async () => (await agentItems(l.page))[0]?.status === 'done', 20000, 'the codex reply');
+      const argv = (JSON.parse(readFileSync(probe, 'utf8')) as { argv: string[] }).argv;
+      assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-6-astra');
+      assert.ok(argv.includes('model_reasoning_effort=ultra'), argv.join(' '));
+
+      // GPT-5.5 stops at xhigh: switching keeps the chat on the highest level it takes.
+      await model.selectOption({ label: 'GPT-5.5' });
+      await until(async () => (await effort.inputValue()) === 'xhigh', 5000, 'the effort to fit GPT-5.5');
+      assert.deepEqual(await options(), ['low effort', 'medium effort', 'high effort', 'xhigh effort']);
+
+      await l.page.getByRole('button', { name: 'Settings' }).click();
+      await l.page.getByText('Effort low, medium, high, xhigh, max, ultra.').first().waitFor();
+      await l.page.getByText('Frontier intelligence for the most demanding work.').waitFor();
+      assert.equal(await l.page.getByRole('button', { name: 'Save' }).isDisabled(), true, 'nothing to save until you change something');
+      const listed = await l.page.getByRole('textbox').evaluateAll((els) => (els as HTMLInputElement[]).map((e) => e.value).filter((v) => v.startsWith('GPT')));
+      assert.deepEqual(listed, ['GPT-6-Astra', 'GPT-5.6-Luna', 'GPT-5.5'], 'newest codex model first');
+      await shot(l.page, 'e2e-models-settings');
+    });
   });
 });
 

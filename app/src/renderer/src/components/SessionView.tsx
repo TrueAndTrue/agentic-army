@@ -1,12 +1,13 @@
 import { ArrowUp, Pencil, Square, Trash2 } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-import { EFFORTS, type Session, type SessionItem } from '../../../shared/types.ts';
+import { fitEffort } from '../../../shared/models.ts';
+import type { Session, SessionItem } from '../../../shared/types.ts';
 import { api, go, setState, useStore } from '../lib/state.ts';
 import { AgentBlock } from './AgentBlock.tsx';
 import { RunCard } from './RunCard.tsx';
 import { RunPanel } from './RunPanel.tsx';
-import { cx, IconButton, Kbd, PillSelect } from './ui.tsx';
+import { cx, EffortOptions, IconButton, Kbd, ModelOptions, PillSelect } from './ui.tsx';
 
 function Item({ item }: { item: SessionItem }) {
   const settings = useStore((s) => s.settings);
@@ -70,6 +71,7 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
   const flowExists = target === 'chat' || target === 'auto' || flows.some((f) => f.id === target);
   const effectiveTarget = flowExists ? target : 'chat';
   const chatBusy = busy && effectiveTarget === 'chat';
+  const chatModel = settings?.models.find((m) => m.id === session.chat.modelId);
 
   const send = () => {
     const body = text.trim();
@@ -114,19 +116,22 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
           </PillSelect>
           {effectiveTarget === 'chat' && settings !== null && (
             <>
-              <PillSelect aria-label="Model" value={session.chat.modelId} onChange={(e) => void api().setChat(session.id, { modelId: e.target.value })}>
-                {settings.models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
+              <PillSelect
+                aria-label="Model"
+                value={session.chat.modelId}
+                onChange={(e) => {
+                  const next = settings.models.find((m) => m.id === e.target.value);
+                  void api().setChat(session.id, { modelId: e.target.value, effort: fitEffort(next, session.chat.effort) });
+                }}
+              >
+                <ModelOptions models={settings.models} />
               </PillSelect>
-              <PillSelect aria-label="Effort" value={session.chat.effort} onChange={(e) => void api().setChat(session.id, { effort: e.target.value as Session['chat']['effort'] })}>
-                {EFFORTS.map((x) => (
-                  <option key={x} value={x}>
-                    {x} effort
-                  </option>
-                ))}
+              <PillSelect
+                aria-label="Effort"
+                value={fitEffort(chatModel, session.chat.effort)}
+                onChange={(e) => void api().setChat(session.id, { effort: e.target.value as Session['chat']['effort'] })}
+              >
+                <EffortOptions model={chatModel} suffix=" effort" />
               </PillSelect>
               <PillSelect aria-label="Permissions" value={session.chat.edits ? 'edit' : 'read'} onChange={(e) => void api().setChat(session.id, { edits: e.target.value === 'edit' })}>
                 <option value="edit">Can edit files</option>

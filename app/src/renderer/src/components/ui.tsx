@@ -1,5 +1,8 @@
 import { cloneElement, isValidElement, useId, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactElement, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 
+import { effortsFor } from '../../../shared/models.ts';
+import type { Harness, ModelEntry } from '../../../shared/types.ts';
+
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(' ');
 }
@@ -130,4 +133,40 @@ export function Dot({ color, pulse, className }: { color: string; pulse?: boolea
 
 export function Kbd({ children }: { children: ReactNode }) {
   return <kbd className="rounded border border-line bg-raised px-1 font-mono text-[10.5px] text-muted">{children}</kbd>;
+}
+
+const HARNESS_GROUP: Record<Harness, string> = { claude: 'Claude', codex: 'Codex' };
+
+/** The models as `<option>`s, grouped by the tool that runs them. */
+export function ModelOptions({ models }: { models: ModelEntry[] }) {
+  return (
+    <>
+      {(['claude', 'codex'] as const).map((h) => {
+        const list = models.filter((m) => m.harness === h);
+        return list.length === 0 ? null : (
+          <optgroup key={h} label={HARNESS_GROUP[h]}>
+            {list.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </optgroup>
+        );
+      })}
+    </>
+  );
+}
+
+/** The effort levels this model takes, as `<option>`s. */
+export function EffortOptions({ model, suffix = '' }: { model: ModelEntry | undefined; suffix?: string }) {
+  return (
+    <>
+      {effortsFor(model).map((x) => (
+        <option key={x} value={x}>
+          {x}
+          {suffix}
+        </option>
+      ))}
+    </>
+  );
 }

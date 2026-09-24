@@ -1,10 +1,11 @@
-import { CheckCircle2, CircleAlert, Plus, Trash2 } from 'lucide-react';
+import { CheckCircle2, CircleAlert, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
-import { AGENT_ROLES, EFFORTS, ROLE_INFO, type DoctorReport, type Harness, type Settings } from '../../../shared/types.ts';
+import { effortsFor, fitEffort } from '../../../shared/models.ts';
+import { AGENT_ROLES, ROLE_INFO, type DoctorReport, type Harness, type Settings, type StageDefault } from '../../../shared/types.ts';
 import { ROLE_COLOR } from '../lib/format.ts';
 import { api, useStore } from '../lib/state.ts';
-import { Button, Field, IconButton, Input, Select } from './ui.tsx';
+import { Button, EffortOptions, Field, IconButton, Input, ModelOptions, Select } from './ui.tsx';
 
 function Section({ title, children, note }: { title: string; note?: string; children: React.ReactNode }) {
   return (
@@ -32,6 +33,7 @@ export function SettingsView() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [jev, setJev] = useState<{ ok: boolean; detail: string } | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [refreshed, setRefreshed] = useState<string | null>(null);
 
   useEffect(() => setS(saved), [saved]);
   useEffect(() => {
@@ -45,6 +47,25 @@ export function SettingsView() {
     void api().doctor().then(setDoctor);
   };
   const modelIds = new Set(s.models.map((m) => m.id));
+  const byId = (id: string) => s.models.find((m) => m.id === id);
+  /** A stage row: pick a model and effort; changing the model keeps the effort if it still fits. */
+  const stageRow = (key: string, label: React.ReactNode, value: StageDefault, onChange: (v: StageDefault) => void) => (
+    <div key={key} className="grid grid-cols-[150px_1fr_130px] items-center gap-2">
+      {label}
+      <Select aria-label={`${key} model`} value={value.modelId} onChange={(e) => onChange({ modelId: e.target.value, effort: fitEffort(byId(e.target.value), value.effort) })}>
+        <ModelOptions models={s.models} />
+      </Select>
+      <Select aria-label={`${key} effort`} value={fitEffort(byId(value.modelId), value.effort)} onChange={(e) => onChange({ ...value, effort: e.target.value as StageDefault['effort'] })}>
+        <EffortOptions model={byId(value.modelId)} />
+      </Select>
+    </div>
+  );
+  const refresh = async () => {
+    const { settings: next, added } = await api().refreshModels();
+    // Keep unsaved edits; take only the models the lists added or updated.
+    setS((cur) => (cur === null ? next : { ...cur, models: next.models, offeredModels: next.offeredModels }));
+    setRefreshed(added.length === 0 ? 'No new models.' : `Added ${added.join(', ')}.`);
+  };
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
@@ -71,7 +92,10 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section title="Models" note="Every model a node or chat can use. Add one when a vendor ships a new model: the model id is what the command-line tool receives.">
+          <Section
+            title="Models"
+            note="Every model a node or chat can use. The claude models are built in. The codex models come from codex's own list, so a model OpenAI ships appears here once codex has seen it. You can also add one by hand: the model id is what the command-line tool receives."
+          >
             <div className="space-y-1.5">
               <div className="grid grid-cols-[1fr_110px_1.3fr_32px] gap-2 px-0.5 text-[11.5px] text-faint">
                 <span>Name</span>
@@ -80,7 +104,7 @@ export function SettingsView() {
                 <span />
               </div>
               {s.models.map((m, i) => (
-                <div key={m.id} className="grid grid-cols-[1fr_110px_1.3fr_32px] gap-2">
+                <div key={m.id} className="grid grid-cols-[1fr_110px_1.3fr_32px] gap-x-2">
                   <Input value={m.label} onChange={(e) => setS({ ...s, models: s.models.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)) })} />
                   <Select value={m.harness} onChange={(e) => setS({ ...s, models: s.models.map((x, j) => (j === i ? { ...x, harness: e.target.value as Harness } : x)) })}>
                     <option value="claude">claude</option>
@@ -105,62 +129,45 @@ export function SettingsView() {
                   >
                     <Trash2 size={14} />
                   </IconButton>
+                  <p className="col-span-4 mb-1.5 mt-0.5 px-0.5 text-[11.5px] text-faint">
+                    {m.description !== undefined && <span className="text-muted">{m.description} </span>}
+                    Effort {effortsFor(m).join(', ')}.
+                  </p>
                 </div>
               ))}
-              <Button
-                tone="quiet"
-                onClick={() => {
-                  let n = s.models.length + 1;
-                  while (modelIds.has(`model-${n}`)) n += 1;
-                  setS({ ...s, models: [...s.models, { id: `model-${n}`, harness: 'claude', model: '', label: 'New model' }] });
-                }}
-              >
-                <Plus size={14} /> Add a model
-              </Button>
+              <div className="flex flex-wrap items-center gap-1 pt-1">
+                <Button
+                  tone="quiet"
+                  onClick={() => {
+                    let n = s.models.length + 1;
+                    while (modelIds.has(`model-${n}`)) n += 1;
+                    setS({ ...s, models: [...s.models, { id: `model-${n}`, harness: 'claude', model: '', label: 'New model' }] });
+                  }}
+                >
+                  <Plus size={14} /> Add a model
+                </Button>
+                <Button tone="quiet" onClick={() => void refresh()}>
+                  <RefreshCw size={13} /> Check for new models
+                </Button>
+                {refreshed !== null && <span className="ml-1 text-[12px] text-muted">{refreshed}</span>}
+              </div>
             </div>
           </Section>
 
           <Section title="Models at each stage" note="What an agent node uses when it does not name its own model. Change a stage here and every flow that relies on the default follows.">
             <div className="space-y-2">
-              {AGENT_ROLES.map((r) => (
-                <div key={r} className="grid grid-cols-[150px_1fr_130px] items-center gap-2">
+              {AGENT_ROLES.map((r) =>
+                stageRow(
+                  r,
                   <span className="flex items-center gap-2 text-[13px] font-medium">
                     <span className="h-2.5 w-2.5 rounded-sm" style={{ background: ROLE_COLOR[r] }} />
                     {ROLE_INFO[r].label}
-                  </span>
-                  <Select value={s.stageDefaults[r].modelId} onChange={(e) => setS({ ...s, stageDefaults: { ...s.stageDefaults, [r]: { ...s.stageDefaults[r], modelId: e.target.value } } })}>
-                    {s.models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label} · {m.harness}
-                      </option>
-                    ))}
-                  </Select>
-                  <Select value={s.stageDefaults[r].effort} onChange={(e) => setS({ ...s, stageDefaults: { ...s.stageDefaults, [r]: { ...s.stageDefaults[r], effort: e.target.value as typeof s.chatDefault.effort } } })}>
-                    {EFFORTS.map((x) => (
-                      <option key={x} value={x}>
-                        {x}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-              ))}
-              <div className="grid grid-cols-[150px_1fr_130px] items-center gap-2 pt-2">
-                <span className="text-[13px] font-medium">New chats</span>
-                <Select value={s.chatDefault.modelId} onChange={(e) => setS({ ...s, chatDefault: { ...s.chatDefault, modelId: e.target.value } })}>
-                  {s.models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label} · {m.harness}
-                    </option>
-                  ))}
-                </Select>
-                <Select value={s.chatDefault.effort} onChange={(e) => setS({ ...s, chatDefault: { ...s.chatDefault, effort: e.target.value as typeof s.chatDefault.effort } })}>
-                  {EFFORTS.map((x) => (
-                    <option key={x} value={x}>
-                      {x}
-                    </option>
-                  ))}
-                </Select>
-              </div>
+                  </span>,
+                  s.stageDefaults[r],
+                  (v) => setS({ ...s, stageDefaults: { ...s.stageDefaults, [r]: v } }),
+                ),
+              )}
+              <div className="pt-2">{stageRow('chat', <span className="text-[13px] font-medium">New chats</span>, s.chatDefault, (v) => setS({ ...s, chatDefault: v }))}</div>
             </div>
           </Section>
 
