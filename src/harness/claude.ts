@@ -140,6 +140,7 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
 
   // Every spec field that reaches an argv value slot is validated before it gets there.
   assertUuid('sessionId', spec.sessionId);
+  if (spec.resumeSessionId !== undefined) assertUuid('resumeSessionId', spec.resumeSessionId);
   if (spec.model !== undefined) assertNotFlagLike('model', spec.model);
   spec.allow.forEach((v, i) => assertNotFlagLike(`allow[${String(i)}]`, v));
   spec.deny.forEach((v, i) => assertNotFlagLike(`deny[${String(i)}]`, v));
@@ -152,8 +153,10 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
     'stream-json',
     // stream-json is only accepted alongside --verbose on the -p path.
     '--verbose',
-    '--session-id',
-    spec.sessionId,
+    // A resumed conversation keeps the id it already has; a fresh one takes the supervisor's.
+    ...(spec.resumeSessionId === undefined
+      ? ['--session-id', spec.sessionId]
+      : ['--resume', spec.resumeSessionId]),
     // Forwards nested subagent messages carrying parent_tool_use_id at every depth — this is what
     // lets the UI reconstruct the org chart. Verified: the forwarded record also carries a
     // top-level `subagent_type`.

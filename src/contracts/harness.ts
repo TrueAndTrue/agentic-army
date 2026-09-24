@@ -116,6 +116,14 @@ export interface SoldierSpec {
    */
   sessionId: string;
   /**
+   * Continue an earlier conversation instead of starting one. The value is the HARNESS's own id:
+   * the claude session id echoed on `system/init`, or the codex thread id from `thread.started`.
+   * When set, claude gets `--resume <id>` in place of `--session-id`, and codex runs
+   * `exec resume <id>`. The desktop app sets it so a chat survives a restart. Campaigns never set
+   * it, so a crashed soldier is still re-attempted fresh.
+   */
+  resumeSessionId?: string;
+  /**
    * Path to a JSON Schema FILE (see `REPORT_SCHEMA_PATH` / `VERDICT_SCHEMA_PATH`).
    *
    * VERIFIED ASYMMETRY, absorbed by the adapters:

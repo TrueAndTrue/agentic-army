@@ -378,10 +378,34 @@ export function assertCodexSpecArgSafe(spec: SoldierSpec): void {
   if (spec.model !== undefined) assertNotFlagLike('model', spec.model);
   if (spec.outputSchemaPath !== undefined) assertNotFlagLike('outputSchemaPath', spec.outputSchemaPath);
   assertNotFlagLike('cwd', spec.cwd);
+  if (spec.resumeSessionId !== undefined) assertNotFlagLike('resumeSessionId', spec.resumeSessionId);
 }
 
 export function buildCodexArgs(spec: SoldierSpec, prompt: string, options?: CodexArgsOptions): string[] {
   assertCodexSpecArgSafe(spec);
+
+  // `exec resume` accepts a narrower flag set than `exec`: no `-C`, no `-s`, no `--color`. The
+  // process cwd is already `spec.cwd`, and the sandbox mode goes in as a `-c` override so the
+  // resumed turn is confined exactly like the first one.
+  if (spec.resumeSessionId !== undefined) {
+    const resumed = [
+      'exec',
+      'resume',
+      '--json',
+      '--skip-git-repo-check',
+      '-c',
+      'sandbox_mode="workspace-write"',
+    ];
+    resumed.push(...(options?.confinement ?? codexConfinement(spec)).args);
+    if (options?.outputPath !== undefined) resumed.push('-o', options.outputPath);
+    if (spec.outputSchemaPath !== undefined && spec.outputSchemaPath !== '') {
+      resumed.push('--output-schema', spec.outputSchemaPath);
+    }
+    if (spec.model !== undefined && spec.model !== '') resumed.push('-m', spec.model);
+    if (spec.effort !== undefined) resumed.push('-c', `model_reasoning_effort=${CODEX_EFFORT[spec.effort]}`);
+    resumed.push('--', spec.resumeSessionId, prompt);
+    return resumed;
+  }
 
   const args = [
     'exec',

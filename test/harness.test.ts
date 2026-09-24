@@ -545,6 +545,35 @@ describe('claude argv', () => {
   });
 });
 
+describe('resuming a conversation (the desktop app keeps a chat across restarts)', () => {
+  const RESUME = '99999999-8888-7777-6666-555555555555';
+
+  test('claude swaps --session-id for --resume, and a fresh spec is untouched', () => {
+    const resumed = buildClaudeArgs(spec({ resumeSessionId: RESUME }));
+    assert.equal(resumed[resumed.indexOf('--resume') + 1], RESUME);
+    assert.equal(resumed.includes('--session-id'), false);
+    assert.equal(buildClaudeArgs(spec()).includes('--resume'), false);
+  });
+
+  test('claude refuses a resume id that is not a UUID', () => {
+    assert.throws(() => buildClaudeArgs(spec({ resumeSessionId: '--bare' })), /resumeSessionId must be a UUID/);
+  });
+
+  test('codex runs exec resume with the id and prompt after --, and keeps the sandbox', () => {
+    const args = buildCodexArgs(spec({ harness: 'codex', resumeSessionId: 'thread-1', model: 'gpt-5.5' }), 'next turn');
+    assert.deepEqual(args.slice(0, 2), ['exec', 'resume']);
+    assert.ok(args.includes('sandbox_mode="workspace-write"'));
+    assert.equal(args.includes('-C'), false);
+    assert.equal(args.includes('-s'), false);
+    assert.deepEqual(args.slice(-3), ['--', 'thread-1', 'next turn']);
+    assert.equal(args[args.indexOf('-m') + 1], 'gpt-5.5');
+  });
+
+  test('codex refuses a flag-like resume id', () => {
+    assert.throws(() => buildCodexArgs(spec({ harness: 'codex', resumeSessionId: '--last' }), 'x'), /resumeSessionId/);
+  });
+});
+
 describe('codex argv + env', () => {
   const args = buildCodexArgs(spec({ harness: 'codex' }), 'review the branch');
 
