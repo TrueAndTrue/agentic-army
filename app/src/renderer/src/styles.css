@@ -1,0 +1,303 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/instrument-sans';
+@import '@fontsource-variable/jetbrains-mono';
+@import '@xyflow/react/dist/style.css';
+
+/* Tokens. Dark is the default; light follows the system or the setting. */
+:root {
+  --bg: #15171a;
+  --panel: #1b1e22;
+  --raised: #22262b;
+  --hover: #2a2f35;
+  --line: #2e3339;
+  --line-strong: #3b4148;
+  --text: #e7e5e0;
+  --muted: #9ba0a7;
+  --faint: #6c727a;
+  --brass: #c9a44c;
+  --brass-ink: #1b1608;
+  --brass-soft: rgba(201, 164, 76, 0.14);
+  --ok: #7fbf7a;
+  --bad: #e5737a;
+  --warn: #e3b35a;
+  --run: #6fb2e0;
+  --scout: #5fb3a8;
+  --planner: #9aa5f2;
+  --engineer: #a3c46e;
+  --reviewer: #df8fa7;
+  --validator: #6fb2e0;
+  --human: #c3c6cc;
+  --shell: #a7a9ad;
+  --git: #e58a5f;
+  --browser: #b494e8;
+  --canvas-dot: #2a2e33;
+  --edge: #59606a;
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f4f1;
+  --panel: #ffffff;
+  --raised: #f7f7f4;
+  --hover: #ecece7;
+  --line: #e1e1db;
+  --line-strong: #cfcfc7;
+  --text: #1c1e21;
+  --muted: #5f646b;
+  --faint: #8d9198;
+  --brass: #9c7a22;
+  --brass-ink: #ffffff;
+  --brass-soft: rgba(156, 122, 34, 0.12);
+  --ok: #3f8a3b;
+  --bad: #c2414a;
+  --warn: #a8761b;
+  --run: #2f7fb5;
+  --scout: #2e8a7f;
+  --planner: #5561c9;
+  --engineer: #5f8a26;
+  --reviewer: #b8506f;
+  --validator: #2f7fb5;
+  --human: #6b7078;
+  --shell: #6b6d71;
+  --git: #c0592a;
+  --browser: #7a52c7;
+  --canvas-dot: #dcdcd4;
+  --edge: #a9aaa3;
+  color-scheme: light;
+}
+
+@theme inline {
+  --font-sans: 'Instrument Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-brass: var(--brass);
+  --color-brass-ink: var(--brass-ink);
+  --color-brass-soft: var(--brass-soft);
+  --color-ok: var(--ok);
+  --color-bad: var(--bad);
+  --color-warn: var(--warn);
+  --color-run: var(--run);
+}
+
+@layer base {
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Text people read or copy stays selectable. */
+.selectable,
+.prose,
+pre,
+code,
+textarea,
+input {
+  user-select: text;
+}
+
+.drag {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--brass);
+  outline-offset: 1px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--line-strong);
+  background-clip: content-box;
+}
+
+/* Agent prose. */
+.prose {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.prose p {
+  margin: 0 0 0.7em;
+}
+.prose p:last-child {
+  margin-bottom: 0;
+}
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
+  font-weight: 600;
+  margin: 1.1em 0 0.45em;
+  line-height: 1.3;
+}
+.prose h1 {
+  font-size: 1.25em;
+}
+.prose h2 {
+  font-size: 1.12em;
+}
+.prose h3,
+.prose h4 {
+  font-size: 1em;
+}
+.prose ul,
+.prose ol {
+  margin: 0 0 0.7em;
+  padding-left: 1.3em;
+}
+.prose ul {
+  list-style: disc;
+}
+.prose ol {
+  list-style: decimal;
+}
+.prose li {
+  margin: 0.15em 0;
+}
+.prose a {
+  color: var(--brass);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+}
+.prose pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0 0 0.8em;
+}
+.prose pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+.prose table {
+  border-collapse: collapse;
+  margin: 0 0 0.8em;
+  font-size: 0.95em;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  text-align: left;
+}
+.prose blockquote {
+  border-left: 3px solid var(--line-strong);
+  padding-left: 10px;
+  color: var(--muted);
+  margin: 0 0 0.7em;
+}
+
+}
+
+/* React Flow, in our colours. */
+.react-flow {
+  --xy-background-color: var(--bg);
+  --xy-edge-stroke: var(--edge);
+  --xy-edge-stroke-width: 1.5;
+  --xy-edge-stroke-selected: var(--brass);
+  --xy-connectionline-stroke: var(--brass);
+  --xy-attribution-background-color: transparent;
+  --xy-controls-button-background-color: var(--panel);
+  --xy-controls-button-background-color-hover: var(--hover);
+  --xy-controls-button-color: var(--text);
+  --xy-controls-button-border-color: var(--line);
+  --xy-minimap-background-color: var(--panel);
+  --xy-selection-background-color: var(--brass-soft);
+  --xy-selection-border: 1px solid var(--brass);
+}
+.react-flow__attribution {
+  display: none;
+}
+.react-flow__controls {
+  box-shadow: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.react-flow__edge-textbg {
+  fill: var(--bg);
+}
+.react-flow__edge-text {
+  fill: var(--muted);
+  font-size: 11px;
+}
+.react-flow__edge.animated path {
+  stroke: var(--run);
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--run) 55%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 7px transparent;
+  }
+}
+.pulse {
+  animation: pulse-ring 1.4s ease-out infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+.caret::after {
+  content: '▍';
+  margin-left: 1px;
+  color: var(--brass);
+  animation: blink 1s steps(1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse,
+  .caret::after {
+    animation: none;
+  }
+}

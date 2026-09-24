@@ -1,0 +1,143 @@
+/**
+ * Launches the built app against a throwaway home, a throwaway git project, the engine's fake
+ * claude and codex, and a fake Jev. Nothing here spends money or touches your real settings.
+ */
+
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+
+import { _electron as electron, type ElectronApplication, type Page } from 'playwright';
+
+const APP = resolve(import.meta.dirname, '..');
+const FIXTURES = resolve(APP, '../test/fixtures');
+
+export interface JevCall {
+  state: unknown;
+  questions: Record<string, { type: string; criteria?: unknown }>;
+}
+
+/** Answers every noul with `noul`, every choice with `choice(criteria)`, every score with 2. */
+export function fakeJev(opts: { noul?: (id: string) => number; choice?: (id: string, keys: string[]) => string } = {}) {
+  const calls: JevCall[] = [];
+  const server: Server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const parsed = JSON.parse(body) as JevCall;
+      calls.push(parsed);
+      const answers: Record<string, unknown> = {};
+      for (const [id, q] of Object.entries(parsed.questions)) {
+        if (q.type === 'noul') answers[id] = { type: 'noul', noul: opts.noul?.(id) ?? 0.9 };
+        else if (q.type === 'choice') {
+          const keys = Object.keys(q.criteria as object);
+          const pick = opts.choice?.(id, keys) ?? keys[0]!;
+          answers[id] = { type: 'choice', choice: pick, confidence: 0.88, probabilities: Object.fromEntries(keys.map((k) => [k, k === pick ? 0.9 : 0.1 / (keys.length - 1)])) };
+        } else answers[id] = { type: 'score', score: 2, confidence: 0.8, legend: {}, probabilities: { '2': 0.8 } };
+      }
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ model: 'jev-fake', answers, usage: { input_tokens: 10, output_tokens: 1 } }));
+    });
+  });
+  return {
+    calls,
+    async listen(): Promise<string> {
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      const addr = server.address();
+      return `http://127.0.0.1:${typeof addr === 'object' && addr !== null ? addr.port : 0}`;
+    },
+    close: () => server.close(),
+  };
+}
+
+export function makeProject(root: string, name = 'calc'): string {
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'calc.js'), 'exports.add = (a, b) => a + b;\n');
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, scripts: { test: 'node -e "process.exit(0)"' } }, null, 1));
+  const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+  git('init', '-q', '-b', 'main');
+  git('add', '-A');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'a calculator');
+  return dir;
+}
+
+export interface Launched {
+  app: ElectronApplication;
+  page: Page;
+  home: string;
+  root: string;
+}
+
+export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?: Record<string, string>; home?: string; root?: string; live?: boolean }): Promise<Launched> {
+  const root = opts.root ?? mkdtempSync(join(tmpdir(), 'army-e2e-'));
+  const home = opts.home ?? join(root, 'home');
+  mkdirSync(home, { recursive: true });
+  if (opts.home === undefined && opts.live !== true) {
+    writeFileSync(
+      join(home, 'settings.json'),
+      JSON.stringify({ typesafe: { apiKey: 'fake-key', model: 'jev-latest', baseUrl: opts.jevUrl }, theme: 'dark' }),
+    );
+  }
+  const require = createRequire(import.meta.url);
+  // ARMY_E2E_PACKAGED=1 runs the same tests against the built .app instead of the dev build.
+  const packaged = process.env['ARMY_E2E_PACKAGED'] === '1';
+  const app = await electron.launch({
+    executablePath: packaged ? join(APP, 'release/mac-arm64/Agentic Army.app/Contents/MacOS/Agentic Army') : (require('electron') as unknown as string),
+    args: packaged ? [] : [join(APP, 'out/main/index.js')],
+    cwd: APP,
+    env:
+      opts.live === true
+        ? { ...process.env, ARMY_APP_HOME: home, ARMY_APP_NO_QUIT_CONFIRM: '1', ...(opts.env ?? {}) }
+        : {
+            ...process.env,
+            ARMY_APP_HOME: home,
+            ARMY_APP_NO_QUIT_CONFIRM: '1',
+            // The army's own home (config, archive) goes somewhere throwaway too.
+            AGENTIC_ARMY_HOME: join(root, 'army-home'),
+            ARMY_CLAUDE_BIN: join(FIXTURES, 'fake-claude.mjs'),
+            ARMY_CODEX_BIN: join(FIXTURES, 'fake-codex.mjs'),
+            FAKE_CLAUDE_MODE: opts.claudeMode ?? 'ok',
+            TYPESAFE_API_KEY: '',
+            ...(opts.env ?? {}),
+          },
+  });
+  const page = await app.firstWindow();
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+  await page.waitForSelector('#root > div');
+  return { app, page, home, root };
+}
+
+export const SHOTS = process.env['ARMY_SHOTS'] ?? join(tmpdir(), 'army-shots');
+mkdirSync(SHOTS, { recursive: true });
+
+export async function shot(page: Page, name: string): Promise<void> {
+  await page.screenshot({ path: join(SHOTS, `${name}.png`) });
+}
+
+/**
+ * Poll until `check` returns true. Playwright's waitForFunction treats a returned Promise as a
+ * truthy value and resolves at once, so async checks against window.api go through this instead.
+ */
+export async function until(check: () => Promise<boolean>, timeoutMs: number, what: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`Timed out after ${String(timeoutMs / 1000)} s waiting for ${what}`);
+}
+
+/** The first session's agent replies, as the main process holds them. */
+export async function agentItems(page: Page): Promise<{ status: string; text: string; error?: string; costUsd?: number; tools: { name: string; summary: string }[] }[]> {
+  return page.evaluate(async () => {
+    const s = await window.api.getState();
+    const id = s.sessions[0]?.id;
+    if (id === undefined) return [];
+    const sess = await window.api.getSession(id);
+    return (sess?.items ?? []).filter((i) => i.kind === 'agent') as never;
+  });
+}

@@ -36,3 +36,7 @@ trials/*/.seed/
 # it fails if any comment, string, schema description or README line in the
 # tree cites the document, so the code cannot come to depend on it again.
 DESIGN.md
+
+# the desktop app's build output and packaged app
+app/out/
+app/release/
