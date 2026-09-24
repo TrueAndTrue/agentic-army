@@ -15,6 +15,7 @@ cd app
 npm install
 npm run dev        # the app, with hot reload of the window
 npm run dist       # an unsigned app at release/mac-arm64/Agentic Army.app
+npm run install:mac  # builds it and copies it into /Applications, so Spotlight finds it
 ```
 
 The built app is not signed. The first time, open it with right-click, Open. It reads your login
