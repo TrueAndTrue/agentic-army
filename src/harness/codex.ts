@@ -73,6 +73,8 @@ const CODEX_EFFORT: Record<ReasoningEffort, string> = {
   medium: 'medium',
   high: 'high',
   xhigh: 'xhigh',
+  max: 'max',
+  ultra: 'ultra',
 };
 
 export interface CodexArgsOptions {

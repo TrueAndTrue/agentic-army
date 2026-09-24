@@ -78,6 +78,9 @@ export const TRIAL_EFFECTIVE_EFFORT: Record<ReasoningEffort, string> = {
   medium: 'medium',
   high: 'high',
   xhigh: 'xhigh',
+  max: 'max',
+  // claude has no level above max.
+  ultra: 'max',
 };
 
 // ---------------------------------------------------------------------------------------------

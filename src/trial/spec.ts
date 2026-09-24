@@ -26,8 +26,14 @@ import * as path from 'node:path';
 
 import { parse as parseToml } from 'smol-toml';
 
-import { REASONING_EFFORTS } from '../contracts/harness.ts';
 import type { ReasoningEffort } from '../contracts/harness.ts';
+
+/**
+ * The levels a trial may sweep, and the default arms when a spec names none. A trial runs claude,
+ * whose `--effort` stops at `max`, and the default stays the five levels trials were measured on,
+ * so adding a level to the engine does not quietly add paid arms to every trial.
+ */
+export const TRIAL_EFFORTS: readonly ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 import { CHECK_KINDS, CHECK_TYPES, TRIAL_MODES } from '../contracts/trial.ts';
 import type { Check, CheckKind, CheckType, TrialArm, TrialMode, TrialSpec } from '../contracts/trial.ts';
 
@@ -166,14 +172,14 @@ function parseArmTimeoutMs(raw: unknown): number | undefined {
 }
 
 function parseEfforts(raw: unknown): ReasoningEffort[] {
-  if (raw === undefined) return [...REASONING_EFFORTS];
+  if (raw === undefined) return [...TRIAL_EFFORTS];
   if (!Array.isArray(raw) || raw.length === 0) {
-    throw new Error(`efforts: expected a non-empty array of ${REASONING_EFFORTS.join(', ')}`);
+    throw new Error(`efforts: expected a non-empty array of ${TRIAL_EFFORTS.join(', ')}`);
   }
   return raw.map((e) => {
-    if (typeof e !== 'string' || !(REASONING_EFFORTS as readonly string[]).includes(e)) {
+    if (typeof e !== 'string' || !(TRIAL_EFFORTS as readonly string[]).includes(e)) {
       throw new Error(
-        `efforts: unknown effort ${JSON.stringify(e)} — expected one of ${REASONING_EFFORTS.join(', ')}`,
+        `efforts: unknown effort ${JSON.stringify(e)} — expected one of ${TRIAL_EFFORTS.join(', ')}`,
       );
     }
     return e as ReasoningEffort;
@@ -191,7 +197,7 @@ function buildArms(
   model: string,
 ): TrialArm[] {
   const requested = new Set(efforts);
-  const orderedEfforts = REASONING_EFFORTS.filter((e) => requested.has(e));
+  const orderedEfforts = TRIAL_EFFORTS.filter((e) => requested.has(e));
   const multiBrief = briefs.length > 1;
 
   const arms: TrialArm[] = [];

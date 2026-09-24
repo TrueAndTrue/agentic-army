@@ -631,7 +631,8 @@ describe('codex argv + env', () => {
   });
 
   test('every ReasoningEffort produces a value codex actually accepts', () => {
-    const usable = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    // `ultra` measured on 2026-09-24 with codex 0.154: gpt-6-astra and gpt-5.6-sol answer at it.
+    const usable = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
     for (const effort of REASONING_EFFORTS) {
       const a = buildCodexArgs(spec({ harness: 'codex', effort }), 'go');
       const value = configOverride(a, 'model_reasoning_effort') ?? '';

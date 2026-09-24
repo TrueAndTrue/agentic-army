@@ -46,8 +46,11 @@ export type HarnessId = (typeof HARNESS_IDS)[number];
  * one is not guaranteed. The test that separates the two cases: if the reason for the lower
  * class is a fact about the BUDGET, it is forbidden; if it is a fact about the measured OUTCOME
  * under a guaranteed input, it is a default.
+ *
+ * `max` and `ultra` came with codex 0.154's GPT-6 and GPT-5.6 models, which list them per model in
+ * `~/.codex/models_cache.json`. claude's `--effort` stops at `max`.
  */
-export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 /**

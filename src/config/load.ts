@@ -310,7 +310,7 @@ export function postureNotice(mode: PermissionPosture): string {
  * Local rather than imported as a value so this stays a pure comparison over a config, with no
  * opinion about what a harness does with the class it is handed.
  */
-const EFFORT_ORDER: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+const EFFORT_ORDER: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
 /**
  * Say so when a hand-written config dispatches Engineers above the measured default.

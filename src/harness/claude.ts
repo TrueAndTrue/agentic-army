@@ -59,6 +59,9 @@ const CLAUDE_EFFORT: Record<ReasoningEffort, string> = {
   medium: 'medium',
   high: 'high',
   xhigh: 'xhigh',
+  max: 'max',
+  // claude has no level above max.
+  ultra: 'max',
 };
 
 export interface ClaudeArgsOptions {
