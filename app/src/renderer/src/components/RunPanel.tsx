@@ -2,12 +2,13 @@ import { Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, 
 import { GitMerge, RefreshCw, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
-import type { DiffResult, FlowNode, NodeVisit, Run } from '../../../shared/types.ts';
+import type { DiffResult, FlowNode, Judgment, NodeVisit, Run } from '../../../shared/types.ts';
 import { duration, NODE_STATUS_COLOR, RUN_STATUS_COLOR, RUN_STATUS_LABEL, tokenDetail, tokenLine } from '../lib/format.ts';
 import { api, setState, useStore } from '../lib/state.ts';
 import { AgentBody } from './AgentBlock.tsx';
 import { layeredPositions, mapEdges, nodeTypes, toRfNodes, TYPE_ICON, nodeColor, useMeasured } from './FlowCanvas.tsx';
 import { Markdown } from './Markdown.tsx';
+import { jevVerdict } from './RunCard.tsx';
 import { Button, cx, Dot, IconButton } from './ui.tsx';
 
 type Tab = 'map' | 'steps' | 'changes';
@@ -78,6 +79,45 @@ function MapView({ run, onPick, picked }: { run: Run; onPick(id: string): void; 
   );
 }
 
+/** What Jev was asked, what it said, and how that became the path the run took. */
+function JevBlock({ node, j }: { node: FlowNode; j: Judgment }) {
+  const d = node.type === 'decide' ? node.data : null;
+  const rule =
+    d === null
+      ? null
+      : j.mode === 'yesno'
+        ? `It answers with the chance the answer is yes. At ${Math.round(d.threshold * 100)}% or more this step goes "yes"${d.minConfidence > 0 ? `, and within ${Math.round(d.minConfidence * 50)} points of 50% it goes "unsure"` : ''}.`
+        : j.mode === 'score'
+          ? `It places the answer on the levels below. At "${d.levels[d.cut] ?? d.cut}" or higher this step goes "high".`
+          : `It picks one option; the bars show how likely it found each.${d.minConfidence > 0 ? ` Below ${Math.round(d.minConfidence * 100)}% sure it goes "unsure".` : ''}`;
+  return (
+    <div className="rounded-md border border-brass/40 bg-brass-soft px-3 py-2.5 text-[12.5px]">
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className="font-semibold">Jev: {jevVerdict(node, j)}</span>
+        <span className="text-[11.5px] text-faint">
+          {j.model ?? 'Jev'}
+          {j.latencyMs !== undefined && `, ${j.latencyMs} ms`}
+        </span>
+      </div>
+      {j.question !== undefined && <p className="selectable mt-1 text-muted">Asked: {j.question}</p>}
+      <div className="mt-2 space-y-1">
+        {Object.entries(j.probabilities)
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, p]) => (
+            <div key={k} className="flex items-center gap-2">
+              <span className={cx('w-24 truncate font-mono text-[11px]', k === j.answer ? 'text-text' : 'text-muted')}>{k}</span>
+              <span className="h-1.5 flex-1 overflow-hidden rounded bg-raised">
+                <span className={cx('block h-full', k === j.answer ? 'bg-brass' : 'bg-line-strong')} style={{ width: `${Math.round(p * 100)}%` }} />
+              </span>
+              <span className="w-9 text-right font-mono text-[11px] text-faint">{Math.round(p * 100)}%</span>
+            </div>
+          ))}
+      </div>
+      {rule !== null && <p className="mt-2 text-[11.5px] text-faint">{rule}</p>}
+    </div>
+  );
+}
+
 function VisitView({ node, visit }: { node: FlowNode; visit: NodeVisit }) {
   return (
     <div className="space-y-2.5">
@@ -94,29 +134,7 @@ function VisitView({ node, visit }: { node: FlowNode; visit: NodeVisit }) {
         </details>
       )}
       {visit.turn !== undefined && <AgentBody turn={visit.turn} compact />}
-      {visit.judgment !== undefined && (
-        <div className="rounded-md border border-brass/40 bg-brass-soft px-3 py-2 text-[12.5px]">
-          <div className="mb-1 font-medium">
-            Jev answered <span className="font-mono">{visit.judgment.answer}</span>
-            {visit.judgment.value !== undefined && <span className="text-muted"> · value {visit.judgment.value.toFixed(2)}</span>}
-            <span className="text-muted"> · confidence {visit.judgment.confidence.toFixed(2)}</span>
-            {visit.judgment.latencyMs !== undefined && <span className="text-faint"> · {visit.judgment.latencyMs} ms</span>}
-          </div>
-          <div className="space-y-1">
-            {Object.entries(visit.judgment.probabilities)
-              .sort((a, b) => b[1] - a[1])
-              .map(([k, p]) => (
-                <div key={k} className="flex items-center gap-2">
-                  <span className="w-24 truncate font-mono text-[11px] text-muted">{k}</span>
-                  <span className="h-1.5 flex-1 overflow-hidden rounded bg-raised">
-                    <span className="block h-full bg-brass" style={{ width: `${Math.round(p * 100)}%` }} />
-                  </span>
-                  <span className="w-9 text-right font-mono text-[11px] text-faint">{Math.round(p * 100)}%</span>
-                </div>
-              ))}
-          </div>
-        </div>
-      )}
+      {visit.judgment !== undefined && <JevBlock node={node} j={visit.judgment} />}
       {visit.steps !== undefined && visit.steps.length > 0 && (
         <ol className="space-y-1.5">
           {visit.steps.map((s) => (
@@ -149,6 +167,19 @@ function VisitView({ node, visit }: { node: FlowNode; visit: NodeVisit }) {
 }
 
 function Steps({ run, focus }: { run: Run; focus: string | null }) {
+  const settings = useStore((s) => s.settings);
+  const running = run.flow.nodes.find((n) => run.nodes[n.id]?.status === 'running' || run.nodes[n.id]?.status === 'waiting')?.id;
+  // Keep the step that is working in view as earlier steps fill with output.
+  useEffect(() => {
+    if (running === undefined) return;
+    document.getElementById(`step-${run.id}-${running}`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [running, run.id]);
+  const who = (n: FlowNode): string | null => {
+    if (n.type === 'decide') return 'Jev';
+    if (n.type !== 'agent') return null;
+    const id = n.data.modelId ?? settings?.stageDefaults[n.data.role].modelId;
+    return settings?.models.find((m) => m.id === id)?.label ?? null;
+  };
   const nodes = run.flow.nodes
     .filter((n) => (run.nodes[n.id]?.visits.length ?? 0) > 0 && (focus === null || n.id === focus))
     .sort((a, b) => (run.nodes[a.id]?.visits[0]?.startedAt ?? '').localeCompare(run.nodes[b.id]?.visits[0]?.startedAt ?? ''));
@@ -159,10 +190,11 @@ function Steps({ run, focus }: { run: Run; focus: string | null }) {
         const Icon = TYPE_ICON[n.type];
         const st = run.nodes[n.id]!;
         return (
-          <section key={n.id}>
+          <section key={n.id} id={`step-${run.id}-${n.id}`}>
             <h3 className="mb-2 flex items-center gap-2 text-[13px] font-semibold">
               <Icon size={14} style={{ color: nodeColor(n) }} />
               {n.data.label}
+              {who(n) !== null && <span className="text-[11.5px] font-normal text-muted">{who(n)}</span>}
               <Dot color={NODE_STATUS_COLOR[st.status]} pulse={st.status === 'running'} />
               <span className="text-[11.5px] font-normal text-faint">{st.status}</span>
             </h3>
@@ -244,7 +276,7 @@ export function RunPanel({ run }: { run: Run }) {
   const [focus, setFocus] = useState<string | null>(null);
   const live = run.status === 'running' || run.status === 'waiting';
   return (
-    <aside className="flex h-full w-[50%] min-w-[440px] max-w-[820px] shrink-0 flex-col border-l border-line bg-panel">
+    <aside className="flex h-full w-[50%] min-w-[440px] max-w-[820px] shrink-0 flex-col border-l border-line bg-panel max-[1180px]:absolute max-[1180px]:inset-y-0 max-[1180px]:right-0 max-[1180px]:z-30 max-[1180px]:w-[min(560px,92%)] max-[1180px]:min-w-0 max-[1180px]:shadow-[-12px_0_32px_rgba(0,0,0,0.28)]">
       <header className="drag flex h-12 shrink-0 items-center gap-2 border-b border-line px-3">
         <Dot color={RUN_STATUS_COLOR[run.status]} pulse={live} />
         <span className="truncate text-[13px] font-semibold">{run.flowName}</span>

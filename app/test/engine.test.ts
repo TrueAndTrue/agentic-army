@@ -145,7 +145,7 @@ describe('running a flow', () => {
     assert.equal(log.agentPrompts[2]?.resume, 's-build');
   });
 
-  test('a loop that never settles stops at the visit limit, and the run says which node', async () => {
+  test('a loop that never settles stops at the visit limit, and the run names the decision that kept sending it back', async () => {
     const f = flow(
       [node('start', 'start'), node('build', 'agent', { maxVisits: 2 }), node('check', 'decide', { mode: 'yesno' })],
       [edge('start', 'out', 'build'), edge('build', 'out', 'check'), edge('check', 'no', 'build')],
@@ -155,7 +155,8 @@ describe('running a flow', () => {
       deps({ judge: async ({ config }) => ({ mode: config.mode, answer: 'no', probabilities: {}, confidence: 1, value: 0 }) }),
     );
     assert.equal(r.status, 'failed');
-    assert.match(r.error ?? '', /"build" reached its limit of 2 visits/);
+    assert.match(r.error ?? '', /Jev answered "no" at "check" each time, sending the work back to "build"\. It ran 2 times, its limit/);
+    assert.notEqual(r.nodes['build']?.status, 'failed', 'build did its job each time; the loop is what ran out');
   });
 
   test('parallel branches meet at a Join, which fires once with both outputs', async () => {
@@ -222,7 +223,43 @@ describe('running a flow', () => {
       [edge('start', 'out', 'test'), edge('test', 'pass', 'ok'), edge('test', 'fail', 'bad')],
     );
     const r = await run(f, deps({ shell: async () => ({ code: 1, output: '1 failing' }) }));
-    assert.match(r.result ?? '', /^red: Command: npm test\nExit code: 1\n\n1 failing/);
+    assert.match(r.result ?? '', /^red: Command: `npm test`\nExit code: 1\n\n```\n1 failing/);
+  });
+});
+
+describe('how a run ends', () => {
+  const failing = deps({ shell: async () => ({ code: 1, output: '1 failing' }) });
+
+  test('an output with nothing connected fails the run and says where, instead of a green finish', async () => {
+    const f = flow([node('start', 'start'), node('test', 'shell', { command: 'npm test' }), node('ok', 'end', { template: 'green' })], [edge('start', 'out', 'test'), edge('test', 'pass', 'ok')]);
+    const r = await run(f, failing);
+    assert.equal(r.status, 'failed');
+    assert.match(r.error ?? '', /"test" took its "fail" path, and nothing is connected there/);
+    assert.equal(r.result, undefined);
+  });
+
+  test('an End marked as a failure fails the run, and one marked stopped stops it, each with its message', async () => {
+    const f = (outcome: 'failure' | 'stopped') =>
+      flow(
+        [node('start', 'start'), node('test', 'shell', { command: 'npm test' }), node('ok', 'end', { template: 'green' }), node('bad', 'end', { template: 'Tests failed.', outcome })],
+        [edge('start', 'out', 'test'), edge('test', 'pass', 'ok'), edge('test', 'fail', 'bad')],
+      );
+    const failed = await run(f('failure'), failing);
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.result, 'Tests failed.');
+    assert.equal(failed.error, undefined);
+    assert.equal((await run(f('stopped'), failing)).status, 'stopped');
+  });
+
+  test('a stopped run has no result, rather than showing its own objective as one', async () => {
+    const f = flow([node('start', 'start'), node('gate', 'human', { prompt: 'ok?' }), node('ok', 'end', { template: 'done' })], [edge('start', 'out', 'gate'), edge('gate', 'approve', 'ok')]);
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'my objective' });
+    const handle = startRun(r, deps(), () => {});
+    while (r.pending.length === 0) await new Promise((res) => setTimeout(res, 1));
+    handle.stop();
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(done.result, undefined);
   });
 });
 

@@ -90,6 +90,17 @@ export interface Project {
   name: string;
   path: string;
   addedAt: string;
+  /** Set by the app when the folder is no longer there. Never saved. */
+  missing?: boolean;
+}
+
+/** What flows need from a project folder. */
+export interface ProjectHealth {
+  exists: boolean;
+  /** `none`: not a repository. `no-commits`: nothing to branch from yet. */
+  git: 'ok' | 'none' | 'no-commits';
+  /** Files with changes not yet committed. A run branches from the last commit, so it leaves these out. */
+  dirty: number;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -102,6 +113,8 @@ export interface ToolCall {
   /** One line a person can read: the command, the file, the pattern. */
   summary: string;
   status: 'running' | 'ok' | 'error';
+  /** How much of the turn's text came before this call, so the thread shows it where it happened. */
+  at?: number;
 }
 
 export type AgentStatus = 'running' | 'done' | 'error' | 'stopped';
@@ -148,6 +161,22 @@ export type SessionItem =
       status: 'pending' | 'started' | 'declined';
       runId?: string;
     }
+  | {
+      /** A flow that uses Jev was about to start with no TypeSafe key. The card takes the key and starts it. */
+      kind: 'needs-jev';
+      id: string;
+      ts: string;
+      flowId: string;
+      flowName: string;
+      objective: string;
+      /** The steps that ask Jev, by label, so the card can say where Jev comes in. */
+      steps: string[];
+      /** Set when there was a key and TypeSafe refused it: what it said. */
+      refused?: string;
+      starter: RunStarter;
+      status: 'pending' | 'started' | 'dismissed';
+      runId?: string;
+    }
   | { kind: 'notice'; id: string; ts: string; text: string; tone: 'info' | 'warn' | 'error' };
 
 export interface Session {
@@ -170,8 +199,6 @@ export interface Session {
     news?: string[];
     /** codex counts tokens for the whole conversation, so the next turn subtracts this. */
     harnessTokens?: TokenCount;
-    /** The flow list the agent was last told about, so it hears again only when it changes. */
-    toldFlows?: string;
   };
   archived?: boolean;
 }
@@ -271,6 +298,11 @@ export interface JoinConfig {
 export interface EndConfig {
   label: string;
   template: string;
+  /**
+   * How a run that ends here counts. A "Tests failed" end is a failed run, not a green one, and
+   * "you rejected the design" is a stopped one. Default success.
+   */
+  outcome?: 'success' | 'failure' | 'stopped';
 }
 
 export interface NodeConfigs {
@@ -369,6 +401,8 @@ export interface NodeVisit {
 }
 
 export interface Judgment {
+  /** The question as Jev got it, with the templates filled in. */
+  question?: string;
   mode: DecideConfig['mode'];
   answer: string;
   probabilities: Record<string, number>;
@@ -481,6 +515,13 @@ export interface Api {
   stopRun(runId: string): Promise<void>;
   /** Answer an agent's request to start a flow. `objective` replaces the agent's when you edited it. */
   answerFlowRequest(sessionId: string, requestId: string, approve: boolean, objective: string): Promise<void>;
+  projectHealth(projectId: string): Promise<ProjectHealth | null>;
+  /** A link from a reply: web links in the browser, file paths in their app, resolved against `base`. */
+  openLink(href: string, base?: string): Promise<{ ok: boolean; message: string }>;
+  /** `git init` if needed, then commit what is in the folder. */
+  setUpGit(projectId: string): Promise<{ ok: boolean; message: string }>;
+  /** Save a TypeSafe key from a needs-jev card, check it, and start the flow. `null` dismisses the card. */
+  connectJev(sessionId: string, itemId: string, apiKey: string | null): Promise<{ ok: boolean; message: string }>;
   runDiff(runId: string): Promise<DiffResult>;
   mergeRun(runId: string): Promise<{ ok: boolean; message: string }>;
   saveFlow(flow: Flow): Promise<Flow>;

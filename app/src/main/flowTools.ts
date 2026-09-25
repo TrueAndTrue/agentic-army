@@ -32,7 +32,7 @@ export interface ToolCaller {
 
 export interface ToolHandler {
   list(caller: ToolCaller): ToolDescription[];
-  call(caller: ToolCaller, name: string, args: Record<string, unknown>): { text: string; isError?: boolean };
+  call(caller: ToolCaller, name: string, args: Record<string, unknown>): { text: string; isError?: boolean } | Promise<{ text: string; isError?: boolean }>;
 }
 
 /** The MCP server, as the script the harness starts. CommonJS with no imports beyond Node's own. */
@@ -113,7 +113,7 @@ export async function startFlowBridge(root: string, handler: ToolHandler, runtim
       body += d;
       if (body.length > 1_000_000) req.destroy();
     });
-    req.on('end', () => {
+    req.on('end', async () => {
       let msg: { op?: unknown; name?: unknown; args?: unknown };
       try {
         msg = JSON.parse(body) as typeof msg;
@@ -124,7 +124,7 @@ export async function startFlowBridge(root: string, handler: ToolHandler, runtim
         if (msg.op === 'list') return reply(200, { tools: handler.list(caller) });
         if (msg.op === 'call' && typeof msg.name === 'string') {
           const args = msg.args !== null && typeof msg.args === 'object' ? (msg.args as Record<string, unknown>) : {};
-          return reply(200, handler.call(caller, msg.name, args));
+          return reply(200, await handler.call(caller, msg.name, args));
         }
         reply(400, { text: 'Unknown request.', isError: true });
       } catch (err) {

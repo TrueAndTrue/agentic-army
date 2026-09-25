@@ -7,7 +7,7 @@ import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import type { DiffResult, GitConfig, Run } from '../shared/types.ts';
+import type { DiffResult, GitConfig, ProjectHealth, Run } from '../shared/types.ts';
 
 export interface Exec {
   code: number;
@@ -37,6 +37,26 @@ export async function isRepo(path: string): Promise<boolean> {
 export async function currentBranch(path: string): Promise<string | null> {
   const r = await git(['symbolic-ref', '--short', '-q', 'HEAD'], path);
   return r.code === 0 ? r.stdout.trim() : null;
+}
+
+/** What a flow needs from a project folder, and what it found there. */
+export async function projectHealth(path: string): Promise<ProjectHealth> {
+  if (!existsSync(path)) return { exists: false, git: 'none', dirty: 0 };
+  if (!(await isRepo(path))) return { exists: true, git: 'none', dirty: 0 };
+  const head = await git(['rev-parse', '--verify', 'HEAD'], path);
+  const dirty = (await git(['status', '--porcelain'], path)).stdout.split('\n').filter((l) => l.trim() !== '').length;
+  return { exists: true, git: head.code === 0 ? 'ok' : 'no-commits', dirty };
+}
+
+/**
+ * Make a folder a repository flows can branch from: `git init` if it is not one, then one commit
+ * of what is there. Only when you press the button that says so.
+ */
+export async function setUpGit(path: string): Promise<void> {
+  if (!(await isRepo(path))) await must(['init', '-q'], path);
+  await must(['add', '-A'], path);
+  const r = await git(['commit', '-q', '--allow-empty', '-m', 'Start tracking this folder'], path);
+  if (r.code !== 0) throw new Error(`git commit failed: ${(r.stderr || r.stdout).trim()}. Set your name and email with "git config --global user.name" and "user.email", then try again.`);
 }
 
 /** Create the run's worktree if it has none yet, and return its path. */
@@ -77,7 +97,7 @@ export async function finalizeWorkspace(run: Run, projectPath: string): Promise<
   if (run.worktreePath === undefined || run.branch === undefined) return;
   if (existsSync(run.worktreePath)) {
     try {
-      await commitAll(run.worktreePath, `flow "${run.flowName}": what run ${run.id} left behind`);
+      await commitAll(run.worktreePath, `${run.flowName}: work its agents left uncommitted`);
     } catch {
       /* a commit that fails leaves the files in the tree; removal below reports it */
     }
@@ -109,7 +129,8 @@ export async function runDiff(run: Run, projectPath: string): Promise<DiffResult
     patch = (await git(['diff', `${base}...${run.branch}`], projectPath)).stdout;
   }
   const truncated = patch.length > PATCH_LIMIT;
-  return { stat: stat.trim(), patch: truncated ? patch.slice(0, PATCH_LIMIT) : patch, truncated };
+  // Keep the leading space on each line: it is what lines the file columns up.
+  return { stat: stat.replace(/^\n+/, '').trimEnd(), patch: truncated ? patch.slice(0, PATCH_LIMIT) : patch, truncated };
 }
 
 /** Merge the run's branch into the branch it was cut from, in the project checkout. */
@@ -127,7 +148,13 @@ export async function mergeRun(run: Run, projectPath: string, message: string): 
   const r = await git(['merge', '--no-ff', '-m', message, run.branch], projectPath);
   if (r.code !== 0) {
     await git(['merge', '--abort'], projectPath);
-    return { ok: false, message: `The merge conflicted, so it was undone. Merge ${run.branch} by hand to resolve it.\n${(r.stdout + r.stderr).trim()}` };
+    const files = (r.stdout + r.stderr).split('\n').flatMap((l) => /CONFLICT .* in (.+)$/.exec(l)?.[1] ?? []);
+    return {
+      ok: false,
+      message:
+        `The merge conflicted${files.length === 0 ? '' : ` in ${files.join(', ')}`}, so the app undid it and your checkout is as it was. ` +
+        `To resolve it, run "git merge ${run.branch}" in the project and fix the conflicts, or ask the chat here to do that.`,
+    };
   }
   run.merged = true;
   return { ok: true, message: `Merged ${run.branch} into ${current ?? 'HEAD'}.` };

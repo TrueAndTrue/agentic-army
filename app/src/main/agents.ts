@@ -6,6 +6,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 
 import { createClaudeAdapter } from '../../../src/harness/claude.ts';
 import { createCodexAdapter } from '../../../src/harness/codex.ts';
@@ -66,6 +68,8 @@ export interface AgentRunInput {
   resume?: string;
   /** codex's running token total when this conversation last ended, so a resumed turn counts only itself. */
   tokensBefore?: TokenCount;
+  /** Standing instructions from the app, sent as system text rather than as part of the prompt. */
+  instructions?: string;
   /** MCP servers the agent may call. Each one's tools are allowed along with the role's. */
   mcp?: McpServerSpec[];
   settings: Settings;
@@ -151,13 +155,26 @@ export function makeAdapter(harness: Harness, settings: Settings): HarnessAdapte
   return createCodexAdapter(settings.codexBin.trim() === '' ? {} : { bin: settings.codexBin.trim() });
 }
 
+/**
+ * Where the CLI would be found, or null. A missing codex otherwise surfaces as "codex exited null
+ * having produced no result event", which tells nobody what to do.
+ */
+export function findBin(harness: Harness, settings: Settings): string | null {
+  const name = (harness === 'claude' ? settings.claudeBin : settings.codexBin).trim() || process.env[harness === 'claude' ? 'ARMY_CLAUDE_BIN' : 'ARMY_CODEX_BIN'] || harness;
+  if (name.includes('/')) return existsSync(name) ? name : null;
+  for (const dir of (process.env['PATH'] ?? '').split(delimiter)) {
+    if (dir !== '' && existsSync(join(dir, name))) return join(dir, name);
+  }
+  return null;
+}
+
 export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
   const unit = ROLE_UNITS[input.role];
   // The protected region is the army's own home (~/.agentic-army), where the CLI keeps its config
   // and archive. Never the user's home directory: that would deny every project under it.
   const perms = permissionsFor(unit.rank, unit.role, armyHome(), input.settings.posture);
   const orders = input.brief
-    ? `${ROLE_BRIEF[input.role]}\n\nWorking directory: ${input.cwd}\nEnd with a short summary: it is what the next step of the flow receives.\n\n---\n\n${input.prompt}`
+    ? `${ROLE_BRIEF[input.role]}\n\nWorking directory: ${input.cwd}\nEnd with a short summary of what you did or found, written for the person who asked. Do not mention steps, flows or what comes next.\n\n---\n\n${input.prompt}`
     : input.prompt;
   const spec: SoldierSpec = {
     agentId: input.label,
@@ -174,11 +191,25 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
     orders,
     ...(input.resume === undefined ? {} : { resumeSessionId: input.resume }),
     ...(input.mcp === undefined || input.mcp.length === 0 ? {} : { mcpServers: input.mcp }),
+    ...(input.instructions === undefined || input.instructions === '' ? {} : { instructions: input.instructions }),
   };
 
   const turn: AgentTurn = { text: '', final: '', tools: [], status: 'running' };
   const emit = () => input.onTurn({ ...turn, tools: turn.tools.map((t) => ({ ...t })) });
   if (input.signal.aborted) return { turn: { ...turn, status: 'stopped' } };
+  if (input.adapter === undefined && findBin(input.harness, input.settings) === null) {
+    const set = (input.harness === 'claude' ? input.settings.claudeBin : input.settings.codexBin).trim();
+    return {
+      turn: {
+        ...turn,
+        status: 'error',
+        error:
+          set === ''
+            ? `${input.harness} is not installed, or not on your PATH. Install it and log in, or set its path in Settings under This machine.`
+            : `${input.harness} is not at ${set}. Fix the path in Settings under This machine.`,
+      },
+    };
+  }
 
   const adapter = input.adapter ?? makeAdapter(input.harness, input.settings);
   const soldier = await adapter.spawn(spec);
@@ -227,7 +258,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
           case 'tool_use':
             if (ev.depth !== 0) break;
             const mcpTool = ev.name === 'mcp_tool_call' && typeof (ev.input as { tool?: unknown } | null)?.tool === 'string' ? (ev.input as { tool: string }).tool : null;
-            turn.tools.push({ id: ev.toolUseId, name: mcpTool ?? toolName(ev.name), summary: summarizeTool(ev.name, ev.input), status: 'running' });
+            turn.tools.push({ id: ev.toolUseId, name: mcpTool ?? toolName(ev.name), summary: summarizeTool(ev.name, ev.input), status: 'running', at: turn.text.length });
             afterTool = true;
             emit();
             break;

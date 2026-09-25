@@ -27,6 +27,11 @@ export function fakeJev(opts: { noul?: (id: string) => number; choice?: (id: str
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
+      if (req.headers.authorization === 'Bearer bad-key') {
+        res.statusCode = 401;
+        res.end('{"error":"invalid api key"}');
+        return;
+      }
       const parsed = JSON.parse(body) as JevCall;
       calls.push(parsed);
       const answers: Record<string, unknown> = {};

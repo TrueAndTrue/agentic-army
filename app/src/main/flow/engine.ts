@@ -12,7 +12,7 @@
  * adapters.
  */
 
-import { renderTemplate, slug, validateFlow } from '../../shared/flow.ts';
+import { renderTemplate, renderUrlTemplate, slug, validateFlow } from '../../shared/flow.ts';
 import { addTokens } from '../../shared/tokens.ts';
 import type {
   AgentConfig,
@@ -90,6 +90,8 @@ const DEFAULT_MAX_VISITS = 20;
 interface Activation {
   nodeId: string;
   input: string;
+  /** The node and the output that sent the work here, to name the cause when a loop runs out. */
+  from?: { node: FlowNode; handle: string };
 }
 
 interface Outcome {
@@ -150,6 +152,9 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
   const inFlight = new Set<Promise<void>>();
   let lastOutput = '';
   let endOutput: string | null = null;
+  let endOutcome: 'success' | 'failure' | 'stopped' = 'success';
+  /** The last output that led nowhere: the node and the handle it took. */
+  let deadEnd: { label: string; handle: string } | null = null;
 
   const update = () => onUpdate(run);
 
@@ -255,7 +260,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         const question = renderTemplate(cfg.question, ctx);
         const state = renderTemplate(cfg.state.trim() === '' ? '{{input}}' : cfg.state, ctx);
         const judgment = await deps.judge({ config: cfg, question, state, signal });
-        visit.judgment = judgment;
+        visit.judgment = { ...judgment, question };
         let handle = judgment.answer;
         if (cfg.minConfidence > 0) {
           const sure = cfg.mode === 'yesno' ? Math.abs((judgment.value ?? 0.5) - 0.5) * 2 : judgment.confidence;
@@ -282,7 +287,8 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         const cwd = await cwdFor(cfg.workspace);
         const res = await deps.shell({ command, cwd, timeoutMs: cfg.timeoutSec * 1000, signal });
         visit.log = `$ ${command}\n${res.output}`;
-        const output = `Command: ${command}\nExit code: ${res.code === null ? 'none (timed out or killed)' : String(res.code)}\n\n${res.output}`;
+        // Fenced, so wherever it is shown as Markdown its lines stay lines and `> x` stays text.
+        const output = `Command: \`${command}\`\nExit code: ${res.code === null ? 'none (timed out or killed)' : String(res.code)}\n\n\`\`\`\n${res.output.trimEnd()}\n\`\`\``;
         return { handle: res.code === 0 ? 'pass' : 'fail', output };
       }
 
@@ -300,7 +306,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
           run,
           config: cfg,
           goal: renderTemplate(cfg.goal, ctx),
-          startUrl: renderTemplate(cfg.startUrl, ctx),
+          startUrl: renderUrlTemplate(cfg.startUrl, ctx),
           signal,
           onStep(step) {
             visit.steps = [...(visit.steps ?? []), step];
@@ -327,6 +333,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
   }
 
   function deliver(node: FlowNode, outcome: Outcome) {
+    if (node.type !== 'end' && !flow.edges.some((e) => e.source === node.id && e.sourceHandle === outcome.handle)) deadEnd = { label: node.data.label, handle: outcome.handle };
     for (const e of flow.edges) {
       if (e.source !== node.id || e.sourceHandle !== outcome.handle) continue;
       const target = byId.get(e.target);
@@ -346,7 +353,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
           queue.push({ nodeId: target.id, input: combined });
         }
       } else {
-        queue.push({ nodeId: target.id, input: outcome.output });
+        queue.push({ nodeId: target.id, input: outcome.output, from: { node, handle: outcome.handle } });
         const state = run.nodes[target.id];
         if (state !== undefined && state.status !== 'running' && state.status !== 'waiting') state.status = 'queued';
       }
@@ -359,8 +366,16 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
     if (node === undefined || state === undefined) return;
     const n = state.visits.length + 1;
     if (n > maxVisitsOf(node)) {
-      fail(`"${node.data.label}" reached its limit of ${String(maxVisitsOf(node))} visits. The loop through it never settled.`);
-      state.status = 'failed';
+      // Name what kept sending the work back. The node itself did its job each time.
+      const max = String(maxVisitsOf(node));
+      const by = act.from;
+      fail(
+        by === undefined
+          ? `"${node.data.label}" ran ${max} times, its limit, so the run stopped instead of looping again.`
+          : by.node.type === 'decide'
+            ? `Jev answered "${by.handle}" at "${by.node.data.label}" each time, sending the work back to "${node.data.label}". It ran ${max} times, its limit, so the run stopped instead of looping again.`
+            : `"${by.node.data.label}" went "${by.handle}" and sent the work back to "${node.data.label}" ${max} times, its limit, so the run stopped instead of looping again.`,
+      );
       update();
       return;
     }
@@ -382,7 +397,9 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
       }
       state.status = 'failed';
       // A wired error path takes the failure; otherwise the run stops on it.
-      const errorHandle = node.type === 'agent' ? 'error' : node.type === 'decide' ? 'unsure' : null;
+      // A Jev setup problem (no key, a refused key) is not uncertainty, so it never takes `unsure`.
+      const setup = (err as { setup?: unknown } | null)?.setup === true;
+      const errorHandle = node.type === 'agent' ? 'error' : node.type === 'decide' && !setup ? 'unsure' : null;
       if (errorHandle !== null && flow.edges.some((e) => e.source === node.id && e.sourceHandle === errorHandle)) {
         visit.handle = errorHandle;
         deliver(node, { handle: errorHandle, output: `${node.data.label} failed: ${message}\n\n${act.input}` });
@@ -399,7 +416,10 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
     outputs[node.id] = outcome.output;
     outputs[slug(node.data.label)] = outcome.output;
     lastOutput = outcome.output;
-    if (node.type === 'end') endOutput = outcome.output;
+    if (node.type === 'end') {
+      endOutput = outcome.output;
+      endOutcome = node.data.outcome ?? 'success';
+    }
     if (!signal.aborted) deliver(node, outcome);
     update();
   }
@@ -424,10 +444,20 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
     }
     run.pending = [];
     run.endedAt = nowIso();
-    if (run.error !== undefined) run.status = 'failed';
-    else if (signal.aborted) run.status = 'stopped';
+    // Reaching no End means the work went down a path that leads nowhere: that is a failure, not
+    // a green "Finished" with the End node never run.
+    const lost = deadEnd as { label: string; handle: string } | null;
+    if (run.error === undefined && !signal.aborted && endOutput === null && lost !== null) {
+      run.error = `"${lost.label}" took its "${lost.handle}" path, and nothing is connected there, so the run ended without reaching an End.`;
+    }
+    // Set inside deliver's callers, which TypeScript cannot see from here.
+    const ended = endOutcome as 'success' | 'failure' | 'stopped';
+    if (run.error !== undefined || ended === 'failure') run.status = 'failed';
+    else if (signal.aborted || ended === 'stopped') run.status = 'stopped';
     else run.status = 'succeeded';
-    run.result = endOutput ?? lastOutput;
+    // A stopped or failed run has no result of its own; the last output would be, say, the objective.
+    const result = endOutput ?? (run.status === 'succeeded' ? lastOutput : null);
+    if (result !== null) run.result = result;
     update();
     return run;
   })();

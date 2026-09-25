@@ -1,3 +1,4 @@
+import { ChevronDown } from 'lucide-react';
 import { cloneElement, isValidElement, useId, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactElement, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from 'react';
 
 import { effortsFor } from '../../../shared/models.ts';
@@ -14,8 +15,9 @@ export function Button({ tone = 'outline', className, children, ...rest }: Butto
     <button
       {...rest}
       className={cx(
-        'no-drag inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45',
-        tone === 'primary' && 'bg-brass text-brass-ink hover:brightness-110',
+        'no-drag inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-3 text-[13px] font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-55',
+        // A disabled primary loses its colour: at reduced opacity brass still read as ready to press.
+        tone === 'primary' && 'bg-brass text-brass-ink hover:brightness-110 disabled:bg-hover disabled:text-faint disabled:hover:brightness-100',
         tone === 'outline' && 'border border-line bg-panel text-text hover:bg-hover',
         tone === 'quiet' && 'text-muted hover:bg-hover hover:text-text',
         tone === 'danger' && 'border border-line bg-panel text-bad hover:bg-hover',
@@ -40,35 +42,44 @@ export function IconButton({ label, className, children, ...rest }: ButtonHTMLAt
   );
 }
 
+/**
+ * The chevron is an icon beside the select, not a background image: Tailwind dropped the old
+ * data-URI class from the build, so every select read as plain text with no sign it opens.
+ */
+function Chevron({ right }: { right: number }) {
+  return <ChevronDown aria-hidden size={13} strokeWidth={2} className="pointer-events-none absolute top-1/2 -translate-y-1/2 text-faint" style={{ right }} />;
+}
+
 export function PillSelect({ className, children, style, ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
   return (
-    <select
-      {...rest}
-      // Size to the chosen option, not the longest one.
-      style={{ fieldSizing: 'content', ...style } as React.CSSProperties}
-      className={cx(
-        'no-drag h-7 max-w-[220px] cursor-pointer appearance-none truncate rounded-md border border-transparent bg-transparent pr-6 pl-2 text-[12.5px] text-muted hover:border-line hover:bg-hover hover:text-text focus:text-text',
-        "bg-[url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2210%22 height=%226%22><path d=%22M1 1l4 4 4-4%22 stroke=%22%23888%22 fill=%22none%22 stroke-width=%221.4%22/></svg>')] bg-[length:10px_6px] bg-[position:right_8px_center] bg-no-repeat",
-        className,
-      )}
-    >
-      {children}
-    </select>
+    <span className="no-drag relative inline-flex min-w-0">
+      <select
+        {...rest}
+        // Size to the chosen option, not the longest one.
+        style={{ fieldSizing: 'content', ...style } as React.CSSProperties}
+        className={cx(
+          'h-7 max-w-[220px] cursor-pointer appearance-none truncate rounded-md border border-transparent bg-transparent pr-6 pl-2 text-[12.5px] text-muted hover:border-line hover:bg-hover hover:text-text focus:text-text',
+          className,
+        )}
+      >
+        {children}
+      </select>
+      <Chevron right={7} />
+    </span>
   );
 }
 
 export function Select({ className, children, ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
   return (
-    <select
-      {...rest}
-      className={cx(
-        'h-8 w-full cursor-pointer appearance-none rounded-md border border-line bg-panel pr-7 pl-2.5 text-[13px] text-text hover:border-line-strong',
-        "bg-[url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2210%22 height=%226%22><path d=%22M1 1l4 4 4-4%22 stroke=%22%23888%22 fill=%22none%22 stroke-width=%221.4%22/></svg>')] bg-[length:10px_6px] bg-[position:right_10px_center] bg-no-repeat",
-        className,
-      )}
-    >
-      {children}
-    </select>
+    <span className="relative flex w-full min-w-0">
+      <select
+        {...rest}
+        className={cx('h-8 w-full cursor-pointer appearance-none rounded-md border border-line bg-panel pr-7 pl-2.5 text-[13px] text-text hover:border-line-strong', className)}
+      >
+        {children}
+      </select>
+      <Chevron right={9} />
+    </span>
   );
 }
 

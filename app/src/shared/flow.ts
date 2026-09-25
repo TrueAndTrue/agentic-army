@@ -45,6 +45,11 @@ export function renderTemplate(template: string, ctx: TemplateContext): string {
   });
 }
 
+/** A URL template: each value is URL-encoded, so `?q={{objective}}` searches for the whole objective. */
+export function renderUrlTemplate(template: string, ctx: TemplateContext): string {
+  return template.replace(TEMPLATE_RE, (all) => encodeURIComponent(renderTemplate(all, ctx)));
+}
+
 /** Every `{{name}}` in a template, for validation and for the editor's hints. */
 export function templateNames(template: string): string[] {
   return [...template.matchAll(TEMPLATE_RE)].map((m) => m[1] ?? '');
@@ -119,6 +124,16 @@ export function validateFlow(flow: Flow, knownModelIds?: ReadonlySet<string>, kn
     }
     for (const n of flow.nodes) {
       if (!seen.has(n.id)) problems.push({ level: 'warn', nodeId: n.id, message: `"${n.data.label}" is not connected to Start, so it never runs.` });
+    }
+    // An output with no connection ends the run there, as failed. Say so before it happens. An
+    // agent's "error" is left out: a crashed agent fails the run with its own message either way.
+    for (const n of flow.nodes) {
+      if (!seen.has(n.id) || n.type === 'end') continue;
+      for (const h of outputHandles(n)) {
+        if (n.type === 'agent' && h === 'error') continue;
+        if (flow.edges.some((e) => e.source === n.id && e.sourceHandle === h)) continue;
+        problems.push({ level: 'warn', nodeId: n.id, message: `"${n.data.label}" has nothing connected to "${h}". If it goes that way, the run stops there as failed.` });
+      }
     }
   }
 

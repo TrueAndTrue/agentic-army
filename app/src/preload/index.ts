@@ -30,6 +30,10 @@ const api: Api = {
   doctor: call('doctor') as Api['doctor'],
   refreshModels: call('refreshModels') as Api['refreshModels'],
   testJev: call('testJev') as Api['testJev'],
+  connectJev: call('connectJev') as Api['connectJev'],
+  projectHealth: call('projectHealth') as Api['projectHealth'],
+  openLink: call('openLink') as Api['openLink'],
+  setUpGit: call('setUpGit') as Api['setUpGit'],
   onEvent(listener) {
     const fn = (_e: unknown, ev: AppEvent) => listener(ev);
     ipcRenderer.on('army:event', fn);

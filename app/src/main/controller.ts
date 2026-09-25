@@ -16,6 +16,7 @@ import type {
   Flow,
   ModelEntry,
   Project,
+  ProjectHealth,
   Run,
   RunStarter,
   Session,
@@ -26,7 +27,7 @@ import type {
 import { killAllAgents, runAgent } from './agents.ts';
 import { pilot, type Page } from './browser/pilot.ts';
 import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/engine.ts';
-import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, runDiff, runShell } from './git.ts';
+import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, projectHealth, runDiff, runShell, setUpGit } from './git.ts';
 import type { FlowBridge, ToolCaller, ToolDescription, ToolHandler } from './flowTools.ts';
 import { askJev, judge } from './jev.ts';
 import { modelCatalog } from './models.ts';
@@ -46,15 +47,57 @@ const MAX_AGENT_RUNS = 3;
 /** How much of a finished run's result an agent is told at the start of its next turn. */
 const NEWS_CHARS = 2000;
 
-/** What a chat agent is told about start_flow, so it knows the tool before it needs it. */
-function flowsNote(lines: string): string {
-  return (
-    'You can start the person\'s flows with the start_flow tool (mcp__army__start_flow). A flow is a team of agents with its own tools and ' +
-    'permissions, so it can do what this chat cannot, such as search the web. When the person asks for something a flow below does, ' +
-    'call start_flow. Do not say you cannot, and do not ask in chat whether to: a flow that needs approval shows the person a card ' +
-    'to approve, edit or decline, so asking first makes them answer twice. Flows you may start:\n' +
-    lines
-  );
+/** A session title from its first message: the first sentence or line, cut at a word. */
+function titleFrom(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  const first = /^(.+?[.?!])(\s|$)/.exec(flat)?.[1] ?? flat;
+  if (first.length <= TITLE_CHARS) return first;
+  const cut = first.slice(0, TITLE_CHARS);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > TITLE_CHARS * 0.6 ? cut.slice(0, space) : cut).replace(/[,;:]$/, '')}…`;
+}
+
+/**
+ * What a chat agent is told apart from the person's message. It goes in as system instructions,
+ * never in front of the message: codex quoted a note put there back as "the first message I sent".
+ */
+function chatInstructions(o: { flows: string[] | null; readOnly: boolean; transcript: string }): string {
+  const parts: string[] = [];
+  if (o.flows !== null && o.flows.length > 0) {
+    // claude loads MCP tools on demand and sees only their names until then, so an agent that was
+    // never told what start_flow is reaches for WebSearch, finds it blocked, and gives up.
+    parts.push(
+      "You can start the person's flows with the start_flow tool (mcp__army__start_flow). A flow is a team of agents with its own tools and " +
+        'permissions, so it can do what this chat cannot, such as search the web. When the person asks for something a flow below does, ' +
+        'call start_flow. Do not say you cannot, and do not ask in chat whether to: a flow that needs approval shows the person a card ' +
+        'to approve, edit or decline, so asking first makes them answer twice. When a flow you started ends, you get a turn to tell the ' +
+        'person how it went, so do not promise to check back. Flows you may start:\n' +
+        o.flows.join('\n'),
+    );
+  }
+  if (o.readOnly) {
+    parts.push(
+      'This chat is set to Read only: you cannot edit files or run commands that change them. When the person asks for a change, ' +
+        'say what you would change, and tell them to switch the chat to "Can edit files" (the menu under the message box) if they want you to make it.',
+    );
+  }
+  if (o.transcript !== '') parts.push(`The conversation so far, before this model took over. Continue it; the person can see all of it:\n\n${o.transcript}`);
+  return parts.join('\n\n');
+}
+
+const TRANSCRIPT_CHARS = 16_000;
+
+/** The thread as text, newest last, cut from the front to fit. Empty when nothing was said yet. */
+function transcriptOf(items: SessionItem[], models: ModelEntry[]): string {
+  const lines: string[] = [];
+  for (const it of items) {
+    if (it.kind === 'user') lines.push(`The person: ${it.text}`);
+    else if (it.kind === 'agent' && it.text.trim() !== '') lines.push(`${models.find((m) => m.id === it.modelId)?.label ?? 'Agent'}: ${it.text.trim()}`);
+    else if (it.kind === 'run') lines.push(`(The flow "${it.flowName}" ran here.)`);
+  }
+  let out = lines.join('\n\n');
+  if (out.length > TRANSCRIPT_CHARS) out = `(earlier messages left out)\n\n${out.slice(-TRANSCRIPT_CHARS)}`;
+  return out;
 }
 
 export class Controller {
@@ -135,13 +178,42 @@ export class Controller {
           title: s.title,
           updatedAt: s.updatedAt,
           busy: this.chats.has(s.id) || runs.some((r) => r?.status === 'running' || r?.status === 'waiting'),
-          waiting: runs.some((r) => r?.status === 'waiting') || s.items.some((i) => i.kind === 'flow-request' && i.status === 'pending'),
+          waiting: runs.some((r) => r?.status === 'waiting') || s.items.some((i) => (i.kind === 'flow-request' || i.kind === 'needs-jev') && i.status === 'pending'),
         };
       });
   }
 
   getState() {
-    return { projects: this.projects, sessions: this.summaries(), flows: this.flows(), settings: this.settings };
+    return { projects: this.projectList(), sessions: this.summaries(), flows: this.flows(), settings: this.settings };
+  }
+
+  /** The projects, each marked when its folder has gone. */
+  private projectList(): Project[] {
+    return this.projects.map((p) => (existsSync(p.path) ? p : { ...p, missing: true }));
+  }
+
+  async projectHealth(id: string): Promise<ProjectHealth | null> {
+    const p = this.projects.find((x) => x.id === id);
+    return p === undefined ? null : projectHealth(p.path);
+  }
+
+  async setUpGit(id: string): Promise<{ ok: boolean; message: string }> {
+    const p = this.projects.find((x) => x.id === id);
+    if (p === undefined) return { ok: false, message: 'That project is gone.' };
+    try {
+      await setUpGit(p.path);
+      return { ok: true, message: `${p.name} is a git repository now, with one commit of what was there.` };
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** Why work cannot happen in this project's folder, or null. */
+  private folderGone(s: Session): string | null {
+    const p = this.projects.find((x) => x.id === s.projectId);
+    if (p === undefined) return 'This session belongs to a project that was removed.';
+    if (!existsSync(p.path)) return `The folder ${p.path} is gone. Move it back, or remove ${p.name} from the sidebar.`;
+    return null;
   }
 
   getSession(id: string): Session | null {
@@ -212,7 +284,7 @@ export class Controller {
     const project: Project = { id: newId('p'), name: basename(full), path: full, addedAt: nowIso() };
     this.projects = [...this.projects, project];
     this.store.saveProjects(this.projects);
-    this.emitRaw({ type: 'projects', projects: this.projects });
+    this.emitRaw({ type: 'projects', projects: this.projectList() });
     return project;
   }
 
@@ -220,11 +292,18 @@ export class Controller {
     for (const s of [...this.sessions.values()]) if (s.projectId === id) this.deleteSession(s.id);
     this.projects = this.projects.filter((p) => p.id !== id);
     this.store.saveProjects(this.projects);
-    this.emitRaw({ type: 'projects', projects: this.projects });
+    this.emitRaw({ type: 'projects', projects: this.projectList() });
   }
 
   createSession(projectId: string): Session {
     if (!this.projects.some((p) => p.id === projectId)) throw new Error('That project is gone.');
+    // An untouched session in the project is the new session: pressing + twice makes one, not two.
+    const empty = [...this.sessions.values()].find((x) => x.projectId === projectId && x.items.length === 0 && x.title === 'New session' && x.archived !== true);
+    if (empty !== undefined) {
+      empty.updatedAt = nowIso();
+      this.touchSession(empty, true);
+      return empty;
+    }
     const s: Session = {
       id: newId('s'),
       projectId,
@@ -260,7 +339,18 @@ export class Controller {
   setChat(id: string, patch: Partial<Session['chat']>): void {
     const s = this.sessions.get(id);
     if (s === undefined) return;
+    const before = s.chat.modelId;
     s.chat = { ...s.chat, ...patch };
+    if (patch.modelId !== undefined && patch.modelId !== before && s.items.some((i) => i.kind === 'agent')) {
+      const next = this.model(patch.modelId);
+      this.notice(s, `Switched to ${next.label}. It reads the conversation so far before your next message.`);
+    }
+    // New sessions start from the model and effort you picked last, not from a fixed default.
+    if (patch.modelId !== undefined || patch.effort !== undefined) {
+      this.settings = { ...this.settings, chatDefault: { modelId: s.chat.modelId, effort: s.chat.effort } };
+      this.store.saveSettings(this.settings);
+      this.emitRaw({ type: 'settings', settings: this.settings });
+    }
     this.touchSession(s, true);
   }
 
@@ -273,14 +363,15 @@ export class Controller {
     if (s === undefined) throw new Error('That session is gone.');
     const body = text.trim();
     if (body === '') return;
-    if (s.items.filter((i) => i.kind === 'user').length === 0) s.title = body.replace(/\s+/g, ' ').slice(0, TITLE_CHARS);
+    // The first message names the session, unless you named it already.
+    if (s.title === 'New session' && s.items.every((i) => i.kind !== 'user')) s.title = titleFrom(body.replace(/^\/[a-z0-9-]+\s*/i, '') || body);
 
-    // `/quick-fix add multiply` runs Quick fix, whatever the picker says, unless it names a flow.
-    const command = flowId === null || flowId === 'auto' ? parseFlowCommand(body, this.flows()) : null;
+    // `/quick-fix add multiply` runs Quick fix, whatever the picker says.
+    const command = parseFlowCommand(body, this.flows());
     if (command !== null) {
       this.push(s, { kind: 'user', id: newId('u'), ts: nowIso(), text: body, flowId: command.flow.id });
       if (command.objective === '') return this.notice(s, `Say what "${command.flow.name}" should do after /${flowCommand(command.flow)}.`, 'warn');
-      return this.startOrSay(s, command.flow, command.objective, { kind: 'you' });
+      return await this.startOrSay(s, command.flow, command.objective, { kind: 'you' });
     }
 
     let target = flowId;
@@ -295,10 +386,11 @@ export class Controller {
     if (target === null) return this.chat(s, body);
     const flow = this.flows().find((f) => f.id === target);
     if (flow === undefined) return this.notice(s, 'That flow no longer exists. Pick another one.', 'error');
-    this.startOrSay(s, flow, body, starter);
+    await this.startOrSay(s, flow, body, starter);
   }
 
-  private startOrSay(s: Session, flow: Flow, objective: string, by: RunStarter): void {
+  private async startOrSay(s: Session, flow: Flow, objective: string, by: RunStarter): Promise<void> {
+    if (await this.askForJev(s, flow, objective, by)) return;
     const res = this.startFlow(s, flow, objective, by);
     if (typeof res === 'string') this.notice(s, res, 'error');
   }
@@ -333,11 +425,17 @@ export class Controller {
     }
   }
 
-  private async chat(s: Session, text: string): Promise<void> {
+  /**
+   * One chat turn. `text` is the person's message, or with `origin: 'run-ended'` a note that a flow
+   * the agent started has ended, so it can tell the person how it went without being asked.
+   */
+  private async chat(s: Session, text: string, origin: 'person' | 'run-ended' = 'person'): Promise<void> {
     const project = this.projects.find((p) => p.id === s.projectId);
-    if (project === undefined) return this.notice(s, 'This session belongs to a project that was removed.', 'error');
+    const gone = this.folderGone(s);
+    if (project === undefined || gone !== null) return this.notice(s, gone ?? 'This session belongs to a project that was removed.', 'error');
     if (this.chats.has(s.id)) return this.notice(s, 'The agent is still answering. Stop it first, or wait.', 'warn');
     const model = this.model(s.chat.modelId);
+    const earlier = s.items.slice();
     const item: Extract<SessionItem, { kind: 'agent' }> = { kind: 'agent', id: newId('a'), ts: nowIso(), modelId: model.id, text: '', tools: [], status: 'running' };
     this.push(s, item);
     const ctl = new AbortController();
@@ -345,20 +443,25 @@ export class Controller {
     this.touchSession(s, true);
     const resume = s.chat.harnessModelId === model.id ? s.chat.harnessSessionId : undefined;
     // The start_flow tool, only when some flow lets an agent start it. Its key dies with this turn.
-    const tools = this.bridge !== null && this.agentFlows().length > 0 ? this.bridge.open({ sessionId: s.id, model: model.label }) : null;
+    // A report on a finished run gets no tool: an agent that started a flow in it would report on
+    // that one too, and start another, and so on.
+    const tools = origin === 'person' && this.bridge !== null && this.agentFlows().length > 0 ? this.bridge.open({ sessionId: s.id, model: model.label }) : null;
     // What happened since the agent last spoke: runs it started that finished, requests you answered.
     const news = s.chat.news ?? [];
     delete s.chat.news;
-    // claude loads MCP tools on demand and sees only their names until then, so an agent that was
-    // never told what start_flow is reaches for WebSearch, finds it blocked, and gives up. Say what
-    // the tool starts on the first turn, and again whenever that list changes.
-    const offered = tools === null ? undefined : this.flowLines().join('\n');
-    const tell = offered !== undefined && (resume === undefined || s.chat.toldFlows !== offered);
-    const parts = [
-      ...(tell ? [flowsNote(offered)] : []),
-      ...(news.length === 0 ? [] : [`Since your last turn:\n${news.map((n) => `- ${n}`).join('\n')}`]),
-    ];
-    const prompt = parts.length === 0 ? text : `${parts.join('\n\n')}\n\nThe person's message:\n${text}`;
+    const instructions = chatInstructions({
+      flows: tools === null ? null : this.flowLines(),
+      readOnly: !s.chat.edits,
+      // A new model starts a new conversation in its CLI; the thread so far comes with it.
+      transcript: resume === undefined ? transcriptOf(earlier, this.settings.models) : '',
+    });
+    const newsText = news.length === 0 ? '' : `Since your last turn:\n${news.map((n) => `- ${n}`).join('\n')}`;
+    const prompt =
+      origin === 'run-ended'
+        ? `${newsText}\n\nThe person has not said anything new. Tell them in a few sentences what the flow found or did, and what they might do next.`
+        : newsText === ''
+          ? text
+          : `${newsText}\n\nThe person's message:\n${text}`;
     try {
       const res = await runAgent({
         harness: model.harness,
@@ -367,6 +470,7 @@ export class Controller {
         role: s.chat.edits ? 'engineer' : 'scout',
         cwd: project.path,
         prompt,
+        ...(instructions === '' ? {} : { instructions }),
         ...(tools === null ? {} : { mcp: [tools.spec] }),
         label: `chat-${s.id.slice(-6)}`,
         brief: false,
@@ -386,8 +490,6 @@ export class Controller {
       }
       if (res.harnessTokens !== undefined) s.chat.harnessTokens = res.harnessTokens;
       else delete s.chat.harnessTokens;
-      if (res.turn.status === 'done' && offered !== undefined) s.chat.toldFlows = offered;
-      else if (offered === undefined) delete s.chat.toldFlows;
     } catch (err) {
       item.status = 'error';
       item.error = err instanceof Error ? err.message : String(err);
@@ -398,10 +500,89 @@ export class Controller {
     }
   }
 
+  /** The last key Jev was asked with, and whether TypeSafe took it. */
+  private jevKnown: { key: string; ok: boolean; setup: boolean; detail: string } | null = null;
+
+  /**
+   * Why this flow cannot reach Jev, or null when it can. No key, or a key TypeSafe refused. A key
+   * not yet tried is tried now, with one small question, so a bad key stops the flow before its
+   * agents are paid for rather than at its first decision.
+   */
+  private async jevProblem(flow: Flow): Promise<{ steps: string[]; refused?: string } | null> {
+    const steps = flow.nodes.filter((n) => n.type === 'decide' || n.type === 'browser').map((n) => n.data.label);
+    if (steps.length === 0) return null;
+    const key = this.settings.typesafe.apiKey.trim();
+    if (key === '') return { steps };
+    if (this.jevKnown?.key !== key) await this.testJev();
+    const known = this.jevKnown;
+    // Only a refused key blocks. TypeSafe being slow or unreachable is left for the run to meet.
+    if (known !== null && known.key === key && !known.ok && known.setup) return { steps, refused: known.detail };
+    return null;
+  }
+
+  /**
+   * A flow that needs Jev, with no key: put a card in the thread that takes the key and starts the
+   * flow, instead of an error that sends you to Settings and back. True when it did.
+   */
+  private async askForJev(s: Session, flow: Flow, objective: string, by: RunStarter): Promise<boolean> {
+    const problem = await this.jevProblem(flow);
+    if (problem === null) return false;
+    this.push(s, {
+      kind: 'needs-jev',
+      id: newId('nj'),
+      ts: nowIso(),
+      flowId: flow.id,
+      flowName: flow.name,
+      objective,
+      steps: problem.steps,
+      ...(problem.refused === undefined ? {} : { refused: problem.refused }),
+      starter: by,
+      status: 'pending',
+    });
+    this.touchSession(s, true);
+    return true;
+  }
+
+  async connectJev(sessionId: string, itemId: string, apiKey: string | null): Promise<{ ok: boolean; message: string }> {
+    const s = this.sessions.get(sessionId);
+    const item = s?.items.find((i) => i.id === itemId);
+    if (s === undefined || item === undefined || item.kind !== 'needs-jev' || item.status !== 'pending') return { ok: false, message: 'This card is no longer waiting.' };
+    if (apiKey === null) {
+      item.status = 'dismissed';
+      if (item.starter.kind === 'agent') s.chat.news = [...(s.chat.news ?? []), `"${item.flowName}" did not start: the person has not added a TypeSafe key.`];
+      this.touchSession(s, true);
+      return { ok: true, message: '' };
+    }
+    const key = apiKey.trim();
+    if (key === '') return { ok: false, message: 'Paste the key first.' };
+    // A key already saved elsewhere, say from Settings in the meantime, is kept unless this one works.
+    const before = this.settings.typesafe.apiKey;
+    this.settings = { ...this.settings, typesafe: { ...this.settings.typesafe, apiKey: key } };
+    const test = await this.testJev();
+    if (!test.ok) {
+      this.settings = { ...this.settings, typesafe: { ...this.settings.typesafe, apiKey: before } };
+      return { ok: false, message: test.detail.replace(/ Paste a working key in Settings under Jev\.$/, '') };
+    }
+    this.saveSettings(this.settings);
+    const flow = this.flows().find((f) => f.id === item.flowId);
+    if (flow === undefined) {
+      item.status = 'dismissed';
+      this.touchSession(s, true);
+      return { ok: false, message: `The key works, but "${item.flowName}" no longer exists.` };
+    }
+    const run = this.startFlow(s, flow, item.objective, item.starter);
+    if (typeof run === 'string') return { ok: false, message: run };
+    item.status = 'started';
+    item.runId = run.id;
+    this.touchSession(s, true);
+    return { ok: true, message: test.detail };
+  }
+
   /** Start a run in this session, or say why not. Every way of starting a flow ends here. */
   private startFlow(s: Session, flow: Flow, objective: string, by: RunStarter, parent?: { runId: string; depth: number }): Run | string {
     const project = this.projects.find((p) => p.id === s.projectId);
-    if (project === undefined) return 'This session belongs to a project that was removed.';
+    const gone = this.folderGone(s);
+    if (project === undefined || gone !== null) return gone ?? 'This session belongs to a project that was removed.';
     // Refuse before anything is spent, rather than fail at the first Jev node halfway through.
     const jevNodes = flow.nodes.filter((n) => n.type === 'decide' || n.type === 'browser');
     if (jevNodes.length > 0 && this.settings.typesafe.apiKey.trim() === '') {
@@ -434,6 +615,9 @@ export class Controller {
       }
       this.touchRun(r);
       this.touchSession(s, true);
+      // The agent that started it reports back on its own, unless you stopped the run or are
+      // talking to it already; then it hears at the start of its next turn.
+      if (by.kind === 'agent' && r.status !== 'stopped' && !this.chats.has(s.id) && this.sessions.has(s.id)) void this.chat(s, '', 'run-ended');
     });
     return run;
   }
@@ -483,7 +667,7 @@ export class Controller {
         },
       ];
     },
-    call: (caller: ToolCaller, name: string, args: Record<string, unknown>) => {
+    call: async (caller: ToolCaller, name: string, args: Record<string, unknown>) => {
       if (name !== 'start_flow') return { text: `There is no tool called ${name}.`, isError: true };
       const s = this.sessions.get(caller.sessionId);
       if (s === undefined) return { text: 'This conversation is gone.', isError: true };
@@ -503,11 +687,17 @@ export class Controller {
       }
       if (objective === '') return { text: 'Give the objective: the flow starts from it alone.', isError: true };
       const going = s.items.filter((i) => i.kind === 'run' && this.runs.get(i.runId)?.startedBy?.kind === 'agent' && this.handles.has(i.runId)).length;
-      const asking = s.items.filter((i) => i.kind === 'flow-request' && i.status === 'pending').length;
+      const asking = s.items.filter((i) => (i.kind === 'flow-request' || (i.kind === 'needs-jev' && i.starter.kind === 'agent')) && i.status === 'pending').length;
       if (going + asking >= MAX_AGENT_RUNS) {
         return { text: `You already have ${String(MAX_AGENT_RUNS)} flows running or waiting for approval in this conversation. Wait for one to end.`, isError: true };
       }
       const { flow, ask } = entry;
+      // With no key, the card that asks for it also asks whether to start: pasting the key is the yes.
+      if (await this.askForJev(s, flow, objective, { kind: 'agent', model: caller.model, approved: ask })) {
+        return {
+          text: `"${flow.name}" uses Jev, and the person has no working TypeSafe key yet. The app shows them a card to paste one; the flow starts when they do, and you will hear how it went at the start of your next turn. Tell them in a sentence; do not ask them to go to Settings.`,
+        };
+      }
       if (ask) {
         this.push(s, { kind: 'flow-request', id: newId('fr'), ts: nowIso(), flowId: flow.id, flowName: flow.name, objective, model: caller.model, why, status: 'pending' });
         return { text: `Asked the person to approve starting "${flow.name}". It starts if they approve, and you will hear how it went at the start of your next turn. Tell them what you asked for and why.` };
@@ -518,7 +708,7 @@ export class Controller {
     },
   };
 
-  answerFlowRequest(sessionId: string, requestId: string, approve: boolean, objective: string): void {
+  async answerFlowRequest(sessionId: string, requestId: string, approve: boolean, objective: string): Promise<void> {
     const s = this.sessions.get(sessionId);
     const req = s?.items.find((i) => i.id === requestId);
     if (s === undefined || req === undefined || req.kind !== 'flow-request' || req.status !== 'pending') return;
@@ -535,6 +725,10 @@ export class Controller {
     }
     const edited = objective.trim();
     if (edited !== '') req.objective = edited;
+    if (await this.askForJev(s, flow, req.objective, { kind: 'agent', model: req.model, approved: true })) {
+      req.status = 'started';
+      return;
+    }
     const run = this.startFlow(s, flow, req.objective, { kind: 'agent', model: req.model, approved: true });
     if (typeof run === 'string') {
       req.status = 'declined';
@@ -605,7 +799,15 @@ export class Controller {
           req.signal.removeEventListener('abort', stop);
         }
       },
-      judge: (req) => judge(this.settings.typesafe, req.config, req.question, req.state, req.signal),
+      judge: async (req) => {
+        try {
+          return await judge(this.settings.typesafe, req.config, req.question, req.state, req.signal);
+        } catch (err) {
+          // The next flow checks the key again instead of trusting an earlier yes.
+          if ((err as { setup?: unknown }).setup === true) this.jevKnown = null;
+          throw err;
+        }
+      },
 
       shell: (req) => runShell(req.command, req.cwd, req.timeoutMs, req.signal),
       git: (req) => gitNode(req.run, req.config, req.message, project.path),
@@ -658,7 +860,7 @@ export class Controller {
     const project = this.projects.find((p) => p.id === r?.projectId);
     if (r === undefined || project === undefined) return { ok: false, message: 'That run is gone.' };
     if (this.handles.has(runId)) return { ok: false, message: 'The run is still going. Merge when it finishes.' };
-    const res = await mergeRun(r, project.path, `Merge flow "${r.flowName}": ${r.objective.slice(0, 60)}`);
+    const res = await mergeRun(r, project.path, `${r.flowName}: ${titleFrom(r.objective).replace(/…$/, '')}\n\n${r.objective}`);
     this.touchRun(r);
     const s = this.sessions.get(r.sessionId);
     if (s !== undefined) this.notice(s, res.message, res.ok ? 'info' : 'error');
@@ -725,11 +927,16 @@ export class Controller {
   }
 
   async testJev(): Promise<{ ok: boolean; detail: string }> {
+    const key = this.settings.typesafe.apiKey.trim();
     try {
       const r = await askJev(this.settings.typesafe, 'The build passed.', { ok: { type: 'noul', instructions: 'Did the build pass?' } });
-      return { ok: true, detail: `${r.model} answered in ${String(r.latencyMs)} ms` };
+      const detail = `${r.model} answered in ${String(r.latencyMs)} ms`;
+      this.jevKnown = { key, ok: true, setup: false, detail };
+      return { ok: true, detail };
     } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+      const detail = err instanceof Error ? err.message : String(err);
+      this.jevKnown = { key, ok: false, setup: (err as { setup?: unknown }).setup === true, detail };
+      return { ok: false, detail };
     }
   }
 
@@ -737,11 +944,20 @@ export class Controller {
   async shutdown(): Promise<void> {
     this.bridge?.stop();
     for (const c of this.chats.values()) c.abort();
+    const cut = [...this.handles.keys()];
     const waits = [...this.handles.values()].map((h) => {
       h.stop();
       return h.done;
     });
     await Promise.race([Promise.allSettled(waits), new Promise((r) => setTimeout(r, 4000))]);
+    // A run cut off by quitting says so, rather than reading as if you pressed Stop.
+    for (const id of cut) {
+      const r = this.runs.get(id);
+      if (r !== undefined && r.status === 'stopped' && r.error === undefined) {
+        r.error = 'The app closed while this run was going. Start it again to redo it.';
+        this.store.saveRunSoon(r);
+      }
+    }
     // Whatever did not stop in time is killed, process group and all.
     killAllAgents();
     this.store.flush();

@@ -10,6 +10,9 @@ export function ago(iso: string): string {
 
 export function duration(startIso: string, endIso?: string): string {
   const ms = (endIso === undefined ? Date.now() : Date.parse(endIso)) - Date.parse(startIso);
+  // A Jev call takes a third of a second; "0s" said nothing about it.
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))} ms`;
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);

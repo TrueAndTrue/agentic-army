@@ -30,10 +30,25 @@ export type JevFetch = typeof fetch;
 
 export class JevError extends Error {
   readonly status: number | null;
-  constructor(message: string, status: number | null) {
+  /** No key, or TypeSafe refused it: a setup problem to fix, never an answer to route on. */
+  readonly setup: boolean;
+  constructor(message: string, status: number | null, setup = false) {
     super(message);
     this.status = status;
+    this.setup = setup;
   }
+}
+
+/** The error text TypeSafe sent, without the JSON around it. */
+function reason(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown; message?: unknown; detail?: unknown };
+    const said = parsed.error ?? parsed.message ?? parsed.detail;
+    if (typeof said === 'string') return said;
+  } catch {
+    /* not JSON: use it as it is */
+  }
+  return text.trim().slice(0, 200);
 }
 
 const TIMEOUT_MS = 20_000;
@@ -46,7 +61,7 @@ export async function askJev(
   fetchImpl: JevFetch = fetch,
 ): Promise<JevResponse> {
   if (settings.apiKey.trim() === '') {
-    throw new JevError('No TypeSafe API key. Add one in Settings to use Jev.', null);
+    throw new JevError('There is no TypeSafe API key yet. Jev needs one; add it in Settings under Jev.', null, true);
   }
   const started = Date.now();
   const timeout = AbortSignal.timeout(TIMEOUT_MS);
@@ -65,8 +80,10 @@ export async function askJev(
   }
   if (!response.ok) {
     const text = await response.text().catch(() => '');
-    const hint = response.status === 401 || response.status === 403 ? ' Check the API key in Settings.' : '';
-    throw new JevError(`TypeSafe answered ${String(response.status)}: ${text.slice(0, 200) || response.statusText}.${hint}`, response.status);
+    if (response.status === 401 || response.status === 403) {
+      throw new JevError(`TypeSafe refused the API key (${reason(text) || response.statusText}). Paste a working key in Settings under Jev.`, response.status, true);
+    }
+    throw new JevError(`TypeSafe answered ${String(response.status)}: ${reason(text) || response.statusText}.`, response.status);
   }
   const parsed = (await response.json()) as { model?: string; answers?: Record<string, JevAnswer>; usage?: { input_tokens?: number } };
   return {

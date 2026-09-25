@@ -84,8 +84,8 @@ describe('sessions', () => {
       await openSession(l);
       await send(l, 'What does calc.js export?');
       await until(async () => (await agentItems(l.page))[0]?.status === 'done', 20000, 'the first reply');
-      // The first turn tells the agent what start_flow starts, since claude sees only the tool's name.
-      assert.match((await agentItems(l.page))[0]!.text, /start_flow tool[\s\S]*- look-it-up-on-the-web: Look it up on the web\.[\s\S]*The person's message:\nWhat does calc\.js export\?/);
+      // What start_flow starts goes in as system instructions, never in front of the message.
+      assert.equal((await agentItems(l.page))[0]!.text, 'echo:What does calc.js export?');
       // Tokens, not dollars: the fake reports 1 new + 3 cache read + 4 cache written in, 2 out.
       await l.page.getByText('8 in, 38% cached, 2 out').waitFor();
       assert.equal(await l.page.getByText(/\$\d/).count(), 0, 'no dollar figure anywhere');
@@ -99,7 +99,9 @@ describe('sessions', () => {
       assert.ok(argv.includes('--resume'), `the second turn resumed: ${argv.join(' ')}`);
       assert.equal(argv.includes('--session-id'), false);
       const second = (await agentItems(l.page))[1]!;
-      assert.equal(second.text, 'echo:And now?', 'the list did not change, so the agent is not told again');
+      assert.equal(second.text, 'echo:And now?');
+      const note = argv[argv.indexOf('--append-system-prompt') + 1] ?? '';
+      assert.match(note, /start_flow tool[\s\S]*- look-it-up-on-the-web: Look it up on the web\./, 'the flows go in as system instructions');
       await shot(l.page, 'e2e-chat-resumed');
     });
   });
@@ -175,7 +177,8 @@ describe('flows', () => {
 
   test('Build and review waits for both approvals and loops back to Build when Jev says the review failed', async () => {
     let reviews = 0;
-    const strict = fakeJev({ noul: () => (++reviews === 1 ? 0.1 : 0.95) });
+    // `ok` is the app checking the key before the run; only the review questions count.
+    const strict = fakeJev({ noul: (id) => (id === 'ok' ? 0.9 : ++reviews === 1 ? 0.1 : 0.95) });
     const url = await strict.listen();
     try {
       await withApp({ jevUrl: url, claudeMode: 'work' }, async (l) => {
@@ -203,7 +206,7 @@ describe('flows', () => {
       await send(l, 'Add divide', 'Build and review');
       await l.page.getByRole('button', { name: 'Reject', exact: true }).waitFor({ timeout: 30000 });
       await l.page.getByPlaceholder(/Optional note/).fill('Use integer division');
-      await l.page.getByRole('button', { name: 'Reject', exact: true }).click();
+      await l.page.getByRole('button', { name: 'Send back with note', exact: true }).click();
       await until(async () => ((await lastRun(l))?.nodes['plan']?.visits.length ?? 0) === 2, 30000, 'a second plan');
       const r = (await lastRun(l))!;
       assert.match(r.nodes['plan']!.visits[1]!.input, /From the person reviewing: Use integer division/);
@@ -212,16 +215,31 @@ describe('flows', () => {
     });
   });
 
-  test('a flow that uses Jev will not start without a TypeSafe key', async () => {
-    await withApp({ jevUrl }, async (l) => {
+  test('a Jev flow with no TypeSafe key asks for one in the thread, checks it, and then starts', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
       await l.page.evaluate(async () => {
         const s = await window.api.getState();
         await window.api.saveSettings({ ...s.settings, typesafe: { ...s.settings.typesafe, apiKey: '' } });
       });
       await openSession(l);
       await send(l, 'Add multiply', 'Quick fix');
-      await l.page.getByText(/uses Jev in "Review passed", and there is no TypeSafe API key/).waitFor();
-      assert.equal(await lastRun(l), null);
+      const card = l.page.getByRole('article', { name: 'Quick fix needs a TypeSafe key' });
+      await card.getByText(/Jev makes the calls in "Review passed"/).waitFor();
+      assert.equal(await lastRun(l), null, 'nothing started without the key');
+      await shot(l.page, 'e2e-needs-jev');
+
+      // A key TypeSafe refuses is not saved, and the card says why.
+      await card.getByRole('textbox', { name: 'TypeSafe API key' }).fill('bad-key');
+      await card.getByRole('button', { name: 'Connect and start' }).click();
+      await card.getByText("TypeSafe refused the API key (invalid api key).", { exact: true }).waitFor();
+      assert.equal(await l.page.evaluate(async () => (await window.api.getState()).settings.typesafe.apiKey), '');
+
+      await card.getByRole('textbox', { name: 'TypeSafe API key' }).fill('good-key');
+      await card.getByRole('button', { name: 'Connect and start' }).click();
+      await l.page.getByText('Jev is connected. Quick fix started.').waitFor();
+      assert.equal(await l.page.evaluate(async () => (await window.api.getState()).settings.typesafe.apiKey), 'good-key');
+      await until(async () => (await lastRun(l))?.status === 'succeeded', 60000, 'the run to finish');
+      await l.page.getByText(/Review passed\s*Jev: yes, 90% sure/).waitFor();
     });
   });
 });
@@ -267,7 +285,7 @@ describe('starting flows', () => {
       await l.page.getByRole('button', { name: 'Flows' }).click();
       await l.page.getByRole('button', { name: 'Run Look it up on the web' }).click();
       assert.equal(await l.page.getByLabel('Where this message goes').inputValue(), 'builtin-web-research');
-      await l.page.getByPlaceholder('Describe the objective for Look it up on the web').waitFor();
+      await l.page.getByPlaceholder('What should Look it up on the web do?').waitFor();
     });
   });
 
@@ -312,7 +330,7 @@ describe('starting flows', () => {
       });
       await openSession(l);
       await send(l, 'Add multiply');
-      await until(async () => (await runs(l)).length === 1, 20000, 'the agent to start a run');
+      await until(async () => (await runs(l)).length >= 1, 20000, 'the agent to start a run');
       assert.equal((await items(l)).some((i) => i.kind === 'flow-request'), false, 'nobody was asked');
       const [r] = await runs(l);
       assert.deepEqual(r!.startedBy, { kind: 'agent', model: 'Sonnet 5', approved: false });

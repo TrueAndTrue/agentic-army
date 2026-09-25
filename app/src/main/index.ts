@@ -3,7 +3,9 @@
  */
 
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, powerSaveBlocker, shell } from 'electron';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import type { AppEvent, Flow, Session, Settings } from '../shared/types.ts';
 import { ElectronPage } from './browser/page.ts';
@@ -56,14 +58,39 @@ function createWindow(): void {
     void shell.openExternal(url);
     return { action: 'deny' };
   });
+  // The window only ever shows the app. A link that would navigate it, even to a file, is
+  // stopped: a file link from an agent once left the window on a blank error page.
+  const own = process.env['ELECTRON_RENDERER_URL'] ?? pathToFileURL(join(__dirname, '../renderer/index.html')).href;
   win.webContents.on('will-navigate', (e, url) => {
-    if (!url.startsWith('http://localhost') && !url.startsWith('file://')) {
-      e.preventDefault();
-      void shell.openExternal(url);
-    }
+    if (url.split('#')[0] === own.split('#')[0]) return;
+    e.preventDefault();
+    if (/^https?:/i.test(url)) void shell.openExternal(url);
   });
   if (process.env['ELECTRON_RENDERER_URL'] !== undefined) void win.loadURL(process.env['ELECTRON_RENDERER_URL']);
   else void win.loadFile(join(__dirname, '../renderer/index.html'));
+}
+
+/**
+ * A link from a reply. Web links go to the browser. A path, the way agents write them
+ * (`src/cart.js:9`, `/abs/cart.js`, `file:///abs/cart.js#L9`), opens in the app macOS uses for
+ * that file, resolved against the project; a path that is not there is left alone.
+ */
+async function openLink(href: string, base?: string): Promise<{ ok: boolean; message: string }> {
+  if (/^(https?|mailto):/i.test(href)) {
+    await shell.openExternal(href);
+    return { ok: true, message: '' };
+  }
+  let path = href;
+  try {
+    if (href.startsWith('file:')) path = fileURLToPath(href);
+  } catch {
+    return { ok: false, message: `Could not read the link ${href}.` };
+  }
+  path = decodeURIComponent(path.replace(/#.*$/, '')).replace(/:\d+(:\d+)?$/, '');
+  const full = isAbsolute(path) ? path : resolvePath(base ?? '', path);
+  if (!existsSync(full)) return { ok: false, message: `${path} is not there.` };
+  const err = await shell.openPath(full);
+  return err === '' ? { ok: true, message: '' } : { ok: false, message: err };
 }
 
 function handle<A extends unknown[], R>(name: string, fn: (...args: A) => R | Promise<R>): void {
@@ -98,6 +125,9 @@ void app.whenReady().then(async () => {
     return c.addProject(target);
   });
   handle('removeProject', (id: string) => c.removeProject(id));
+  handle('openLink', (href: string, base?: string) => openLink(href, base));
+  handle('projectHealth', (id: string) => c.projectHealth(id));
+  handle('setUpGit', (id: string) => c.setUpGit(id));
   handle('createSession', (projectId: string) => c.createSession(projectId));
   handle('getSession', (id: string) => c.getSession(id));
   handle('renameSession', (id: string, title: string) => c.renameSession(id, title));
@@ -123,6 +153,7 @@ void app.whenReady().then(async () => {
   handle('doctor', () => c.doctor());
   handle('refreshModels', () => c.refreshModels());
   handle('testJev', () => c.testJev());
+  handle('connectJev', (sessionId: string, itemId: string, apiKey: string | null) => c.connectJev(sessionId, itemId, apiKey));
 
   // macOS naps a background app and the agents it started with it: a claude turn stalled mid-request
   // every time the window was not in front. Hold the app awake while anything is working.

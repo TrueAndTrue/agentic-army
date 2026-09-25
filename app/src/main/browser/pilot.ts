@@ -115,11 +115,14 @@ export function candidatesFor(snap: PageSnapshot, goal: string): Candidate[] {
       }
       if (typeTargets >= MAX_TYPE_TARGETS) continue;
       typeTargets += 1;
+      // A search box can be a textarea (DuckDuckGo's is). Without Enter, the text sat there and the
+      // browser clicked around it for eight steps.
+      const submit = el.kind === 'input' || /search|^q$/i.test(`${el.name ?? ''} ${el.text}`);
       phrases.forEach((p, i) => {
         out.push({
           key: `type_${el.id}_${String(i)}`,
-          action: { kind: 'type', elementId: el.id, text: p, submit: el.kind === 'input' },
-          description: `Type "${p}" into ${describe(el)}${el.kind === 'input' ? ' and press Enter' : ''}`,
+          action: { kind: 'type', elementId: el.id, text: p, submit },
+          description: `Type "${p}" into ${describe(el)}${submit ? ' and press Enter' : ''}`,
         });
       });
     } else if (el.kind === 'link' || el.kind === 'button' || el.kind === 'other') {
@@ -153,12 +156,17 @@ export async function pilot(input: PilotInput): Promise<PilotResult> {
   await input.page.open(input.startUrl);
   let snap = await input.page.snapshot();
 
-  const summary = (why: string) =>
-    `${why}\n\nPage: ${snap.title}\nURL: ${snap.url}\n\nSteps taken:\n${history.length === 0 ? '(none)' : history.map((h, i) => `${String(i + 1)}. ${h}`).join('\n')}\n\nPage text:\n${snap.text.slice(0, 4000)}`;
+  // A success hands the page to the agent that answers from it. A failure is read by a person, who
+  // wants where it stopped and what it tried, not a whole page of text.
+  const summary = (why: string, pageChars = 4000) =>
+    `${why}\n\nPage: ${snap.title}\nURL: ${snap.url}\n\nSteps taken:\n${history.length === 0 ? '(none)' : history.map((h, i) => `${String(i + 1)}. ${h}`).join('\n')}${pageChars === 0 ? '' : `\n\nPage text:\n${snap.text.slice(0, pageChars)}`}`;
+  /** What was already tried on each URL. Offering it again is how the browser looped. */
+  const tried = new Map<string, Set<string>>();
 
   for (let n = 1; n <= input.maxSteps; n += 1) {
-    if (input.signal.aborted) return { ok: false, output: summary('Stopped.'), steps };
-    const candidates = candidatesFor(snap, input.goal);
+    if (input.signal.aborted) return { ok: false, output: summary('Stopped.', 0), steps };
+    const done = tried.get(snap.url) ?? new Set<string>();
+    const candidates = candidatesFor(snap, input.goal).filter((c) => c.key === 'scroll' || !done.has(c.key));
     const state = {
       goal: input.goal,
       page: { url: snap.url, title: snap.title, text: snap.text.slice(0, PAGE_TEXT_CHARS) },
@@ -190,7 +198,7 @@ export async function pilot(input: PilotInput): Promise<PilotResult> {
     }
     if (picked === undefined || picked.action.kind === 'fail') {
       record({ n, url: snap.url, action: 'Stop: cannot proceed', why: 'Jev found no action that moves toward the goal.', confidence, outcome: 'failed' });
-      return { ok: false, output: summary('Could not find a way to the goal from here.'), steps };
+      return { ok: false, output: summary('Could not find a way to the goal from here.', 0), steps };
     }
 
     let risk: number | undefined;
@@ -209,12 +217,13 @@ export async function pilot(input: PilotInput): Promise<PilotResult> {
         );
         if (!approved) {
           record({ n, url: snap.url, action: picked.description, why: 'You refused a risky action.', confidence, risk, outcome: 'refused' });
-          return { ok: false, output: summary(`Stopped before a risky action you refused: ${picked.description}`), steps };
+          return { ok: false, output: summary(`Stopped before a risky action you refused: ${picked.description}`, 0), steps };
         }
         outcome = 'approved';
       }
     }
 
+    tried.set(snap.url, done.add(picked.key));
     try {
       await input.page.perform(picked.action);
     } catch (err) {
@@ -228,5 +237,5 @@ export async function pilot(input: PilotInput): Promise<PilotResult> {
     history.push(picked.description);
     snap = await input.page.snapshot();
   }
-  return { ok: false, output: summary(`Reached the limit of ${String(input.maxSteps)} steps before the goal.`), steps };
+  return { ok: false, output: summary(`Reached the limit of ${String(input.maxSteps)} steps before the goal.`, 0), steps };
 }

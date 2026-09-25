@@ -134,7 +134,8 @@ const quickFix: Flow = {
       threshold: 0.6,
       maxVisits: 3,
     }),
-    n('end', 'end', X * 4, 40, { label: 'Done', template: 'Ready on {{branch}}.\n\n{{nodes.review}}' }),
+    // The engineer's summary says what changed and how the tests went; the review only says it passed.
+    n('end', 'end', X * 4, 40, { label: 'Done', template: 'Ready on {{branch}}. The review passed.\n\n{{nodes.build}}' }),
   ],
   edges: [e('start', 'out', 'build'), e('build', 'out', 'review'), e('review', 'out', 'passed'), e('passed', 'yes', 'end'), e('passed', 'no', 'build')],
 };
@@ -148,7 +149,8 @@ const webResearch: Flow = {
   updatedAt: '2026-09-24T00:00:00.000Z',
   nodes: [
     n('start', 'start', 0, 100, { label: 'Start' }),
-    n('browse', 'browser', X, 100, { label: 'Browse', goal: 'search for {{objective}}', startUrl: 'https://duckduckgo.com', maxSteps: 8 }),
+    // Start on the results page: typing into a search box is the step the browser got stuck on.
+    n('browse', 'browser', X, 100, { label: 'Browse', goal: 'Open a page that answers this: {{objective}}', startUrl: 'https://duckduckgo.com/html/?q={{objective}}', maxSteps: 8 }),
     n('answer', 'agent', X * 2, 40, {
       label: 'Answer',
       role: 'scout',
@@ -156,7 +158,7 @@ const webResearch: Flow = {
       prompt: 'Answer this from the page a browser found. Quote what you rely on, and say if the page does not answer it.\n\nQuestion: {{objective}}\n\n{{input}}',
     }),
     n('end', 'end', X * 3, 40, { label: 'Done', template: '{{input}}' }),
-    n('gave_up', 'end', X * 2, 200, { label: 'Not found', template: 'The browser could not get there.\n\n{{input}}' }),
+    n('gave_up', 'end', X * 2, 200, { label: 'Not found', outcome: 'failure', template: 'The browser could not find an answer.\n\n{{input}}' }),
   ],
   edges: [e('start', 'out', 'browse'), e('browse', 'done', 'answer'), e('browse', 'failed', 'gave_up'), e('answer', 'out', 'end')],
 };
@@ -186,9 +188,12 @@ const triage: Flow = {
       label: 'Fix',
       role: 'engineer',
       workspace: 'run',
-      prompt: 'Fix this bug: {{objective}}\n\nWrite a failing test first, then make it pass. End with the cause and the test result.',
+      keepContext: true,
+      maxVisits: 3,
+      prompt:
+        'Fix this bug: {{objective}}\n\nAttempt {{visit}}. Write a failing test first, then make it pass. End with the cause and the test result.\n\nThe test run after your last attempt, if there was one:\n{{nodes.tests}}',
     }),
-    n('tests', 'shell', X * 3, 40, { label: 'Tests', command: 'npm test --silent', workspace: 'run', timeoutSec: 600 }),
+    n('tests', 'shell', X * 3, 40, { label: 'Tests', command: 'npm test --silent', workspace: 'run', timeoutSec: 600, maxVisits: 3 }),
     n('design', 'agent', X * 2, 200, {
       label: 'Design',
       role: 'planner',
@@ -204,6 +209,9 @@ const triage: Flow = {
     }),
     n('ask_me', 'human', X * 2, 500, { label: 'Ask me', prompt: 'Jev was not sure what kind of request this is. Approve to treat it as a feature, reject to stop.\n\n{{objective}}' }),
     n('end', 'end', X * 4, 200, { label: 'Done', template: '{{input}}' }),
+    n('fixed', 'end', X * 4, 40, { label: 'Fixed', template: 'Fixed on {{branch}}, and the tests pass.\n\n{{nodes.fix}}' }),
+    n('designed', 'end', X * 4, 280, { label: 'Design approved', template: '{{nodes.design}}' }),
+    n('declined', 'end', X * 3, 500, { label: 'Stopped', outcome: 'stopped', template: 'You stopped it here.' }),
   ],
   edges: [
     e('start', 'out', 'route'),
@@ -213,10 +221,13 @@ const triage: Flow = {
     e('route', 'unsure', 'ask_me'),
     e('ask_me', 'approve', 'design'),
     e('fix', 'out', 'tests'),
-    e('tests', 'pass', 'end'),
-    e('tests', 'fail', 'end'),
+    // The fix-and-test loop the description promises: failing tests go back to Fix, three times at most.
+    e('tests', 'pass', 'fixed'),
+    e('tests', 'fail', 'fix'),
     e('design', 'out', 'approve'),
-    e('approve', 'approve', 'end'),
+    e('approve', 'approve', 'designed'),
+    e('approve', 'reject', 'declined'),
+    e('ask_me', 'reject', 'declined'),
     e('answer', 'out', 'end'),
   ],
 };

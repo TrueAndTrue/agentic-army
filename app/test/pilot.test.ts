@@ -152,12 +152,12 @@ describe('Jev decisions', () => {
   });
 
   test('a missing key fails with a message that says where to fix it', async () => {
-    await assert.rejects(judge({ apiKey: '', model: 'jev-latest', baseUrl: 'https://x' }, base, 'q', 's'), /Add one in Settings/);
+    await assert.rejects(judge({ apiKey: '', model: 'jev-latest', baseUrl: 'https://x' }, base, 'q', 's'), /no TypeSafe API key yet/);
   });
 
   test('a 401 names the key as the likely cause', async () => {
     const fake = (async () => new Response('bad key', { status: 401 })) as typeof fetch;
-    await assert.rejects(judge({ apiKey: 'k', model: 'jev-latest', baseUrl: 'https://x' }, base, 'q', 's', undefined, fake), /401.*Check the API key/s);
+    await assert.rejects(judge({ apiKey: 'k', model: 'jev-latest', baseUrl: 'https://x' }, base, 'q', 's', undefined, fake), /refused the API key/);
   });
 });
 
