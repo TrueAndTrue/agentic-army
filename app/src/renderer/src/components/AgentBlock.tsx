@@ -2,7 +2,7 @@ import { Check, ChevronRight, CircleAlert, LoaderCircle, Wrench } from 'lucide-r
 import { useState } from 'react';
 
 import type { AgentTurn, ToolCall } from '../../../shared/types.ts';
-import { usd } from '../lib/format.ts';
+import { tokenDetail, tokenLine } from '../lib/format.ts';
 import { Markdown } from './Markdown.tsx';
 import { cx } from './ui.tsx';
 
@@ -65,7 +65,7 @@ export function AgentBlock({ turn, modelLabel }: { turn: AgentTurn; modelLabel: 
     <article className="group">
       <header className="mb-1.5 flex items-center gap-2 text-[12px] text-faint">
         <span className="font-medium text-muted">{modelLabel}</span>
-        {turn.costUsd !== undefined && turn.status !== 'running' && <span>{usd(turn.costUsd)}</span>}
+        {turn.status !== 'running' && tokenLine(turn.tokens) !== '' && <span title={tokenDetail(turn.tokens)}>{tokenLine(turn.tokens)}</span>}
       </header>
       <AgentBody turn={turn} />
     </article>

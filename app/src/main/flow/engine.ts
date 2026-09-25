@@ -13,6 +13,7 @@
  */
 
 import { renderTemplate, slug, validateFlow } from '../../shared/flow.ts';
+import { addTokens } from '../../shared/tokens.ts';
 import type {
   AgentConfig,
   AgentTurn,
@@ -26,6 +27,7 @@ import type {
   NodeVisit,
   PendingQuestion,
   Run,
+  TokenCount,
 } from '../../shared/types.ts';
 
 export interface AgentRequest {
@@ -34,6 +36,8 @@ export interface AgentRequest {
   prompt: string;
   cwd: string;
   resume?: string;
+  /** codex's running token total for the conversation being resumed. */
+  tokensBefore?: TokenCount;
   signal: AbortSignal;
   onTurn(turn: AgentTurn): void;
 }
@@ -41,6 +45,7 @@ export interface AgentRequest {
 export interface AgentResult {
   turn: AgentTurn;
   harnessSessionId?: string;
+  harnessTokens?: TokenCount;
 }
 
 export interface BrowserRequest {
@@ -138,6 +143,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
   /** Last output per node, under its id and its label slug, for `{{nodes.x}}`. */
   const outputs: Record<string, string> = {};
   const harnessSessions = new Map<string, string>();
+  const harnessTokens = new Map<string, TokenCount>();
   const joinArrivals = new Map<string, Map<string, string>>();
   const waiters = new Map<string, (answer: { approve: boolean; text: string }) => void>();
   const queue: Activation[] = [];
@@ -208,6 +214,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         const prompt = renderTemplate(cfg.prompt, ctx);
         const cwd = await cwdFor(cfg.workspace);
         const resume = cfg.keepContext ? harnessSessions.get(node.id) : undefined;
+        const tokensBefore = resume === undefined ? undefined : harnessTokens.get(node.id);
         visit.turn = { text: '', tools: [], status: 'running' };
         let result: AgentResult;
         try {
@@ -217,6 +224,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
             prompt,
             cwd,
             ...(resume === undefined ? {} : { resume }),
+            ...(tokensBefore === undefined ? {} : { tokensBefore }),
             signal,
             onTurn(turn) {
               visit.turn = turn;
@@ -230,7 +238,12 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         }
         visit.turn = result.turn;
         if (result.harnessSessionId !== undefined) harnessSessions.set(node.id, result.harnessSessionId);
+        if (result.harnessTokens !== undefined) harnessTokens.set(node.id, result.harnessTokens);
         run.costUsd += result.turn.costUsd ?? 0;
+        // A run's agents each have their own context, so the total leaves context out.
+        const { context: _context, ...spent } = result.turn.tokens ?? { input: 0, cached: 0, output: 0 };
+        const tokens = result.turn.tokens === undefined ? run.tokens : addTokens(run.tokens, spent);
+        if (tokens !== undefined) run.tokens = tokens;
         if (result.turn.status !== 'done') {
           throw new NodeFailure(result.turn.error ?? `The agent ended with status ${result.turn.status}.`);
         }

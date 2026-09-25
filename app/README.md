@@ -61,6 +61,10 @@ Two others can start one, if you let them:
 - **Jev in Auto.** Pick Auto in the picker and Jev chooses a chat or a flow for your message.
 - **A chat agent.** A claude or codex chat gets a `start_flow` tool listing the flows it may
   use, with each one's description. It is told the result at the start of its next turn.
+  claude sees an MCP tool only by name until it loads it, so the chat's first prompt also lists
+  the flows and says to start one rather than refuse. Without that, a chat asked to search the
+  web tried WebSearch, which an editing chat does not hold, and gave up. The list goes out again
+  only when it changes.
 
 Each flow has a "Who can start this" setting, in its side panel on the canvas:
 
@@ -193,13 +197,25 @@ program needs a judgment rather than prose:
 
 A flow that uses Jev will not start without a key, rather than fail halfway through.
 
+## Tokens
+
+The app runs on your claude and codex logins, so each reply and run shows the tokens it read and
+wrote, and how much came from the cache: "26k in, 89% cached, 41 out". Hover for exact numbers and,
+on claude, how full the context was after the last request. codex reports a running total for the
+whole conversation, so the app subtracts the total it saw last turn. claude's dollar figure is
+what the turn would cost at API prices; the app still saves it but no longer shows it.
+
 ## Testing
 
 ```sh
-npm test           # engine, Jev, browser pilot, permissions, models, who may start a flow: 45 tests
+npm test           # engine, Jev, browser pilot, permissions, models, tokens, who may start a flow: 51 tests
 npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
 ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
+ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
 ```
+
+The test window stays hidden and out of the Dock, so a run does not take focus while you work.
+The app does this when `ARMY_APP_HIDDEN=1`; it keeps painting, so screenshots still work.
 
 The end-to-end tests launch the app against a throwaway home and project, the engine's fake
 `claude` and `codex` (`../test/fixtures`), and a fake Jev server. They cover a chat that resumes
@@ -240,6 +256,9 @@ What those showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
   reviewed" to Quick fix at 0.79.
 - A chat on GPT-6-Astra at `ultra` answered in 12 s, and its second turn quoted the first question
   back.
+- The same Sonnet chat, set to "Can edit files" and asked "Can you look up the best way to make
+  peanut butter for me?", loaded `start_flow` and asked to run the web lookup, with an objective
+  listing what to find. Before the chat was told about its flows, it tried WebSearch and gave up.
 - The packaged app, started with PATH set to `/usr/bin:/bin` as the Dock would, found claude and
   completed two turns.
 
@@ -252,7 +271,6 @@ What those showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
   not its held inspector tests or its question ladder. Those still live in `army campaign`.
 - **The browser types only what the goal says.** It cannot fill a form with details it was not
   given, and it does not log in to sites.
-- **Codex reports no cost** on a ChatGPT subscription, so codex turns show none.
 - **No app icon and no signing.** The app uses Electron's default icon.
 
 ## Layout

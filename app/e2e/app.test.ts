@@ -83,8 +83,12 @@ describe('sessions', () => {
       root = l.root;
       await openSession(l);
       await send(l, 'What does calc.js export?');
-      await l.page.getByText('echo:What does calc.js export?').waitFor();
       await until(async () => (await agentItems(l.page))[0]?.status === 'done', 20000, 'the first reply');
+      // The first turn tells the agent what start_flow starts, since claude sees only the tool's name.
+      assert.match((await agentItems(l.page))[0]!.text, /start_flow tool[\s\S]*- look-it-up-on-the-web: Look it up on the web\.[\s\S]*The person's message:\nWhat does calc\.js export\?/);
+      // Tokens, not dollars: the fake reports 1 new + 3 cache read + 4 cache written in, 2 out.
+      await l.page.getByText('8 in, 38% cached, 2 out').waitFor();
+      assert.equal(await l.page.getByText(/\$\d/).count(), 0, 'no dollar figure anywhere');
     });
     const probe = join(root, 'argv.json');
     await withApp({ jevUrl, home, root, env: { FAKE_PROBE_FILE: probe } }, async (l) => {
@@ -94,6 +98,8 @@ describe('sessions', () => {
       const argv = (JSON.parse(readFileSync(probe, 'utf8')) as { argv: string[] }).argv;
       assert.ok(argv.includes('--resume'), `the second turn resumed: ${argv.join(' ')}`);
       assert.equal(argv.includes('--session-id'), false);
+      const second = (await agentItems(l.page))[1]!;
+      assert.equal(second.text, 'echo:And now?', 'the list did not change, so the agent is not told again');
       await shot(l.page, 'e2e-chat-resumed');
     });
   });

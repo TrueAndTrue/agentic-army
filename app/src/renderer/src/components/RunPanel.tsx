@@ -3,7 +3,7 @@ import { GitMerge, RefreshCw, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
 import type { DiffResult, FlowNode, NodeVisit, Run } from '../../../shared/types.ts';
-import { duration, NODE_STATUS_COLOR, RUN_STATUS_COLOR, RUN_STATUS_LABEL, usd } from '../lib/format.ts';
+import { duration, NODE_STATUS_COLOR, RUN_STATUS_COLOR, RUN_STATUS_LABEL, tokenDetail, tokenLine } from '../lib/format.ts';
 import { api, setState, useStore } from '../lib/state.ts';
 import { AgentBody } from './AgentBlock.tsx';
 import { layeredPositions, mapEdges, nodeTypes, toRfNodes, TYPE_ICON, nodeColor, useMeasured } from './FlowCanvas.tsx';
@@ -85,7 +85,7 @@ function VisitView({ node, visit }: { node: FlowNode; visit: NodeVisit }) {
         <span>Visit {visit.n}</span>
         <span>{duration(visit.startedAt, visit.endedAt)}</span>
         {visit.handle !== undefined && visit.handle !== '' && <span className="rounded bg-raised px-1.5 py-px font-mono text-muted">→ {visit.handle}</span>}
-        {visit.turn?.costUsd !== undefined && <span>{usd(visit.turn.costUsd)}</span>}
+        {tokenLine(visit.turn?.tokens) !== '' && <span title={tokenDetail(visit.turn?.tokens)}>{tokenLine(visit.turn?.tokens)}</span>}
       </div>
       {node.type !== 'start' && visit.input.trim() !== '' && (
         <details className="group rounded-md border border-line bg-raised">
@@ -276,7 +276,7 @@ export function RunPanel({ run }: { run: Run }) {
               </ReactFlowProvider>
             </div>
             <div className="shrink-0 border-t border-line px-4 py-2 text-[11.5px] text-faint">
-              Click a node to read what it did. {run.costUsd > 0 && `Spent ${usd(run.costUsd)}.`}
+              Click a node to read what it did. {tokenLine(run.tokens) !== '' && `All agents together: ${tokenLine(run.tokens)}.`}
             </div>
           </div>
         )}

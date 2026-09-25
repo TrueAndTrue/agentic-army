@@ -1,4 +1,4 @@
-import type { AgentRole, NodeRunStatus, NodeType, RunStatus } from '../../../shared/types.ts';
+import type { AgentRole, NodeRunStatus, NodeType, RunStatus, TokenCount } from '../../../shared/types.ts';
 
 export function ago(iso: string): string {
   const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
@@ -17,9 +17,28 @@ export function duration(startIso: string, endIso?: string): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-export function usd(n: number | undefined): string {
-  if (n === undefined || n === 0) return '';
-  return n < 0.01 ? '<$0.01' : `$${n.toFixed(2)}`;
+/** 41, 8.2k, 26k, 1.4M: short enough for a header, exact below 1,000. */
+export function count(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+}
+
+/** "26k in, 89% cached, 41 out", or '' when the CLI reported nothing. */
+export function tokenLine(t: TokenCount | undefined): string {
+  if (t === undefined || t.input + t.output === 0) return '';
+  const share = t.input === 0 ? 0 : Math.round((t.cached / t.input) * 100);
+  return `${count(t.input)} in${share > 0 ? `, ${share}% cached` : ''}, ${count(t.output)} out`;
+}
+
+/** The exact numbers, for the hover. */
+export function tokenDetail(t: TokenCount | undefined): string {
+  if (t === undefined) return '';
+  const n = (x: number) => x.toLocaleString('en-US');
+  const lines = [`Read ${n(t.input)} tokens, ${n(t.cached)} of them from the cache.`, `Wrote ${n(t.output)} tokens.`];
+  if (t.context !== undefined) lines.push(`The context held ${n(t.context)} tokens at the end.`);
+  return lines.join('\n');
 }
 
 export const ROLE_COLOR: Record<AgentRole, string> = {

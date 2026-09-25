@@ -106,6 +106,17 @@ export interface ToolCall {
 
 export type AgentStatus = 'running' | 'done' | 'error' | 'stopped';
 
+/** Tokens one turn read and wrote, as claude or codex reported them. */
+export interface TokenCount {
+  /** Every token the model read over the turn, from the cache or not. */
+  input: number;
+  /** The part of `input` read from the prompt cache. */
+  cached: number;
+  output: number;
+  /** How full the model's context was on its last request. claude reports it; codex does not. */
+  context?: number;
+}
+
 /** One agent turn's worth of output, as a session or a run node shows it. */
 export interface AgentTurn {
   /** Everything the agent said, with a paragraph break wherever a tool call sat. */
@@ -114,7 +125,9 @@ export interface AgentTurn {
   final?: string;
   tools: ToolCall[];
   status: AgentStatus;
+  /** What the CLI says the turn would cost at API prices. Kept, not shown: a subscription pays nothing per turn. */
   costUsd?: number;
+  tokens?: TokenCount;
   error?: string;
 }
 
@@ -155,6 +168,10 @@ export interface Session {
     harnessModelId?: string;
     /** What happened since the agent's last turn, told to it at the start of the next. */
     news?: string[];
+    /** codex counts tokens for the whole conversation, so the next turn subtracts this. */
+    harnessTokens?: TokenCount;
+    /** The flow list the agent was last told about, so it hears again only when it changes. */
+    toldFlows?: string;
   };
   archived?: boolean;
 }
@@ -407,6 +424,8 @@ export interface Run {
   result?: string;
   error?: string;
   costUsd: number;
+  /** Every agent turn's tokens, added up. Absent on runs from before this was recorded. */
+  tokens?: TokenCount;
   pending: PendingQuestion[];
   /** Absent on runs from before this was recorded; those were all yours. */
   startedBy?: RunStarter;

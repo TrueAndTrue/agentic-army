@@ -14,7 +14,8 @@ import { permissionsFor } from '../../../src/command/permissions.ts';
 import { armyHome } from '../../../src/config/paths.ts';
 import type { HarnessAdapter, McpServerSpec, Soldier, SoldierEvent, SoldierSpec } from '../../../src/contracts/harness.ts';
 import type { Rank, Role } from '../../../src/contracts/ranks.ts';
-import type { AgentRole, AgentTurn, Effort, Harness, Settings } from '../shared/types.ts';
+import { tokensSince } from '../shared/tokens.ts';
+import type { AgentRole, AgentTurn, Effort, Harness, Settings, TokenCount } from '../shared/types.ts';
 
 export const ROLE_UNITS: Record<AgentRole, { rank: Rank; role: Role }> = {
   scout: { rank: 'CAPTAIN', role: 'SCOUT' },
@@ -63,6 +64,8 @@ export interface AgentRunInput {
   /** Put the role's brief in front of the prompt. Chats skip it. */
   brief: boolean;
   resume?: string;
+  /** codex's running token total when this conversation last ended, so a resumed turn counts only itself. */
+  tokensBefore?: TokenCount;
   /** MCP servers the agent may call. Each one's tools are allowed along with the role's. */
   mcp?: McpServerSpec[];
   settings: Settings;
@@ -75,6 +78,8 @@ export interface AgentRunInput {
 export interface AgentRunResult {
   turn: AgentTurn;
   harnessSessionId?: string;
+  /** codex only: its running total after this turn. Pass it back as `tokensBefore` on resume. */
+  harnessTokens?: TokenCount;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -111,6 +116,28 @@ function toolName(name: string): string {
   const mcp = /^mcp__[a-z0-9_]+__(.+)$/.exec(name);
   if (mcp !== null) return mcp[1]!;
   return name;
+}
+
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/**
+ * A result event's usage in the app's terms. claude reports cache reads apart from `input_tokens`
+ * and codex counts them inside it, so input here is everything read either way. claude also lists
+ * each request of the turn in `usage.iterations`; the last one's size is how full the context is.
+ */
+export function readTokens(harness: Harness, ev: SoldierEvent & { type: 'result' }): TokenCount | undefined {
+  const u = ev.usage;
+  if (u === undefined) return undefined;
+  const cached = u.cacheReadInputTokens ?? 0;
+  if (harness === 'codex') return { input: u.inputTokens ?? 0, cached, output: u.outputTokens ?? 0 };
+  const tokens: TokenCount = { input: (u.inputTokens ?? 0) + cached + (u.cacheCreationInputTokens ?? 0), cached, output: u.outputTokens ?? 0 };
+  const raw = ev.raw as { usage?: { iterations?: unknown } } | null;
+  const iters = raw?.usage?.iterations;
+  const last = Array.isArray(iters) ? (iters.at(-1) as Record<string, unknown> | undefined) : undefined;
+  if (last !== undefined && last !== null && typeof last === 'object') {
+    tokens.context = num(last['input_tokens']) + num(last['cache_read_input_tokens']) + num(last['cache_creation_input_tokens']) + num(last['output_tokens']);
+  }
+  return tokens;
 }
 
 export function makeAdapter(harness: Harness, settings: Settings): HarnessAdapter {
@@ -160,6 +187,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
   let afterTool = false;
   const errors: string[] = [];
   let resultSeen: (SoldierEvent & { type: 'result' }) | null = null;
+  let harnessTokens: TokenCount | undefined;
   let stopped = false;
 
   const onAbort = () => {
@@ -217,6 +245,13 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
           case 'result':
             resultSeen = ev;
             if (ev.costUsd !== undefined) turn.costUsd = (turn.costUsd ?? 0) + ev.costUsd;
+            {
+              const read = readTokens(input.harness, ev);
+              if (read !== undefined && input.harness === 'codex') {
+                harnessTokens = read;
+                turn.tokens = tokensSince(read, input.resume === undefined ? undefined : input.tokensBefore);
+              } else if (read !== undefined) turn.tokens = read;
+            }
             resolveResult();
             break;
           default:
@@ -261,5 +296,5 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
   }
   turn.tools = turn.tools.map((t) => (t.status === 'running' ? { ...t, status: turn.status === 'done' ? 'ok' : 'error' } : t));
   emit();
-  return { turn, ...(harnessSessionId === undefined ? {} : { harnessSessionId }) };
+  return { turn, ...(harnessSessionId === undefined ? {} : { harnessSessionId }), ...(harnessTokens === undefined ? {} : { harnessTokens }) };
 }

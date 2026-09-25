@@ -46,6 +46,16 @@ const MAX_AGENT_RUNS = 3;
 /** How much of a finished run's result an agent is told at the start of its next turn. */
 const NEWS_CHARS = 2000;
 
+/** What a chat agent is told about start_flow, so it knows the tool before it needs it. */
+function flowsNote(lines: string): string {
+  return (
+    'You can start the person\'s flows with the start_flow tool (mcp__army__start_flow). A flow is a team of agents with its own tools and ' +
+    'permissions, so it can do what this chat cannot, such as search the web. When the person asks for something a flow below does, ' +
+    'start it rather than saying you cannot. Flows you may start:\n' +
+    lines
+  );
+}
+
 export class Controller {
   private readonly store: Store;
   private readonly emitRaw: (e: AppEvent) => void;
@@ -338,7 +348,16 @@ export class Controller {
     // What happened since the agent last spoke: runs it started that finished, requests you answered.
     const news = s.chat.news ?? [];
     delete s.chat.news;
-    const prompt = news.length === 0 ? text : `Since your last turn:\n${news.map((n) => `- ${n}`).join('\n')}\n\nThe person's message:\n${text}`;
+    // claude loads MCP tools on demand and sees only their names until then, so an agent that was
+    // never told what start_flow is reaches for WebSearch, finds it blocked, and gives up. Say what
+    // the tool starts on the first turn, and again whenever that list changes.
+    const offered = tools === null ? undefined : this.flowLines().join('\n');
+    const tell = offered !== undefined && (resume === undefined || s.chat.toldFlows !== offered);
+    const parts = [
+      ...(tell ? [flowsNote(offered)] : []),
+      ...(news.length === 0 ? [] : [`Since your last turn:\n${news.map((n) => `- ${n}`).join('\n')}`]),
+    ];
+    const prompt = parts.length === 0 ? text : `${parts.join('\n\n')}\n\nThe person's message:\n${text}`;
     try {
       const res = await runAgent({
         harness: model.harness,
@@ -351,6 +370,7 @@ export class Controller {
         label: `chat-${s.id.slice(-6)}`,
         brief: false,
         ...(resume === undefined ? {} : { resume }),
+        ...(resume === undefined || s.chat.harnessTokens === undefined ? {} : { tokensBefore: s.chat.harnessTokens }),
         settings: this.settings,
         signal: ctl.signal,
         onTurn: (turn) => {
@@ -363,6 +383,10 @@ export class Controller {
         s.chat.harnessSessionId = res.harnessSessionId;
         s.chat.harnessModelId = model.id;
       }
+      if (res.harnessTokens !== undefined) s.chat.harnessTokens = res.harnessTokens;
+      else delete s.chat.harnessTokens;
+      if (res.turn.status === 'done' && offered !== undefined) s.chat.toldFlows = offered;
+      else if (offered === undefined) delete s.chat.toldFlows;
     } catch (err) {
       item.status = 'error';
       item.error = err instanceof Error ? err.message : String(err);
@@ -429,10 +453,15 @@ export class Controller {
     });
   }
 
+  /** One line per flow an agent may start, as the tool and the chat note list them. */
+  private flowLines(): string[] {
+    return this.agentFlows().map(({ flow, ask }) => `- ${flowCommand(flow)}: ${flow.name}. ${flow.description}${ask ? ' (The person approves before it starts.)' : ''}`);
+  }
+
   readonly flowTools: ToolHandler = {
     list: (): ToolDescription[] => {
       const flows = this.agentFlows();
-      const lines = flows.map(({ flow, ask }) => `- ${flowCommand(flow)}: ${flow.name}. ${flow.description}${ask ? ' (The person approves before it starts.)' : ''}`);
+      const lines = this.flowLines();
       return [
         {
           name: 'start_flow',
@@ -548,6 +577,7 @@ export class Controller {
           label: `${slug(cfg.label) || 'agent'}-${visit}`,
           brief: true,
           ...(req.resume === undefined ? {} : { resume: req.resume }),
+          ...(req.tokensBefore === undefined ? {} : { tokensBefore: req.tokensBefore }),
           settings: this.settings,
           signal: req.signal,
           onTurn: req.onTurn,

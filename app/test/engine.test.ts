@@ -30,7 +30,7 @@ function deps(over: Partial<EngineDeps> = {}, log: FakeLog = { agentPrompts: [],
     },
     async agent(req) {
       log.agentPrompts.push({ node: req.node.id, prompt: req.prompt, ...(req.resume ? { resume: req.resume } : {}) });
-      return { turn: { text: `${req.node.id} did: ${req.prompt.split('\n')[0]}`, tools: [], status: 'done', costUsd: 0.01 }, harnessSessionId: `s-${req.node.id}` };
+      return { turn: { text: `${req.node.id} did: ${req.prompt.split('\n')[0]}`, tools: [], status: 'done', costUsd: 0.01, tokens: { input: 100, cached: 60, output: 7, context: 107 } }, harnessSessionId: `s-${req.node.id}` };
     },
     async judge({ config }): Promise<Judgment> {
       return { mode: config.mode, answer: config.mode === 'yesno' ? 'yes' : (config.options[0]?.key ?? 'a'), probabilities: {}, confidence: 0.9, value: 0.9 };
@@ -107,6 +107,8 @@ describe('running a flow', () => {
     assert.deepEqual(log.agentPrompts.map((p) => p.prompt), ['Plan add multiply', 'Build from: plan did: Plan add multiply']);
     assert.equal(r.result, 'Plan was: plan did: Plan add multiply');
     assert.equal(r.costUsd, 0.02);
+    assert.deepEqual(r.tokens, { input: 200, cached: 120, output: 14 }, 'two agents added up, with no context: each had its own');
+    assert.deepEqual(r.tokens, { input: 200, cached: 120, output: 14 }, 'two agents added up, with no context: each had its own');
     assert.equal(r.nodes['build']?.status, 'done');
   });
 
