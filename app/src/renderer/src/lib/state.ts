@@ -147,6 +147,18 @@ export async function openSession(id: string): Promise<void> {
   go({ kind: 'session', id });
 }
 
+/** A new session whose message box is set to run `flowId`, waiting for you to say the objective. */
+export async function newFlowSession(projectId: string, flowId: string): Promise<void> {
+  const s = await api().createSession(projectId);
+  try {
+    localStorage.setItem(`army.target.${s.id}`, flowId);
+  } catch {
+    /* the box falls back to chat */
+  }
+  setState((st) => ({ sessionById: { ...st.sessionById, [s.id]: s }, panelRunId: null }));
+  go({ kind: 'session', id: s.id });
+}
+
 export async function newSession(projectId: string): Promise<void> {
   const s = await api().createSession(projectId);
   setState((st) => ({ sessionById: { ...st.sessionById, [s.id]: s }, panelRunId: null }));

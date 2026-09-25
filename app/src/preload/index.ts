@@ -21,6 +21,7 @@ const api: Api = {
   getRun: call('getRun') as Api['getRun'],
   answer: call('answer') as Api['answer'],
   stopRun: call('stopRun') as Api['stopRun'],
+  answerFlowRequest: call('answerFlowRequest') as Api['answerFlowRequest'],
   runDiff: call('runDiff') as Api['runDiff'],
   mergeRun: call('mergeRun') as Api['mergeRun'],
   saveFlow: call('saveFlow') as Api['saveFlow'],

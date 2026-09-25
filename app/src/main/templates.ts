@@ -19,6 +19,7 @@ const ROW = 250;
 
 const mainFlow: Flow = {
   id: 'builtin-main-flow',
+  invoke: 'agent-ask',
   name: 'Build and review',
   description:
     'A change that needs planning, building and independent review. A scout reads the code, a planner writes the plan you approve, an engineer builds it on its own branch, a reviewer on a different model checks it, and Jev sends it back to the engineer until the review passes.',
@@ -103,6 +104,7 @@ const mainFlow: Flow = {
 
 const quickFix: Flow = {
   id: 'builtin-quick-fix',
+  invoke: 'agent-ask',
   name: 'Quick fix',
   description: 'A small, clear change. An engineer makes it on a branch, a reviewer checks it, and Jev loops it back until the review passes. No planning step.',
   builtin: true,
@@ -139,6 +141,7 @@ const quickFix: Flow = {
 
 const webResearch: Flow = {
   id: 'builtin-web-research',
+  invoke: 'agent',
   name: 'Look it up on the web',
   description: 'A question answered from a live web page. A browser driven by Jev searches and reads, a guard stops risky clicks, and a scout writes the answer from what the browser found.',
   builtin: true,
@@ -160,6 +163,7 @@ const webResearch: Flow = {
 
 const triage: Flow = {
   id: 'builtin-triage',
+  invoke: 'auto',
   name: 'Triage with Jev',
   description: 'Jev reads the request and sends it down the right path: a bug goes to a fix-and-test loop, a feature gets a plan for you to approve, and a question gets an answer.',
   builtin: true,

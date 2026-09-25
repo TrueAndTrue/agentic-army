@@ -45,6 +45,9 @@ function deps(over: Partial<EngineDeps> = {}, log: FakeLog = { agentPrompts: [],
     async browser() {
       return { ok: true, output: 'browsed' };
     },
+    async subflow({ objective }) {
+      return { ok: true, output: `sub-run did: ${objective}`, runId: 'child' };
+    },
     ...over,
   };
 }

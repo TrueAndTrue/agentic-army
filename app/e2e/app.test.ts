@@ -220,6 +220,155 @@ describe('flows', () => {
   });
 });
 
+describe('starting flows', () => {
+  async function items(l: Launched) {
+    return l.page.evaluate(async () => {
+      const s = await window.api.getState();
+      return (await window.api.getSession(s.sessions[0]!.id))!.items;
+    });
+  }
+  async function runs(l: Launched): Promise<Run[]> {
+    return l.page.evaluate(async () => {
+      const s = await window.api.getState();
+      const sess = await window.api.getSession(s.sessions[0]!.id);
+      const ids = sess!.items.flatMap((i) => (i.kind === 'run' ? [i.runId] : []));
+      return (await Promise.all(ids.map((id) => window.api.getRun(id)))) as Run[];
+    });
+  }
+  const settled = (r: Run | undefined) => r !== undefined && r.status !== 'running' && r.status !== 'waiting';
+
+  test('typing / lists the flows, and /quick-fix runs Quick fix as yours', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
+      await openSession(l);
+      await l.page.getByRole('textbox', { name: 'Message' }).fill('/qu');
+      await l.page.getByRole('listbox', { name: 'Flows you can run' }).getByText('/quick-fix').waitFor();
+      await l.page.keyboard.press('Tab');
+      assert.equal(await l.page.getByRole('textbox', { name: 'Message' }).inputValue(), '/quick-fix ');
+      await l.page.keyboard.type('Add multiply');
+      await l.page.getByText('Runs Quick fix with the rest as its objective.').waitFor();
+      await shot(l.page, 'e2e-slash-command');
+      await l.page.keyboard.press('Enter');
+      const r = await runToEnd(l);
+      assert.equal(r.flowName, 'Quick fix');
+      assert.equal(r.objective, 'Add multiply');
+      assert.deepEqual(r.startedBy, { kind: 'you' });
+    });
+  });
+
+  test('Run on the Flows page opens a session set to that flow', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      await l.page.evaluate((path) => window.api.addProject(path), makeProject(l.root));
+      await l.page.getByRole('button', { name: 'Flows' }).click();
+      await l.page.getByRole('button', { name: 'Run Look it up on the web' }).click();
+      assert.equal(await l.page.getByLabel('Where this message goes').inputValue(), 'builtin-web-research');
+      await l.page.getByPlaceholder('Describe the objective for Look it up on the web').waitFor();
+    });
+  });
+
+  test('a chat agent asks to start Quick fix; you edit the objective and approve; it hears how it went', async () => {
+    await withApp({ jevUrl, claudeMode: 'start-flow', env: { FAKE_FLOW: 'quick-fix' } }, async (l) => {
+      await openSession(l);
+      await send(l, 'Add multiply to calc.js');
+      const card = l.page.getByRole('article', { name: /asks to run Quick fix/ });
+      await card.waitFor({ timeout: 20000 });
+      await l.page.getByText(/start_flow said: Asked the person to approve starting "Quick fix"/).waitFor();
+      await shot(l.page, 'e2e-agent-asks');
+      await card.getByRole('textbox').fill('Add multiply to calc.js, with a test for negative numbers');
+      await card.getByRole('button', { name: 'Start with my edit' }).click();
+      await until(async () => settled((await runs(l))[0]), 60000, 'the approved run to end');
+      const [r] = await runs(l);
+      assert.equal(r!.objective, 'Add multiply to calc.js, with a test for negative numbers');
+      assert.equal(r!.startedBy?.kind, 'agent');
+      assert.equal((r!.startedBy as { approved: boolean }).approved, true);
+      await l.page.getByText(/asked, you approved/).first().waitFor();
+      await l.page.getByText(/You approved it\./).waitFor();
+
+      // The next turn opens with what happened. (In this mode the fake asks again; decline that one.)
+      await send(l, 'How did it go?');
+      await until(
+        async () => (await items(l)).some((i) => i.kind === 'agent' && /^echo:Since your last turn:\n- The flow "Quick fix" you started finished\. Its result:\nReady on /.test(i.text)),
+        20000,
+        'the next turn to open with the news',
+      );
+      const again = l.page.getByRole('article', { name: /asks to run Quick fix/ });
+      await again.getByRole('button', { name: 'Decline' }).click();
+      await l.page.getByText(/You declined\./).waitFor();
+    });
+  });
+
+  test('with "Agents too, without asking", the agent starts the flow itself', async () => {
+    await withApp({ jevUrl, claudeMode: 'start-flow', env: { FAKE_FLOW: 'quick-fix' } }, async (l) => {
+      await l.page.evaluate(async () => {
+        const s = await window.api.getState();
+        await window.api.saveSettings({ ...s.settings, invokeCeiling: 'agent' });
+        const q = s.flows.find((f) => f.id === 'builtin-quick-fix')!;
+        await window.api.saveFlow({ ...q, invoke: 'agent' });
+      });
+      await openSession(l);
+      await send(l, 'Add multiply');
+      await until(async () => (await runs(l)).length === 1, 20000, 'the agent to start a run');
+      assert.equal((await items(l)).some((i) => i.kind === 'flow-request'), false, 'nobody was asked');
+      const [r] = await runs(l);
+      assert.deepEqual(r!.startedBy, { kind: 'agent', model: 'Sonnet 5', approved: false });
+      await l.page.getByText('Sonnet 5 started it').waitFor();
+      await until(async () => settled((await runs(l))[0]), 60000, 'the run to end');
+    });
+  });
+
+  test('with Settings at "Only you", a chat agent is not even given the tool', async () => {
+    await withApp({ jevUrl, claudeMode: 'start-flow' }, async (l) => {
+      await l.page.evaluate(async () => {
+        const s = await window.api.getState();
+        await window.api.saveSettings({ ...s.settings, invokeCeiling: 'you' });
+      });
+      await openSession(l);
+      await send(l, 'Add multiply');
+      await l.page.getByText('start_flow said: start_flow is not available: no --mcp-config.').waitFor({ timeout: 20000 });
+      assert.deepEqual(await runs(l), []);
+    });
+  });
+
+  test('a Run flow node runs Quick fix as a step, and the child run says who started it', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
+      await l.page.evaluate(async () => {
+        await window.api.saveFlow({
+          id: 'outer',
+          name: 'Fix then report',
+          description: 'Runs Quick fix, then reports.',
+          updatedAt: '',
+          nodes: [
+            { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: { label: 'Start' } },
+            { id: 'fix', type: 'flow', position: { x: 260, y: 0 }, data: { label: 'Fix it', flowId: 'builtin-quick-fix', objective: 'Quickly: {{input}}' } },
+            { id: 'end', type: 'end', position: { x: 520, y: 0 }, data: { label: 'Done', template: 'Report: {{input}}' } },
+            { id: 'bad', type: 'end', position: { x: 520, y: 160 }, data: { label: 'Failed', template: 'It failed: {{input}}' } },
+          ],
+          edges: [
+            { id: 'a', source: 'start', sourceHandle: 'out', target: 'fix' },
+            { id: 'b', source: 'fix', sourceHandle: 'done', target: 'end' },
+            { id: 'c', source: 'fix', sourceHandle: 'failed', target: 'bad' },
+          ],
+        });
+      });
+      await openSession(l);
+      await send(l, 'Add multiply', 'Fix then report');
+      await until(async () => {
+        const rs = await runs(l);
+        return rs.length === 2 && rs.every(settled);
+      }, 90000, 'both runs to end');
+      const [outer, inner] = await runs(l);
+      assert.equal(outer!.flowName, 'Fix then report');
+      assert.equal(inner!.flowName, 'Quick fix');
+      assert.equal(inner!.objective, 'Quickly: Add multiply');
+      assert.deepEqual(inner!.startedBy, { kind: 'flow', runId: outer!.id, flowName: 'Fix then report', node: 'Fix it' });
+      assert.equal(inner!.parentRunId, outer!.id);
+      assert.equal(outer!.status, 'succeeded', outer!.error);
+      assert.match(outer!.result ?? '', /^Report: Ready on army\/run-/);
+      await l.page.getByText('"Fix it" in Fix then report started it').waitFor();
+      await shot(l.page, 'e2e-flow-runs-flow');
+    });
+  });
+});
+
 describe('the canvas', () => {
   test('a flow drawn on the canvas saves and runs from a session', async () => {
     await withApp({ jevUrl }, async (l) => {

@@ -12,7 +12,7 @@ import { createCodexAdapter } from '../../../src/harness/codex.ts';
 import { killSoldierTree } from '../../../src/harness/kill.ts';
 import { permissionsFor } from '../../../src/command/permissions.ts';
 import { armyHome } from '../../../src/config/paths.ts';
-import type { HarnessAdapter, Soldier, SoldierEvent, SoldierSpec } from '../../../src/contracts/harness.ts';
+import type { HarnessAdapter, McpServerSpec, Soldier, SoldierEvent, SoldierSpec } from '../../../src/contracts/harness.ts';
 import type { Rank, Role } from '../../../src/contracts/ranks.ts';
 import type { AgentRole, AgentTurn, Effort, Harness, Settings } from '../shared/types.ts';
 
@@ -63,6 +63,8 @@ export interface AgentRunInput {
   /** Put the role's brief in front of the prompt. Chats skip it. */
   brief: boolean;
   resume?: string;
+  /** MCP servers the agent may call. Each one's tools are allowed along with the role's. */
+  mcp?: McpServerSpec[];
   settings: Settings;
   signal: AbortSignal;
   onTurn(turn: AgentTurn): void;
@@ -77,12 +79,14 @@ export interface AgentRunResult {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const STR_FIELDS = ['command', 'cmd', 'file_path', 'path', 'pattern', 'url', 'query', 'description', 'prompt'];
+const STR_FIELDS = ['command', 'cmd', 'file_path', 'path', 'pattern', 'url', 'query', 'description', 'prompt', 'flow'];
 
 /** One readable line for a tool call. */
 export function summarizeTool(name: string, input: unknown): string {
   if (input === null || typeof input !== 'object') return '';
   const rec = input as Record<string, unknown>;
+  // A codex MCP call arrives as the whole item, with the tool's own arguments inside it.
+  if (name === 'mcp_tool_call' && rec['arguments'] !== null && typeof rec['arguments'] === 'object') return summarizeTool('', rec['arguments']);
   if (Array.isArray(rec['changes'])) {
     const paths = (rec['changes'] as unknown[])
       .map((c) => (c !== null && typeof c === 'object' ? (c as Record<string, unknown>)['path'] : undefined))
@@ -103,6 +107,9 @@ function toolName(name: string): string {
   if (name === 'file_change') return 'Edit';
   if (name === 'web_search') return 'WebSearch';
   if (name === 'mcp_tool_call') return 'MCP';
+  // claude names an MCP tool `mcp__<server>__<tool>`; the tool is the readable part.
+  const mcp = /^mcp__[a-z0-9_]+__(.+)$/.exec(name);
+  if (mcp !== null) return mcp[1]!;
   return name;
 }
 
@@ -134,11 +141,12 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
     effort: input.effort,
     cwd: input.cwd,
     sessionId: randomUUID(),
-    allow: perms.allow,
+    allow: [...perms.allow, ...(input.mcp ?? []).map((m) => `mcp__${m.name}`)],
     deny: perms.deny,
     posture: input.settings.posture,
     orders,
     ...(input.resume === undefined ? {} : { resumeSessionId: input.resume }),
+    ...(input.mcp === undefined || input.mcp.length === 0 ? {} : { mcpServers: input.mcp }),
   };
 
   const turn: AgentTurn = { text: '', final: '', tools: [], status: 'running' };
@@ -190,7 +198,8 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
             break;
           case 'tool_use':
             if (ev.depth !== 0) break;
-            turn.tools.push({ id: ev.toolUseId, name: toolName(ev.name), summary: summarizeTool(ev.name, ev.input), status: 'running' });
+            const mcpTool = ev.name === 'mcp_tool_call' && typeof (ev.input as { tool?: unknown } | null)?.tool === 'string' ? (ev.input as { tool: string }).tool : null;
+            turn.tools.push({ id: ev.toolUseId, name: mcpTool ?? toolName(ev.name), summary: summarizeTool(ev.name, ev.input), status: 'running' });
             afterTool = true;
             emit();
             break;

@@ -10,16 +10,16 @@ import {
   type EdgeChange,
   type NodeChange,
 } from '@xyflow/react';
-import { ChevronLeft, Copy, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
+import { ChevronLeft, Copy, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
-import { defaultNodeData, newId, validateFlow } from '../../../shared/flow.ts';
-import { NODE_TYPES, type Flow, type FlowNode, type NodeType } from '../../../shared/types.ts';
+import { defaultNodeData, flowCommand, invokeLevel, newId, validateFlow } from '../../../shared/flow.ts';
+import { INVOKE_INFO, INVOKE_LEVELS, NODE_TYPES, type Flow, type FlowNode, type InvokeLevel, type NodeType } from '../../../shared/types.ts';
 import { TYPE_LABEL } from '../lib/format.ts';
-import { api, go, useStore } from '../lib/state.ts';
+import { api, go, newFlowSession, useStore } from '../lib/state.ts';
 import { nodeColor, nodeTypes, toRfEdges, toRfNodes, TYPE_ICON, useMeasured } from './FlowCanvas.tsx';
 import { NodeInspector } from './NodeInspector.tsx';
-import { Button, cx, Field, Input, TextArea } from './ui.tsx';
+import { Button, cx, Field, Input, PillSelect, Select, TextArea } from './ui.tsx';
 
 const PALETTE: { type: NodeType; hint: string }[] = [
   { type: 'agent', hint: 'Claude or Codex with a role' },
@@ -28,6 +28,7 @@ const PALETTE: { type: NodeType; hint: string }[] = [
   { type: 'shell', hint: 'Run a command' },
   { type: 'browser', hint: 'Jev drives a web page' },
   { type: 'git', hint: 'Diff, commit or merge' },
+  { type: 'flow', hint: 'Run another flow as a step' },
   { type: 'join', hint: 'Wait for parallel paths' },
   { type: 'end', hint: 'Finish with a result' },
   { type: 'start', hint: 'Where a run begins' },
@@ -59,7 +60,8 @@ function Canvas({ draft, setDraft, selected, setSelected }: { draft: Flow; setDr
   const measured = useMeasured();
   const draftRef = useRef(draft);
   draftRef.current = draft;
-  const problems = useMemo(() => validateFlow(draft, new Set(settings?.models.map((m) => m.id))), [draft, settings]);
+  const allFlows = useStore((s) => s.flows);
+  const problems = useMemo(() => validateFlow(draft, new Set(settings?.models.map((m) => m.id)), new Set(allFlows.map((f) => f.id))), [draft, settings, allFlows]);
   const nodes = useMemo(
     () =>
       toRfNodes(draft, settings, (n) => {
@@ -225,7 +227,8 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
     setDirty(false);
   };
 
-  const problems = draft === null || settings === null ? [] : validateFlow(draft, new Set(settings.models.map((m) => m.id)));
+  const projects = useStore((s) => s.projects);
+  const problems = draft === null || settings === null ? [] : validateFlow(draft, new Set(settings.models.map((m) => m.id)), new Set(flows.map((f) => f.id)));
   const node = draft?.nodes.find((n) => n.id === selected) ?? null;
   const isBuiltinCopy = draft !== null && draft.id.startsWith('builtin-') && draft.builtin !== true;
 
@@ -260,15 +263,22 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
           <div className="min-h-0 flex-1 overflow-y-auto">
             <div className="mx-auto max-w-[980px] px-6 py-8">
               <p className="max-w-[640px] text-[13px] leading-relaxed text-muted">
-                A flow is a team of agents you wire together. Each node is a step: an agent with a role and a model, a Jev decision that picks a path, your approval, a command, a browser, or git. Loops are connections that point back. Run any flow from a session.
+                A flow is a team of agents you wire together. Each node is a step: an agent with a role and a model, a Jev decision that picks a path, your approval, a command, a browser, git, or another flow. Loops are connections that point back.
+              </p>
+              <p className="mt-2 max-w-[640px] text-[13px] leading-relaxed text-muted">
+                Start one with Run below, from the box in a session, or by typing its command, such as <code className="font-mono text-[12px] text-text">/quick-fix add a multiply function</code>. Each flow also says whether Jev and chat agents may start it.
               </p>
               <ul className="mt-6 grid grid-cols-2 gap-3">
                 {flows.map((f) => (
-                  <li key={f.id}>
+                  <li key={f.id} className="relative">
                     <button onClick={() => open(f.id)} className="flex h-full w-full flex-col items-start justify-start rounded-xl border border-line bg-panel p-4 text-left hover:border-line-strong hover:bg-raised">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 pr-20">
                         <span className="text-[14px] font-semibold">{f.name}</span>
                         <span className="text-[11.5px] text-faint">{f.builtin === true ? 'ships with the app' : f.id.startsWith('builtin-') ? 'your version' : 'yours'}</span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[11.5px] text-faint">
+                        <code className="font-mono">/{flowCommand(f)}</code>
+                        <span>{settings === null ? '' : INVOKE_INFO[invokeLevel(f, settings)].label}</span>
                       </div>
                       <p className="mt-1.5 line-clamp-3 text-[12.5px] leading-relaxed text-muted">{f.description || 'No description yet.'}</p>
                       <div className="mt-3 flex flex-wrap gap-1">
@@ -282,6 +292,31 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
                           ))}
                       </div>
                     </button>
+                    <div className="absolute top-3 right-3">
+                      {projects.length <= 1 ? (
+                        <Button
+                          tone="outline"
+                          aria-label={`Run ${f.name}`}
+                          disabled={projects.length === 0}
+                          title={projects.length === 0 ? 'Add a project first' : undefined}
+                          onClick={() => projects[0] !== undefined && void newFlowSession(projects[0].id, f.id)}
+                        >
+                          <Play size={12} /> Run
+                        </Button>
+                      ) : (
+                        <label className="flex h-8 items-center gap-1 rounded-md border border-line bg-panel pl-2.5 text-[12.5px] font-medium text-text hover:border-line-strong">
+                          <Play size={12} />
+                          <PillSelect aria-label={`Run ${f.name} in`} value="" onChange={(e) => e.target.value !== '' && void newFlowSession(e.target.value, f.id)} className="pl-0 font-medium text-text">
+                            <option value="">Run in…</option>
+                            {projects.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name}
+                              </option>
+                            ))}
+                          </PillSelect>
+                        </label>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -361,9 +396,20 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
                   <Field label="Name">
                     <Input value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} />
                   </Field>
-                  <Field label="Description" hint="Auto mode shows this to Jev when it picks a flow for a message, so say what kind of work the flow is for.">
+                  <Field label="Description" hint="Jev in Auto and chat agents read this when they choose a flow, so say what kind of work the flow is for.">
                     <TextArea rows={5} className="font-sans text-[12.5px]" value={draft.description} onChange={(e) => setDraft((d) => ({ ...d, description: e.target.value }))} />
                   </Field>
+                  {settings !== null && (
+                    <Field label="Who can start this" hint={<InvokeHint flow={draft} ceiling={settings.invokeCeiling ?? 'agent-ask'} />}>
+                      <Select value={draft.invoke ?? 'auto'} onChange={(e) => setDraft((d) => ({ ...d, invoke: e.target.value as InvokeLevel }))}>
+                        {INVOKE_LEVELS.map((l) => (
+                          <option key={l} value={l}>
+                            {INVOKE_INFO[l].label}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                  )}
                   <div>
                     <div className="mb-1.5 text-[12px] font-medium text-muted">Checks</div>
                     {problems.length === 0 ? (
@@ -393,5 +439,16 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
         </div>
       )}
     </div>
+  );
+}
+
+function InvokeHint({ flow, ceiling }: { flow: Flow; ceiling: InvokeLevel }) {
+  const own = flow.invoke ?? 'auto';
+  const held = INVOKE_LEVELS.indexOf(own) > INVOKE_LEVELS.indexOf(ceiling);
+  return (
+    <>
+      {INVOKE_INFO[own].summary} You can always start it yourself, or type <code className="font-mono">/{flowCommand(flow)}</code> in a session.
+      {held && <span className="text-warn"> Settings allows at most "{INVOKE_INFO[ceiling].label}", so that is what applies.</span>}
+    </>
   );
 }

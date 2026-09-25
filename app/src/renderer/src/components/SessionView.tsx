@@ -1,15 +1,17 @@
 import { ArrowUp, Pencil, Square, Trash2 } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
+import { flowCommand, parseFlowCommand } from '../../../shared/flow.ts';
 import { fitEffort } from '../../../shared/models.ts';
 import type { Session, SessionItem } from '../../../shared/types.ts';
 import { api, go, setState, useStore } from '../lib/state.ts';
 import { AgentBlock } from './AgentBlock.tsx';
+import { FlowRequestCard } from './FlowRequestCard.tsx';
 import { RunCard } from './RunCard.tsx';
 import { RunPanel } from './RunPanel.tsx';
 import { cx, EffortOptions, IconButton, Kbd, ModelOptions, PillSelect } from './ui.tsx';
 
-function Item({ item }: { item: SessionItem }) {
+function Item({ item, sessionId }: { item: SessionItem; sessionId: string }) {
   const settings = useStore((s) => s.settings);
   const run = useStore((s) => (item.kind === 'run' ? s.runById[item.runId] : undefined));
   const panelRunId = useStore((s) => s.panelRunId);
@@ -30,6 +32,8 @@ function Item({ item }: { item: SessionItem }) {
     }
     case 'run':
       return <RunCard run={run} active={panelRunId === item.runId} />;
+    case 'flow-request':
+      return <FlowRequestCard sessionId={sessionId} item={item} />;
     case 'notice':
       return (
         <div className={cx('selectable text-center text-[12px]', item.tone === 'error' ? 'text-bad' : item.tone === 'warn' ? 'text-warn' : 'text-faint')}>{item.text}</div>
@@ -81,15 +85,42 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
   };
 
   const noJevKey = settings !== null && settings.typesafe.apiKey.trim() === '';
+  // `/qu` lists the flows whose command starts that way; `/quick-fix add x` says what it will run.
+  const typing = /^\/([a-z0-9-]*)$/i.exec(text);
+  const matches = typing === null || (effectiveTarget !== 'chat' && effectiveTarget !== 'auto') ? [] : flows.filter((f) => flowCommand(f).startsWith(typing[1]!.toLowerCase()));
+  const command = effectiveTarget === 'chat' || effectiveTarget === 'auto' ? parseFlowCommand(text, flows) : null;
+  const complete = (f: (typeof flows)[number]) => {
+    setText(`/${flowCommand(f)} `);
+    ref.current?.focus();
+  };
 
   return (
     <div className="mx-auto w-full max-w-[820px] px-6 pb-5">
+      {matches.length > 0 && (
+        <ul role="listbox" aria-label="Flows you can run" className="mb-1.5 overflow-hidden rounded-xl border border-line bg-panel py-1 shadow-[0_2px_12px_rgba(0,0,0,0.18)]">
+          {matches.map((f, i) => (
+            <li key={f.id} role="option" aria-selected={i === 0}>
+              <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => complete(f)} className={cx('flex w-full items-baseline gap-3 px-3.5 py-1.5 text-left hover:bg-hover', i === 0 && 'bg-hover/60')}>
+                <code className="shrink-0 font-mono text-[12.5px] text-text">/{flowCommand(f)}</code>
+                <span className="truncate text-[12.5px] text-muted">{f.name}. {f.description}</span>
+              </button>
+            </li>
+          ))}
+          <li className="px-3.5 pt-1 pb-0.5 text-[11px] text-faint">Tab completes. Then say what the flow should do.</li>
+        </ul>
+      )}
+      {command !== null && <div className="mb-1.5 px-1 text-[12px] text-muted">Runs {command.flow.name}{command.objective === '' ? '. Say what it should do after the command.' : ' with the rest as its objective.'}</div>}
       <div className="rounded-2xl border border-line bg-panel shadow-[0_2px_12px_rgba(0,0,0,0.18)] focus-within:border-line-strong">
         <textarea
           ref={ref}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
+            if (e.key === 'Tab' && matches[0] !== undefined) {
+              e.preventDefault();
+              complete(matches[0]);
+              return;
+            }
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               send();
@@ -97,7 +128,7 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
           }}
           rows={1}
           aria-label="Message"
-          placeholder={effectiveTarget === 'chat' ? 'Ask or tell the agent something' : effectiveTarget === 'auto' ? 'Describe the work; Jev picks a flow or a chat' : `Describe the objective for ${flows.find((f) => f.id === effectiveTarget)?.name ?? 'the flow'}`}
+          placeholder={effectiveTarget === 'chat' ? 'Ask or tell the agent something. Type / to run a flow.' : effectiveTarget === 'auto' ? 'Describe the work; Jev picks a flow or a chat' : `Describe the objective for ${flows.find((f) => f.id === effectiveTarget)?.name ?? 'the flow'}`}
           className="block max-h-[260px] min-h-[52px] w-full resize-none bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-relaxed placeholder:text-faint focus:outline-none focus-visible:outline-none"
         />
         <div className="flex items-center gap-0.5 px-2 pb-2">
@@ -271,7 +302,7 @@ export function SessionView({ id }: { id: string }) {
               </div>
             )}
             {session.items.map((item) => (
-              <Item key={item.id} item={item} />
+              <Item key={item.id} item={item} sessionId={session.id} />
             ))}
           </div>
         </div>

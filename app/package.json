@@ -16,7 +16,8 @@
     "live:chat": "node e2e/live/chat.ts",
     "live:flow": "node e2e/live/flow.ts",
     "live:jev": "node e2e/live/jev.ts",
-    "install:mac": "npm run dist && rm -rf \"/Applications/Agentic Army.app\" && ditto \"release/mac-arm64/Agentic Army.app\" \"/Applications/Agentic Army.app\" && codesign --force --deep -s - \"/Applications/Agentic Army.app\""
+    "install:mac": "npm run dist && rm -rf \"/Applications/Agentic Army.app\" && ditto \"release/mac-arm64/Agentic Army.app\" \"/Applications/Agentic Army.app\" && codesign --force --deep -s - \"/Applications/Agentic Army.app\"",
+    "live:agent-flow": "node e2e/live/agent-flow.ts"
   },
   "devDependencies": {
     "@fontsource-variable/instrument-sans": "^5.3.0",

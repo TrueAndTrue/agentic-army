@@ -37,6 +37,7 @@ export const TYPE_COLOR: Record<Exclude<NodeType, 'agent'>, string> = {
   shell: 'var(--shell)',
   git: 'var(--git)',
   browser: 'var(--browser)',
+  flow: 'var(--brass)',
   join: 'var(--muted)',
   end: 'var(--muted)',
 };
@@ -49,6 +50,7 @@ export const TYPE_LABEL: Record<NodeType, string> = {
   shell: 'Command',
   git: 'Git',
   browser: 'Browser',
+  flow: 'Run flow',
   join: 'Join',
   end: 'End',
 };

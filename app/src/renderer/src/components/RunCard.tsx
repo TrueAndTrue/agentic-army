@@ -1,11 +1,19 @@
 import { ChevronDown, GitMerge, Map as MapIcon, Square } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
-import type { PendingQuestion, Run } from '../../../shared/types.ts';
+import type { PendingQuestion, Run, RunStarter } from '../../../shared/types.ts';
 import { duration, NODE_STATUS_COLOR, RUN_STATUS_COLOR, RUN_STATUS_LABEL, usd } from '../lib/format.ts';
 import { api, setState } from '../lib/state.ts';
 import { Markdown } from './Markdown.tsx';
 import { Button, cx, Dot, TextArea } from './ui.tsx';
+
+/** Who started the run, in a few words. Nothing for runs you started from the box. */
+export function starterLabel(by: RunStarter | undefined): string | null {
+  if (by === undefined || by.kind === 'you') return null;
+  if (by.kind === 'jev') return `Jev picked it in Auto, ${Math.round(by.confidence * 100)}% sure`;
+  if (by.kind === 'agent') return by.approved ? `${by.model} asked, you approved` : `${by.model} started it`;
+  return `"${by.node}" in ${by.flowName} started it`;
+}
 
 function Ticker({ run }: { run: Run }) {
   const [, tick] = useState(0);
@@ -68,6 +76,7 @@ export function RunCard({ run, active }: { run: Run | undefined; active: boolean
         <Dot color={RUN_STATUS_COLOR[run.status]} pulse={live} />
         <span className="text-[13px] font-semibold">{run.flowName}</span>
         <span className="text-[12px] text-muted">{RUN_STATUS_LABEL[run.status]}</span>
+        {starterLabel(run.startedBy) !== null && <span className="truncate text-[12px] text-faint">· {starterLabel(run.startedBy)}</span>}
         <span className="ml-auto flex items-center gap-3 text-[12px] text-faint">
           {run.costUsd > 0 && <span>{usd(run.costUsd)}</span>}
           <Ticker run={run} />

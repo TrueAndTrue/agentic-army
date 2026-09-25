@@ -58,7 +58,32 @@ export interface Settings {
    * so it is not added back the next time the app reads the vendor lists.
    */
   offeredModels?: string[];
+  /** The most any flow may allow. A flow set higher is held to this. Absent means `agent-ask`. */
+  invokeCeiling?: InvokeLevel;
 }
+
+/**
+ * Who may start a flow, lowest first. Each level includes the ones before it: you can always
+ * start a flow, `auto` adds Jev choosing it for a message you sent in Auto, and the agent levels
+ * let a chat agent start it with its `start_flow` tool, after you approve or without asking.
+ * A Run flow node is not on this scale: you put it in a flow you built, so it is your call.
+ */
+export const INVOKE_LEVELS = ['you', 'auto', 'agent-ask', 'agent'] as const;
+export type InvokeLevel = (typeof INVOKE_LEVELS)[number];
+
+export const INVOKE_INFO: Record<InvokeLevel, { label: string; summary: string }> = {
+  you: { label: 'Only you', summary: 'Starts only when you pick it or type its command.' },
+  auto: { label: 'You, and Jev in Auto', summary: 'Jev may also pick it for a message you send in Auto.' },
+  'agent-ask': { label: 'Agents too, with your approval', summary: 'A chat agent may ask to start it. You see a card and approve, edit or decline.' },
+  agent: { label: 'Agents too, without asking', summary: 'A chat agent may start it on its own. The run still shows in the thread, marked with who started it.' },
+};
+
+/** Who started a run. */
+export type RunStarter =
+  | { kind: 'you' }
+  | { kind: 'jev'; confidence: number }
+  | { kind: 'agent'; model: string; approved: boolean }
+  | { kind: 'flow'; runId: string; flowName: string; node: string };
 
 export interface Project {
   id: string;
@@ -97,6 +122,19 @@ export type SessionItem =
   | { kind: 'user'; id: string; ts: string; text: string; flowId?: string }
   | ({ kind: 'agent'; id: string; ts: string; modelId: string } & AgentTurn)
   | { kind: 'run'; id: string; ts: string; runId: string; flowId: string; flowName: string }
+  | {
+      kind: 'flow-request';
+      id: string;
+      ts: string;
+      flowId: string;
+      flowName: string;
+      objective: string;
+      /** The model that asked, by its label. */
+      model: string;
+      why: string;
+      status: 'pending' | 'started' | 'declined';
+      runId?: string;
+    }
   | { kind: 'notice'; id: string; ts: string; text: string; tone: 'info' | 'warn' | 'error' };
 
 export interface Session {
@@ -115,6 +153,8 @@ export interface Session {
     /** The harness's own conversation id, for resume. */
     harnessSessionId?: string;
     harnessModelId?: string;
+    /** What happened since the agent's last turn, told to it at the start of the next. */
+    news?: string[];
   };
   archived?: boolean;
 }
@@ -133,7 +173,7 @@ export interface SessionSummary {
 // Flows
 // ------------------------------------------------------------------------------------------------
 
-export const NODE_TYPES = ['start', 'agent', 'decide', 'human', 'shell', 'git', 'browser', 'join', 'end'] as const;
+export const NODE_TYPES = ['start', 'agent', 'decide', 'human', 'shell', 'git', 'browser', 'flow', 'join', 'end'] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
 
 export type Workspace = 'run' | 'project';
@@ -201,6 +241,13 @@ export interface BrowserConfig {
   guardThreshold: number;
   showWindow: boolean;
 }
+export interface FlowCallConfig {
+  label: string;
+  /** The flow to run. */
+  flowId: string;
+  /** Its objective, as a template. */
+  objective: string;
+}
 export interface JoinConfig {
   label: string;
 }
@@ -217,6 +264,7 @@ export interface NodeConfigs {
   shell: ShellConfig;
   git: GitConfig;
   browser: BrowserConfig;
+  flow: FlowCallConfig;
   join: JoinConfig;
   end: EndConfig;
 }
@@ -241,6 +289,8 @@ export interface Flow {
   updatedAt: string;
   /** Shipped with the app. Editing one saves a copy. */
   builtin?: boolean;
+  /** Who may start it. Absent means `auto`, what every flow allowed before this existed. */
+  invoke?: InvokeLevel;
 }
 
 /** The output handles a node offers, in display order. */
@@ -263,6 +313,8 @@ export function outputHandles(node: FlowNode): string[] {
     case 'git':
       return ['out', 'fail'];
     case 'browser':
+      return ['done', 'failed'];
+    case 'flow':
       return ['done', 'failed'];
     case 'join':
       return ['out'];
@@ -356,6 +408,12 @@ export interface Run {
   error?: string;
   costUsd: number;
   pending: PendingQuestion[];
+  /** Absent on runs from before this was recorded; those were all yours. */
+  startedBy?: RunStarter;
+  /** Set when a Run flow node started this run. */
+  parentRunId?: string;
+  /** How many Run flow nodes deep this run is. A run you start is 0. */
+  depth?: number;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -402,6 +460,8 @@ export interface Api {
   getRun(id: string): Promise<Run | null>;
   answer(runId: string, questionId: string, approve: boolean, text: string): Promise<void>;
   stopRun(runId: string): Promise<void>;
+  /** Answer an agent's request to start a flow. `objective` replaces the agent's when you edited it. */
+  answerFlowRequest(sessionId: string, requestId: string, approve: boolean, objective: string): Promise<void>;
   runDiff(runId: string): Promise<DiffResult>;
   mergeRun(runId: string): Promise<{ ok: boolean; message: string }>;
   saveFlow(flow: Flow): Promise<Flow>;

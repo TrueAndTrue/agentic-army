@@ -4,11 +4,12 @@
  */
 
 import { Handle, Position, type Edge, type Node, type NodeChange, type NodeProps } from '@xyflow/react';
-import { Bot, Flag, GitBranch, Globe, Merge, Play, Split, Terminal, UserCheck } from 'lucide-react';
+import { Bot, Flag, GitBranch, Globe, Merge, Play, Split, Terminal, UserCheck, Workflow } from 'lucide-react';
 import { memo, useCallback, useRef, useState } from 'react';
 
 import { outputHandles, hasInput, ROLE_INFO, type Flow, type FlowNode, type NodeRunStatus, type NodeType, type Settings } from '../../../shared/types.ts';
 import { NODE_STATUS_COLOR, ROLE_COLOR, TYPE_COLOR, TYPE_LABEL } from '../lib/format.ts';
+import { getState } from '../lib/state.ts';
 import { cx } from './ui.tsx';
 
 export const TYPE_ICON: Record<NodeType, typeof Bot> = {
@@ -19,6 +20,7 @@ export const TYPE_ICON: Record<NodeType, typeof Bot> = {
   shell: Terminal,
   git: GitBranch,
   browser: Globe,
+  flow: Workflow,
   join: Merge,
   end: Flag,
 };
@@ -57,6 +59,10 @@ export function subtitleFor(node: FlowNode, settings: Settings | null): string {
       return node.data.action === 'merge' ? 'Merge into your branch' : node.data.action === 'commit' ? 'Commit the run branch' : 'Show the diff';
     case 'browser':
       return node.data.startUrl;
+    case 'flow': {
+      const id = node.data.flowId;
+      return id === '' ? 'Pick a flow to run' : `Runs "${getState().flows.find((f) => f.id === id)?.name ?? 'a missing flow'}"`;
+    }
     case 'join':
       return 'Waits for every input';
     case 'start':

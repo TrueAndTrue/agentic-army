@@ -2,7 +2,7 @@ import { CheckCircle2, CircleAlert, Plus, RefreshCw, Trash2 } from 'lucide-react
 import { useEffect, useState } from 'react';
 
 import { effortsFor, fitEffort } from '../../../shared/models.ts';
-import { AGENT_ROLES, ROLE_INFO, type DoctorReport, type Harness, type Settings, type StageDefault } from '../../../shared/types.ts';
+import { AGENT_ROLES, INVOKE_INFO, INVOKE_LEVELS, ROLE_INFO, type DoctorReport, type Harness, type InvokeLevel, type Settings, type StageDefault } from '../../../shared/types.ts';
 import { ROLE_COLOR } from '../lib/format.ts';
 import { api, useStore } from '../lib/state.ts';
 import { Button, EffortOptions, Field, IconButton, Input, ModelOptions, Select } from './ui.tsx';
@@ -168,6 +168,25 @@ export function SettingsView() {
                 ),
               )}
               <div className="pt-2">{stageRow('chat', <span className="text-[13px] font-medium">New chats</span>, s.chatDefault, (v) => setS({ ...s, chatDefault: v }))}</div>
+            </div>
+          </Section>
+
+          <Section
+            title="Starting flows"
+            note="You can always start a flow: pick it under the message box, press Run on the Flows page, or type its command, like /quick-fix. Each flow also says whether Jev in Auto and chat agents may start it. This is the most any flow may allow."
+          >
+            <div className="grid grid-cols-[150px_1fr] items-start gap-2">
+              <span className="pt-1.5 text-[13px] font-medium">At most</span>
+              <div>
+                <Select aria-label="The most any flow may allow" value={s.invokeCeiling ?? 'agent-ask'} onChange={(e) => setS({ ...s, invokeCeiling: e.target.value as InvokeLevel })}>
+                  {INVOKE_LEVELS.map((l) => (
+                    <option key={l} value={l}>
+                      {INVOKE_INFO[l].label}
+                    </option>
+                  ))}
+                </Select>
+                <p className="mt-1.5 text-[12px] leading-relaxed text-muted">{INVOKE_INFO[s.invokeCeiling ?? 'agent-ask'].summary}</p>
+              </div>
             </div>
           </Section>
 

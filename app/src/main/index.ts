@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import type { AppEvent, Flow, Session, Settings } from '../shared/types.ts';
 import { ElectronPage } from './browser/page.ts';
 import { Controller } from './controller.ts';
+import { startFlowBridge } from './flowTools.ts';
 import { loginShellPath } from './git.ts';
 import { Store } from './store.ts';
 
@@ -70,6 +71,12 @@ void app.whenReady().then(async () => {
   const root = process.env['ARMY_APP_HOME'] ?? join(app.getPath('userData'), 'army');
   controller = new Controller({ store: new Store(root), emit, openPage: (show) => new ElectronPage(show) });
   const c = controller;
+  // Chat agents reach the start_flow tool through this. If it cannot start, chats still work.
+  try {
+    c.attachBridge(await startFlowBridge(root, c.flowTools));
+  } catch (err) {
+    console.error('The start_flow tool is unavailable:', err);
+  }
   nativeTheme.themeSource = c.settings.theme;
 
   handle('getState', () => c.getState());
@@ -96,6 +103,7 @@ void app.whenReady().then(async () => {
   handle('getRun', (id: string) => c.getRun(id));
   handle('answer', (runId: string, qid: string, approve: boolean, text: string) => c.answer(runId, qid, approve, text));
   handle('stopRun', (id: string) => c.stopRun(id));
+  handle('answerFlowRequest', (sessionId: string, requestId: string, approve: boolean, objective: string) => c.answerFlowRequest(sessionId, requestId, approve, objective));
   handle('runDiff', (id: string) => c.runDiff(id));
   handle('mergeRun', (id: string) => c.mergeRun(id));
   handle('saveFlow', (f: Flow) => c.saveFlow(f));

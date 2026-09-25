@@ -1,9 +1,10 @@
 import { Plus, Trash2 } from 'lucide-react';
 
-import { slug } from '../../../shared/flow.ts';
+import { MAX_FLOW_DEPTH, slug } from '../../../shared/flow.ts';
 import { fitEffort } from '../../../shared/models.ts';
 import { AGENT_ROLES, ROLE_INFO, type Flow, type FlowNode, type NodeConfigs, type Settings } from '../../../shared/types.ts';
 import { TYPE_LABEL } from '../lib/format.ts';
+import { useStore } from '../lib/state.ts';
 import { EffortOptions, Field, IconButton, Input, ModelOptions, Select, TextArea, Toggle, cx } from './ui.tsx';
 
 type Patch<T> = (p: Partial<T>) => void;
@@ -52,6 +53,7 @@ function Segmented<T extends string>({ value, options, onChange }: { value: T; o
 
 export function NodeInspector({ node, flow, settings, onChange, onDelete }: { node: FlowNode; flow: Flow; settings: Settings; onChange(data: FlowNode['data']): void; onDelete(): void }) {
   const set = <K extends keyof NodeConfigs>(d: NodeConfigs[K]): Patch<NodeConfigs[K]> => (p) => onChange({ ...d, ...p } as FlowNode['data']);
+  const flows = useStore((s) => s.flows);
 
   let body: React.ReactNode = null;
   switch (node.type) {
@@ -249,6 +251,31 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
             </Field>
           )}
           <Toggle checked={d.showWindow} onChange={(v) => s({ showWindow: v })} label="Show the browser window while it works" />
+        </>
+      );
+      break;
+    }
+    case 'flow': {
+      const d = node.data;
+      const s = set<'flow'>(d);
+      body = (
+        <>
+          <Field label="Flow to run" hint="It runs as a run of its own, on its own branch, and shows in the thread. This node waits for it, then leaves by done or failed with its result.">
+            <Select value={d.flowId} onChange={(e) => s({ flowId: e.target.value })}>
+              <option value="">Pick a flow</option>
+              {flows
+                .filter((f) => f.id !== flow.id)
+                .map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name}
+                  </option>
+                ))}
+            </Select>
+          </Field>
+          <PromptField label="Its objective" value={d.objective} onChange={(v) => s({ objective: v })} flow={flow} self={node.id} rows={4} />
+          <p className="text-[12px] leading-relaxed text-faint">
+            You put this step here, so it runs whatever the other flow's "Who can start this" says. Flows can run flows {String(MAX_FLOW_DEPTH)} deep; a deeper one fails instead of starting.
+          </p>
         </>
       );
       break;

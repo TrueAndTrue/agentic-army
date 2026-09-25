@@ -46,6 +46,52 @@ Each message goes where the picker under the box says:
 Stop, next to the send button, stops everything running in the session. Quitting the app while
 agents work asks first, then stops them and kills their processes.
 
+## Starting a flow
+
+You can always start a flow yourself, three ways:
+
+- Pick it in the picker under the message box, then type the objective.
+- Type its command in the box: `/quick-fix add a multiply function`. Typing `/` lists the
+  flows and Tab completes one. A message that starts with a path, like `/Users/me`, is not a
+  command.
+- Press Run on its card on the Flows page. That opens a new session with the flow picked.
+
+Two others can start one, if you let them:
+
+- **Jev in Auto.** Pick Auto in the picker and Jev chooses a chat or a flow for your message.
+- **A chat agent.** A claude or codex chat gets a `start_flow` tool listing the flows it may
+  use, with each one's description. It is told the result at the start of its next turn.
+
+Each flow has a "Who can start this" setting, in its side panel on the canvas:
+
+| Level | You | Jev in Auto | A chat agent |
+|---|---|---|---|
+| Only you | yes | no | no |
+| You, and Jev in Auto | yes | yes | no |
+| Agents too, with your approval | yes | yes | asks first |
+| Agents too, without asking | yes | yes | yes |
+
+Settings, under "Starting flows", holds every flow to at most one level. The default limit is
+"with your approval", so an agent never starts a flow on its own until you raise both the limit
+and the flow's own level. With the limit at "Only you", chat agents do not get the tool at all.
+
+When an agent asks, a card appears in the thread with its reason and the objective it wrote. You
+can start it as asked, edit the objective first, or decline. Every run card says who started it:
+Jev and how sure it was, the agent and whether you approved, or the flow that ran it.
+
+An agent can have at most three flows running or waiting for approval in one session. The tool's
+key works only during the chat turn it was issued for, so a copy of it found later starts
+nothing.
+
+A flow can also run another flow as a step with the **Run flow** node. You put that step in the
+flow yourself, so it runs whatever the other flow's setting says. The other flow gets a run of its
+own, on its own branch, shown in the same thread. Flows can run flows three deep, and a deeper one
+fails instead of starting.
+
+The built-in flows start as: Build and review and Quick fix at "with your approval", Look it up
+on the web at "without asking" (held to "with your approval" by the default limit), and Triage
+with Jev at "You, and Jev in Auto".
+
 ## Flows
 
 A flow is a graph. A node runs each time a connection delivers to it, with the previous node's
@@ -62,6 +108,7 @@ that never settles.
 | Command | Runs a shell command in the run's branch or the project folder. Exit 0 is pass. | pass, fail |
 | Browser | A Chromium window that Jev drives toward a goal, with a guard on risky actions. | done, failed |
 | Git | Shows the diff, commits the run branch, or merges it into your branch. | out, fail |
+| Run flow | Runs another flow with an objective from a template, waits for it, and passes its result on. | done, failed |
 | Join | Waits until every node connected into it has delivered, then passes all their outputs on together. | out |
 | End | The run's result, from a template. | none |
 
@@ -149,16 +196,21 @@ A flow that uses Jev will not start without a key, rather than fail halfway thro
 ## Testing
 
 ```sh
-npm test           # the flow engine, Jev client, browser pilot, permissions and models: 39 tests, no network
-npm run e2e        # builds, then drives the real app window with Playwright: 8 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 8 against the built .app
+npm test           # engine, Jev, browser pilot, permissions, models, who may start a flow: 45 tests
+npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
 ```
 
 The end-to-end tests launch the app against a throwaway home and project, the engine's fake
 `claude` and `codex` (`../test/fixtures`), and a fake Jev server. They cover a chat that resumes
 after a restart, Stop, quitting without leaving agent processes behind, Quick fix to a merge, the
 main flow's two approvals and its review loop, a rejected plan going back with its note, a Jev flow
-refusing to start without a key, and a flow drawn on the canvas by dragging connections.
+refusing to start without a key, a flow drawn on the canvas by dragging connections, codex's model
+list and per-model efforts, and every way to start a flow: a slash command, Run on the Flows page,
+a chat agent asking and you editing and approving, an agent starting one without asking, an agent
+given no tool when Settings says "Only you", and a Run flow node running Quick fix. In the agent
+tests the fake claude starts the app's MCP server from `--mcp-config` and calls `start_flow` over
+stdio, the same path real claude takes.
 
 `e2e/live/` holds the runs against the real tools. They cost money and need you logged in:
 
@@ -166,6 +218,7 @@ refusing to start without a key, and a flow drawn on the canvas by dragging conn
 npm run live:chat                       # two turns with claude; MODEL="GPT-6-Astra" EFFORT=ultra for codex
 TYPESAFE_API_KEY=... npm run live:flow  # Quick fix with claude, codex and Jev, then merge and npm test
 TYPESAFE_API_KEY=... npm run live:jev   # the browser guard on a local shop page, and Auto routing
+TYPESAFE_API_KEY=... npm run live:agent-flow  # a claude chat asks for Quick fix, is approved, reports back
 ```
 
 What those showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
@@ -178,6 +231,11 @@ What those showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
   that two search snippets disagreed.
 - The guard let "type kettle into the search box" through at 4% risk, stopped "Click Place order"
   at 93%, and the refusal ended the run without clicking.
+- A Sonnet 5 chat, asked to "start the right flow" for a multiply function, called `start_flow`
+  for Quick fix with a specific objective and a one-line reason. After approval the run took 48 s
+  and $0.22, and on the next turn Sonnet reported the branch and that 5 tests passed. codex
+  (GPT-5.6-Luna) also calls the tool: codex needs its MCP tools marked approved, since `exec`
+  cannot answer a prompt.
 - Auto kept "What does the README say?" as a chat and sent "Add a CONTRIBUTING.md ... and have it
   reviewed" to Quick fix at 0.79.
 - A chat on GPT-6-Astra at `ultra` answered in 12 s, and its second turn quoted the first question

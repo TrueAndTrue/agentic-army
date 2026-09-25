@@ -3,7 +3,7 @@
  * to start a run that has any of the errors.
  */
 
-import { outputHandles, type Flow, type FlowNode, type NodeType } from './types.ts';
+import { INVOKE_LEVELS, outputHandles, type Flow, type FlowNode, type InvokeLevel, type NodeType, type Settings } from './types.ts';
 
 export interface FlowProblem {
   level: 'error' | 'warn';
@@ -64,6 +64,8 @@ function templatesOf(node: FlowNode): string[] {
       return [node.data.message];
     case 'browser':
       return [node.data.goal, node.data.startUrl];
+    case 'flow':
+      return [node.data.objective];
     case 'end':
       return [node.data.template];
     default:
@@ -71,7 +73,7 @@ function templatesOf(node: FlowNode): string[] {
   }
 }
 
-export function validateFlow(flow: Flow, knownModelIds?: ReadonlySet<string>): FlowProblem[] {
+export function validateFlow(flow: Flow, knownModelIds?: ReadonlySet<string>, knownFlowIds?: ReadonlySet<string>): FlowProblem[] {
   const problems: FlowProblem[] = [];
   const byId = new Map(flow.nodes.map((n) => [n.id, n]));
   const starts = flow.nodes.filter((n) => n.type === 'start');
@@ -151,6 +153,11 @@ export function validateFlow(flow: Flow, knownModelIds?: ReadonlySet<string>): F
       }
     }
     if (n.type === 'shell' && n.data.command.trim() === '') problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" has no command.` });
+    if (n.type === 'flow') {
+      if (n.data.flowId === '') problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" does not say which flow to run.` });
+      else if (n.data.flowId === flow.id) problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" runs this same flow. Use a connection that points back to loop instead.` });
+      else if (knownFlowIds !== undefined && !knownFlowIds.has(n.data.flowId)) problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" runs a flow that no longer exists.` });
+    }
     if (n.type === 'browser' && n.data.goal.trim() === '') problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" has no goal.` });
     if (n.type !== 'end' && n.type !== 'start' && !flow.edges.some((e) => e.source === n.id)) {
       problems.push({ level: 'warn', nodeId: n.id, message: `Nothing follows "${n.data.label}". The path stops there.` });
@@ -212,9 +219,53 @@ export function defaultNodeData(type: NodeType): FlowNode['data'] {
         guardThreshold: 0.5,
         showWindow: true,
       };
+    case 'flow':
+      return { label: 'Run flow', flowId: '', objective: '{{input}}' };
     case 'join':
       return { label: 'Join' };
     case 'end':
       return { label: 'End', template: '{{input}}' };
   }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Who may start a flow
+// ------------------------------------------------------------------------------------------------
+
+/** How far run flow nodes may nest: a flow, a flow it runs, and one more. */
+export const MAX_FLOW_DEPTH = 3;
+
+const rankOf = (l: InvokeLevel) => INVOKE_LEVELS.indexOf(l);
+
+/** The flow's own level, held to the ceiling in Settings. */
+export function invokeLevel(flow: Flow, settings: Pick<Settings, 'invokeCeiling'>): InvokeLevel {
+  const own = flow.invoke ?? 'auto';
+  const ceiling = settings.invokeCeiling ?? 'agent-ask';
+  return rankOf(own) <= rankOf(ceiling) ? own : ceiling;
+}
+
+/** Whether Jev in Auto, or an agent, may start this flow, and whether an agent must ask first. */
+export function mayStart(flow: Flow, settings: Pick<Settings, 'invokeCeiling'>, by: 'jev' | 'agent'): 'yes' | 'ask' | 'no' {
+  const level = invokeLevel(flow, settings);
+  if (by === 'jev') return rankOf(level) >= rankOf('auto') ? 'yes' : 'no';
+  return level === 'agent' ? 'yes' : level === 'agent-ask' ? 'ask' : 'no';
+}
+
+/** `Build and review` -> `build-and-review`, the name after a slash in the message box. */
+export function flowCommand(flow: Pick<Flow, 'name'>): string {
+  return flow.name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * A message that starts with `/name` and names a flow: the flow and the rest as its objective.
+ * Anything else, a path like `/Users/me` included, is not a command and goes where it was sent.
+ */
+export function parseFlowCommand<F extends Pick<Flow, 'name'>>(text: string, flows: F[]): { flow: F; objective: string } | null {
+  const m = /^\/([a-z0-9][a-z0-9-]*)(?:\s+([\s\S]*))?$/i.exec(text.trim());
+  if (m === null) return null;
+  const flow = flows.find((f) => flowCommand(f) === m[1]!.toLowerCase());
+  return flow === undefined ? null : { flow, objective: (m[2] ?? '').trim() };
 }

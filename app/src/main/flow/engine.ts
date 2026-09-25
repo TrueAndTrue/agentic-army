@@ -60,6 +60,11 @@ export interface EngineDeps {
   shell(req: { command: string; cwd: string; timeoutMs: number; signal: AbortSignal }): Promise<{ code: number | null; output: string }>;
   git(req: { run: Run; config: GitConfig; message: string; signal: AbortSignal }): Promise<{ ok: boolean; output: string }>;
   browser(req: BrowserRequest): Promise<{ ok: boolean; output: string }>;
+  /**
+   * Run another flow to its end, for a Run flow node, and say how it went. The child run is its own
+   * run, with its own branch, and stops when this one does.
+   */
+  subflow(req: { run: Run; node: Extract<FlowNode, { type: 'flow' }>; objective: string; signal: AbortSignal }): Promise<{ ok: boolean; output: string; runId?: string }>;
   /** The run's own worktree, created the first time a node asks for it. */
   workspace(run: Run): Promise<string>;
   projectPath: string;
@@ -290,6 +295,13 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
           },
           ask: async (title, body) => (await ask(node.id, 'guard', title, body)).approve,
         });
+        return { handle: res.ok ? 'done' : 'failed', output: res.output };
+      }
+
+      case 'flow': {
+        const objective = renderTemplate(node.data.objective, ctx);
+        const res = await deps.subflow({ run, node, objective, signal });
+        if (res.runId !== undefined) visit.log = `Run ${res.runId}`;
         return { handle: res.ok ? 'done' : 'failed', output: res.output };
       }
 
