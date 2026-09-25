@@ -17,6 +17,11 @@ import { Store } from './store.ts';
 if (process.env['ARMY_APP_HOME'] !== undefined) app.setPath('userData', join(process.env['ARMY_APP_HOME'], 'chromium'));
 
 let win: BrowserWindow | null = null;
+/**
+ * The e2e suite sets ARMY_APP_HIDDEN=1: the window never shows and the app stays out of the Dock,
+ * so a test run does not take focus from whatever you are doing. Playwright drives it all the same.
+ */
+const HIDDEN = process.env['ARMY_APP_HIDDEN'] === '1';
 let controller: Controller | null = null;
 let quitting = false;
 
@@ -37,13 +42,15 @@ function createWindow(): void {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     trafficLightPosition: { x: 16, y: 16 },
     webPreferences: {
+      // A hidden window still has to run its timers and paint, or the tests driving it stall.
+      backgroundThrottling: !HIDDEN,
       preload: join(__dirname, '../preload/index.mjs'),
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
-  win.once('ready-to-show', () => win?.show());
+  if (!HIDDEN) win.once('ready-to-show', () => win?.show());
   // Links in agent replies open in the default browser, never inside the app.
   win.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
@@ -64,6 +71,7 @@ function handle<A extends unknown[], R>(name: string, fn: (...args: A) => R | Pr
 }
 
 void app.whenReady().then(async () => {
+  if (HIDDEN) app.dock?.hide();
   if (process.platform === 'darwin') {
     const path = await loginShellPath();
     if (path !== null && path !== '') process.env['PATH'] = path;

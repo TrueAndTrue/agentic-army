@@ -99,17 +99,20 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
   const require = createRequire(import.meta.url);
   // ARMY_E2E_PACKAGED=1 runs the same tests against the built .app instead of the dev build.
   const packaged = process.env['ARMY_E2E_PACKAGED'] === '1';
+  // Set ARMY_E2E_SHOW=1 to watch the window; by default it runs hidden and never takes focus.
+  const hidden: Record<string, string> = process.env['ARMY_E2E_SHOW'] === '1' ? {} : { ARMY_APP_HIDDEN: '1' };
   const app = await electron.launch({
     executablePath: packaged ? join(APP, 'release/mac-arm64/Agentic Army.app/Contents/MacOS/Agentic Army') : (require('electron') as unknown as string),
     args: packaged ? [] : [join(APP, 'out/main/index.js')],
     cwd: APP,
     env:
       opts.live === true
-        ? { ...process.env, ARMY_APP_HOME: home, ARMY_APP_NO_QUIT_CONFIRM: '1', ...(opts.env ?? {}) }
+        ? { ...process.env, ARMY_APP_HOME: home, ARMY_APP_NO_QUIT_CONFIRM: '1', ...hidden, ...(opts.env ?? {}) }
         : {
             ...process.env,
             ARMY_APP_HOME: home,
             ARMY_APP_NO_QUIT_CONFIRM: '1',
+            ...hidden,
             // The army's own home (config, archive) goes somewhere throwaway too.
             AGENTIC_ARMY_HOME: join(root, 'army-home'),
             ARMY_CLAUDE_BIN: join(FIXTURES, 'fake-claude.mjs'),
