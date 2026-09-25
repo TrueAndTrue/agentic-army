@@ -80,7 +80,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
               ))}
             </Select>
           </Field>
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-1 gap-2">
             <Field label="Model">
               <Select
                 value={d.modelId ?? ''}
@@ -167,8 +167,11 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
               </Field>
             </>
           )}
-          <Field label="Take the unsure output below this confidence" hint="0 turns it off. When on, the node gets an unsure output, for example to ask you.">
-            <Num value={d.minConfidence} min={0} max={0.95} step={0.05} onChange={(v) => s({ minConfidence: v })} />
+          <Field
+            label={d.minConfidence === 0 ? 'Unsure output: off' : `Go "unsure" when Jev is under ${Math.round(d.minConfidence * 100)}% sure`}
+            hint="Slide to 0 to turn it off. When on, the node gets an unsure output you can send somewhere, for example to ask you."
+          >
+            <input type="range" min={0} max={0.95} step={0.05} value={d.minConfidence} onChange={(e) => s({ minConfidence: Number(e.target.value) })} className="w-full accent-[var(--brass)]" />
           </Field>
           <Field label="Most visits in one run">
             <Num value={d.maxVisits} min={1} max={50} onChange={(v) => s({ maxVisits: v })} />
@@ -283,7 +286,18 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
     case 'end': {
       const d = node.data;
       const s = set<'end'>(d);
-      body = <PromptField label="Result" value={d.template} onChange={(v) => s({ template: v })} flow={flow} self={node.id} rows={4} />;
+      body = (
+        <>
+          <PromptField label="Result" value={d.template} onChange={(v) => s({ template: v })} flow={flow} self={node.id} rows={4} />
+          <Field label="A run that ends here counts as" hint="Use Failed for an end like &quot;Tests failed&quot;, so the run shows red instead of a green Finished.">
+            <Select value={d.outcome ?? 'success'} onChange={(e) => s({ outcome: e.target.value as 'success' | 'failure' | 'stopped' })}>
+              <option value="success">Finished</option>
+              <option value="failure">Failed</option>
+              <option value="stopped">Stopped</option>
+            </Select>
+          </Field>
+        </>
+      );
       break;
     }
   }

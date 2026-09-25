@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { readTokens } from '../src/main/agents.ts';
+import { readableReport, readTokens } from '../src/main/agents.ts';
 import { addTokens, tokensSince } from '../src/shared/tokens.ts';
 import type { SoldierEvent } from '../../src/contracts/harness.ts';
 
@@ -22,6 +22,15 @@ describe('reading a turn\'s tokens', () => {
 
   test('no usage gives nothing rather than zeros', () => {
     assert.equal(readTokens('claude', result(undefined)), undefined);
+  });
+});
+
+describe('a JSON verdict, as a person reads it', () => {
+  test('a reviewer verdict becomes a line with its findings; other text is left alone', () => {
+    const v = JSON.stringify({ verdict: 'fail', summary: 'multiply is wrong for negatives.', findings: [{ severity: 'blocker', message: 'returns a + b', file: 'calc.js', line: 2 }], testsRun: true, testCommand: 'npm test' });
+    assert.equal(readableReport(v), '**Review: failed.** multiply is wrong for negatives.\n\nFindings:\n- blocker: returns a + b (calc.js:2)\n\nTests: ran `npm test`.');
+    assert.equal(readableReport('{"a": 1}'), '{"a": 1}');
+    assert.equal(readableReport('APPROVED'), 'APPROVED');
   });
 });
 

@@ -28,6 +28,20 @@ describe('what the pilot may type', () => {
     const keys = candidatesFor(snap, 'search for "a" or "b"').map((c) => c.key);
     assert.deepEqual(keys, ['type_e0_0', 'type_e0_1', 'click_e1', 'click_e2', 'scroll', 'done', 'fail']);
   });
+  test("a search box that is a textarea gets Enter too, as DuckDuckGo's does; a plain textarea does not", () => {
+    const snap: PageSnapshot = {
+      url: 'https://x',
+      title: 'x',
+      text: '',
+      canGoBack: false,
+      elements: [
+        { id: 'e0', tag: 'textarea', kind: 'textarea', text: '', name: 'q', inViewport: true },
+        { id: 'e1', tag: 'textarea', kind: 'textarea', text: '', name: 'comment', inViewport: true },
+      ],
+    };
+    const typed = candidatesFor(snap, 'search for "zod"').filter((c) => c.action.kind === 'type');
+    assert.deepEqual(typed.map((c) => (c.action as { submit: boolean }).submit), [true, false]);
+  });
 });
 
 /** A two-page site: a search box, then results with a buy button. */

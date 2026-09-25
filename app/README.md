@@ -35,9 +35,10 @@ Each message goes where the picker under the box says:
 
 - **Chat** sends it to one agent in the project folder, on the model, effort and permission you
   pick. "Can edit files" runs it as an engineer; "Read only" runs it as a scout, which can read
-  and search the web but change nothing. A chat remembers the conversation across turns and across
-  restarts: the next turn resumes the same claude or codex conversation. Changing the model starts
-  a fresh one.
+  and search the web but change nothing. A read-only chat is told so, and asked for an edit it
+  tells you to switch. A chat remembers the conversation across turns and across restarts: the
+  next turn resumes the same claude or codex conversation. Changing the model starts a fresh one
+  in the new CLI, so the app hands it the thread so far and says so in the thread.
 - **Auto** asks Jev which fits: a chat, or one of your flows, judged from each flow's
   description. A notice in the thread says what it picked and how sure it was. Below 0.4
   confidence it stays a chat.
@@ -60,11 +61,13 @@ Two others can start one, if you let them:
 
 - **Jev in Auto.** Pick Auto in the picker and Jev chooses a chat or a flow for your message.
 - **A chat agent.** A claude or codex chat gets a `start_flow` tool listing the flows it may
-  use, with each one's description. It is told the result at the start of its next turn.
-  claude sees an MCP tool only by name until it loads it, so the chat's first prompt also lists
-  the flows and says to start one rather than refuse. Without that, a chat asked to search the
-  web tried WebSearch, which an editing chat does not hold, and gave up. The list goes out again
-  only when it changes.
+  use, with each one's description. When a run it started ends, it gets a short turn of its own
+  to tell you how it went; that turn has no tool, so it cannot start another. claude sees an MCP
+  tool only by name until it loads it, so the chat's system instructions (`--append-system-prompt`
+  for claude, `developer_instructions` for codex) list the flows and say to start one rather than
+  refuse. Without that, a chat asked to search the web tried WebSearch, which an editing chat does
+  not hold, and gave up. The note never goes in front of your message: codex once quoted it back
+  as "the first thing you asked".
 
 Each flow has a "Who can start this" setting, in its side panel on the canvas:
 
@@ -175,9 +178,17 @@ run's copy, and the thread says so when there were some.
   engineer builds it, a codex reviewer checks it, and Jev sends it back to the engineer until the
   review passes. A validator judges the result against your objective, and you sign off.
 - **Quick fix** is the same without planning.
-- **Look it up on the web** sends the Jev browser to search, then a scout answers from the page.
+- **Look it up on the web** opens DuckDuckGo's results for your question, has the Jev browser
+  open the page that answers it, and a scout answers from that page. If the browser finds
+  nothing, the run ends as Failed.
 - **Triage with Jev** has Jev sort a request into a bug, a feature or a question, and asks you
-  when it is not sure.
+  when it is not sure. A bug goes to a fix-and-test loop that sends failing tests back to the
+  engineer, three times at most.
+
+An End node says how a run that reaches it counts: Finished, Failed or Stopped. An output with
+nothing connected ends the run as Failed and says which step went where, and the canvas warns
+about such outputs before you run. A loop that runs out of visits names the decision that kept
+sending the work back.
 
 Editing one saves your own version in its place; Reset brings the original back.
 
@@ -199,7 +210,16 @@ program needs a judgment rather than prose:
   the run pauses and asks you. The browser runs in its own session, with no access to the app or
   to your Chrome profile.
 
-A flow that uses Jev will not start without a key, rather than fail halfway through.
+A flow that uses Jev will not start without a working key, rather than fail halfway through. The
+app asks TypeSafe one small question to check a key it has not tried yet. With no key, or one
+TypeSafe refuses, the thread shows a card where you paste a key; the app checks it, saves it and
+starts the flow. That happens whoever started the flow: you, Jev in Auto, or a chat agent. A
+refused key during a run fails the step with a message that says so; it never counts as Jev
+being unsure.
+
+Each decision shows on the run card as the step's name with Jev's answer, like "Review passed,
+Jev: yes, 93% sure", and on the run map. The step in the run panel shows the question Jev was
+asked, every probability, and the cutoff that turned them into a path.
 
 ## Tokens
 
@@ -212,7 +232,7 @@ what the turn would cost at API prices; the app still saves it but no longer sho
 ## Testing
 
 ```sh
-npm test           # engine, Jev, browser pilot, permissions, models, tokens, who may start a flow: 51 tests
+npm test           # engine, Jev, browser pilot, permissions, models, tokens, who may start a flow, how a run ends: 56 tests
 npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
 ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
@@ -225,7 +245,7 @@ The end-to-end tests launch the app against a throwaway home and project, the en
 `claude` and `codex` (`../test/fixtures`), and a fake Jev server. They cover a chat that resumes
 after a restart, Stop, quitting without leaving agent processes behind, Quick fix to a merge, the
 main flow's two approvals and its review loop, a rejected plan going back with its note, a Jev flow
-refusing to start without a key, a flow drawn on the canvas by dragging connections, codex's model
+with no key asking for one in the thread (refusing a bad key, then starting with a good one), a flow drawn on the canvas by dragging connections, codex's model
 list and per-model efforts, and every way to start a flow: a slash command, Run on the Flows page,
 a chat agent asking and you editing and approving, an agent starting one without asking, an agent
 given no tool when Settings says "Only you", and a Run flow node running Quick fix. In the agent
@@ -241,7 +261,19 @@ TYPESAFE_API_KEY=... npm run live:jev   # the browser guard on a local shop page
 TYPESAFE_API_KEY=... npm run live:agent-flow  # a claude chat asks for Quick fix, is approved, reports back
 ```
 
-What those showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
+Before a change to the app's look or wording ships, it goes through a dogfood pass: agents drive
+the built app with real models, screenshot every state they reach, and report what looks broken
+or confusing. The 2026-09-25 pass covered first run and setup, chat, and flows. It reported 72
+findings, a few of them the same problem seen twice; this README describes the app after the fixes. On the same day, live:
+
+- A Haiku chat read two files, added `multiply` with a test and ran it. The thread showed its three
+  groups of tool calls between the sentences they belonged to. Switched to GPT-5.6-Luna, the chat
+  quoted the first message back from the transcript the app handed over.
+- "What is the latest version of zod on npm" through Look it up on the web: the browser clicked
+  through from the results to npmjs.com and the scout answered "4.6.5" from the page, in 7 s.
+  Before the fix it typed into DuckDuckGo's search box eight times and never searched.
+
+What the earlier runs showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
 
 - A claude chat answered in about 4 s and its second turn quoted the first question back. A codex
   chat's second turn named the file the first asked about. Both resume paths work.

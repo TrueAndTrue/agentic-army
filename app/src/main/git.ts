@@ -75,10 +75,7 @@ export async function ensureWorkspace(run: Run, projectPath: string, root: strin
   run.worktreePath = path;
   run.branch = branch;
   run.baseRef = baseRef;
-  const dirty = (await git(['status', '--porcelain'], projectPath)).stdout.trim();
-  return dirty === ''
-    ? { path }
-    : { path, notice: `The run works on a copy of your last commit. Uncommitted changes in ${projectPath} are not in it.` };
+  return { path };
 }
 
 async function commitAll(cwd: string, message: string): Promise<boolean> {

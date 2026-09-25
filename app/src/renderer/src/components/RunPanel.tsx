@@ -22,11 +22,15 @@ function MapView({ run, onPick, picked }: { run: Run; onPick(id: string): void; 
       toRfNodes(
         run.flow,
         settings,
-        (n) => ({
-          status: run.nodes[n.id]?.status ?? 'idle',
-          visits: run.nodes[n.id]?.visits.length ?? 0,
-          compact: true,
-        }),
+        (n) => {
+          const j = run.nodes[n.id]?.visits.at(-1)?.judgment;
+          return {
+            status: run.nodes[n.id]?.status ?? 'idle',
+            visits: run.nodes[n.id]?.visits.length ?? 0,
+            compact: true,
+            ...(j === undefined ? {} : { note: jevVerdict(n, j) }),
+          };
+        },
         1,
       ).map((n) => ({ ...n, position: layout[n.id] ?? n.position }))
       .map((n) => ({ ...n, selected: n.id === picked, draggable: false, connectable: false })),

@@ -33,6 +33,8 @@ export interface ArmyNodeData extends Record<string, unknown> {
   problem?: 'error' | 'warn';
   /** The run map's small form: name and status only. */
   compact?: boolean;
+  /** What the node decided, shown under its name on the run map: Jev's answer. */
+  note?: string;
 }
 
 export type ArmyFlowNode = Node<ArmyNodeData, 'army'>;
@@ -79,7 +81,7 @@ function handleColor(h: string, color: string): string {
 }
 
 function CompactNode({ data, selected }: NodeProps<ArmyFlowNode>) {
-  const { node, status, visits } = data;
+  const { node, status, visits, note } = data;
   const Icon = TYPE_ICON[node.type];
   const color = nodeColor(node);
   const outs = outputHandles(node);
@@ -96,7 +98,7 @@ function CompactNode({ data, selected }: NodeProps<ArmyFlowNode>) {
       <div className="min-w-0 flex-1">
         <div className="truncate text-[12.5px] leading-tight font-semibold">{node.data.label}</div>
         <div className="truncate text-[10.5px] leading-tight" style={{ color: statusColor ?? 'var(--faint)' }}>
-          {status === undefined || status === 'idle' ? 'not run' : status}
+          {note !== undefined && status === 'done' ? `Jev: ${note}` : status === undefined || status === 'idle' ? 'not run' : status}
           {visits !== undefined && visits > 1 ? ` ×${visits}` : ''}
         </div>
       </div>
@@ -163,6 +165,8 @@ function ArmyNodeView(props: NodeProps<ArmyFlowNode>) {
       {hasInput(node.type) && (
         <Handle id="in" type="target" position={Position.Left} className="!h-2.5 !w-2.5 !border-2 !border-panel !bg-line-strong" style={{ top: 22, left: -5 }} />
       )}
+      {/* A loop comes back in over the top, so its line runs above the row instead of behind it. */}
+      {hasInput(node.type) && <Handle id="back" type="target" position={Position.Top} className="!h-1.5 !w-1.5 !border-0 !bg-transparent" style={{ top: -1 }} />}
     </div>
   );
 }
@@ -179,20 +183,30 @@ export function toRfNodes(flow: Flow, settings: Settings | null, extra?: (n: Flo
 }
 
 export function toRfEdges(flow: Flow, animated?: (targetId: string) => boolean): Edge[] {
-  return flow.edges.map((e) => ({
-    id: e.id,
-    source: e.source,
-    sourceHandle: e.sourceHandle,
-    target: e.target,
-    targetHandle: 'in',
-    type: 'smoothstep',
-    pathOptions: { borderRadius: 14, offset: 22 },
-    animated: animated?.(e.target) ?? false,
-  })) as Edge[];
+  const at = new Map(flow.nodes.map((n) => [n.id, n.position]));
+  let loops = 0;
+  return flow.edges.map((e) => {
+    // A connection that goes back (to a node left of its source) is a loop. It enters from the top
+    // and each loop gets its own height, so two loops never share one line.
+    const back = (at.get(e.target)?.x ?? 0) < (at.get(e.source)?.x ?? 0) + 40;
+    const offset = back ? 34 + 16 * loops++ : 22;
+    return {
+      id: e.id,
+      source: e.source,
+      sourceHandle: e.sourceHandle,
+      target: e.target,
+      targetHandle: back ? 'back' : 'in',
+      type: 'smoothstep',
+      pathOptions: { borderRadius: 14, offset },
+      ...(back ? { label: e.sourceHandle, labelBgPadding: [4, 2] as [number, number], labelBgBorderRadius: 4 } : {}),
+      animated: animated?.(e.target) ?? false,
+    };
+  }) as Edge[];
 }
 
 /** Edges for the top-to-bottom run map: curves going down, loops around the left side. */
 export function mapEdges(flow: Flow, layout: Record<string, { x: number; y: number }>, animated: (targetId: string) => boolean): Edge[] {
+  let loops = 0;
   return flow.edges.map((e) => {
     const back = (layout[e.target]?.y ?? 0) <= (layout[e.source]?.y ?? 0);
     return {
@@ -202,7 +216,8 @@ export function mapEdges(flow: Flow, layout: Record<string, { x: number; y: numb
       target: e.target,
       targetHandle: back ? 'back' : 'in',
       type: back ? 'smoothstep' : 'default',
-      ...(back ? { pathOptions: { borderRadius: 12, offset: 26 } } : {}),
+      // Each loop its own lane on the left, so "no" and "reject" loops no longer share one line.
+      ...(back ? { pathOptions: { borderRadius: 12, offset: 26 + 18 * loops++ } } : {}),
       ...(e.sourceHandle !== 'out' ? { label: e.sourceHandle, labelBgPadding: [4, 2] as [number, number], labelBgBorderRadius: 4 } : {}),
       animated: animated(e.target),
     } as Edge;

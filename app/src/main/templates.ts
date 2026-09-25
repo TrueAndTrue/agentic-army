@@ -150,7 +150,7 @@ const webResearch: Flow = {
   nodes: [
     n('start', 'start', 0, 100, { label: 'Start' }),
     // Start on the results page: typing into a search box is the step the browser got stuck on.
-    n('browse', 'browser', X, 100, { label: 'Browse', goal: 'Open a page that answers this: {{objective}}', startUrl: 'https://duckduckgo.com/html/?q={{objective}}', maxSteps: 8 }),
+    n('browse', 'browser', X, 100, { label: 'Browse', goal: 'Open the page that best answers this, not a search results page: {{objective}}', startUrl: 'https://duckduckgo.com/html/?q={{objective}}', maxSteps: 8 }),
     n('answer', 'agent', X * 2, 40, {
       label: 'Answer',
       role: 'scout',

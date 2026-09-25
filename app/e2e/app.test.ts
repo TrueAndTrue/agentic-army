@@ -92,7 +92,7 @@ describe('sessions', () => {
     });
     const probe = join(root, 'argv.json');
     await withApp({ jevUrl, home, root, env: { FAKE_PROBE_FILE: probe } }, async (l) => {
-      await l.page.getByRole('navigation').getByRole('button', { name: /What does calc.js export/ }).click();
+      await l.page.getByRole('navigation').getByRole('button', { name: /^What does calc.js export/ }).click();
       await send(l, 'And now?');
       await until(async () => (await agentItems(l.page)).filter((a) => a.status === 'done').length === 2, 20000, 'the second reply');
       const argv = (JSON.parse(readFileSync(probe, 'utf8')) as { argv: string[] }).argv;
@@ -282,7 +282,7 @@ describe('starting flows', () => {
   test('Run on the Flows page opens a session set to that flow', async () => {
     await withApp({ jevUrl }, async (l) => {
       await l.page.evaluate((path) => window.api.addProject(path), makeProject(l.root));
-      await l.page.getByRole('button', { name: 'Flows' }).click();
+      await l.page.getByRole('button', { name: 'Flows', exact: true }).click();
       await l.page.getByRole('button', { name: 'Run Look it up on the web' }).click();
       assert.equal(await l.page.getByLabel('Where this message goes').inputValue(), 'builtin-web-research');
       await l.page.getByPlaceholder('What should Look it up on the web do?').waitFor();
@@ -397,7 +397,7 @@ describe('the canvas', () => {
   test('a flow drawn on the canvas saves and runs from a session', async () => {
     await withApp({ jevUrl }, async (l) => {
       await openSession(l);
-      await l.page.getByRole('button', { name: 'Flows' }).click();
+      await l.page.getByRole('button', { name: 'Flows', exact: true }).click();
       await l.page.getByRole('button', { name: 'New flow' }).click();
       await l.page.getByRole('button', { name: 'Agent', exact: true }).click();
       const node = (label: string) => l.page.locator('.react-flow__node').filter({ hasText: label });

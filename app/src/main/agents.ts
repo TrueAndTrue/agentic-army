@@ -144,6 +144,39 @@ export function readTokens(harness: Harness, ev: SoldierEvent & { type: 'result'
   return tokens;
 }
 
+/**
+ * A reply that is one of the engine's JSON reports or verdicts, as prose a person reads. codex's
+ * reviewer answers in the verdict schema, and the run card showed the raw JSON. Anything else
+ * comes back unchanged. Jev reads the prose as well as it read the JSON.
+ */
+export function readableReport(text: string): string {
+  const t = text.trim();
+  if (!t.startsWith('{') || !t.endsWith('}')) return text;
+  let o: Record<string, unknown>;
+  try {
+    o = JSON.parse(t) as Record<string, unknown>;
+  } catch {
+    return text;
+  }
+  const summary = typeof o['summary'] === 'string' ? o['summary'] : null;
+  const verdict = typeof o['verdict'] === 'string' ? o['verdict'] : null;
+  const status = typeof o['status'] === 'string' ? o['status'] : null;
+  if (summary === null || (verdict === null && status === null)) return text;
+  const head = verdict !== null ? `**Review: ${verdict === 'pass' ? 'passed' : verdict === 'fail' ? 'failed' : verdict}.**` : `**${status!.charAt(0).toUpperCase()}${status!.slice(1)}.**`;
+  const lines = [`${head} ${summary}`];
+  const findings = Array.isArray(o['findings']) ? (o['findings'] as Record<string, unknown>[]) : [];
+  if (findings.length > 0) {
+    lines.push('', 'Findings:');
+    for (const f of findings) {
+      const where = typeof f['file'] === 'string' ? ` (${f['file']}${typeof f['line'] === 'number' ? `:${String(f['line'])}` : ''})` : '';
+      lines.push(`- ${typeof f['severity'] === 'string' ? `${f['severity']}: ` : ''}${String(f['message'] ?? '')}${where}`);
+    }
+  }
+  if (typeof o['testCommand'] === 'string') lines.push('', `Tests: ran \`${o['testCommand']}\`.`);
+  else if (o['testsRun'] === false) lines.push('', 'Tests: not run.');
+  return lines.join('\n');
+}
+
 export function makeAdapter(harness: Harness, settings: Settings): HarnessAdapter {
   if (harness === 'claude') {
     return createClaudeAdapter({
@@ -326,6 +359,12 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
     turn.error = errors.at(-1) ?? (status === 'timeout' ? 'The agent ran out of time.' : `The agent exited with status ${status}.`);
   }
   turn.tools = turn.tools.map((t) => (t.status === 'running' ? { ...t, status: turn.status === 'done' ? 'ok' : 'error' } : t));
+  const final = turn.final ?? '';
+  const readable = readableReport(final);
+  if (readable !== final) {
+    turn.text = turn.text.slice(0, turn.text.length - final.length) + readable;
+    turn.final = readable;
+  }
   emit();
   return { turn, ...(harnessSessionId === undefined ? {} : { harnessSessionId }), ...(harnessTokens === undefined ? {} : { harnessTokens }) };
 }

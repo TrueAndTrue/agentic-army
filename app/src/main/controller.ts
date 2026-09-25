@@ -595,7 +595,19 @@ export class Controller {
       run.depth = parent.depth;
     }
     this.runs.set(run.id, run);
-    this.push(s, { kind: 'run', id: newId('r'), ts: nowIso(), runId: run.id, flowId: flow.id, flowName: flow.name });
+    const runItem: SessionItem = { kind: 'run', id: newId('r'), ts: nowIso(), runId: run.id, flowId: flow.id, flowName: flow.name };
+    this.push(s, runItem);
+    // Uncommitted work is not in the run, which starts from the last commit. Say so above the run
+    // card, as it starts, not under it once it has finished without them.
+    void projectHealth(project.path).then((h) => {
+      // Only a flow that works on a branch leaves your uncommitted work out; a web lookup does not care.
+      const branches = flow.nodes.some((n) => (n.type === 'agent' || n.type === 'shell') && n.data.workspace === 'run') || flow.nodes.some((n) => n.type === 'git');
+      if (h.dirty === 0 || parent !== undefined || !branches) return;
+      const at = s.items.indexOf(runItem);
+      const text = `${h.dirty} ${h.dirty === 1 ? 'file has' : 'files have'} uncommitted changes, and this run starts from your last commit, so it will not see ${h.dirty === 1 ? 'it' : 'them'}. Commit first if the run needs ${h.dirty === 1 ? 'it' : 'them'}.`;
+      s.items.splice(at < 0 ? s.items.length : at, 0, { kind: 'notice', id: newId('n'), ts: nowIso(), text, tone: 'warn' });
+      this.touchSession(s, true);
+    });
     const handle = startRun(run, this.engineDeps(s, project), (r) => this.touchRun(r));
     this.handles.set(run.id, handle);
     this.touchRun(run);

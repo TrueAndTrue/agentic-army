@@ -1,8 +1,8 @@
-import { ChevronRight, FolderPlus, Plus, Settings as Cog, Workflow, Trash2 } from 'lucide-react';
+import { ChevronRight, FolderPlus, FolderX, Plus, Settings as Cog, Workflow, Trash2, X } from 'lucide-react';
 import { useState } from 'react';
 
 import { ago } from '../lib/format.ts';
-import { api, go, newSession, openSession, useStore } from '../lib/state.ts';
+import { addProjectFlow, api, getState, go, newSession, openSession, setState, useStore } from '../lib/state.ts';
 import { cx, Dot, IconButton } from './ui.tsx';
 
 export function Sidebar() {
@@ -11,10 +11,11 @@ export function Sidebar() {
   const view = useStore((s) => s.view);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
-  const addProject = async () => {
-    const p = await api().addProject();
-    if (p !== null) await newSession(p.id);
-  };
+  const addProject = () => void addProjectFlow();
+  // Two folders with the same name: show the folder each sits in, so they can be told apart.
+  const names = new Map<string, number>();
+  for (const p of projects) names.set(p.name, (names.get(p.name) ?? 0) + 1);
+  const parentOf = (path: string) => path.split('/').slice(-2, -1)[0] ?? '';
 
   return (
     <aside className="flex h-full w-[264px] shrink-0 flex-col border-r border-line bg-panel">
@@ -42,7 +43,13 @@ export function Sidebar() {
                   title={p.path}
                 >
                   <ChevronRight size={14} className={cx('shrink-0 text-faint transition-transform', open && 'rotate-90')} />
-                  <span className="truncate text-[13px] font-semibold">{p.name}</span>
+                  <span className={cx('truncate text-[13px] font-semibold', p.missing === true && 'text-faint line-through')}>{p.name}</span>
+                  {(names.get(p.name) ?? 0) > 1 && <span className="truncate text-[11.5px] text-faint">in {parentOf(p.path)}</span>}
+                  {p.missing === true && (
+                    <span title={`${p.path} is gone`} className="shrink-0">
+                      <FolderX size={13} className="text-bad" />
+                    </span>
+                  )}
                 </button>
                 <IconButton
                   label={`Remove ${p.name} and its sessions`}
@@ -53,7 +60,7 @@ export function Sidebar() {
                 >
                   <Trash2 size={13} />
                 </IconButton>
-                <IconButton label={`New session in ${p.name}`} onClick={() => void newSession(p.id)}>
+                <IconButton label={`New session in ${p.name}`} disabled={p.missing === true} onClick={() => void newSession(p.id)}>
                   <Plus size={15} />
                 </IconButton>
               </div>
@@ -63,12 +70,13 @@ export function Sidebar() {
                   {mine.map((s) => {
                     const active = view.kind === 'session' && view.id === s.id;
                     return (
-                      <li key={s.id}>
+                      <li key={s.id} className="group/row relative">
                         <button
                           onClick={() => void openSession(s.id)}
+                          aria-current={active ? 'page' : undefined}
                           className={cx(
                             'flex h-8 w-full items-center gap-2 rounded-md pr-2 pl-7 text-left text-[13px]',
-                            active ? 'bg-hover text-text' : 'text-muted hover:bg-hover hover:text-text',
+                            active ? 'bg-hover font-medium text-text' : 'text-muted hover:bg-hover/60 hover:text-text',
                           )}
                         >
                           <span className="min-w-0 flex-1 truncate">{s.title}</span>
@@ -77,9 +85,27 @@ export function Sidebar() {
                           ) : s.busy ? (
                             <Dot color="var(--run)" pulse />
                           ) : (
-                            <span className="shrink-0 text-[11px] text-faint">{ago(s.updatedAt)}</span>
+                            <span className="shrink-0 text-[11px] text-faint group-hover/row:invisible">{ago(s.updatedAt)}</span>
                           )}
                         </button>
+                        {!s.busy && !s.waiting && (
+                          <IconButton
+                            label={`Delete ${s.title}`}
+                            className="absolute top-0.5 right-1 opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100"
+                            onClick={() => {
+                              if (!window.confirm(`Delete "${s.title}"? Its runs' record goes with it. Branches stay in git.`)) return;
+                              void api().deleteSession(s.id);
+                              if (active) {
+                                const next = getState().sessions.find((x) => x.id !== s.id && x.projectId === s.projectId) ?? getState().sessions.find((x) => x.id !== s.id);
+                                setState({ panelRunId: null });
+                                if (next !== undefined) void openSession(next.id);
+                                else go({ kind: 'home' });
+                              }
+                            }}
+                          >
+                            <X size={13} />
+                          </IconButton>
+                        )}
                       </li>
                     );
                   })}

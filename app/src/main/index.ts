@@ -104,7 +104,7 @@ void app.whenReady().then(async () => {
     if (path !== null && path !== '') process.env['PATH'] = path;
   }
   const root = process.env['ARMY_APP_HOME'] ?? join(app.getPath('userData'), 'army');
-  controller = new Controller({ store: new Store(root), emit, openPage: (show) => new ElectronPage(show) });
+  controller = new Controller({ store: new Store(root), emit, openPage: (show) => new ElectronPage(show && !HIDDEN) });
   const c = controller;
   // Chat agents reach the start_flow tool through this. If it cannot start, chats still work.
   try {

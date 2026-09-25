@@ -2,15 +2,15 @@ import { CheckCircle2, CircleAlert, Plus, RefreshCw, Trash2 } from 'lucide-react
 import { useEffect, useState } from 'react';
 
 import { effortsFor, fitEffort } from '../../../shared/models.ts';
-import { AGENT_ROLES, INVOKE_INFO, INVOKE_LEVELS, ROLE_INFO, type DoctorReport, type Harness, type InvokeLevel, type Settings, type StageDefault } from '../../../shared/types.ts';
+import { AGENT_ROLES, INVOKE_INFO, INVOKE_LEVELS, ROLE_INFO, type Harness, type InvokeLevel, type Settings, type StageDefault } from '../../../shared/types.ts';
 import { DEFAULT_INVOKE_CEILING } from '../../../shared/flow.ts';
 import { ROLE_COLOR } from '../lib/format.ts';
-import { api, useStore } from '../lib/state.ts';
+import { api, checkMachine, useStore } from '../lib/state.ts';
 import { Button, EffortOptions, Field, IconButton, Input, ModelOptions, Select } from './ui.tsx';
 
-function Section({ title, children, note }: { title: string; note?: string; children: React.ReactNode }) {
+function Section({ id, title, children, note }: { id?: string; title: string; note?: string; children: React.ReactNode }) {
   return (
-    <section className="border-b border-line py-7 first:pt-2 last:border-0">
+    <section id={id === undefined ? undefined : `settings-${id}`} className="scroll-mt-4 border-b border-line py-7 first:pt-2 last:border-0">
       <h2 className="text-[15px] font-semibold">{title}</h2>
       {note !== undefined && <p className="mt-1 max-w-[620px] text-[12.5px] leading-relaxed text-muted">{note}</p>}
       <div className="mt-4">{children}</div>
@@ -31,21 +31,28 @@ function Check({ label, r }: { label: string; r: { ok: boolean; detail: string }
 export function SettingsView() {
   const saved = useStore((s) => s.settings);
   const [s, setS] = useState<Settings | null>(saved);
-  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const doctor = useStore((st) => st.doctor);
+  const view = useStore((st) => st.view);
+  const [checking, setChecking] = useState(false);
   const [jev, setJev] = useState<{ ok: boolean; detail: string } | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [refreshed, setRefreshed] = useState<string | null>(null);
 
   useEffect(() => setS(saved), [saved]);
   useEffect(() => {
-    void api().doctor().then(setDoctor);
+    void checkMachine();
   }, []);
+  // A link from elsewhere ("add it in Settings under Jev") lands on that section.
+  const section = view.kind === 'settings' ? view.section : undefined;
+  useEffect(() => {
+    if (section !== undefined) document.getElementById(`settings-${section}`)?.scrollIntoView({ block: 'start' });
+  }, [section]);
   if (s === null) return null;
   const dirty = JSON.stringify(s) !== JSON.stringify(saved);
   const save = async () => {
     await api().saveSettings(s);
     setSavedAt(Date.now());
-    void api().doctor().then(setDoctor);
+    void checkMachine(true);
   };
   const modelIds = new Set(s.models.map((m) => m.id));
   const byId = (id: string) => s.models.find((m) => m.id === id);
@@ -84,8 +91,18 @@ export function SettingsView() {
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-[760px] px-6 pb-16">
-          <Section title="This machine" note="The app drives the claude and codex command-line tools you are already logged in to. It never asks for an Anthropic or OpenAI key.">
+          <Section id="machine" title="This machine" note="The app drives the claude and codex command-line tools you are already logged in to. It never asks for an Anthropic or OpenAI key.">
             <div className="space-y-2">
+              <button
+                className="float-right -mt-1 flex items-center gap-1 rounded px-1.5 py-0.5 text-[12px] text-faint hover:bg-hover hover:text-text"
+                onClick={async () => {
+                  setChecking(true);
+                  await checkMachine(true);
+                  setChecking(false);
+                }}
+              >
+                <RefreshCw size={12} className={checking ? 'animate-spin' : undefined} /> Check again
+              </button>
               <Check label="claude" r={doctor?.claude} />
               <Check label="codex" r={doctor?.codex} />
               <Check label="git" r={doctor?.git} />
@@ -93,7 +110,79 @@ export function SettingsView() {
             </div>
           </Section>
 
+          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, and drives and guards the browser step. Every built-in flow uses it. The key stays on this machine.">
+            <div className="space-y-3">
+              <Field
+                label="TypeSafe API key"
+                hint={
+                  <>
+                    No key yet?{' '}
+                    <a className="text-muted underline decoration-line-strong underline-offset-2 hover:text-text" href="https://typesafe.ai" target="_blank" rel="noreferrer">
+                      Get one from TypeSafe
+                    </a>
+                    .
+                  </>
+                }
+              >
+                <Input type="password" autoComplete="off" value={s.typesafe.apiKey} placeholder="Paste a key" onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, apiKey: e.target.value } })} />
+              </Field>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Model">
+                  <Input className="font-mono text-[12px]" value={s.typesafe.model} onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, model: e.target.value } })} />
+                </Field>
+                <Field label="Endpoint">
+                  <Input className="font-mono text-[12px]" value={s.typesafe.baseUrl} onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, baseUrl: e.target.value } })} />
+                </Field>
+              </div>
+              <div className="flex items-center gap-3">
+                <Button
+                  onClick={async () => {
+                    if (dirty) await save();
+                    setJev(await api().testJev());
+                  }}
+                >
+                  {dirty ? 'Save and test' : 'Test Jev'}
+                </Button>
+                {jev !== null && <span className={`selectable min-w-0 text-[12.5px] ${jev.ok ? 'text-ok' : 'text-bad'}`}>{jev.detail.replace(/ (Jev needs one; add it in Settings under Jev|Paste a working key in Settings under Jev)\.$/, '')}</span>}
+              </div>
+            </div>
+          </Section>
+          <Section title="Models at each stage" note="What an agent node uses when it does not name its own model. Change a stage here and every flow that relies on the default follows.">
+            <div className="space-y-2">
+              {AGENT_ROLES.map((r) =>
+                stageRow(
+                  r,
+                  <span className="flex items-center gap-2 text-[13px] font-medium">
+                    <span className="h-2.5 w-2.5 rounded-sm" style={{ background: ROLE_COLOR[r] }} />
+                    {ROLE_INFO[r].label}
+                  </span>,
+                  s.stageDefaults[r],
+                  (v) => setS({ ...s, stageDefaults: { ...s.stageDefaults, [r]: v } }),
+                ),
+              )}
+              <div className="pt-2">{stageRow('chat', <span className="text-[13px] font-medium">New chats</span>, s.chatDefault, (v) => setS({ ...s, chatDefault: v }))}</div>
+            </div>
+          </Section>
           <Section
+            title="Starting flows"
+            note="You can always start a flow: pick it under the message box, press Run on the Flows page, or type its command, like /quick-fix. Each flow also says whether Jev in Auto and chat agents may start it. This is the most any flow may allow."
+          >
+            <div className="grid grid-cols-[150px_1fr] items-start gap-2">
+              <span className="pt-1.5 text-[13px] font-medium">At most</span>
+              <div>
+                <Select aria-label="The most any flow may allow" value={s.invokeCeiling ?? DEFAULT_INVOKE_CEILING} onChange={(e) => setS({ ...s, invokeCeiling: e.target.value as InvokeLevel })}>
+                  {INVOKE_LEVELS.map((l) => (
+                    <option key={l} value={l}>
+                      {INVOKE_INFO[l].label}
+                    </option>
+                  ))}
+                </Select>
+                <p className="mt-1.5 text-[12px] leading-relaxed text-muted">{INVOKE_INFO[s.invokeCeiling ?? DEFAULT_INVOKE_CEILING].summary}</p>
+              </div>
+            </div>
+          </Section>
+          <Section
+            id="models"
             title="Models"
             note="Every model a node or chat can use. The claude models are built in. The codex models come from codex's own list, so a model OpenAI ships appears here once codex has seen it. You can also add one by hand: the model id is what the command-line tool receives."
           >
@@ -155,68 +244,8 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section title="Models at each stage" note="What an agent node uses when it does not name its own model. Change a stage here and every flow that relies on the default follows.">
-            <div className="space-y-2">
-              {AGENT_ROLES.map((r) =>
-                stageRow(
-                  r,
-                  <span className="flex items-center gap-2 text-[13px] font-medium">
-                    <span className="h-2.5 w-2.5 rounded-sm" style={{ background: ROLE_COLOR[r] }} />
-                    {ROLE_INFO[r].label}
-                  </span>,
-                  s.stageDefaults[r],
-                  (v) => setS({ ...s, stageDefaults: { ...s.stageDefaults, [r]: v } }),
-                ),
-              )}
-              <div className="pt-2">{stageRow('chat', <span className="text-[13px] font-medium">New chats</span>, s.chatDefault, (v) => setS({ ...s, chatDefault: v }))}</div>
-            </div>
-          </Section>
 
-          <Section
-            title="Starting flows"
-            note="You can always start a flow: pick it under the message box, press Run on the Flows page, or type its command, like /quick-fix. Each flow also says whether Jev in Auto and chat agents may start it. This is the most any flow may allow."
-          >
-            <div className="grid grid-cols-[150px_1fr] items-start gap-2">
-              <span className="pt-1.5 text-[13px] font-medium">At most</span>
-              <div>
-                <Select aria-label="The most any flow may allow" value={s.invokeCeiling ?? DEFAULT_INVOKE_CEILING} onChange={(e) => setS({ ...s, invokeCeiling: e.target.value as InvokeLevel })}>
-                  {INVOKE_LEVELS.map((l) => (
-                    <option key={l} value={l}>
-                      {INVOKE_INFO[l].label}
-                    </option>
-                  ))}
-                </Select>
-                <p className="mt-1.5 text-[12px] leading-relaxed text-muted">{INVOKE_INFO[s.invokeCeiling ?? DEFAULT_INVOKE_CEILING].summary}</p>
-              </div>
-            </div>
-          </Section>
 
-          <Section title="Jev" note="TypeSafe's Jev answers the decision nodes, picks flows in Auto mode, and drives and guards the browser node. The key stays on this machine.">
-            <div className="space-y-3">
-              <Field label="TypeSafe API key">
-                <Input type="password" autoComplete="off" value={s.typesafe.apiKey} placeholder="Paste a key" onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, apiKey: e.target.value } })} />
-              </Field>
-              <div className="grid grid-cols-2 gap-2">
-                <Field label="Model">
-                  <Input className="font-mono text-[12px]" value={s.typesafe.model} onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, model: e.target.value } })} />
-                </Field>
-                <Field label="Endpoint">
-                  <Input className="font-mono text-[12px]" value={s.typesafe.baseUrl} onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, baseUrl: e.target.value } })} />
-                </Field>
-              </div>
-              <div className="flex items-center gap-3">
-                <Button
-                  onClick={async () => {
-                    if (dirty) await save();
-                    setJev(await api().testJev());
-                  }}
-                >
-                  {dirty ? 'Save and test' : 'Test Jev'}
-                </Button>
-                {jev !== null && <span className={`selectable text-[12.5px] ${jev.ok ? 'text-ok' : 'text-bad'}`}>{jev.detail}</span>}
-              </div>
-            </div>
-          </Section>
 
           <Section title="Permissions" note="Every agent gets its role's tools and nothing more, and every role is denied your credentials and destructive commands. This setting decides how tightly the shell is scoped.">
             <div className="space-y-2">

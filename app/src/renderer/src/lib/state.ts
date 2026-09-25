@@ -5,7 +5,7 @@
 
 import { useSyncExternalStore } from 'react';
 
-import type { AppEvent, Api, Flow, Project, Run, Session, SessionSummary, Settings } from '../../../shared/types.ts';
+import type { AppEvent, Api, DoctorReport, Flow, Project, Run, Session, SessionSummary, Settings } from '../../../shared/types.ts';
 
 declare global {
   interface Window {
@@ -19,7 +19,7 @@ export type View =
   | { kind: 'home' }
   | { kind: 'session'; id: string }
   | { kind: 'flows'; flowId: string | null }
-  | { kind: 'settings' };
+  | { kind: 'settings'; section?: 'jev' | 'models' | 'machine' };
 
 export interface State {
   ready: boolean;
@@ -33,6 +33,11 @@ export interface State {
   /** The run shown in the side panel, if any, and which tab it opens on. */
   panelRunId: string | null;
   panelTab: 'map' | 'steps' | 'changes';
+  /** The last check of claude, codex, git and Jev. Null until the first one ends. */
+  doctor: DoctorReport | null;
+  doctorAt: number;
+  /** A short message at the bottom of the window, for errors with nowhere else to go. */
+  toast: { text: string; tone: 'info' | 'error' } | null;
 }
 
 let state: State = {
@@ -46,7 +51,58 @@ let state: State = {
   runById: {},
   panelRunId: null,
   panelTab: 'map',
+  doctor: null,
+  doctorAt: 0,
+  toast: null,
 };
+
+let checking: Promise<DoctorReport> | null = null;
+
+/**
+ * Check claude, codex, git and Jev. The answer is kept for a few minutes, so opening Settings does
+ * not re-run a live Jev call and show "Checking…" every time; `force` checks again now.
+ */
+export function checkMachine(force = false): Promise<DoctorReport> {
+  const s = getState();
+  if (!force && s.doctor !== null && Date.now() - s.doctorAt < 5 * 60_000) return Promise.resolve(s.doctor);
+  if (checking !== null && !force) return checking;
+  const p = api()
+    .doctor()
+    .then((d) => {
+      setState({ doctor: d, doctorAt: Date.now() });
+      return d;
+    })
+    .finally(() => {
+      if (checking === p) checking = null;
+    });
+  checking = p;
+  return p;
+}
+
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+export function toast(text: string, tone: 'info' | 'error' = 'error'): void {
+  setState({ toast: { text, tone } });
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => setState({ toast: null }), 6000);
+}
+
+/** Add a folder as a project and open a session there. Adding one you have opens its latest session. */
+export async function addProjectFlow(path?: string): Promise<void> {
+  try {
+    const known = new Set(getState().projects.map((p) => p.id));
+    const p = await api().addProject(path);
+    if (p === null) return;
+    const latest = getState().sessions.find((x) => x.projectId === p.id);
+    if (known.has(p.id) && latest !== undefined) {
+      toast(`${p.name} is already here.`, 'info');
+      await openSession(latest.id);
+      return;
+    }
+    await newSession(p.id);
+  } catch (err) {
+    toast(err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err));
+  }
+}
 
 const listeners = new Set<() => void>();
 

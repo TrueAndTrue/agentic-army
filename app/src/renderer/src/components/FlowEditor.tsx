@@ -34,6 +34,22 @@ const PALETTE: { type: NodeType; hint: string }[] = [
   { type: 'start', hint: 'Where a run begins' },
 ];
 
+/** Node size on the canvas, near enough to keep a new node off the ones already there. */
+const NODE_W = 230;
+const NODE_H = 76;
+
+/** The nearest free spot to `at`, stepping down, then right, until nothing overlaps. */
+function freeSpot(nodes: FlowNode[], at: { x: number; y: number }): { x: number; y: number } {
+  const taken = (p: { x: number; y: number }) => nodes.some((n) => Math.abs(n.position.x - p.x) < NODE_W && Math.abs(n.position.y - p.y) < NODE_H + 12);
+  for (let col = 0; col < 6; col += 1) {
+    for (let row = 0; row < 8; row += 1) {
+      const p = { x: at.x + col * (NODE_W + 50), y: at.y + row * (NODE_H + 24) };
+      if (!taken(p)) return p;
+    }
+  }
+  return at;
+}
+
 function blankFlow(): Flow {
   return {
     id: newId('flow'),
@@ -137,7 +153,11 @@ function Canvas({ draft, setDraft, selected, setSelected }: { draft: Flow; setDr
     })();
     setDraft((d) => {
       const data = defaultNodeData(type);
-      return { ...d, nodes: [...d.nodes, { id, type, position: { x: Math.round(at.x), y: Math.round(at.y) }, data: { ...data, label: uniqueLabel(d, data.label) } } as FlowNode] };
+      // From the Add bar, a new node goes to the right of the one you have selected, else the
+      // middle of the view, and never on top of another: eight added in a row used to stack up.
+      const anchor = position === undefined && selected !== null ? d.nodes.find((n) => n.id === selected) : undefined;
+      const spot = position ?? freeSpot(d.nodes, anchor === undefined ? at : { x: anchor.position.x + NODE_W + 50, y: anchor.position.y });
+      return { ...d, nodes: [...d.nodes, { id, type, position: { x: Math.round(spot.x), y: Math.round(spot.y) }, data: { ...data, label: uniqueLabel(d, data.label) } } as FlowNode] };
     });
     setSelected(id);
   };
@@ -146,7 +166,7 @@ function Canvas({ draft, setDraft, selected, setSelected }: { draft: Flow; setDr
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-panel px-3 py-1.5">
         <span className="mr-1 shrink-0 text-[11.5px] text-faint">Add</span>
-        {PALETTE.map((p) => {
+        {PALETTE.filter((p) => p.type !== 'start' || !draft.nodes.some((n) => n.type === 'start')).map((p) => {
           const Icon = TYPE_ICON[p.type];
           const color = nodeColor({ type: p.type, data: defaultNodeData(p.type) } as FlowNode);
           return (
@@ -278,7 +298,7 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
                       </div>
                       <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[11.5px] text-faint">
                         <code className="font-mono">/{flowCommand(f)}</code>
-                        <span>{settings === null ? '' : INVOKE_INFO[invokeLevel(f, settings)].label}</span>
+                        <span>{settings === null ? '' : `Who can start it: ${INVOKE_INFO[invokeLevel(f, settings)].label}`}</span>
                       </div>
                       <p className="mt-1.5 line-clamp-3 text-[12.5px] leading-relaxed text-muted">{f.description || 'No description yet.'}</p>
                       <div className="mt-3 flex flex-wrap gap-1">

@@ -117,7 +117,7 @@ export function candidatesFor(snap: PageSnapshot, goal: string): Candidate[] {
       typeTargets += 1;
       // A search box can be a textarea (DuckDuckGo's is). Without Enter, the text sat there and the
       // browser clicked around it for eight steps.
-      const submit = el.kind === 'input' || /search|^q$/i.test(`${el.name ?? ''} ${el.text}`);
+      const submit = el.kind === 'input' || /^q$|search/i.test(el.name ?? '') || /search/i.test(el.text);
       phrases.forEach((p, i) => {
         out.push({
           key: `type_${el.id}_${String(i)}`,
