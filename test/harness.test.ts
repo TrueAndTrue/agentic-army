@@ -574,6 +574,26 @@ describe('extra MCP servers (the desktop app hands a chat agent its start_flow t
   });
 });
 
+describe('standing instructions (the desktop app tells a chat what start_flow starts)', () => {
+  const note = 'You can start flows.\nSay "done" when "done".';
+
+  test('claude gets --append-system-prompt, and nothing when there are none', () => {
+    const a = buildClaudeArgs(spec({ instructions: note }));
+    assert.equal(a[a.indexOf('--append-system-prompt') + 1], note);
+    assert.equal(buildClaudeArgs(spec()).includes('--append-system-prompt'), false);
+    assert.throws(() => buildClaudeArgs(spec({ instructions: '--bare' })), /must not start with "-"/);
+  });
+
+  test('codex gets developer_instructions as a TOML string, on exec and exec resume', () => {
+    for (const extra of [{}, { resumeSessionId: 'thread-1' }]) {
+      const a = buildCodexArgs(spec({ harness: 'codex', instructions: note, ...extra }), 'go');
+      assert.ok(a.includes(`developer_instructions=${JSON.stringify(note)}`), a.join(' '));
+      assert.ok(a.indexOf('--') > a.indexOf(`developer_instructions=${JSON.stringify(note)}`), 'before the prompt');
+    }
+    assert.equal(buildCodexArgs(spec({ harness: 'codex' }), 'go').some((x) => x.startsWith('developer_instructions')), false);
+  });
+});
+
 describe('resuming a conversation (the desktop app keeps a chat across restarts)', () => {
   const RESUME = '99999999-8888-7777-6666-555555555555';
 

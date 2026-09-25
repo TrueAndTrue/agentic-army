@@ -190,6 +190,11 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
   // `--mcp-config` is variadic too, so it goes BEFORE the tool lists: a flag always follows it, and
   // its JSON can never be swallowed by `--allowedTools`.
   if (spec.mcpServers !== undefined && spec.mcpServers.length > 0) args.push('--mcp-config', buildMcpJson(spec.mcpServers));
+  if (spec.instructions !== undefined && spec.instructions !== '') {
+    // A value that starts with a dash would be read as another flag.
+    if (spec.instructions.startsWith('-')) throw new Error('instructions must not start with "-"');
+    args.push('--append-system-prompt', spec.instructions);
+  }
   if (spec.allow.length > 0) args.push('--allowedTools', ...spec.allow);
   if (spec.deny.length > 0) args.push('--disallowedTools', ...spec.deny);
 

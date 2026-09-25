@@ -390,6 +390,9 @@ export function assertCodexSpecArgSafe(spec: SoldierSpec): void {
  */
 export function codexMcpArgs(spec: SoldierSpec): string[] {
   const out: string[] = [];
+  // Measured on codex 0.154: `-c developer_instructions="..."` is obeyed on exec, as a standing
+  // instruction rather than a user turn. A JSON string is a valid TOML basic string.
+  if (spec.instructions !== undefined && spec.instructions !== '') out.push('-c', `developer_instructions=${JSON.stringify(spec.instructions)}`);
   for (const s of spec.mcpServers ?? []) {
     if (!/^[a-z][a-z0-9_]*$/.test(s.name)) throw new Error(`mcpServers: name must be a lowercase identifier, got ${JSON.stringify(s.name)}`);
     const env = Object.entries(s.env).map(([k, v]) => {

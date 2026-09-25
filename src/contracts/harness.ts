@@ -142,6 +142,13 @@ export interface SoldierSpec {
   /** Extra MCP servers for this soldier. Campaigns never set it. */
   mcpServers?: McpServerSpec[];
   /**
+   * Standing instructions from the app, apart from the orders: claude gets them through
+   * `--append-system-prompt`, codex as `developer_instructions`. Text put in front of the orders
+   * reads as something the person said, and a model will quote it back as theirs. Campaigns never
+   * set it.
+   */
+  instructions?: string;
+  /**
    * Path to a JSON Schema FILE (see `REPORT_SCHEMA_PATH` / `VERDICT_SCHEMA_PATH`).
    *
    * VERIFIED ASYMMETRY, absorbed by the adapters:
