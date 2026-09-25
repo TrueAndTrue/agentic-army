@@ -75,9 +75,13 @@ Each flow has a "Who can start this" setting, in its side panel on the canvas:
 | Agents too, with your approval | yes | yes | asks first |
 | Agents too, without asking | yes | yes | yes |
 
-Settings, under "Starting flows", holds every flow to at most one level. The default limit is
-"with your approval", so an agent never starts a flow on its own until you raise both the limit
-and the flow's own level. With the limit at "Only you", chat agents do not get the tool at all.
+Settings, under "Starting flows", holds every flow to at most one level. Until you set it, the
+limit allows everything, so each flow's own level decides. Lower it to rein in every flow at once:
+at "with your approval" every agent request becomes a card, and at "Only you" chat agents do not
+get the tool at all.
+
+The agent is told to call the tool rather than ask in chat first. The card does the asking, and
+an agent that also asked in chat made you answer twice.
 
 When an agent asks, a card appears in the thread with its reason and the objective it wrote. You
 can start it as asked, edit the objective first, or decline. Every run card says who started it:
@@ -93,7 +97,7 @@ own, on its own branch, shown in the same thread. Flows can run flows three deep
 fails instead of starting.
 
 The built-in flows start as: Build and review and Quick fix at "with your approval", Look it up
-on the web at "without asking" (held to "with your approval" by the default limit), and Triage
+on the web at "without asking", and Triage
 with Jev at "You, and Jev in Auto".
 
 ## Flows

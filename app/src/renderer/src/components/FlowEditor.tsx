@@ -13,7 +13,7 @@ import {
 import { ChevronLeft, Copy, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
-import { defaultNodeData, flowCommand, invokeLevel, newId, validateFlow } from '../../../shared/flow.ts';
+import { DEFAULT_INVOKE_CEILING, defaultNodeData, flowCommand, invokeLevel, newId, validateFlow } from '../../../shared/flow.ts';
 import { INVOKE_INFO, INVOKE_LEVELS, NODE_TYPES, type Flow, type FlowNode, type InvokeLevel, type NodeType } from '../../../shared/types.ts';
 import { TYPE_LABEL } from '../lib/format.ts';
 import { api, go, newFlowSession, useStore } from '../lib/state.ts';
@@ -400,7 +400,7 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
                     <TextArea rows={5} className="font-sans text-[12.5px]" value={draft.description} onChange={(e) => setDraft((d) => ({ ...d, description: e.target.value }))} />
                   </Field>
                   {settings !== null && (
-                    <Field label="Who can start this" hint={<InvokeHint flow={draft} ceiling={settings.invokeCeiling ?? 'agent-ask'} />}>
+                    <Field label="Who can start this" hint={<InvokeHint flow={draft} ceiling={settings.invokeCeiling ?? DEFAULT_INVOKE_CEILING} />}>
                       <Select value={draft.invoke ?? 'auto'} onChange={(e) => setDraft((d) => ({ ...d, invoke: e.target.value as InvokeLevel }))}>
                         {INVOKE_LEVELS.map((l) => (
                           <option key={l} value={l}>

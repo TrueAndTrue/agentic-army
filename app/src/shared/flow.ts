@@ -237,10 +237,17 @@ export const MAX_FLOW_DEPTH = 3;
 
 const rankOf = (l: InvokeLevel) => INVOKE_LEVELS.indexOf(l);
 
+/**
+ * The limit in Settings when you never set one. It allows everything, so each flow's own "Who can
+ * start this" is what decides. The limit is a brake you pull, not a second setting to find: with
+ * it at "with your approval", a flow you marked "without asking" still asked.
+ */
+export const DEFAULT_INVOKE_CEILING: InvokeLevel = 'agent';
+
 /** The flow's own level, held to the ceiling in Settings. */
 export function invokeLevel(flow: Flow, settings: Pick<Settings, 'invokeCeiling'>): InvokeLevel {
   const own = flow.invoke ?? 'auto';
-  const ceiling = settings.invokeCeiling ?? 'agent-ask';
+  const ceiling = settings.invokeCeiling ?? DEFAULT_INVOKE_CEILING;
   return rankOf(own) <= rankOf(ceiling) ? own : ceiling;
 }
 

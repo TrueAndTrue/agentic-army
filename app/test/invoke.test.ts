@@ -22,7 +22,8 @@ describe('who may start a flow', () => {
     assert.equal(invokeLevel(flowAt('agent'), { invokeCeiling: 'agent-ask' }), 'agent-ask');
     assert.equal(invokeLevel(flowAt('you'), { invokeCeiling: 'agent' }), 'you');
     assert.equal(invokeLevel(flowAt(undefined), {}), 'auto');
-    assert.equal(invokeLevel(flowAt('agent'), {}), 'agent-ask', 'the default ceiling asks you');
+    assert.equal(invokeLevel(flowAt('agent'), {}), 'agent', 'with no limit set, the flow decides');
+    assert.equal(invokeLevel(flowAt('agent-ask'), {}), 'agent-ask');
   });
 
   test('Jev may pick auto and above; an agent starts only agent flows, and asks for agent-ask ones', () => {

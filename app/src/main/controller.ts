@@ -51,7 +51,8 @@ function flowsNote(lines: string): string {
   return (
     'You can start the person\'s flows with the start_flow tool (mcp__army__start_flow). A flow is a team of agents with its own tools and ' +
     'permissions, so it can do what this chat cannot, such as search the web. When the person asks for something a flow below does, ' +
-    'start it rather than saying you cannot. Flows you may start:\n' +
+    'call start_flow. Do not say you cannot, and do not ask in chat whether to: a flow that needs approval shows the person a card ' +
+    'to approve, edit or decline, so asking first makes them answer twice. Flows you may start:\n' +
     lines
   );
 }
@@ -455,7 +456,7 @@ export class Controller {
 
   /** One line per flow an agent may start, as the tool and the chat note list them. */
   private flowLines(): string[] {
-    return this.agentFlows().map(({ flow, ask }) => `- ${flowCommand(flow)}: ${flow.name}. ${flow.description}${ask ? ' (The person approves before it starts.)' : ''}`);
+    return this.agentFlows().map(({ flow, ask }) => `- ${flowCommand(flow)}: ${flow.name}. ${flow.description}${ask ? ' (Calling it shows the person a card; the flow starts if they approve.)' : ' (Starts as soon as you call it.)'}`);
   }
 
   readonly flowTools: ToolHandler = {
