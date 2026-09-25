@@ -82,6 +82,19 @@ export interface SubagentDefinition {
   tools: string[];
 }
 
+/**
+ * An MCP server a soldier may call, started by the harness over stdio. The desktop app uses this
+ * to hand a chat agent its `start_flow` tool. `name` becomes the tool prefix (`mcp__<name>__...`
+ * in claude), so it is a plain identifier. Adding a server does not allow its tools: claude still
+ * needs `mcp__<name>` in `allow`.
+ */
+export interface McpServerSpec {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
 /** Everything a spawner decides about a soldier before the process exists. */
 export interface SoldierSpec {
   /** Supervisor-minted, stable, human-legible: `cpt-03`. Identity is spawner-owned. */
@@ -126,6 +139,8 @@ export interface SoldierSpec {
    * it, so a crashed soldier is still re-attempted fresh.
    */
   resumeSessionId?: string;
+  /** Extra MCP servers for this soldier. Campaigns never set it. */
+  mcpServers?: McpServerSpec[];
   /**
    * Path to a JSON Schema FILE (see `REPORT_SCHEMA_PATH` / `VERDICT_SCHEMA_PATH`).
    *

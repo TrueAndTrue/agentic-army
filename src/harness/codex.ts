@@ -383,6 +383,32 @@ export function assertCodexSpecArgSafe(spec: SoldierSpec): void {
   if (spec.resumeSessionId !== undefined) assertNotFlagLike('resumeSessionId', spec.resumeSessionId);
 }
 
+/**
+ * MCP servers as `-c mcp_servers.<name>.*` overrides. Each value is TOML: a JSON string is a valid
+ * TOML basic string, a JSON array of strings a valid TOML array, and env is an inline table whose
+ * keys are checked to be bare TOML keys.
+ */
+export function codexMcpArgs(spec: SoldierSpec): string[] {
+  const out: string[] = [];
+  for (const s of spec.mcpServers ?? []) {
+    if (!/^[a-z][a-z0-9_]*$/.test(s.name)) throw new Error(`mcpServers: name must be a lowercase identifier, got ${JSON.stringify(s.name)}`);
+    const env = Object.entries(s.env).map(([k, v]) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`mcpServers.${s.name}.env: ${JSON.stringify(k)} is not a variable name`);
+      return `${k} = ${JSON.stringify(v)}`;
+    });
+    out.push(
+      '-c', `mcp_servers.${s.name}.command=${JSON.stringify(s.command)}`,
+      '-c', `mcp_servers.${s.name}.args=${JSON.stringify(s.args)}`,
+      '-c', `mcp_servers.${s.name}.env={ ${env.join(', ')} }`,
+      // exec runs with approval_policy=never, and codex refuses an MCP call that needs approval:
+      // "MCP tool call requires approval, but approval policy is never". Whoever passes a server
+      // here has decided its tools may run; approval, where there is any, happens behind the tool.
+      '-c', `mcp_servers.${s.name}.default_tools_approval_mode="approve"`,
+    );
+  }
+  return out;
+}
+
 export function buildCodexArgs(spec: SoldierSpec, prompt: string, options?: CodexArgsOptions): string[] {
   assertCodexSpecArgSafe(spec);
 
@@ -405,6 +431,7 @@ export function buildCodexArgs(spec: SoldierSpec, prompt: string, options?: Code
     }
     if (spec.model !== undefined && spec.model !== '') resumed.push('-m', spec.model);
     if (spec.effort !== undefined) resumed.push('-c', `model_reasoning_effort=${CODEX_EFFORT[spec.effort]}`);
+    resumed.push(...codexMcpArgs(spec));
     resumed.push('--', spec.resumeSessionId, prompt);
     return resumed;
   }
@@ -448,6 +475,7 @@ export function buildCodexArgs(spec: SoldierSpec, prompt: string, options?: Code
   if (spec.effort !== undefined) {
     args.push('-c', `model_reasoning_effort=${CODEX_EFFORT[spec.effort]}`);
   }
+  args.push(...codexMcpArgs(spec));
 
   // `--` before the positional prompt, ALWAYS.
   //

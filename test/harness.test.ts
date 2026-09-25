@@ -545,6 +545,35 @@ describe('claude argv', () => {
   });
 });
 
+describe('extra MCP servers (the desktop app hands a chat agent its start_flow tool)', () => {
+  const army = { name: 'army', command: '/Applications/X.app/Contents/MacOS/X', args: ['/home/mcp/army-flows.cjs'], env: { ELECTRON_RUN_AS_NODE: '1', ARMY_FLOW_TOKEN: 't"1' } };
+
+  test('claude gets them inline in --mcp-config, placed before the variadic tool lists', () => {
+    const a = buildClaudeArgs(spec({ mcpServers: [army], allow: ['Read', 'mcp__army'] }));
+    const i = a.indexOf('--mcp-config');
+    assert.ok(i > 0 && i < a.indexOf('--allowedTools'), a.join(' '));
+    assert.deepEqual(JSON.parse(a[i + 1]!), { mcpServers: { army: { type: 'stdio', command: army.command, args: army.args, env: army.env } } });
+    assert.equal(buildClaudeArgs(spec()).includes('--mcp-config'), false);
+  });
+
+  test('codex gets TOML overrides on both a fresh exec and exec resume', () => {
+    for (const extra of [{}, { resumeSessionId: 'thread-1' }]) {
+      const a = buildCodexArgs(spec({ harness: 'codex', mcpServers: [army], ...extra }), 'go');
+      assert.ok(a.includes(`mcp_servers.army.command="${army.command}"`));
+      assert.ok(a.includes(`mcp_servers.army.args=["/home/mcp/army-flows.cjs"]`));
+      assert.ok(a.includes('mcp_servers.army.env={ ELECTRON_RUN_AS_NODE = "1", ARMY_FLOW_TOKEN = "t\\"1" }'), a.join(' '));
+      assert.ok(a.indexOf('--') > a.indexOf(`mcp_servers.army.command="${army.command}"`), 'before the prompt');
+      assert.ok(a.includes('mcp_servers.army.default_tools_approval_mode="approve"'), 'exec cannot answer an approval prompt');
+    }
+  });
+
+  test('a server name or env key that could break out of its slot is refused', () => {
+    assert.throws(() => buildClaudeArgs(spec({ mcpServers: [{ ...army, name: 'a b' }] })), /lowercase identifier/);
+    assert.throws(() => buildCodexArgs(spec({ harness: 'codex', mcpServers: [{ ...army, name: 'x.y' }] }), 'go'), /lowercase identifier/);
+    assert.throws(() => buildCodexArgs(spec({ harness: 'codex', mcpServers: [{ ...army, env: { 'A=1,B': 'x' } }] }), 'go'), /not a variable name/);
+  });
+});
+
 describe('resuming a conversation (the desktop app keeps a chat across restarts)', () => {
   const RESUME = '99999999-8888-7777-6666-555555555555';
 
