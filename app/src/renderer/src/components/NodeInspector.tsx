@@ -105,6 +105,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
             <Segmented value={d.workspace} onChange={(v) => s({ workspace: v })} options={[{ v: 'run', label: 'Run branch' }, { v: 'project', label: 'Project folder' }]} />
           </Field>
           <PromptField label="Prompt" value={d.prompt} onChange={(v) => s({ prompt: v })} flow={flow} self={node.id} rows={9} />
+          <Toggle checked={d.web ?? d.role === 'scout'} onChange={(v) => s({ web: v })} label="Can search the web" />
           <Toggle checked={d.keepContext} onChange={(v) => s({ keepContext: v })} label="Continue the same conversation on a repeat visit" />
           <Field label="Most visits in one run" hint="A loop through this node stops the run when it reaches this.">
             <Num value={d.maxVisits} min={1} max={50} onChange={(v) => s({ maxVisits: v })} />

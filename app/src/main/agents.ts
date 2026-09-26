@@ -36,6 +36,8 @@ const ROLE_BRIEF: Record<AgentRole, string> = {
   validator: 'You are a validator. Run the checks and judge the result against the objective. You cannot edit files.',
 };
 
+const WEB_TOOLS = ['WebSearch', 'WebFetch'];
+
 /** Every agent process alive right now, so quitting the app can take them all down with it. */
 const live = new Set<Soldier>();
 
@@ -70,6 +72,11 @@ export interface AgentRunInput {
   tokensBefore?: TokenCount;
   /** Standing instructions from the app, sent as system text rather than as part of the prompt. */
   instructions?: string;
+  /**
+   * Search and read the web with the CLI's own tools: claude's WebSearch and WebFetch, codex's
+   * web_search. Nothing opens on screen. Defaults to what the role holds, which is only the scout.
+   */
+  web?: boolean;
   /** MCP servers the agent may call. Each one's tools are allowed along with the role's. */
   mcp?: McpServerSpec[];
   settings: Settings;
@@ -206,6 +213,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
   // The protected region is the army's own home (~/.agentic-army), where the CLI keeps its config
   // and archive. Never the user's home directory: that would deny every project under it.
   const perms = permissionsFor(unit.rank, unit.role, armyHome(), input.settings.posture);
+  const allow = input.web === undefined ? [...perms.allow] : [...perms.allow.filter((t) => !WEB_TOOLS.includes(t)), ...(input.web ? WEB_TOOLS : [])];
   const orders = input.brief
     ? `${ROLE_BRIEF[input.role]}\n\nWorking directory: ${input.cwd}\nEnd with a short summary of what you did or found, written for the person who asked. Do not mention steps, flows or what comes next.\n\n---\n\n${input.prompt}`
     : input.prompt;
@@ -218,7 +226,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
     effort: input.effort,
     cwd: input.cwd,
     sessionId: randomUUID(),
-    allow: [...perms.allow, ...(input.mcp ?? []).map((m) => `mcp__${m.name}`)],
+    allow: [...allow, ...(input.mcp ?? []).map((m) => `mcp__${m.name}`)],
     deny: perms.deny,
     posture: input.settings.posture,
     orders,
@@ -299,6 +307,8 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
             const t = turn.tools.find((x) => x.id === ev.toolUseId);
             if (t !== undefined) {
               t.status = ev.isError ? 'error' : 'ok';
+              // codex fills in a web search's query only when the search finishes.
+              if (t.summary === '' && input.harness === 'codex') t.summary = summarizeTool('', ev.content);
               emit();
             }
             break;

@@ -105,7 +105,7 @@ export function Home() {
                 {doctor !== null && !doctor.typesafe.ok && (
                   <>
                     <p className="mt-1 text-[12px] text-faint">
-                      Every built-in flow asks Jev at some step. Chat works without it.{' '}
+                      Build and review, Quick fix and Triage ask Jev at some step. Chat and web lookups work without it.{' '}
                       <a className="text-muted underline decoration-line-strong underline-offset-2 hover:text-text" href="https://typesafe.ai" target="_blank" rel="noreferrer">
                         Get a key from TypeSafe
                       </a>

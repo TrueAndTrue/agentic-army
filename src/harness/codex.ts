@@ -393,6 +393,10 @@ export function codexMcpArgs(spec: SoldierSpec): string[] {
   // Measured on codex 0.154: `-c developer_instructions="..."` is obeyed on exec, as a standing
   // instruction rather than a user turn. A JSON string is a valid TOML basic string.
   if (spec.instructions !== undefined && spec.instructions !== '') out.push('-c', `developer_instructions=${JSON.stringify(spec.instructions)}`);
+  // The allow list is claude's spelling of a loadout; `WebSearch` in it means codex searches too.
+  // Measured on codex 0.154: `web_search="live"` gives exec the Responses web_search tool, which
+  // runs on OpenAI's side, needs no approval, and reports as a `web_search` item with its query.
+  if (spec.allow.includes('WebSearch')) out.push('-c', 'web_search="live"');
   for (const s of spec.mcpServers ?? []) {
     if (!/^[a-z][a-z0-9_]*$/.test(s.name)) throw new Error(`mcpServers: name must be a lowercase identifier, got ${JSON.stringify(s.name)}`);
     const env = Object.entries(s.env).map(([k, v]) => {

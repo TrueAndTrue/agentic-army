@@ -215,4 +215,41 @@ describe('what an agent is allowed to touch', async () => {
     assert.ok(deny.some((d) => d.startsWith(`Write(${armyHome}`)), 'the army home is protected');
     delete process.env['AGENTIC_ARMY_HOME'];
   });
+
+  test('web search follows the web switch, and the role when it is unset', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    process.env['AGENTIC_ARMY_HOME'] = mkdtempSync(join(tmpdir(), 'army-home-'));
+    const allowFor = async (role: 'engineer' | 'scout', web?: boolean) => {
+      let allow: string[] = [];
+      await runAgent({
+        harness: 'claude',
+        model: 'm',
+        effort: 'low',
+        role,
+        ...(web === undefined ? {} : { web }),
+        cwd: '/tmp/p',
+        prompt: 'x',
+        label: 'probe',
+        brief: false,
+        settings: DEFAULT_SETTINGS,
+        signal: new AbortController().signal,
+        onTurn: () => {},
+        adapter: {
+          id: 'claude',
+          supportsDuplex: true,
+          async spawn(s) {
+            allow = s.allow;
+            throw new Error('stop here');
+          },
+        },
+      }).catch((e: Error) => { if (e.message !== 'stop here') throw e; });
+      return allow.filter((t) => t.startsWith('Web'));
+    };
+    assert.deepEqual(await allowFor('engineer'), []);
+    assert.deepEqual(await allowFor('engineer', true), ['WebSearch', 'WebFetch']);
+    assert.deepEqual(await allowFor('scout'), ['WebFetch', 'WebSearch']);
+    assert.deepEqual(await allowFor('scout', false), []);
+    delete process.env['AGENTIC_ARMY_HOME'];
+  });
 });

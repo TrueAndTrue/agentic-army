@@ -594,6 +594,16 @@ describe('standing instructions (the desktop app tells a chat what start_flow st
   });
 });
 
+describe('web search (the desktop app answers from the web without opening a browser)', () => {
+  test('codex searches live when the allow list names WebSearch, on exec and exec resume', () => {
+    for (const extra of [{}, { resumeSessionId: 'thread-1' }]) {
+      const a = buildCodexArgs(spec({ harness: 'codex', allow: ['Read', 'WebSearch'], ...extra }), 'go');
+      assert.ok(a.includes('web_search="live"'), a.join(' '));
+    }
+    assert.equal(buildCodexArgs(spec({ harness: 'codex', allow: ['Read'] }), 'go').includes('web_search="live"'), false);
+  });
+});
+
 describe('resuming a conversation (the desktop app keeps a chat across restarts)', () => {
   const RESUME = '99999999-8888-7777-6666-555555555555';
 

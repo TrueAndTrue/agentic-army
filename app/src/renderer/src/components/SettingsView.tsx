@@ -110,7 +110,7 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, and drives and guards the browser step. Every built-in flow uses it. The key stays on this machine.">
+          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, and drives and guards the browser step. Every built-in flow but the web lookup uses it. The key stays on this machine.">
             <div className="space-y-3">
               <Field
                 label="TypeSafe API key"

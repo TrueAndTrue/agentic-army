@@ -144,23 +144,23 @@ const webResearch: Flow = {
   id: 'builtin-web-research',
   invoke: 'agent',
   name: 'Look it up on the web',
-  description: 'A question answered from a live web page. A browser driven by Jev searches and reads, a guard stops risky clicks, and a scout writes the answer from what the browser found.',
+  description: "A question answered from the live web. A scout searches and reads pages with its model's own web search, then answers with links. Nothing opens on your screen.",
   builtin: true,
-  updatedAt: '2026-09-24T00:00:00.000Z',
+  updatedAt: '2026-09-26T00:00:00.000Z',
   nodes: [
     n('start', 'start', 0, 100, { label: 'Start' }),
-    // Start on the results page: typing into a search box is the step the browser got stuck on.
-    n('browse', 'browser', X, 100, { label: 'Browse', goal: 'Open the page that best answers this, not a search results page: {{objective}}', startUrl: 'https://duckduckgo.com/html/?q={{objective}}', maxSteps: 8 }),
-    n('answer', 'agent', X * 2, 40, {
-      label: 'Answer',
+    n('search', 'agent', X, 100, {
+      label: 'Search',
       role: 'scout',
+      web: true,
       workspace: 'project',
-      prompt: 'Answer this from the page a browser found. Quote what you rely on, and say if the page does not answer it.\n\nQuestion: {{objective}}\n\n{{input}}',
+      prompt:
+        'Answer this from the web. Search, open the pages that answer it, and prefer the primary source. Give the answer first, then the links you relied on. ' +
+        'If the pages disagree or do not answer it, say so.\n\nQuestion: {{objective}}',
     }),
-    n('end', 'end', X * 3, 40, { label: 'Done', template: '{{input}}' }),
-    n('gave_up', 'end', X * 2, 200, { label: 'Not found', outcome: 'failure', template: 'The browser could not find an answer.\n\n{{input}}' }),
+    n('end', 'end', X * 2, 100, { label: 'Done', template: '{{input}}' }),
   ],
-  edges: [e('start', 'out', 'browse'), e('browse', 'done', 'answer'), e('browse', 'failed', 'gave_up'), e('answer', 'out', 'end')],
+  edges: [e('start', 'out', 'search'), e('search', 'out', 'end')],
 };
 
 const triage: Flow = {

@@ -232,7 +232,9 @@ export function defaultNodeData(type: NodeType): FlowNode['data'] {
         maxSteps: 12,
         guard: true,
         guardThreshold: 0.5,
-        showWindow: true,
+        // The pilot drives the page whether or not you can see it; a window you did not ask for
+        // takes over the screen.
+        showWindow: false,
       };
     case 'flow':
       return { label: 'Run flow', flowId: '', objective: '{{input}}' };

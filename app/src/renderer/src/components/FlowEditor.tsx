@@ -26,7 +26,7 @@ const PALETTE: { type: NodeType; hint: string }[] = [
   { type: 'decide', hint: 'Jev routes on a question' },
   { type: 'human', hint: 'Pause for your approval' },
   { type: 'shell', hint: 'Run a command' },
-  { type: 'browser', hint: 'Jev drives a web page' },
+  { type: 'browser', hint: 'Jev clicks and types on a page' },
   { type: 'git', hint: 'Diff, commit or merge' },
   { type: 'flow', hint: 'Run another flow as a step' },
   { type: 'join', hint: 'Wait for parallel paths' },

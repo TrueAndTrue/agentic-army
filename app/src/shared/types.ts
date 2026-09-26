@@ -236,6 +236,8 @@ export interface AgentConfig {
   /** On a second visit, continue the same conversation rather than start fresh. */
   keepContext: boolean;
   maxVisits: number;
+  /** Search and read the web with the CLI's own tools. Unset means the role decides: only a scout can. */
+  web?: boolean;
 }
 export interface DecideOption {
   key: string;

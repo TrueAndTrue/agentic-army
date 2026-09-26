@@ -35,7 +35,9 @@ Each message goes where the picker under the box says:
 
 - **Chat** sends it to one agent in the project folder, on the model, effort and permission you
   pick. "Can edit files" runs it as an engineer; "Read only" runs it as a scout, which can read
-  and search the web but change nothing. A read-only chat is told so, and asked for an edit it
+  but change nothing. Either one searches the web with its CLI's own tools: claude's WebSearch and
+  WebFetch, codex's `web_search` (`-c web_search="live"`). Nothing opens on your screen, and the
+  searches show in the reply with their queries. A read-only chat is told so, and asked for an edit it
   tells you to switch. A chat remembers the conversation across turns and across restarts: the
   next turn resumes the same claude or codex conversation. Changing the model starts a fresh one
   in the new CLI, so the app hands it the thread so far and says so in the thread.
@@ -65,8 +67,7 @@ Two others can start one, if you let them:
   to tell you how it went; that turn has no tool, so it cannot start another. claude sees an MCP
   tool only by name until it loads it, so the chat's system instructions (`--append-system-prompt`
   for claude, `developer_instructions` for codex) list the flows and say to start one rather than
-  refuse. Without that, a chat asked to search the web tried WebSearch, which an editing chat does
-  not hold, and gave up. The note never goes in front of your message: codex once quoted it back
+  refuse. They also say to search the web directly rather than start a flow for a lookup. The note never goes in front of your message: codex once quoted it back
   as "the first thing you asked".
 
 Each flow has a "Who can start this" setting, in its side panel on the canvas:
@@ -113,11 +114,11 @@ that never settles.
 | Node | What it does | Outputs |
 |---|---|---|
 | Start | The run begins here with your message. | out |
-| Agent | claude or codex with a role, a model and a prompt. | out, error |
+| Agent | claude or codex with a role, a model and a prompt. "Can search the web" gives it the CLI's own web search; a scout has it unless you turn it off. | out, error |
 | Jev decision | Asks Jev a yes/no, choice or score question about its input, and leaves by the answer. The input passes through unchanged. | yes/no, each option, or high/low; plus unsure when a confidence floor is set |
 | Your approval | Pauses the run and shows you the text, with Approve and Reject. A note you add travels on with the work, so a rejection can say what to fix. | approve, reject |
 | Command | Runs a shell command in the run's branch or the project folder. Exit 0 is pass. | pass, fail |
-| Browser | A Chromium window that Jev drives toward a goal, with a guard on risky actions. | done, failed |
+| Browser | A page Jev clicks and types on toward a goal, with a guard on risky actions. For forms and sites that need clicking; an agent with web search is the way to look something up. The window stays hidden unless you turn on "Show the browser window". | done, failed |
 | Git | Shows the diff, commits the run branch, or merges it into your branch. | out, fail |
 | Run flow | Runs another flow with an objective from a template, waits for it, and passes its result on. | done, failed |
 | Join | Waits until every node connected into it has delivered, then passes all their outputs on together. | out |
@@ -178,9 +179,9 @@ run's copy, and the thread says so when there were some.
   engineer builds it, a codex reviewer checks it, and Jev sends it back to the engineer until the
   review passes. A validator judges the result against your objective, and you sign off.
 - **Quick fix** is the same without planning.
-- **Look it up on the web** opens DuckDuckGo's results for your question, has the Jev browser
-  open the page that answers it, and a scout answers from that page. If the browser finds
-  nothing, the run ends as Failed.
+- **Look it up on the web** is one scout with web search. It searches, reads the pages that
+  answer the question, and replies with the answer first and the links after. It needs no
+  TypeSafe key and opens no window.
 - **Triage with Jev** has Jev sort a request into a bug, a feature or a question, and asks you
   when it is not sure. A bug goes to a fix-and-test loop that sends failing tests back to the
   engineer, three times at most.
@@ -232,7 +233,7 @@ what the turn would cost at API prices; the app still saves it but no longer sho
 ## Testing
 
 ```sh
-npm test           # engine, Jev, browser pilot, permissions, models, tokens, who may start a flow, how a run ends: 56 tests
+npm test           # engine, Jev, browser pilot, permissions, web search, models, tokens, who may start a flow, how a run ends: 57 tests
 npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
 ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
@@ -272,6 +273,10 @@ findings, a few of them the same problem seen twice; this README describes the a
 - "What is the latest version of zod on npm" through Look it up on the web: the browser clicked
   through from the results to npmjs.com and the scout answered "4.6.5" from the page, in 7 s.
   Before the fix it typed into DuckDuckGo's search box eight times and never searched.
+
+On 2026-09-26 web lookups moved off the browser. The same question to an editing chat's agent,
+with no window: Haiku fetched the npm registry and answered "4.6.5" in 8 s; GPT-5.5 ran one
+`web_search` ("npm zod package latest version") and answered the same in 11 s.
 
 What the earlier runs showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
 

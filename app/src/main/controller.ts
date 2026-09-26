@@ -64,11 +64,12 @@ function titleFrom(text: string): string {
 function chatInstructions(o: { flows: string[] | null; readOnly: boolean; transcript: string }): string {
   const parts: string[] = [];
   if (o.flows !== null && o.flows.length > 0) {
-    // claude loads MCP tools on demand and sees only their names until then, so an agent that was
-    // never told what start_flow is reaches for WebSearch, finds it blocked, and gives up.
+    // claude loads MCP tools on demand and sees only their names until then, so an agent is told
+    // what start_flow is. It searches the web itself; a flow is for work that needs a team.
     parts.push(
       "You can start the person's flows with the start_flow tool (mcp__army__start_flow). A flow is a team of agents with its own tools and " +
-        'permissions, so it can do what this chat cannot, such as search the web. When the person asks for something a flow below does, ' +
+        'permissions that works on its own git branch. To look something up, search the web yourself; do not start a flow for that. ' +
+        'When the person asks for something a flow below does, ' +
         'call start_flow. Do not say you cannot, and do not ask in chat whether to: a flow that needs approval shows the person a card ' +
         'to approve, edit or decline, so asking first makes them answer twice. When a flow you started ends, you get a turn to tell the ' +
         'person how it went, so do not promise to check back. Flows you may start:\n' +
@@ -468,6 +469,7 @@ export class Controller {
         model: model.model,
         effort: fitEffort(model, s.chat.effort),
         role: s.chat.edits ? 'engineer' : 'scout',
+        web: true,
         cwd: project.path,
         prompt,
         ...(instructions === '' ? {} : { instructions }),
@@ -779,6 +781,7 @@ export class Controller {
           model: model.model,
           effort: fitEffort(model, cfg.effort ?? stage.effort),
           role: cfg.role,
+          ...(cfg.web === undefined ? {} : { web: cfg.web }),
           cwd: req.cwd,
           prompt: req.prompt,
           label: `${slug(cfg.label) || 'agent'}-${visit}`,
