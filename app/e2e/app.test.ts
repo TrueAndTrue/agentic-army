@@ -339,7 +339,7 @@ describe('starting flows', () => {
     });
   });
 
-  test('with Settings at "Only you", a chat agent is not even given the tool', async () => {
+  test('with Settings at "Only you", a chat agent is not given start_flow, only Jev\'s web tools', async () => {
     await withApp({ jevUrl, claudeMode: 'start-flow' }, async (l) => {
       await l.page.evaluate(async () => {
         const s = await window.api.getState();
@@ -347,7 +347,7 @@ describe('starting flows', () => {
       });
       await openSession(l);
       await send(l, 'Add multiply');
-      await l.page.getByText('start_flow said: start_flow is not available: no --mcp-config.').waitFor({ timeout: 20000 });
+      await l.page.getByText('start_flow said: start_flow is not listed; the tools are: jev_search, read_page.').waitFor({ timeout: 20000 });
       assert.deepEqual(await runs(l), []);
     });
   });

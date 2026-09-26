@@ -245,6 +245,7 @@ async function callStartFlow(objective) {
     await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake-claude', version: '0' } });
     const list = await rpc('tools/list', {});
     const tool = list.result.tools.find((t) => t.name === 'start_flow');
+    if (tool === undefined) return `start_flow is not listed; the tools are: ${list.result.tools.map((t) => t.name).join(', ') || 'none'}.`;
     const flow = process.env['FAKE_FLOW'] ?? tool.inputSchema.properties.flow.enum[0];
     const res = await rpc('tools/call', { name: 'start_flow', arguments: { flow, objective, why: 'The fake agent was told to.' } });
     return `${res.result.isError ? 'ERROR ' : ''}${res.result.content[0].text}`;

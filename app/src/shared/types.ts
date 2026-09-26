@@ -48,6 +48,11 @@ export interface Settings {
   /** The model a new chat starts on. */
   chatDefault: StageDefault;
   typesafe: { apiKey: string; model: string; baseUrl: string };
+  /**
+   * A key for Brave's Search API. Optional: without one, web searches read DuckDuckGo's and Brave's
+   * public results pages, which turn a program away after many searches in a row.
+   */
+  braveApiKey?: string;
   /** `unguarded` keeps each role's tools but drops argv scoping on the shell. */
   posture: 'guarded' | 'unguarded';
   claudeBin: string;
@@ -217,7 +222,7 @@ export interface SessionSummary {
 // Flows
 // ------------------------------------------------------------------------------------------------
 
-export const NODE_TYPES = ['start', 'agent', 'decide', 'human', 'shell', 'git', 'browser', 'flow', 'join', 'end'] as const;
+export const NODE_TYPES = ['start', 'agent', 'decide', 'human', 'shell', 'git', 'search', 'browser', 'flow', 'join', 'end'] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
 
 export type Workspace = 'run' | 'project';
@@ -287,6 +292,16 @@ export interface BrowserConfig {
   guardThreshold: number;
   showWindow: boolean;
 }
+/** A web search Jev reads: it opens the likeliest results and picks the passages that answer. */
+export interface SearchConfig {
+  label: string;
+  /** What goes to the search engine. */
+  query: string;
+  /** What the passages must answer. Empty means the query. */
+  question: string;
+  /** Jev's probability that the pages answer, at or above which the step leaves by found. */
+  threshold: number;
+}
 export interface FlowCallConfig {
   label: string;
   /** The flow to run. */
@@ -314,6 +329,7 @@ export interface NodeConfigs {
   human: HumanConfig;
   shell: ShellConfig;
   git: GitConfig;
+  search: SearchConfig;
   browser: BrowserConfig;
   flow: FlowCallConfig;
   join: JoinConfig;
@@ -363,6 +379,8 @@ export function outputHandles(node: FlowNode): string[] {
       return ['pass', 'fail'];
     case 'git':
       return ['out', 'fail'];
+    case 'search':
+      return ['found', 'unanswered'];
     case 'browser':
       return ['done', 'failed'];
     case 'flow':

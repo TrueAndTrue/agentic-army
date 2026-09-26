@@ -42,6 +42,10 @@ function nowLine(run: Run): string | null {
     }
     case 'decide':
       return `Jev is deciding "${label}"`;
+    case 'search': {
+      const line = visit?.log?.split('\n').at(-1);
+      return line === undefined || line === '' ? `${label}: searching` : `${label}: ${line}`;
+    }
     case 'browser': {
       const step = visit?.steps?.at(-1);
       return step === undefined ? `${label}: opening the browser` : `${label}: ${step.action}`;

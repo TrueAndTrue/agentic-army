@@ -26,6 +26,7 @@ const PALETTE: { type: NodeType; hint: string }[] = [
   { type: 'decide', hint: 'Jev routes on a question' },
   { type: 'human', hint: 'Pause for your approval' },
   { type: 'shell', hint: 'Run a command' },
+  { type: 'search', hint: 'Jev reads the web for an answer' },
   { type: 'browser', hint: 'Jev clicks and types on a page' },
   { type: 'git', hint: 'Diff, commit or merge' },
   { type: 'flow', hint: 'Run another flow as a step' },
@@ -283,7 +284,7 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
           <div className="min-h-0 flex-1 overflow-y-auto">
             <div className="mx-auto max-w-[980px] px-6 py-8">
               <p className="max-w-[640px] text-[13px] leading-relaxed text-muted">
-                A flow is a team of agents you wire together. Each node is a step: an agent with a role and a model, a Jev decision that picks a path, your approval, a command, a browser, git, or another flow. Loops are connections that point back.
+                A flow is a team of agents you wire together. Each node is a step: an agent with a role and a model, a Jev decision that picks a path, your approval, a command, a web search, a browser, git, or another flow. Loops are connections that point back.
               </p>
               <p className="mt-2 max-w-[640px] text-[13px] leading-relaxed text-muted">
                 Start one with Run below, from the box in a session, or by typing its command, such as <code className="font-mono text-[12px] text-text">/quick-fix add a multiply function</code>. Each flow also says whether Jev and chat agents may start it.

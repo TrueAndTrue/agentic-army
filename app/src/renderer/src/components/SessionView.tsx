@@ -1,7 +1,7 @@
 import { ArrowUp, ChevronDown, FolderX, GitBranch, Pencil, Square, Trash2 } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-import { flowCommand, parseFlowCommand } from '../../../shared/flow.ts';
+import { flowCommand, jevSteps, parseFlowCommand } from '../../../shared/flow.ts';
 import { fitEffort } from '../../../shared/models.ts';
 import type { Flow, Project, ProjectHealth, Session, SessionItem } from '../../../shared/types.ts';
 import { api, getState, go, openSession, setState, useStore } from '../lib/state.ts';
@@ -87,7 +87,7 @@ function store(key: string, value: string | null): void {
 }
 
 function usesJev(f: Flow): boolean {
-  return f.nodes.some((n) => n.type === 'decide' || n.type === 'browser');
+  return jevSteps(f).length > 0;
 }
 
 /** The message box. Mounted once per session (keyed by its id), so the picker and draft are that session's own. */

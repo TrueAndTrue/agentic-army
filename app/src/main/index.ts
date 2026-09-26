@@ -2,7 +2,7 @@
  * Electron main: one window, the controller, and the IPC bridge between them.
  */
 
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, powerSaveBlocker, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, powerSaveBlocker, session, shell } from 'electron';
 import { existsSync } from 'node:fs';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -104,7 +104,11 @@ void app.whenReady().then(async () => {
     if (path !== null && path !== '') process.env['PATH'] = path;
   }
   const root = process.env['ARMY_APP_HOME'] ?? join(app.getPath('userData'), 'army');
-  controller = new Controller({ store: new Store(root), emit, openPage: (show) => new ElectronPage(show && !HIDDEN) });
+  // Web searches go through Chromium's network stack, in a session of their own with no link to the
+  // app window's or the browser step's cookies.
+  const web = session.fromPartition('persist:army-web');
+  const webFetch = ((input: string | URL | Request, init?: RequestInit) => web.fetch(input as string, init)) as typeof fetch;
+  controller = new Controller({ store: new Store(root), emit, openPage: (show) => new ElectronPage(show && !HIDDEN), fetch: webFetch });
   const c = controller;
   // Chat agents reach the start_flow tool through this. If it cannot start, chats still work.
   try {

@@ -35,9 +35,8 @@ Each message goes where the picker under the box says:
 
 - **Chat** sends it to one agent in the project folder, on the model, effort and permission you
   pick. "Can edit files" runs it as an engineer; "Read only" runs it as a scout, which can read
-  but change nothing. Either one searches the web with its CLI's own tools: claude's WebSearch and
-  WebFetch, codex's `web_search` (`-c web_search="live"`). Nothing opens on your screen, and the
-  searches show in the reply with their queries. A read-only chat is told so, and asked for an edit it
+  but change nothing. Either one searches the web through Jev (see "Web search with Jev" below),
+  and the searches show in the reply with their queries. A read-only chat is told so, and asked for an edit it
   tells you to switch. A chat remembers the conversation across turns and across restarts: the
   next turn resumes the same claude or codex conversation. Changing the model starts a fresh one
   in the new CLI, so the app hands it the thread so far and says so in the thread.
@@ -67,7 +66,7 @@ Two others can start one, if you let them:
   to tell you how it went; that turn has no tool, so it cannot start another. claude sees an MCP
   tool only by name until it loads it, so the chat's system instructions (`--append-system-prompt`
   for claude, `developer_instructions` for codex) list the flows and say to start one rather than
-  refuse. They also say to search the web directly rather than start a flow for a lookup. The note never goes in front of your message: codex once quoted it back
+  refuse, and not to start a flow just to look something up. The note never goes in front of your message: codex once quoted it back
   as "the first thing you asked".
 
 Each flow has a "Who can start this" setting, in its side panel on the canvas:
@@ -114,11 +113,12 @@ that never settles.
 | Node | What it does | Outputs |
 |---|---|---|
 | Start | The run begins here with your message. | out |
-| Agent | claude or codex with a role, a model and a prompt. "Can search the web" gives it the CLI's own web search; a scout has it unless you turn it off. | out, error |
+| Agent | claude or codex with a role, a model and a prompt. "Can search the web" gives it Jev's `jev_search` and `read_page`; a scout has it unless you turn it off. | out, error |
 | Jev decision | Asks Jev a yes/no, choice or score question about its input, and leaves by the answer. The input passes through unchanged. | yes/no, each option, or high/low; plus unsure when a confidence floor is set |
 | Your approval | Pauses the run and shows you the text, with Approve and Reject. A note you add travels on with the work, so a rejection can say what to fix. | approve, reject |
 | Command | Runs a shell command in the run's branch or the project folder. Exit 0 is pass. | pass, fail |
-| Browser | A page Jev clicks and types on toward a goal, with a guard on risky actions. For forms and sites that need clicking; an agent with web search is the way to look something up. The window stays hidden unless you turn on "Show the browser window". | done, failed |
+| Web search | Searches the web and has Jev pick the pages and the passages that answer. The output is those passages with their links. | found, unanswered |
+| Browser | A page Jev clicks and types on toward a goal, with a guard on risky actions. For forms and sites that need clicking; a Web search step is the way to look something up. The window stays hidden unless you turn on "Show the browser window". | done, failed |
 | Git | Shows the diff, commits the run branch, or merges it into your branch. | out, fail |
 | Run flow | Runs another flow with an objective from a template, waits for it, and passes its result on. | done, failed |
 | Join | Waits until every node connected into it has delivered, then passes all their outputs on together. | out |
@@ -179,9 +179,9 @@ run's copy, and the thread says so when there were some.
   engineer builds it, a codex reviewer checks it, and Jev sends it back to the engineer until the
   review passes. A validator judges the result against your objective, and you sign off.
 - **Quick fix** is the same without planning.
-- **Look it up on the web** is one scout with web search. It searches, reads the pages that
-  answer the question, and replies with the answer first and the links after. It needs no
-  TypeSafe key and opens no window.
+- **Look it up on the web** is a Web search step, then a scout that writes the answer from the
+  passages with links. When Jev is less than 50% sure the pages answer it, the run ends as
+  Failed and shows the closest passages. Nothing opens on your screen.
 - **Triage with Jev** has Jev sort a request into a bug, a feature or a question, and asks you
   when it is not sure. A bug goes to a fix-and-test loop that sends failing tests back to the
   engineer, three times at most.
@@ -202,6 +202,7 @@ program needs a judgment rather than prose:
   the option Jev picked. A score leaves by high at or above the cut level. With a confidence floor
   set, an unsure answer takes its own output, for example to your approval.
 - **Auto routing.** One choice question over "chat" and every flow's description.
+- **Web search.** See the next section.
 - **The browser.** Each step, the page becomes a closed list of actions: click this link or
   button, type this phrase into that box, scroll, go back, stop. Jev picks one, and a second
   question asks whether the goal is already met. Typing is limited to phrases taken from the goal,
@@ -210,6 +211,34 @@ program needs a judgment rather than prose:
   send, post, change account settings or hand over a password. At or above the node's threshold
   the run pauses and asks you. The browser runs in its own session, with no access to the app or
   to your Chrome profile.
+
+## Web search with Jev
+
+Agents search without a browser. A search is plain HTTP plus two Jev requests, and takes 1 to 2 s:
+
+1. The app fetches a results page: DuckDuckGo's HTML page, then Brave's, then Bing's. An engine
+   that returns fewer than 3 results is turning a program away (DuckDuckGo sends a challenge,
+   Bing unrelated pages), so it is passed over and left alone for ten minutes. A Brave Search API
+   key in Settings under Jev goes first and is never turned away.
+2. Jev ranks the results with one Choice question, preferring primary sources, and the app opens
+   the top three at once. A page that refuses gives way to the next result.
+3. Every readable line of those pages, and the result snippets, gets an id like `P012`. One
+   request asks a Choice question over the ids (which passage answers) and a Noul question (do
+   these passages answer it at all). This is the line-search recipe from TypeSafe's cookbook.
+
+The agent gets up to six passages in the pages' own words, each page's link, Jev's probability
+that they answer the question, and the other results. Jev picks and does not write; the agent
+writes the answer. `read_page` does step 3 for one page. Pages and results come through
+Electron's own network stack in a session of their own: Brave refuses Node's HTTP/1.1 `fetch`
+with a 429 and npmjs.com with a 403, and serves Chromium. Only public http and https pages are
+read, never localhost or a private network.
+
+Chats and agent steps get `jev_search` and `read_page` from the app's MCP server when there is a
+working TypeSafe key. They keep their CLI's own search (claude's WebSearch, codex's
+`web_search="live"`) and are told to use it only when `jev_search` says every engine turned it
+away. Without a key, the CLI's own search is all they have. An agent step with "Can search the
+web" off gets neither, and on codex that means `web_search="disabled"`, since `codex exec`
+otherwise searches a cached index.
 
 A flow that uses Jev will not start without a working key, rather than fail halfway through. The
 app asks TypeSafe one small question to check a key it has not tried yet. With no key, or one
@@ -233,7 +262,7 @@ what the turn would cost at API prices; the app still saves it but no longer sho
 ## Testing
 
 ```sh
-npm test           # engine, Jev, browser pilot, permissions, web search, models, tokens, who may start a flow, how a run ends: 57 tests
+npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends: 66 tests
 npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
 ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
@@ -274,9 +303,18 @@ findings, a few of them the same problem seen twice; this README describes the a
   through from the results to npmjs.com and the scout answered "4.6.5" from the page, in 7 s.
   Before the fix it typed into DuckDuckGo's search box eight times and never searched.
 
-On 2026-09-26 web lookups moved off the browser. The same question to an editing chat's agent,
-with no window: Haiku fetched the npm registry and answered "4.6.5" in 8 s; GPT-5.5 ran one
-`web_search` ("npm zod package latest version") and answered the same in 11 s.
+On 2026-09-26 web lookups moved off the browser and onto Jev:
+
+- Three searches through Electron's fetch took 1.5 to 2 s each, of which Jev took 0.3 to 0.4 s,
+  and Jev was 96 to 97% sure each time. "Latest version of zod on npm" quoted npmjs.com's own
+  "4.6.5 • Published 13 days ago".
+- Look it up on the web answered the zod question in 12 s, with the npm page and the GitHub
+  releases as sources, and pointed out the one site that still listed 4.5.4.
+- Asked how long to roast peanuts, a Sonnet chat and a GPT-5.5 chat each ran one `jev_search`
+  and answered with links, in 25 s and 16 s.
+- After about fifteen searches in a few minutes DuckDuckGo answered with a challenge (HTTP 202)
+  and Bing with one page about a 19th-century neurologist. That is why an engine with fewer than
+  3 results is passed over, and why the Brave API key exists.
 
 What the earlier runs showed on 2026-09-24, with claude 2.1.281 and codex 0.154.0:
 
@@ -318,7 +356,7 @@ What the earlier runs showed on 2026-09-24, with claude 2.1.281 and codex 0.154.
 
 ```
 src/shared/     types and flow rules both sides read (validation, templates)
-src/main/       Electron main: the controller, the flow engine, agents, git, Jev, the browser
+src/main/       Electron main: the controller, the flow engine, agents, git, Jev, web search, the browser
 src/preload/    the bridge the window calls
 src/renderer/   React: sessions, the run panel, the canvas editor, settings
 test/           unit tests for the engine, Jev and the pilot

@@ -600,7 +600,7 @@ describe('web search (the desktop app answers from the web without opening a bro
       const a = buildCodexArgs(spec({ harness: 'codex', allow: ['Read', 'WebSearch'], ...extra }), 'go');
       assert.ok(a.includes('web_search="live"'), a.join(' '));
     }
-    assert.equal(buildCodexArgs(spec({ harness: 'codex', allow: ['Read'] }), 'go').includes('web_search="live"'), false);
+    assert.ok(buildCodexArgs(spec({ harness: 'codex', allow: ['Read'] }), 'go').includes('web_search="disabled"'), 'without WebSearch, no cached search either');
   });
 });
 

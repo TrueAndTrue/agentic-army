@@ -4,7 +4,7 @@
  */
 
 import { Handle, Position, type Edge, type Node, type NodeChange, type NodeProps } from '@xyflow/react';
-import { Bot, Flag, GitBranch, Globe, Merge, Play, Split, Terminal, UserCheck, Workflow } from 'lucide-react';
+import { Bot, Flag, GitBranch, Globe, Merge, Play, Search, Split, Terminal, UserCheck, Workflow } from 'lucide-react';
 import { memo, useCallback, useRef, useState } from 'react';
 
 import { outputHandles, hasInput, ROLE_INFO, type Flow, type FlowNode, type NodeRunStatus, type NodeType, type Settings } from '../../../shared/types.ts';
@@ -19,6 +19,7 @@ export const TYPE_ICON: Record<NodeType, typeof Bot> = {
   human: UserCheck,
   shell: Terminal,
   git: GitBranch,
+  search: Search,
   browser: Globe,
   flow: Workflow,
   join: Merge,
@@ -59,6 +60,8 @@ export function subtitleFor(node: FlowNode, settings: Settings | null): string {
       return node.data.command;
     case 'git':
       return node.data.action === 'merge' ? 'Merge into your branch' : node.data.action === 'commit' ? 'Commit the run branch' : 'Show the diff';
+    case 'search':
+      return node.data.query;
     case 'browser':
       return node.data.startUrl;
     case 'flow': {

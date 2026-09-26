@@ -67,6 +67,8 @@ function templatesOf(node: FlowNode): string[] {
       return [node.data.command];
     case 'git':
       return [node.data.message];
+    case 'search':
+      return [node.data.query, node.data.question];
     case 'browser':
       return [node.data.goal, node.data.startUrl];
     case 'flow':
@@ -173,6 +175,7 @@ export function validateFlow(flow: Flow, knownModelIds?: ReadonlySet<string>, kn
       else if (n.data.flowId === flow.id) problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" runs this same flow. Use a connection that points back to loop instead.` });
       else if (knownFlowIds !== undefined && !knownFlowIds.has(n.data.flowId)) problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" runs a flow that no longer exists.` });
     }
+    if (n.type === 'search' && n.data.query.trim() === '') problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" has nothing to search for.` });
     if (n.type === 'browser' && n.data.goal.trim() === '') problems.push({ level: 'error', nodeId: n.id, message: `"${n.data.label}" has no goal.` });
     if (n.type !== 'end' && n.type !== 'start' && !flow.edges.some((e) => e.source === n.id)) {
       problems.push({ level: 'warn', nodeId: n.id, message: `Nothing follows "${n.data.label}". The path stops there.` });
@@ -224,6 +227,8 @@ export function defaultNodeData(type: NodeType): FlowNode['data'] {
       return { label: 'Run tests', command: 'npm test', workspace: 'run', timeoutSec: 600, maxVisits: 5 };
     case 'git':
       return { label: 'Commit', action: 'commit', message: 'flow: {{objective}}' };
+    case 'search':
+      return { label: 'Web search', query: '{{input}}', question: '', threshold: 0.5 };
     case 'browser':
       return {
         label: 'Browser',
@@ -292,4 +297,9 @@ export function parseFlowCommand<F extends Pick<Flow, 'name'>>(text: string, flo
   if (m === null) return null;
   const flow = flows.find((f) => flowCommand(f) === m[1]!.toLowerCase());
   return flow === undefined ? null : { flow, objective: (m[2] ?? '').trim() };
+}
+
+/** The steps that ask Jev, so a flow with any cannot start without a working key. */
+export function jevSteps(flow: Flow): string[] {
+  return flow.nodes.filter((n) => n.type === 'decide' || n.type === 'browser' || n.type === 'search').map((n) => n.data.label);
 }

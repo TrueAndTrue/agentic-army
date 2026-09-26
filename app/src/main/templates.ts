@@ -144,23 +144,26 @@ const webResearch: Flow = {
   id: 'builtin-web-research',
   invoke: 'agent',
   name: 'Look it up on the web',
-  description: "A question answered from the live web. A scout searches and reads pages with its model's own web search, then answers with links. Nothing opens on your screen.",
+  description:
+    'A question answered from the live web. Jev searches, opens the likeliest pages and picks the passages that answer, and a scout writes the answer from them with links. Nothing opens on your screen.',
   builtin: true,
   updatedAt: '2026-09-26T00:00:00.000Z',
   nodes: [
     n('start', 'start', 0, 100, { label: 'Start' }),
-    n('search', 'agent', X, 100, {
-      label: 'Search',
+    n('search', 'search', X, 100, { label: 'Search', query: '{{objective}}', question: '', threshold: 0.5 }),
+    n('answer', 'agent', X * 2, 40, {
+      label: 'Answer',
       role: 'scout',
-      web: true,
+      // It answers from what the search found. With no web tools it cannot wander off and search again.
+      web: false,
       workspace: 'project',
       prompt:
-        'Answer this from the web. Search, open the pages that answer it, and prefer the primary source. Give the answer first, then the links you relied on. ' +
-        'If the pages disagree or do not answer it, say so.\n\nQuestion: {{objective}}',
+        'Answer this from the passages a web search found. Give the answer first, then the links you relied on. If the passages disagree, say which source says what.\n\nQuestion: {{objective}}\n\n{{input}}',
     }),
-    n('end', 'end', X * 2, 100, { label: 'Done', template: '{{input}}' }),
+    n('end', 'end', X * 3, 40, { label: 'Done', template: '{{input}}' }),
+    n('gave_up', 'end', X * 2, 200, { label: 'Not found', outcome: 'failure', template: 'Jev could not find an answer on the web. The closest it found:\n\n{{input}}' }),
   ],
-  edges: [e('start', 'out', 'search'), e('search', 'out', 'end')],
+  edges: [e('start', 'out', 'search'), e('search', 'found', 'answer'), e('search', 'unanswered', 'gave_up'), e('answer', 'out', 'end')],
 };
 
 const triage: Flow = {

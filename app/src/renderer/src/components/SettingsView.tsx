@@ -110,7 +110,7 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, and drives and guards the browser step. Every built-in flow but the web lookup uses it. The key stays on this machine.">
+          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, reads web searches for agents, and drives and guards the browser step. Every built-in flow uses it. The keys stay on this machine.">
             <div className="space-y-3">
               <Field
                 label="TypeSafe API key"
@@ -145,6 +145,20 @@ export function SettingsView() {
                 </Button>
                 {jev !== null && <span className={`selectable min-w-0 text-[12.5px] ${jev.ok ? 'text-ok' : 'text-bad'}`}>{jev.detail.replace(/ (Jev needs one; add it in Settings under Jev|Paste a working key in Settings under Jev)\.$/, '')}</span>}
               </div>
+              <Field
+                label="Brave Search API key (optional)"
+                hint={
+                  <>
+                    Jev's web searches read DuckDuckGo's and Brave's public results pages, which turn a program away after many searches in a row. Brave's Search API does not, and{' '}
+                    <a className="text-muted underline decoration-line-strong underline-offset-2 hover:text-text" href="https://brave.com/search/api/" target="_blank" rel="noreferrer">
+                      its free plan
+                    </a>{' '}
+                    covers 2,000 searches a month.
+                  </>
+                }
+              >
+                <Input type="password" autoComplete="off" value={s.braveApiKey ?? ''} placeholder="Leave empty to use the public pages" onChange={(e) => setS({ ...s, braveApiKey: e.target.value })} />
+              </Field>
             </div>
           </Section>
           <Section title="Models at each stage" note="What an agent node uses when it does not name its own model. Change a stage here and every flow that relies on the default follows.">

@@ -145,7 +145,7 @@ describe('the start_flow bridge', () => {
       },
       { command: process.execPath, env: {} },
     );
-    const turn = bridge.open({ sessionId: 's1', model: 'Sonnet 5' });
+    const turn = bridge.open({ sessionId: 's1', model: 'Sonnet 5', flows: true, web: false });
     const mcp = await mcpSession(turn.spec);
     try {
       const init = await mcp.rpc('initialize', { protocolVersion: '2025-06-18' });
@@ -153,7 +153,7 @@ describe('the start_flow bridge', () => {
       assert.equal((await mcp.rpc('tools/list')).result?.tools?.[0]?.description, 'flows for Sonnet 5');
       const res = await mcp.rpc('tools/call', { name: 'start_flow', arguments: { flow: 'quick-fix', objective: 'x' } });
       assert.equal(res.result?.content?.[0]?.text, 'started quick-fix');
-      assert.deepEqual(calls[0]?.caller, { sessionId: 's1', model: 'Sonnet 5' });
+      assert.deepEqual(calls[0]?.caller, { sessionId: 's1', model: 'Sonnet 5', flows: true, web: false });
 
       turn.close();
       const late = await mcp.rpc('tools/call', { name: 'start_flow', arguments: { flow: 'quick-fix', objective: 'y' } });

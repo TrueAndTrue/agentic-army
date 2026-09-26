@@ -59,12 +59,23 @@ export interface BrowserRequest {
   ask(title: string, body: string): Promise<boolean>;
 }
 
+export interface SearchResult {
+  /** The pages' own words, with links, as Markdown. */
+  output: string;
+  /** Jev's probability that the pages answer the question. */
+  answered: number;
+  model: string;
+  latencyMs: number;
+}
+
 export interface EngineDeps {
   agent(req: AgentRequest): Promise<AgentResult>;
   judge(req: { config: DecideConfig; question: string; state: string; signal: AbortSignal }): Promise<Judgment>;
   shell(req: { command: string; cwd: string; timeoutMs: number; signal: AbortSignal }): Promise<{ code: number | null; output: string }>;
   git(req: { run: Run; config: GitConfig; message: string; signal: AbortSignal }): Promise<{ ok: boolean; output: string }>;
   browser(req: BrowserRequest): Promise<{ ok: boolean; output: string }>;
+  /** Search the web, with Jev picking the pages and the passages. */
+  search(req: { query: string; question: string; signal: AbortSignal; onProgress(line: string): void }): Promise<SearchResult>;
   /**
    * Run another flow to its end, for a Run flow node, and say how it went. The child run is its own
    * run, with its own branch, and stops when this one does.
@@ -297,6 +308,35 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         const res = await deps.git({ run, config: node.data, message, signal });
         visit.log = res.output;
         return { handle: res.ok ? 'out' : 'fail', output: res.ok && node.data.action !== 'diff' ? input : res.output };
+      }
+
+      case 'search': {
+        const cfg = node.data;
+        const query = renderTemplate(cfg.query, ctx);
+        const question = cfg.question.trim() === '' ? query : renderTemplate(cfg.question, ctx);
+        visit.log = '';
+        const res = await deps.search({
+          query,
+          question,
+          signal,
+          onProgress(line) {
+            visit.log = `${visit.log ?? ''}${visit.log === '' ? '' : '\n'}${line}`;
+            update();
+          },
+        });
+        const found = res.answered >= cfg.threshold;
+        // The verdict shows where every Jev answer shows: on the card, the map and the step.
+        visit.judgment = {
+          question: `Do the pages answer: ${question}`,
+          mode: 'yesno',
+          answer: found ? 'yes' : 'no',
+          probabilities: { yes: res.answered, no: 1 - res.answered },
+          confidence: Math.abs(res.answered - 0.5) * 2,
+          value: res.answered,
+          model: res.model,
+          latencyMs: res.latencyMs,
+        };
+        return { handle: found ? 'found' : 'unanswered', output: res.output };
       }
 
       case 'browser': {

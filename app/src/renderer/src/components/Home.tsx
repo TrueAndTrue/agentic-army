@@ -101,11 +101,11 @@ export function Home() {
                 {doctor !== null && !doctor.codex.ok && <p className="mt-1 text-[12px] text-faint">Install the Codex CLI and log in to use GPT models. Everything else works without it.</p>}
               </Row>
               <Row label="git" what="each run works on its own branch" r={doctor?.git} />
-              <Row label="Jev" what="makes the decisions inside flows, and picks a flow in Auto" r={doctor?.typesafe}>
+              <Row label="Jev" what="makes the decisions inside flows, reads web searches, and picks a flow in Auto" r={doctor?.typesafe}>
                 {doctor !== null && !doctor.typesafe.ok && (
                   <>
                     <p className="mt-1 text-[12px] text-faint">
-                      Build and review, Quick fix and Triage ask Jev at some step. Chat and web lookups work without it.{' '}
+                      Every built-in flow asks Jev at some step, and agents search the web through it. Chat works without it.{' '}
                       <a className="text-muted underline decoration-line-strong underline-offset-2 hover:text-text" href="https://typesafe.ai" target="_blank" rel="noreferrer">
                         Get a key from TypeSafe
                       </a>

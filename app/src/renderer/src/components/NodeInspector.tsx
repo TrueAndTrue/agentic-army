@@ -233,13 +233,31 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
       );
       break;
     }
+    case 'search': {
+      const d = node.data;
+      const s = set<'search'>(d);
+      body = (
+        <>
+          <p className="rounded-md border border-brass/40 bg-brass-soft px-2.5 py-2 text-[12px] leading-relaxed text-muted">
+            Searches the web over plain HTTP; nothing opens on screen. Jev opens the likeliest three results and picks the passages that answer. The output is those passages with their links, for the next step to answer from.
+          </p>
+          <PromptField label="Search for" value={d.query} onChange={(v) => s({ query: v })} flow={flow} self={node.id} rows={2} />
+          <PromptField label="Question to answer" value={d.question} onChange={(v) => s({ question: v })} flow={flow} self={node.id} rows={2} />
+          <p className="-mt-1 text-[11.5px] text-faint">Leave it empty to use the search words.</p>
+          <Field label={`Found when Jev is ${Math.round(d.threshold * 100)}% sure or more`} hint="Below that, the step leaves by unanswered.">
+            <input type="range" min={0.1} max={0.9} step={0.05} value={d.threshold} onChange={(e) => s({ threshold: Number(e.target.value) })} className="w-full accent-[var(--brass)]" />
+          </Field>
+        </>
+      );
+      break;
+    }
     case 'browser': {
       const d = node.data;
       const s = set<'browser'>(d);
       body = (
         <>
           <p className="rounded-md border border-brass/40 bg-brass-soft px-2.5 py-2 text-[12px] leading-relaxed text-muted">
-            A Chromium window that Jev drives. Each step the page becomes a list of actions and Jev picks one. It only types phrases taken from the goal, quoted or after "search for".
+            A Chromium page that Jev drives, for sites that need clicking and typing. To look something up, a Web search step is faster. Each step the page becomes a list of actions and Jev picks one. It only types phrases taken from the goal, quoted or after "search for".
           </p>
           <PromptField label="Goal" value={d.goal} onChange={(v) => s({ goal: v })} flow={flow} self={node.id} rows={3} />
           <Field label="Start page">

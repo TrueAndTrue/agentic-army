@@ -1,5 +1,5 @@
 /**
- * The tools a chat agent uses to start flows, served over MCP.
+ * The tools the app gives an agent, served over MCP: start_flow, and Jev's jev_search and read_page.
  *
  * claude and codex start MCP servers themselves, as child processes speaking JSON-RPC on stdio. So
  * the server is a small script the app writes to disk, run by the app's own binary with
@@ -28,6 +28,11 @@ export interface ToolCaller {
   sessionId: string;
   /** The model's label, for the thread: "Sonnet 5". */
   model: string;
+  /** Which tools this key opens: start_flow, and Jev's jev_search and read_page. */
+  flows: boolean;
+  web: boolean;
+  /** Stops a web search when the turn or run it belongs to stops. */
+  signal?: AbortSignal;
 }
 
 export interface ToolHandler {
@@ -104,7 +109,7 @@ export async function startFlowBridge(root: string, handler: ToolHandler, runtim
     const key = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1];
     const caller = key === undefined ? undefined : keys.get(key);
     if (req.method !== 'POST' || caller === undefined) {
-      res.writeHead(401).end('This key is not live. Flows can be started only during the chat turn that was given the tool.');
+      res.writeHead(401).end('This key is not live. These tools work only during the turn that was given them.');
       return;
     }
     let body = '';

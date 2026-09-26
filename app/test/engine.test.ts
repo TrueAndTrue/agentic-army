@@ -45,6 +45,10 @@ function deps(over: Partial<EngineDeps> = {}, log: FakeLog = { agentPrompts: [],
     async browser() {
       return { ok: true, output: 'browsed' };
     },
+    async search({ query, onProgress }) {
+      onProgress(`searched ${query}`);
+      return { output: `passages about ${query}`, answered: query.includes('nothing') ? 0.1 : 0.9, model: 'jev', latencyMs: 1 };
+    },
     async subflow({ objective }) {
       return { ok: true, output: `sub-run did: ${objective}`, runId: 'child' };
     },
@@ -224,6 +228,20 @@ describe('running a flow', () => {
     );
     const r = await run(f, deps({ shell: async () => ({ code: 1, output: '1 failing' }) }));
     assert.match(r.result ?? '', /^red: Command: `npm test`\nExit code: 1\n\n```\n1 failing/);
+  });
+
+  test('a web search leaves by found or unanswered on Jev\'s verdict, and keeps it as a judgment', async () => {
+    for (const [objective, end] of [['zod version', 'answer: passages about zod version'], ['nothing at all', 'no luck']] as const) {
+      const f = flow(
+        [node('start', 'start'), node('web', 'search', { query: '{{objective}}' }), node('ok', 'end', { template: 'answer: {{input}}' }), node('no', 'end', { template: 'no luck' })],
+        [edge('start', 'out', 'web'), edge('web', 'found', 'ok'), edge('web', 'unanswered', 'no')],
+      );
+      const r = await run(f, deps(), objective);
+      assert.equal(r.result, end);
+      const visit = r.nodes['web']?.visits[0];
+      assert.equal(visit?.judgment?.answer, end === 'no luck' ? 'no' : 'yes');
+      assert.match(visit?.log ?? '', /^searched /);
+    }
   });
 });
 

@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 
-import { flowCommand, MAX_FLOW_DEPTH, mayStart, newId, parseFlowCommand, slug } from '../shared/flow.ts';
+import { flowCommand, jevSteps, MAX_FLOW_DEPTH, mayStart, newId, parseFlowCommand, slug } from '../shared/flow.ts';
 import { fitEffort, mergeCatalog } from '../shared/models.ts';
 import type {
   AppEvent,
@@ -29,6 +29,7 @@ import { pilot, type Page } from './browser/pilot.ts';
 import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/engine.ts';
 import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, projectHealth, runDiff, runShell, setUpGit } from './git.ts';
 import type { FlowBridge, ToolCaller, ToolDescription, ToolHandler } from './flowTools.ts';
+import { formatAnswer, webRead, webSearch, type WebDeps } from './websearch.ts';
 import { askJev, judge } from './jev.ts';
 import { modelCatalog } from './models.ts';
 import { Store } from './store.ts';
@@ -38,6 +39,11 @@ export interface ControllerOptions {
   store: Store;
   emit(event: AppEvent): void;
   openPage(show: boolean): Page & { close(): void };
+  /**
+   * How web searches reach the web. The app passes Electron's own, which speaks HTTP/2 with
+   * Chromium's TLS: Brave turns Node's HTTP/1.1 fetch away with a 429, and npmjs.com with a 403.
+   */
+  fetch?: typeof fetch;
 }
 
 const nowIso = () => new Date().toISOString();
@@ -61,14 +67,15 @@ function titleFrom(text: string): string {
  * What a chat agent is told apart from the person's message. It goes in as system instructions,
  * never in front of the message: codex quoted a note put there back as "the first message I sent".
  */
-function chatInstructions(o: { flows: string[] | null; readOnly: boolean; transcript: string }): string {
+function chatInstructions(o: { flows: string[] | null; web: boolean; readOnly: boolean; transcript: string }): string {
   const parts: string[] = [];
+  if (o.web) parts.push(WEB_NOTE);
   if (o.flows !== null && o.flows.length > 0) {
     // claude loads MCP tools on demand and sees only their names until then, so an agent is told
     // what start_flow is. It searches the web itself; a flow is for work that needs a team.
     parts.push(
       "You can start the person's flows with the start_flow tool (mcp__army__start_flow). A flow is a team of agents with its own tools and " +
-        'permissions that works on its own git branch. To look something up, search the web yourself; do not start a flow for that. ' +
+        'permissions that works on its own git branch. Do not start a flow just to look something up. ' +
         'When the person asks for something a flow below does, ' +
         'call start_flow. Do not say you cannot, and do not ask in chat whether to: a flow that needs approval shows the person a card ' +
         'to approve, edit or decline, so asking first makes them answer twice. When a flow you started ends, you get a turn to tell the ' +
@@ -85,6 +92,14 @@ function chatInstructions(o: { flows: string[] | null; readOnly: boolean; transc
   if (o.transcript !== '') parts.push(`The conversation so far, before this model took over. Continue it; the person can see all of it:\n\n${o.transcript}`);
   return parts.join('\n\n');
 }
+
+/** What an agent with Jev's web tools is told. claude sees an MCP tool only by name until it loads it. */
+const WEB_NOTE =
+  'To look something up on the web, call jev_search (mcp__army__jev_search) with search words and the question to answer. ' +
+  'It searches, has Jev open the likeliest pages and pick the passages that answer, and returns them with their links and how sure Jev is. ' +
+  'Answer from those passages and link the pages you used. When Jev is sure, one search is enough: answer, do not search again to confirm. ' +
+  'When Jev is unsure, search again with different words, or call read_page (mcp__army__read_page) on a result that looks right. ' +
+  'To read a page the person gives you, call read_page. Use your own web search tool only when jev_search says every search engine turned it away.';
 
 const TRANSCRIPT_CHARS = 16_000;
 
@@ -105,6 +120,7 @@ export class Controller {
   private readonly store: Store;
   private readonly emitRaw: (e: AppEvent) => void;
   private readonly openPage: ControllerOptions['openPage'];
+  private readonly webFetch: typeof fetch | undefined;
   settings: Settings;
   private projects: Project[];
   private userFlows: Flow[];
@@ -120,6 +136,7 @@ export class Controller {
     this.store = opts.store;
     this.emitRaw = opts.emit;
     this.openPage = opts.openPage;
+    this.webFetch = opts.fetch;
     this.settings = this.store.loadSettings();
     this.addListedModels();
     this.projects = this.store.loadProjects();
@@ -446,12 +463,15 @@ export class Controller {
     // The start_flow tool, only when some flow lets an agent start it. Its key dies with this turn.
     // A report on a finished run gets no tool: an agent that started a flow in it would report on
     // that one too, and start another, and so on.
-    const tools = origin === 'person' && this.bridge !== null && this.agentFlows().length > 0 ? this.bridge.open({ sessionId: s.id, model: model.label }) : null;
+    const offerFlows = origin === 'person' && this.agentFlows().length > 0;
+    const jevWeb = origin === 'person' && this.jevWeb();
+    const tools = this.bridge !== null && (offerFlows || jevWeb) ? this.bridge.open({ sessionId: s.id, model: model.label, flows: offerFlows, web: jevWeb, signal: ctl.signal }) : null;
     // What happened since the agent last spoke: runs it started that finished, requests you answered.
     const news = s.chat.news ?? [];
     delete s.chat.news;
     const instructions = chatInstructions({
-      flows: tools === null ? null : this.flowLines(),
+      flows: tools === null || !offerFlows ? null : this.flowLines(),
+      web: tools !== null && jevWeb,
       readOnly: !s.chat.edits,
       // A new model starts a new conversation in its CLI; the thread so far comes with it.
       transcript: resume === undefined ? transcriptOf(earlier, this.settings.models) : '',
@@ -469,6 +489,8 @@ export class Controller {
         model: model.model,
         effort: fitEffort(model, s.chat.effort),
         role: s.chat.edits ? 'engineer' : 'scout',
+        // Jev's web tools when there is a working key. The CLI's own search stays, as the backup for
+        // when every search engine turns Jev's search away, and as the only search without a key.
         web: true,
         cwd: project.path,
         prompt,
@@ -505,13 +527,20 @@ export class Controller {
   /** The last key Jev was asked with, and whether TypeSafe took it. */
   private jevKnown: { key: string; ok: boolean; setup: boolean; detail: string } | null = null;
 
+  /** Whether agents search the web through Jev: a key TypeSafe has not refused. */
+  private jevWeb(): boolean {
+    const key = this.settings.typesafe.apiKey.trim();
+    if (key === '') return false;
+    return !(this.jevKnown?.key === key && !this.jevKnown.ok && this.jevKnown.setup);
+  }
+
   /**
    * Why this flow cannot reach Jev, or null when it can. No key, or a key TypeSafe refused. A key
    * not yet tried is tried now, with one small question, so a bad key stops the flow before its
    * agents are paid for rather than at its first decision.
    */
   private async jevProblem(flow: Flow): Promise<{ steps: string[]; refused?: string } | null> {
-    const steps = flow.nodes.filter((n) => n.type === 'decide' || n.type === 'browser').map((n) => n.data.label);
+    const steps = jevSteps(flow);
     if (steps.length === 0) return null;
     const key = this.settings.typesafe.apiKey.trim();
     if (key === '') return { steps };
@@ -586,9 +615,9 @@ export class Controller {
     const gone = this.folderGone(s);
     if (project === undefined || gone !== null) return gone ?? 'This session belongs to a project that was removed.';
     // Refuse before anything is spent, rather than fail at the first Jev node halfway through.
-    const jevNodes = flow.nodes.filter((n) => n.type === 'decide' || n.type === 'browser');
+    const jevNodes = jevSteps(flow);
     if (jevNodes.length > 0 && this.settings.typesafe.apiKey.trim() === '') {
-      return `"${flow.name}" uses Jev in ${jevNodes.map((n) => `"${n.data.label}"`).join(', ')}, and there is no TypeSafe API key. Add one in Settings, then send again.`;
+      return `"${flow.name}" uses Jev in ${jevNodes.map((l) => `"${l}"`).join(', ')}, and there is no TypeSafe API key. Add one in Settings, then send again.`;
     }
     const run = createRun({ id: newId('run'), flow, sessionId: s.id, projectId: project.id, objective });
     run.startedBy = by;
@@ -658,10 +687,41 @@ export class Controller {
   }
 
   readonly flowTools: ToolHandler = {
-    list: (): ToolDescription[] => {
+    list: (caller: ToolCaller): ToolDescription[] => {
       const flows = this.agentFlows();
       const lines = this.flowLines();
+      const web: ToolDescription[] = [
+        {
+          name: 'jev_search',
+          description:
+            'Search the web. Jev, a fast judgment model, opens the likeliest results and picks the passages that answer your question. ' +
+            'Returns those passages in the pages\' own words, with links, how sure Jev is that they answer it, and the other results. ' +
+            'Takes a few seconds and opens nothing on screen.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'Search words, as you would type them into a search engine.' },
+              question: { type: 'string', description: 'The question the passages must answer, in full. Defaults to the query.' },
+            },
+            required: ['query'],
+          },
+        },
+        {
+          name: 'read_page',
+          description: "Read one public web page and have Jev pick the passages that answer your question. Returns them in the page's own words, and how sure Jev is.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: 'The page, http or https.' },
+              question: { type: 'string', description: 'What you want from the page.' },
+            },
+            required: ['url', 'question'],
+          },
+        },
+      ];
+      if (!caller.flows) return caller.web ? web : [];
       return [
+        ...(caller.web ? web : []),
         {
           name: 'start_flow',
           description:
@@ -682,7 +742,8 @@ export class Controller {
       ];
     },
     call: async (caller: ToolCaller, name: string, args: Record<string, unknown>) => {
-      if (name !== 'start_flow') return { text: `There is no tool called ${name}.`, isError: true };
+      if ((name === 'jev_search' || name === 'read_page') && caller.web) return this.webTool(name, args, caller.signal);
+      if (name !== 'start_flow' || !caller.flows) return { text: `There is no tool called ${name}.`, isError: true };
       const s = this.sessions.get(caller.sessionId);
       if (s === undefined) return { text: 'This conversation is gone.', isError: true };
       const wanted = typeof args['flow'] === 'string' ? args['flow'] : '';
@@ -721,6 +782,27 @@ export class Controller {
       return { text: `Started "${flow.name}" as run ${run.id}. It shows in this conversation, and you will hear how it went at the start of your next turn.` };
     },
   };
+
+  /** Jev's jev_search and read_page, for any agent given them. */
+  private async webTool(name: 'jev_search' | 'read_page', args: Record<string, unknown>, signal?: AbortSignal): Promise<{ text: string; isError?: boolean }> {
+    const str = (k: string) => (typeof args[k] === 'string' ? (args[k] as string).trim() : '');
+    const deps = { ...this.webDeps(), ...(signal === undefined ? {} : { signal }) };
+    try {
+      if (name === 'read_page') {
+        if (str('url') === '') return { text: 'Give the url of the page to read.', isError: true };
+        return { text: formatAnswer(await webRead(str('url'), str('question') || 'What does this page say?', deps)) };
+      }
+      if (str('query') === '') return { text: 'Give the search words in query.', isError: true };
+      return { text: formatAnswer(await webSearch(str('query'), str('question') || str('query'), deps)) };
+    } catch (err) {
+      return { text: err instanceof Error ? err.message : String(err), isError: true };
+    }
+  }
+
+  private webDeps(): WebDeps {
+    const brave = this.settings.braveApiKey?.trim() ?? '';
+    return { jev: this.settings.typesafe, ...(brave === '' ? {} : { braveKey: brave }), ...(this.webFetch === undefined ? {} : { fetch: this.webFetch }) };
+  }
 
   async answerFlowRequest(sessionId: string, requestId: string, approve: boolean, objective: string): Promise<void> {
     const s = this.sessions.get(sessionId);
@@ -776,22 +858,34 @@ export class Controller {
         const stage = this.settings.stageDefaults[cfg.role];
         const model = this.model(cfg.modelId ?? stage.modelId);
         const visit = (req.run.nodes[req.node.id]?.visits.length ?? 1).toString();
-        return runAgent({
-          harness: model.harness,
-          model: model.model,
-          effort: fitEffort(model, cfg.effort ?? stage.effort),
-          role: cfg.role,
-          ...(cfg.web === undefined ? {} : { web: cfg.web }),
-          cwd: req.cwd,
-          prompt: req.prompt,
-          label: `${slug(cfg.label) || 'agent'}-${visit}`,
-          brief: true,
-          ...(req.resume === undefined ? {} : { resume: req.resume }),
-          ...(req.tokensBefore === undefined ? {} : { tokensBefore: req.tokensBefore }),
-          settings: this.settings,
-          signal: req.signal,
-          onTurn: req.onTurn,
-        });
+        // A step that may search gets Jev's web tools when there is a key, and its CLI's own search when not.
+        const web = cfg.web ?? cfg.role === 'scout';
+        const tools = web && this.jevWeb() && this.bridge !== null ? this.bridge.open({ sessionId: s.id, model: model.label, flows: false, web: true, signal: req.signal }) : null;
+        try {
+          return await runAgent({
+            harness: model.harness,
+            model: model.model,
+            effort: fitEffort(model, cfg.effort ?? stage.effort),
+            role: cfg.role,
+            web,
+            ...(tools === null ? {} : { mcp: [tools.spec], instructions: WEB_NOTE }),
+            cwd: req.cwd,
+            prompt: req.prompt,
+            label: `${slug(cfg.label) || 'agent'}-${visit}`,
+            brief: true,
+            ...(req.resume === undefined ? {} : { resume: req.resume }),
+            ...(req.tokensBefore === undefined ? {} : { tokensBefore: req.tokensBefore }),
+            settings: this.settings,
+            signal: req.signal,
+            onTurn: req.onTurn,
+          });
+        } finally {
+          tools?.close();
+        }
+      },
+      search: async (req) => {
+        const a = await webSearch(req.query, req.question, { ...this.webDeps(), signal: req.signal, onProgress: req.onProgress });
+        return { output: formatAnswer(a), answered: a.answered, model: a.model, latencyMs: a.jevMs };
       },
       subflow: async (req) => {
         const flow = this.flows().find((f) => f.id === req.node.data.flowId);
