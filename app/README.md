@@ -265,6 +265,15 @@ Each decision shows on the run card as the step's name with Jev's answer, like "
 Jev: yes, 93% sure", and on the run map. The step in the run panel shows the question Jev was
 asked, every probability, and the cutoff that turned them into a path.
 
+## Code in replies
+
+Code blocks are highlighted for ts, tsx, js, jsx, json, bash, sh, shell, python, go, rust, css,
+html, yaml, toml, sql and markdown, in colours taken from the theme, so light and dark both work.
+Diffs are coloured by line instead: added green, removed red, hunk headers blue. The grammars are
+highlight.js's core and those languages only, about 155 kB (39 kB gzipped), in a chunk the window
+loads the first time a reply has a code block. Each block is highlighted again only when its own
+text changes, so a long reply streaming in redoes the block still growing and nothing above it.
+
 ## Tokens
 
 The app runs on your claude and codex logins, so each reply and run shows the tokens it read and

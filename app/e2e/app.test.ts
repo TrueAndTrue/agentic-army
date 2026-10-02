@@ -124,6 +124,31 @@ describe('sessions', () => {
     });
   });
 
+  test('code blocks in a reply are highlighted, diffs keep their line colours, and each block has a copy button', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      await openSession(l);
+      // The fake claude echoes the message, so the reply carries these blocks back.
+      await l.page.getByRole('textbox', { name: 'Message' }).fill(
+        'Blocks:\n```ts\n// add two numbers\nexport const add = (a: number, b: number): number => a + b;\n```\n```diff\n@@ -1 +1 @@\n-old line\n+new line\n```\n```python\ndef hi(name):\n    return f"hi {name}"\n```',
+      );
+      await l.page.keyboard.press('Enter');
+      const reply = l.page.locator('article').filter({ hasText: 'echo:Blocks:' });
+      await reply.locator('.hljs-keyword', { hasText: 'export' }).waitFor();
+      await reply.locator('.hljs-comment', { hasText: '// add two numbers' }).waitFor();
+      await reply.locator('.hljs-string', { hasText: 'f"hi {name}"' }).waitFor();
+      await reply.locator('span.text-ok', { hasText: '+new line' }).waitFor();
+      await reply.locator('span.text-bad', { hasText: '-old line' }).waitFor();
+      assert.equal(await reply.getByRole('button', { name: 'Copy code' }).count(), 3);
+      await shot(l.page, 'e2e-code-dark');
+      await l.page.evaluate(async () => {
+        const s = await window.api.getState();
+        await window.api.saveSettings({ ...s.settings, theme: 'light' });
+      });
+      await l.page.locator('html[data-theme="light"]').waitFor({ state: 'attached' });
+      await shot(l.page, 'e2e-code-light');
+    });
+  });
+
   test('Stop ends a running reply, and quitting leaves no agent process behind', async () => {
     await withApp({ jevUrl, claudeMode: 'slow' }, async (l) => {
       await openSession(l);

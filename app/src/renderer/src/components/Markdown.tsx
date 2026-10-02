@@ -1,8 +1,9 @@
 import { Check, Copy } from 'lucide-react';
-import { createContext, memo, useContext, useState, type ReactNode } from 'react';
+import { createContext, memo, useContext, useMemo, useState, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+import { grammarFor, highlight, useHighlighter } from '../lib/highlight.ts';
 import { api } from '../lib/state.ts';
 import { cx } from './ui.tsx';
 
@@ -37,11 +38,23 @@ function textOf(node: ReactNode): string {
   return '';
 }
 
+/**
+ * One block's code, coloured. Memoized on the text, so while a reply streams only the block still
+ * growing is highlighted again; the finished blocks above it keep their markup.
+ */
+const Highlighted = memo(function Highlighted({ text, grammar }: { text: string; grammar: string }) {
+  const h = useHighlighter();
+  const html = useMemo(() => (h === null ? null : highlight(h, text, grammar)), [h, text, grammar]);
+  if (html === null) return <code>{text}</code>;
+  return <code className="hljs" dangerouslySetInnerHTML={{ __html: html }} />;
+});
+
 function CodeBlock({ children }: { children?: ReactNode }) {
   const code = children as { props?: { className?: string; children?: ReactNode } } | undefined;
   const lang = /language-([\w+-]+)/.exec(code?.props?.className ?? '')?.[1];
   const text = textOf(code?.props?.children).replace(/\n$/, '');
   const diff = lang === 'diff' || lang === 'patch';
+  const grammar = diff ? undefined : grammarFor(lang);
   return (
     <div className="code-block group/code relative">
       <div className="absolute top-1 right-1 flex items-center gap-1 opacity-0 transition-opacity group-hover/code:opacity-100 focus-within:opacity-100">
@@ -57,6 +70,8 @@ function CodeBlock({ children }: { children?: ReactNode }) {
               </span>
             ))}
           </code>
+        ) : grammar !== undefined ? (
+          <Highlighted text={text} grammar={grammar} />
         ) : (
           children
         )}
