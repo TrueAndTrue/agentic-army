@@ -1,6 +1,6 @@
 import { Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, useReactFlow } from '@xyflow/react';
 import { GitMerge, RefreshCw, X } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 
 import type { DiffResult, FlowNode, Judgment, NodeVisit, Run } from '../../../shared/types.ts';
 import { duration, NODE_STATUS_COLOR, RUN_STATUS_COLOR, RUN_STATUS_LABEL, tokenDetail, tokenLine } from '../lib/format.ts';
@@ -274,13 +274,40 @@ function Changes({ run }: { run: Run }) {
   );
 }
 
-export function RunPanel({ run }: { run: Run }) {
+/**
+ * Below this width the panel and the thread do not both fit side by side, so the panel lies over
+ * the thread instead. The session view uses it to decide where the panel goes.
+ */
+const NARROW = '(max-width: 1180px)';
+
+export function useNarrow(): boolean {
+  return useSyncExternalStore(
+    (l) => {
+      const q = window.matchMedia(NARROW);
+      q.addEventListener('change', l);
+      return () => q.removeEventListener('change', l);
+    },
+    () => window.matchMedia(NARROW).matches,
+  );
+}
+
+/**
+ * The run beside the thread, or over it when `overlay` is set. The overlay covers the thread only,
+ * never the message box under it, so you can still write while you read the run.
+ */
+export function RunPanel({ run, overlay = false }: { run: Run; overlay?: boolean }) {
   const tab = useStore((s) => s.panelTab);
   const setTab = (t: Tab) => setState({ panelTab: t });
   const [focus, setFocus] = useState<string | null>(null);
   const live = run.status === 'running' || run.status === 'waiting';
   return (
-    <aside className="flex h-full w-[50%] min-w-[440px] max-w-[820px] shrink-0 flex-col border-l border-line bg-panel max-[1180px]:absolute max-[1180px]:inset-y-0 max-[1180px]:right-0 max-[1180px]:z-30 max-[1180px]:w-[min(560px,92%)] max-[1180px]:min-w-0 max-[1180px]:shadow-[-12px_0_32px_rgba(0,0,0,0.28)]">
+    <aside
+      aria-label="Run"
+      className={cx(
+        'flex flex-col border-l border-line bg-panel',
+        overlay ? 'absolute inset-y-0 right-0 z-30 w-[min(560px,92%)] border-b shadow-[-12px_0_32px_rgba(0,0,0,0.28)]' : 'h-full w-[50%] min-w-[440px] max-w-[820px] shrink-0',
+      )}
+    >
       <header className="drag flex h-12 shrink-0 items-center gap-2 border-b border-line px-3">
         <Dot color={RUN_STATUS_COLOR[run.status]} pulse={live} />
         <span className="truncate text-[13px] font-semibold">{run.flowName}</span>

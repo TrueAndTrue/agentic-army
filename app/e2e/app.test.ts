@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -106,6 +106,117 @@ describe('sessions', () => {
     });
   });
 
+  test('the sidebar keeps its order when you send in an older session', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      await openSession(l);
+      await send(l, 'First session');
+      await until(async () => (await agentItems(l.page))[0]?.status === 'done', 20000, 'the first reply');
+      await l.page.getByRole('button', { name: 'New session in calc' }).click();
+      await send(l, 'Second session');
+      const rows = l.page.getByRole('navigation').getByRole('listitem');
+      await until(async () => (await rows.allTextContents()).length === 2 && (await rows.allTextContents()).every((t) => !t.startsWith('New session')), 10000, 'two named sessions');
+      const order = async () => (await rows.allTextContents()).map((t) => t.replace(/(now|\d+[smhd]( ago)?)$/, '').trim());
+      assert.deepEqual(await order(), ['Second session', 'First session']);
+      await l.page.getByRole('navigation').getByRole('button', { name: /^First session/ }).click();
+      await send(l, 'Back in the first one');
+      await l.page.getByText('echo:Back in the first one').waitFor();
+      assert.deepEqual(await order(), ['Second session', 'First session'], 'sending did not move the open session to the top');
+    });
+  });
+
+  test('a message sent while the agent answers is queued, survives a reload, and goes out when the reply ends', async () => {
+    await withApp({ jevUrl, claudeMode: 'slow' }, async (l) => {
+      const userTexts = async () =>
+        l.page.evaluate(async () => {
+          const s = await window.api.getState();
+          const sess = await window.api.getSession(s.sessions[0]!.id);
+          return { users: sess!.items.filter((i) => i.kind === 'user').map((i) => (i as { text: string }).text), queued: sess!.queued };
+        });
+      const queued = l.page.getByLabel('Queued message');
+      await openSession(l);
+      await send(l, 'first');
+      await until(async () => (await agentItems(l.page))[0]?.status === 'running', 10000, 'the first reply to start');
+      await send(l, 'second');
+      await queued.getByText('Queued. It goes out when the reply ends.').waitFor();
+      await l.page.getByText('A message is already queued. What you send now is added to the end of it.').waitFor();
+      await send(l, 'third');
+      await until(async () => (await userTexts()).queued?.text === 'second\n\nthird', 5000, 'the second send to join the queued one');
+      assert.deepEqual((await userTexts()).users, ['first'], 'nothing queued went into the thread yet');
+      await shot(l.page, 'e2e-queued');
+
+      await queued.getByRole('button', { name: 'Edit' }).click();
+      await queued.getByRole('textbox', { name: 'Edit queued message' }).fill('second, edited');
+      await l.page.keyboard.press('Enter');
+      await until(async () => (await userTexts()).queued?.text === 'second, edited', 5000, 'the edit to reach the main process');
+
+      // The window reloading does not lose it: the main process holds the queue.
+      await l.page.reload();
+      await queued.getByText('second, edited').waitFor();
+
+      await until(async () => (await userTexts()).users.length === 2, 20000, 'the queued message to go out when the reply ended');
+      assert.deepEqual((await userTexts()).users, ['first', 'second, edited']);
+      assert.equal((await userTexts()).queued, undefined);
+      await until(async () => (await agentItems(l.page))[1]?.status === 'running', 10000, 'the second reply to start');
+
+      // Esc still stops the reply. A stopped reply holds the queued message until you decide.
+      await send(l, 'fourth');
+      await queued.waitFor();
+      await l.page.getByRole('textbox', { name: 'Message' }).press('Escape');
+      await queued.getByText('Not sent, because you stopped the reply.').waitFor();
+      assert.equal((await agentItems(l.page))[1]?.status, 'stopped');
+      await queued.getByRole('button', { name: 'Send now' }).click();
+      await until(async () => (await userTexts()).users.at(-1) === 'fourth', 10000, 'Send now to send it');
+
+      await until(async () => (await agentItems(l.page))[2]?.status === 'running', 10000, 'the third reply to start');
+      await send(l, 'never mind');
+      await queued.getByRole('button', { name: 'Remove' }).click();
+      await queued.waitFor({ state: 'detached' });
+      assert.equal((await userTexts()).queued, undefined);
+      await l.page.getByRole('button', { name: 'Stop' }).click();
+      await until(async () => (await agentItems(l.page))[2]?.status === 'stopped', 10000, 'the third reply to stop');
+
+      // A reply that fails holds the queued message too. This claude takes a moment, then fails.
+      const failing = join(l.root, 'failing-claude');
+      writeFileSync(failing, '#!/bin/sh\nsleep 2\necho "no such model" >&2\nexit 1\n');
+      chmodSync(failing, 0o755);
+      await l.page.evaluate(async (bin) => {
+        const s = await window.api.getState();
+        await window.api.saveSettings({ ...s.settings, claudeBin: bin });
+      }, failing);
+      await send(l, 'this one fails');
+      await until(async () => (await agentItems(l.page))[3]?.status === 'running', 10000, 'the failing reply to start');
+      await send(l, 'wait for me');
+      await queued.getByText('Not sent, because the reply failed. Send it, change it, or remove it.').waitFor({ timeout: 15000 });
+      assert.equal((await agentItems(l.page))[3]?.status, 'error');
+      assert.equal((await userTexts()).queued?.text, 'wait for me');
+    });
+  });
+
+  test('code blocks in a reply are highlighted, diffs keep their line colours, and each block has a copy button', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      await openSession(l);
+      // The fake claude echoes the message, so the reply carries these blocks back.
+      await l.page.getByRole('textbox', { name: 'Message' }).fill(
+        'Blocks:\n```ts\n// add two numbers\nexport const add = (a: number, b: number): number => a + b;\n```\n```diff\n@@ -1 +1 @@\n-old line\n+new line\n```\n```python\ndef hi(name):\n    return f"hi {name}"\n```',
+      );
+      await l.page.keyboard.press('Enter');
+      const reply = l.page.locator('article').filter({ hasText: 'echo:Blocks:' });
+      await reply.locator('.hljs-keyword', { hasText: 'export' }).waitFor();
+      await reply.locator('.hljs-comment', { hasText: '// add two numbers' }).waitFor();
+      await reply.locator('.hljs-string', { hasText: 'f"hi {name}"' }).waitFor();
+      await reply.locator('span.text-ok', { hasText: '+new line' }).waitFor();
+      await reply.locator('span.text-bad', { hasText: '-old line' }).waitFor();
+      assert.equal(await reply.getByRole('button', { name: 'Copy code' }).count(), 3);
+      await shot(l.page, 'e2e-code-dark');
+      await l.page.evaluate(async () => {
+        const s = await window.api.getState();
+        await window.api.saveSettings({ ...s.settings, theme: 'light' });
+      });
+      await l.page.locator('html[data-theme="light"]').waitFor({ state: 'attached' });
+      await shot(l.page, 'e2e-code-light');
+    });
+  });
+
   test('Stop ends a running reply, and quitting leaves no agent process behind', async () => {
     await withApp({ jevUrl, claudeMode: 'slow' }, async (l) => {
       await openSession(l);
@@ -117,6 +228,80 @@ describe('sessions', () => {
       await until(async () => (await agentItems(l.page)).length === 2 && fakeAgents() > 0, 10000, 'the second agent');
     });
     await until(async () => fakeAgents() === 0, 10000, 'every agent to be gone after quit');
+  });
+});
+
+describe('first run', () => {
+  test('on a Mac with no claude, every dead end says how to install it, and Check again finds it once it is there', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'army-e2e-'));
+    const userHome = join(root, 'user');
+    mkdirSync(userHome);
+    // A clean Mac: only the system folders on PATH, no login shell to read a longer one from, an
+    // empty home folder, and no fake CLIs.
+    const env = { PATH: '/usr/bin:/bin', SHELL: '/nonexistent', HOME: userHome, ARMY_CLAUDE_BIN: '', ARMY_CODEX_BIN: '' };
+    await withApp({ jevUrl, root, env }, async (l) => {
+      const claudeRow = l.page.getByLabel('How to install claude');
+      await claudeRow.getByText('curl -fsSL https://claude.ai/install.sh | bash').waitFor();
+      await l.page.getByLabel('How to install codex').getByText('npm install -g @openai/codex').waitFor();
+      await l.page.getByText('The Reviewer and Validator stages run on a GPT model').waitFor();
+      await shot(l.page, 'e2e-first-run-home');
+
+      // A folder that is not a repository: chat says how to install claude, a flow says what it lacks.
+      const folder = join(root, 'notes');
+      mkdirSync(folder);
+      writeFileSync(join(folder, 'todo.md'), '- milk\n');
+      await l.page.evaluate((path) => window.api.addProject(path), folder);
+      await l.page.getByRole('button', { name: 'New session in notes' }).click();
+      await l.page.getByText('claude is not installed on this Mac, so Sonnet 5 cannot answer yet.').waitFor();
+      await send(l, 'What is in todo.md?');
+      await l.page.getByText('claude is not installed on this Mac, or the app cannot find it.').waitFor();
+      await l.page.getByRole('main').getByLabel('How to install claude').waitFor();
+      await send(l, 'add a line', 'Quick fix');
+      await l.page.getByText(/^Quick fix did not start\. "Build" runs on claude, which is not installed\. "Review" runs on codex/).waitFor();
+      await l.page.getByRole('button', { name: 'Start a git repository here' }).waitFor();
+      assert.equal(await lastRun(l), null, 'nothing started');
+      await shot(l.page, 'e2e-first-run-flow-blocked');
+
+      // Claude Code's installer puts claude in ~/.local/bin. Check again finds it there without a restart.
+      mkdirSync(join(userHome, '.local/bin'), { recursive: true });
+      writeFileSync(join(userHome, '.local/bin/claude'), '#!/bin/sh\necho "2.1.281 (Claude Code)"\n');
+      chmodSync(join(userHome, '.local/bin/claude'), 0o755);
+      const help = l.page.getByRole('main').getByLabel('How to install claude').first();
+      await help.getByRole('button', { name: 'Check again' }).click();
+      await help.getByText('Found 2.1.281 (Claude Code).').waitFor();
+    });
+  });
+});
+
+describe('narrow window', () => {
+  test('with a run open at 900 wide, the panel lies over the thread and the message box stays usable', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
+      await openSession(l);
+      await send(l, 'Add multiply', 'Quick fix');
+      await runToEnd(l);
+      await l.page.getByRole('button', { name: 'Open run' }).click();
+      // The hidden test window keeps the size it was made with, so the page's viewport stands in for
+      // the window: the layout's media queries follow it the same way.
+      await l.page.setViewportSize({ width: 900, height: 700 });
+      const panel = l.page.getByRole('complementary', { name: 'Run' });
+      await panel.getByRole('button', { name: 'changes', exact: true }).click();
+      await panel.getByRole('button', { name: 'Merge into main' }).waitFor();
+      const box = l.page.getByRole('textbox', { name: 'Message' });
+      const p = (await panel.boundingBox())!;
+      const b = (await box.boundingBox())!;
+      assert.ok(p.x + p.width <= 900 && p.x >= 264, `the panel sits inside the session area: ${JSON.stringify(p)}`);
+      assert.ok(p.y + p.height <= b.y, `the panel ends above the message box: panel ${JSON.stringify(p)}, box ${JSON.stringify(b)}`);
+      // Nothing lies over the box: a click in its middle lands on it.
+      const onTop = await l.page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute('aria-label'), { x: b.x + b.width / 2, y: b.y + b.height / 2 });
+      assert.equal(onTop, 'Message');
+      await shot(l.page, 'e2e-narrow-900');
+      await l.page.getByLabel('Where this message goes').selectOption({ label: 'Chat' });
+      await box.fill('Written with the run open');
+      await l.page.keyboard.press('Enter');
+      await l.page.getByText('echo:Written with the run open').waitFor();
+      await panel.getByRole('button', { name: 'Close run panel' }).click();
+      await panel.waitFor({ state: 'detached' });
+    });
   });
 });
 

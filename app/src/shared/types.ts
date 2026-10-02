@@ -157,7 +157,15 @@ export interface AgentTurn {
   costUsd?: number;
   tokens?: TokenCount;
   error?: string;
+  /** The CLI this turn needed and could not find, so the window can say how to install it. */
+  missing?: Harness;
 }
+
+/**
+ * Something this Mac or project lacks, that a notice can offer to fix: a CLI to install, or a
+ * folder that needs a git repository before a flow can branch from it.
+ */
+export type SetupFix = Harness | 'git' | 'repo';
 
 export type SessionItem =
   | { kind: 'user'; id: string; ts: string; text: string; flowId?: string }
@@ -192,7 +200,7 @@ export type SessionItem =
       status: 'pending' | 'started' | 'dismissed';
       runId?: string;
     }
-  | { kind: 'notice'; id: string; ts: string; text: string; tone: 'info' | 'warn' | 'error' };
+  | { kind: 'notice'; id: string; ts: string; text: string; tone: 'info' | 'warn' | 'error'; fix?: SetupFix[] };
 
 export interface Session {
   id: string;
@@ -215,6 +223,11 @@ export interface Session {
     /** codex counts tokens for the whole conversation, so the next turn subtracts this. */
     harnessTokens?: TokenCount;
   };
+  /**
+   * A message sent while the agent was still answering. It goes out when the reply ends. A reply
+   * that failed or was stopped holds it instead, and `held` says which, so you decide what next.
+   */
+  queued?: { text: string; flowId: string | null; ts: string; held?: 'error' | 'stopped' };
   archived?: boolean;
 }
 
@@ -222,6 +235,7 @@ export interface SessionSummary {
   id: string;
   projectId: string;
   title: string;
+  createdAt: string;
   updatedAt: string;
   busy: boolean;
   /** A run in this session is waiting on you. */
@@ -510,8 +524,9 @@ export interface Run {
 // ------------------------------------------------------------------------------------------------
 
 export interface DoctorReport {
-  claude: { ok: boolean; detail: string };
-  codex: { ok: boolean; detail: string };
+  /** `missing` is set when the CLI is not there at all, as opposed to there but failing to run. */
+  claude: { ok: boolean; detail: string; missing?: boolean };
+  codex: { ok: boolean; detail: string; missing?: boolean };
   git: { ok: boolean; detail: string };
   typesafe: { ok: boolean; detail: string };
 }
@@ -562,6 +577,10 @@ export interface Api {
   deleteSession(id: string): Promise<void>;
   setChat(id: string, chat: Partial<Session['chat']>): Promise<void>;
   send(sessionId: string, text: string, flowId: string | null): Promise<void>;
+  /** Change the queued message, or drop it with null. */
+  editQueued(sessionId: string, text: string | null): Promise<void>;
+  /** Send the queued message now, if the agent is not answering. */
+  sendQueued(sessionId: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   getRun(id: string): Promise<Run | null>;
   answer(runId: string, questionId: string, approve: boolean, text: string): Promise<void>;

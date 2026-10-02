@@ -199,6 +199,8 @@ void app.whenReady().then(async () => {
       log.error('Sending a message failed', err);
     });
   });
+  handle('editQueued', (id: string, text: string | null) => c.editQueued(id, text));
+  handle('sendQueued', (id: string) => c.sendQueued(id));
   handle('stop', (id: string) => c.stop(id));
   handle('getRun', (id: string) => c.getRun(id));
   handle('answer', (runId: string, qid: string, approve: boolean, text: string) => c.answer(runId, qid, approve, text));

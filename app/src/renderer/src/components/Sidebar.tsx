@@ -33,7 +33,10 @@ export function Sidebar() {
           </div>
         )}
         {projects.map((p) => {
-          const mine = sessions.filter((s) => s.projectId === p.id);
+          // Newest first by when the session was made, not by its last message. Sorting by activity
+          // moved the open session to the top each time you sent, so the row under the cursor
+          // changed while you were using the list. A row now moves only when a new session lands above it.
+          const mine = sessions.filter((s) => s.projectId === p.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
           const open = collapsed[p.id] !== true;
           return (
             <section key={p.id} className="mb-2">

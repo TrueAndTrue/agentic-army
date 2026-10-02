@@ -1,9 +1,10 @@
 import { CheckCircle2, CircleAlert, FolderPlus, LoaderCircle, RefreshCw } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
-import type { DoctorReport } from '../../../shared/types.ts';
+import { AGENT_ROLES, ROLE_INFO, type DoctorReport } from '../../../shared/types.ts';
 import { addProjectFlow, api, checkMachine, go, newSession, useStore } from '../lib/state.ts';
 import { shortPath } from './SessionView.tsx';
+import { SetupHelp } from './SetupHelp.tsx';
 import { Button, Input } from './ui.tsx';
 
 type Check = DoctorReport[keyof DoctorReport] | undefined;
@@ -63,7 +64,10 @@ export function Home() {
   useEffect(() => {
     void checkMachine();
   }, []);
+  const settings = useStore((s) => s.settings);
   const ready = doctor !== null && doctor.claude.ok && doctor.git.ok && doctor.typesafe.ok;
+  // The stages whose default model needs codex: what goes wrong without it, said by name.
+  const codexStages = AGENT_ROLES.filter((r) => settings?.models.find((m) => m.id === settings.stageDefaults[r].modelId)?.harness === 'codex').map((r) => ROLE_INFO[r].label);
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
@@ -91,12 +95,31 @@ export function Home() {
             </div>
             <ul className="mt-1 divide-y divide-line rounded-lg border border-line bg-panel px-3.5">
               <Row label="claude" what="runs chats and most flow steps" r={doctor?.claude}>
-                {doctor !== null && !doctor.claude.ok && <p className="mt-1 text-[12px] text-faint">Install Claude Code and log in, or set its path in Settings.</p>}
+                {doctor !== null && !doctor.claude.ok && <SetupHelp tool="claude" className="mt-2" />}
               </Row>
-              <Row label="codex" what="optional: GPT models, and the reviewer in Build and review" r={doctor?.codex}>
-                {doctor !== null && !doctor.codex.ok && <p className="mt-1 text-[12px] text-faint">Install the Codex CLI and log in to use GPT models. Everything else works without it.</p>}
+              <Row label="codex" what="optional: runs the GPT models" r={doctor?.codex}>
+                {doctor !== null && !doctor.codex.ok && (
+                  <>
+                    <p className="mt-1 text-[12px] text-faint">
+                      {codexStages.length === 0 ? (
+                        'Chats and flows run on claude without it.'
+                      ) : (
+                        <>
+                          The {codexStages.join(' and ')} {codexStages.length === 1 ? 'stage runs' : 'stages run'} on a GPT model, so flows with {codexStages.length === 1 ? 'that step' : 'those steps'} need codex.{' '}
+                          <button className="text-muted underline decoration-line-strong underline-offset-2 hover:text-text" onClick={() => go({ kind: 'settings', section: 'stages' })}>
+                            Pick claude models for {codexStages.length === 1 ? 'it' : 'them'}
+                          </button>
+                          , or install codex.
+                        </>
+                      )}
+                    </p>
+                    <SetupHelp tool="codex" className="mt-2" />
+                  </>
+                )}
               </Row>
-              <Row label="git" what="each run works on its own branch" r={doctor?.git} />
+              <Row label="git" what="each run works on its own branch" r={doctor?.git}>
+                {doctor !== null && !doctor.git.ok && <SetupHelp tool="git" className="mt-2" />}
+              </Row>
               <Row label="Jev" what="makes the decisions inside flows, reads web searches, and picks a flow in Auto" r={doctor?.typesafe}>
                 {doctor !== null && !doctor.typesafe.ok && (
                   <>

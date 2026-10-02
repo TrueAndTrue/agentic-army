@@ -4,7 +4,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -103,6 +103,19 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
       ],
     }),
   );
+  // The app checks the machine with `claude --version` and `codex --version`. The fakes do not
+  // answer that: they wait on stdin until the check gives up, and they overwrite FAKE_PROBE_FILE,
+  // which tests read to see what a real turn received. A wrapper answers it and passes the rest on.
+  const bin = join(root, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const wrap = (name: string, fixture: string, version: string) => {
+    const path = join(bin, name);
+    writeFileSync(path, `#!/bin/sh\nif [ "$#" = 1 ] && [ "$1" = "--version" ]; then echo "${version}"; exit 0; fi\nexec "${join(FIXTURES, fixture)}" "$@"\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+  const fakeClaude = wrap('claude', 'fake-claude.mjs', '2.1.281 (Claude Code)');
+  const fakeCodex = wrap('codex', 'fake-codex.mjs', 'codex-cli 0.154.0');
   const require = createRequire(import.meta.url);
   // ARMY_E2E_PACKAGED=1 runs the same tests against the built .app instead of the dev build.
   const packaged = process.env['ARMY_E2E_PACKAGED'] === '1';
@@ -124,8 +137,8 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
             ...hidden,
             // The army's own home (config, archive) goes somewhere throwaway too.
             AGENTIC_ARMY_HOME: join(root, 'army-home'),
-            ARMY_CLAUDE_BIN: join(FIXTURES, 'fake-claude.mjs'),
-            ARMY_CODEX_BIN: join(FIXTURES, 'fake-codex.mjs'),
+            ARMY_CLAUDE_BIN: fakeClaude,
+            ARMY_CODEX_BIN: fakeCodex,
             FAKE_CLAUDE_MODE: opts.claudeMode ?? 'ok',
             TYPESAFE_API_KEY: '',
             CODEX_HOME: codexHome,

@@ -21,6 +21,17 @@ npm run install:mac  # builds it, copies it into /Applications and ad hoc signs 
 `npm run dist` takes about 15 s and never signs, even on a Mac with a Developer ID. The first time,
 open the app with right-click, Open. It reads your login shell's PATH at startup, so an app opened
 from the Dock finds `claude`, `codex` and `git` the same way your terminal does.
+The app also looks in `~/.local/bin` (where Claude Code's installer puts
+`claude`), `/opt/homebrew/bin` and `/usr/local/bin`.
+
+On a Mac without them, Home lists what is missing with the command that installs each one, a
+button that opens Terminal, and "Check again", which reads the shell's PATH again so a CLI you
+just installed is found without a restart. The same help shows wherever the missing tool stops
+you: under a chat reply that could not start, in Settings, and in the model pickers, which mark a
+model "needs codex" when codex is not there. A flow checks before it starts, before it asks for a
+Jev key: if one of its agent steps runs on a CLI this Mac lacks, or it works on a branch and the
+folder is not a git repository with a commit, it does not start and the thread says which steps
+and how to fix each one.
 
 Settings holds the TypeSafe key and the optional Brave Search key. Both are encrypted in
 `settings.json` with Electron's safeStorage, whose own key macOS keeps in your login Keychain. A
@@ -36,6 +47,10 @@ window's own storage moves with it, so two homes never share state.
 
 ## Sessions
 
+The sidebar lists each project's sessions newest first, by when you made them. Sending a message
+does not move a row, so the list stays put under the cursor; the time beside each row is its last
+activity.
+
 Each message goes where the picker under the box says:
 
 - **Chat** sends it to one agent in the project folder, on the model, effort and permission you
@@ -50,7 +65,20 @@ Each message goes where the picker under the box says:
   confidence it stays a chat.
 - **A flow** runs the flow with your message as its objective.
 
-Stop, next to the send button, stops everything running in the session. Quitting the app while
+A chat message you send while the agent is still answering waits its turn. It shows dimmed at the
+end of the thread, where you can edit or remove it, and goes out when the reply ends. A session
+holds one queued message: sending again while one waits adds the new text to the end of it, and
+the line above the box says so. If the reply fails, or you stop it, the queued message stays put
+with Send now beside it. The main process keeps the queue with the session, so it survives the
+window reloading and the app restarting. A flow, or a slash command, does not wait: it runs beside
+the chat.
+
+Stop, next to the send button, stops everything running in the session (Esc does the same).
+
+Open run, on a run card, shows the run's map, steps and changes in a panel. In a window wider
+than 1180 px it sits beside the thread. In a narrower one it lies over the thread but stops above
+the message box, so you can keep writing while you read the run. The message box grows to fit its
+text again whenever its width changes. Quitting the app while
 agents work asks first, then stops them and kills their processes.
 
 ## Starting a flow
@@ -282,6 +310,15 @@ Each decision shows on the run card as the step's name with Jev's answer, like "
 Jev: yes, 93% sure", and on the run map. The step in the run panel shows the question Jev was
 asked, every probability, and the cutoff that turned them into a path.
 
+## Code in replies
+
+Code blocks are highlighted for ts, tsx, js, jsx, json, bash, sh, shell, python, go, rust, css,
+html, yaml, toml, sql and markdown, in colours taken from the theme, so light and dark both work.
+Diffs are coloured by line instead: added green, removed red, hunk headers blue. The grammars are
+highlight.js's core and those languages only, about 155 kB (39 kB gzipped), in a chunk the window
+loads the first time a reply has a code block. Each block is highlighted again only when its own
+text changes, so a long reply streaming in redoes the block still growing and nothing above it.
+
 ## Tokens
 
 The app runs on your claude and codex logins, so each reply and run shows the tokens it read and
@@ -308,9 +345,9 @@ logs folder" opens the folder in Finder.
 ## Testing
 
 ```sh
-npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends, updates, keys at rest, the log: 88 tests
-npm run e2e        # builds, then drives the real app window with Playwright: 17 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 17 against the built .app
+npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends, updates, keys at rest, the log, setup help, sidebar order: 88 tests
+npm run e2e        # builds, then drives the real app window with Playwright: 22 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 22 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
 ```
 
@@ -332,6 +369,16 @@ the diagnostics or the log), and that a Git merge step waits on its card, leaves
 alone when you decline, and merges when you approve. In the agent
 tests the fake claude starts the app's MCP server from `--mcp-config` and calls `start_flow` over
 stdio, the same path real claude takes.
+
+Five more cover the first run and the session view. One starts the app as a clean Mac would, with
+`PATH=/usr/bin:/bin`, no login shell, an empty home folder and no CLIs, and checks that Home, a
+chat reply and a flow each say how to install what is missing; then it puts a `claude` in
+`~/.local/bin` and Check again finds it. The others check that sending in an older session leaves
+the sidebar's order alone, that a message sent mid-reply is queued, edited, kept across a reload,
+sent when the reply ends and held when one fails or is stopped, that code blocks are highlighted
+in both themes, and that at 900 px wide the run panel leaves the message box clear. The hidden test
+window does not resize, so that test narrows the page's viewport, which the layout follows the
+same way.
 
 `e2e/live/` holds the runs against the real tools. They cost money and need you logged in:
 
