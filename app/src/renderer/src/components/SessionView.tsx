@@ -1,4 +1,4 @@
-import { ArrowUp, ChevronDown, FolderX, GitBranch, Pencil, Square, Trash2 } from 'lucide-react';
+import { ArrowUp, ChevronDown, Clock, FolderX, GitBranch, Pencil, Square, Trash2 } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 import { flowCommand, jevSteps, parseFlowCommand } from '../../../shared/flow.ts';
@@ -19,6 +19,94 @@ export function shortPath(path: string): string {
   const home = path.replace(/^\/Users\/[^/]+/, '~');
   const parts = home.split('/');
   return parts.length > 4 ? `${parts[0] === '~' ? '~/…' : '…'}/${parts.slice(-2).join('/')}` : home;
+}
+
+/**
+ * The message waiting for the agent to finish, dimmed at the end of the thread. You can change it or
+ * drop it while it waits. A failed or stopped reply holds it, and Send now is how it goes out then.
+ */
+function QueuedMessage({ session }: { session: Session }) {
+  const q = session.queued!;
+  const answering = session.items.some((i) => i.kind === 'agent' && i.status === 'running');
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(q.text);
+  const status =
+    q.held === 'error'
+      ? 'Not sent, because the reply failed. Send it, change it, or remove it.'
+      : q.held === 'stopped'
+        ? 'Not sent, because you stopped the reply.'
+        : answering
+          ? 'Queued. It goes out when the reply ends.'
+          : 'Queued.';
+  const save = () => {
+    void api().editQueued(session.id, draft);
+    setEditing(false);
+  };
+  const cancel = () => {
+    setDraft(q.text);
+    setEditing(false);
+  };
+  return (
+    <div className="flex flex-col items-end" aria-label="Queued message">
+      {editing ? (
+        <div className="w-full max-w-[85%] rounded-2xl rounded-br-md border border-dashed border-line-strong bg-panel p-2">
+          <textarea
+            autoFocus
+            aria-label="Edit queued message"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                save();
+              }
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                cancel();
+              }
+            }}
+            rows={Math.min(8, draft.split('\n').length + 1)}
+            className="block w-full resize-none bg-transparent px-1.5 py-1 text-[13.5px] leading-relaxed focus:outline-none"
+          />
+          <div className="flex justify-end gap-1">
+            <Button tone="quiet" className="h-7 px-2 text-[12px]" onClick={cancel}>
+              Cancel
+            </Button>
+            <Button tone="primary" className="h-7 px-2 text-[12px]" onClick={save}>
+              Save
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="selectable max-w-[85%] rounded-2xl rounded-br-md border border-dashed border-line-strong px-3.5 py-2 text-[13.5px] whitespace-pre-wrap text-muted">{q.text}</div>
+      )}
+      <div className="mt-1 flex flex-wrap items-center justify-end gap-1 text-[11.5px] text-faint">
+        <Clock size={12} className="shrink-0" />
+        <span className={cx(q.held === 'error' && 'text-warn')}>{status}</span>
+        {!editing && (
+          <>
+            {!answering && (
+              <button className="ml-1 rounded px-1.5 py-0.5 text-[12px] font-medium text-text hover:bg-hover" onClick={() => void api().sendQueued(session.id)}>
+                Send now
+              </button>
+            )}
+            <button
+              className="rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-hover hover:text-text"
+              onClick={() => {
+                setDraft(q.text);
+                setEditing(true);
+              }}
+            >
+              Edit
+            </button>
+            <button className="rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-hover hover:text-text" onClick={() => void api().editQueued(session.id, null)}>
+              Remove
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
 }
 
 const LONG_LINES = 14;
@@ -153,16 +241,13 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
   const matches = typing === null || menuClosed ? [] : flows.filter((f) => flowCommand(f).startsWith(typing[1]!.toLowerCase()));
   const selected = Math.min(pick, Math.max(0, matches.length - 1));
   const command = parseFlowCommand(text, flows);
-  // A flow, or a slash command, starts work regardless of the chat; only a chat message waits for the agent.
-  const chatBusy = busy && toChat && command === null;
+  // A flow, or a slash command, starts work beside the chat; only a chat message waits its turn.
+  const answering = session.items.some((i) => i.kind === 'agent' && i.status === 'running');
+  const willQueue = answering && toChat && command === null;
 
   const send = () => {
     const body = text.trim();
     if (body === '') return;
-    if (chatBusy) {
-      setHint('The agent is still answering. Press Esc to stop it, or wait and send again.');
-      return;
-    }
     setText('');
     void api().send(session.id, body, effectiveTarget === 'chat' ? null : effectiveTarget);
   };
@@ -208,6 +293,11 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
         </div>
       )}
       {hint !== null && <div className="mb-1.5 px-1 text-[12px] text-warn">{hint}</div>}
+      {hint === null && willQueue && (
+        <div className="mb-1.5 px-1 text-[12px] text-muted">
+          {session.queued === undefined ? 'The agent is answering. What you send now waits and goes out when the reply ends.' : 'A message is already queued. What you send now is added to the end of it.'}
+        </div>
+      )}
       {hint === null && toChat && chatMissing && (
         <div className="mb-1.5 px-1 text-[12px] text-warn">
           {chatModel?.harness} is not installed on this Mac, so {chatModel?.label} cannot answer yet.{' '}
@@ -319,7 +409,8 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
               onClick={send}
               disabled={text.trim() === ''}
               aria-label="Send"
-              className={cx('flex h-8 w-8 items-center justify-center rounded-full bg-brass text-brass-ink transition-opacity disabled:opacity-30', chatBusy && 'opacity-40')}
+              title={willQueue ? 'Queue it for when the reply ends' : undefined}
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-brass text-brass-ink transition-opacity disabled:opacity-30"
             >
               <ArrowUp size={16} strokeWidth={2.4} />
             </button>
@@ -514,6 +605,7 @@ export function SessionView({ id }: { id: string }) {
               {session.items.map((item) => (
                 <Item key={item.id} item={item} sessionId={session.id} />
               ))}
+              {session.queued !== undefined && <QueuedMessage key={session.queued.ts} session={session} />}
             </div>
           </div>
           <Composer key={session.id} session={session} busy={busy} />

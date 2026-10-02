@@ -124,6 +124,74 @@ describe('sessions', () => {
     });
   });
 
+  test('a message sent while the agent answers is queued, survives a reload, and goes out when the reply ends', async () => {
+    await withApp({ jevUrl, claudeMode: 'slow' }, async (l) => {
+      const userTexts = async () =>
+        l.page.evaluate(async () => {
+          const s = await window.api.getState();
+          const sess = await window.api.getSession(s.sessions[0]!.id);
+          return { users: sess!.items.filter((i) => i.kind === 'user').map((i) => (i as { text: string }).text), queued: sess!.queued };
+        });
+      const queued = l.page.getByLabel('Queued message');
+      await openSession(l);
+      await send(l, 'first');
+      await until(async () => (await agentItems(l.page))[0]?.status === 'running', 10000, 'the first reply to start');
+      await send(l, 'second');
+      await queued.getByText('Queued. It goes out when the reply ends.').waitFor();
+      await l.page.getByText('A message is already queued. What you send now is added to the end of it.').waitFor();
+      await send(l, 'third');
+      await until(async () => (await userTexts()).queued?.text === 'second\n\nthird', 5000, 'the second send to join the queued one');
+      assert.deepEqual((await userTexts()).users, ['first'], 'nothing queued went into the thread yet');
+      await shot(l.page, 'e2e-queued');
+
+      await queued.getByRole('button', { name: 'Edit' }).click();
+      await queued.getByRole('textbox', { name: 'Edit queued message' }).fill('second, edited');
+      await l.page.keyboard.press('Enter');
+      await until(async () => (await userTexts()).queued?.text === 'second, edited', 5000, 'the edit to reach the main process');
+
+      // The window reloading does not lose it: the main process holds the queue.
+      await l.page.reload();
+      await queued.getByText('second, edited').waitFor();
+
+      await until(async () => (await userTexts()).users.length === 2, 20000, 'the queued message to go out when the reply ended');
+      assert.deepEqual((await userTexts()).users, ['first', 'second, edited']);
+      assert.equal((await userTexts()).queued, undefined);
+      await until(async () => (await agentItems(l.page))[1]?.status === 'running', 10000, 'the second reply to start');
+
+      // Esc still stops the reply. A stopped reply holds the queued message until you decide.
+      await send(l, 'fourth');
+      await queued.waitFor();
+      await l.page.getByRole('textbox', { name: 'Message' }).press('Escape');
+      await queued.getByText('Not sent, because you stopped the reply.').waitFor();
+      assert.equal((await agentItems(l.page))[1]?.status, 'stopped');
+      await queued.getByRole('button', { name: 'Send now' }).click();
+      await until(async () => (await userTexts()).users.at(-1) === 'fourth', 10000, 'Send now to send it');
+
+      await until(async () => (await agentItems(l.page))[2]?.status === 'running', 10000, 'the third reply to start');
+      await send(l, 'never mind');
+      await queued.getByRole('button', { name: 'Remove' }).click();
+      await queued.waitFor({ state: 'detached' });
+      assert.equal((await userTexts()).queued, undefined);
+      await l.page.getByRole('button', { name: 'Stop' }).click();
+      await until(async () => (await agentItems(l.page))[2]?.status === 'stopped', 10000, 'the third reply to stop');
+
+      // A reply that fails holds the queued message too. This claude takes a moment, then fails.
+      const failing = join(l.root, 'failing-claude');
+      writeFileSync(failing, '#!/bin/sh\nsleep 2\necho "no such model" >&2\nexit 1\n');
+      chmodSync(failing, 0o755);
+      await l.page.evaluate(async (bin) => {
+        const s = await window.api.getState();
+        await window.api.saveSettings({ ...s.settings, claudeBin: bin });
+      }, failing);
+      await send(l, 'this one fails');
+      await until(async () => (await agentItems(l.page))[3]?.status === 'running', 10000, 'the failing reply to start');
+      await send(l, 'wait for me');
+      await queued.getByText('Not sent, because the reply failed. Send it, change it, or remove it.').waitFor({ timeout: 15000 });
+      assert.equal((await agentItems(l.page))[3]?.status, 'error');
+      assert.equal((await userTexts()).queued?.text, 'wait for me');
+    });
+  });
+
   test('code blocks in a reply are highlighted, diffs keep their line colours, and each block has a copy button', async () => {
     await withApp({ jevUrl }, async (l) => {
       await openSession(l);

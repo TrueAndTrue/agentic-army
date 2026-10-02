@@ -213,6 +213,11 @@ export interface Session {
     /** codex counts tokens for the whole conversation, so the next turn subtracts this. */
     harnessTokens?: TokenCount;
   };
+  /**
+   * A message sent while the agent was still answering. It goes out when the reply ends. A reply
+   * that failed or was stopped holds it instead, and `held` says which, so you decide what next.
+   */
+  queued?: { text: string; flowId: string | null; ts: string; held?: 'error' | 'stopped' };
   archived?: boolean;
 }
 
@@ -538,6 +543,10 @@ export interface Api {
   deleteSession(id: string): Promise<void>;
   setChat(id: string, chat: Partial<Session['chat']>): Promise<void>;
   send(sessionId: string, text: string, flowId: string | null): Promise<void>;
+  /** Change the queued message, or drop it with null. */
+  editQueued(sessionId: string, text: string | null): Promise<void>;
+  /** Send the queued message now, if the agent is not answering. */
+  sendQueued(sessionId: string): Promise<void>;
   stop(sessionId: string): Promise<void>;
   getRun(id: string): Promise<Run | null>;
   answer(runId: string, questionId: string, approve: boolean, text: string): Promise<void>;

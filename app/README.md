@@ -59,7 +59,15 @@ Each message goes where the picker under the box says:
   confidence it stays a chat.
 - **A flow** runs the flow with your message as its objective.
 
-Stop, next to the send button, stops everything running in the session. Quitting the app while
+A chat message you send while the agent is still answering waits its turn. It shows dimmed at the
+end of the thread, where you can edit or remove it, and goes out when the reply ends. A session
+holds one queued message: sending again while one waits adds the new text to the end of it, and
+the line above the box says so. If the reply fails, or you stop it, the queued message stays put
+with Send now beside it. The main process keeps the queue with the session, so it survives the
+window reloading and the app restarting. A flow, or a slash command, does not wait: it runs beside
+the chat.
+
+Stop, next to the send button, stops everything running in the session (Esc does the same). Quitting the app while
 agents work asks first, then stops them and kills their processes.
 
 ## Starting a flow

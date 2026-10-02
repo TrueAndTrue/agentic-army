@@ -10,6 +10,7 @@ import { basename, resolve } from 'node:path';
 import { flowCommand, jevSteps, MAX_FLOW_DEPTH, mayStart, newId, parseFlowCommand, slug } from '../shared/flow.ts';
 import { fitEffort, mergeCatalog } from '../shared/models.ts';
 import type {
+  AgentStatus,
   AppEvent,
   DiffResult,
   DoctorReport,
@@ -392,11 +393,14 @@ export class Controller {
     if (s === undefined) throw new Error('That session is gone.');
     const body = text.trim();
     if (body === '') return;
+    // `/quick-fix add multiply` runs Quick fix, whatever the picker says.
+    const command = parseFlowCommand(body, this.flows());
+    // A message for the chat while the agent is still answering waits its turn. A flow does not
+    // wait: it runs beside the chat. Auto might pick the chat, so it waits too.
+    if (command === null && (flowId === null || flowId === 'auto') && this.chats.has(s.id)) return this.enqueue(s, body, flowId);
     // The first message names the session, unless you named it already.
     if (s.title === 'New session' && s.items.every((i) => i.kind !== 'user')) s.title = titleFrom(body.replace(/^\/[a-z0-9-]+\s*/i, '') || body);
 
-    // `/quick-fix add multiply` runs Quick fix, whatever the picker says.
-    const command = parseFlowCommand(body, this.flows());
     if (command !== null) {
       this.push(s, { kind: 'user', id: newId('u'), ts: nowIso(), text: body, flowId: command.flow.id });
       if (command.objective === '') return this.notice(s, `Say what "${command.flow.name}" should do after /${flowCommand(command.flow)}.`, 'warn');
@@ -416,6 +420,40 @@ export class Controller {
     const flow = this.flows().find((f) => f.id === target);
     if (flow === undefined) return this.notice(s, 'That flow no longer exists. Pick another one.', 'error');
     await this.startOrSay(s, flow, body, starter);
+  }
+
+  /** One queued message per session: a second send while one waits is added to the end of it. */
+  private enqueue(s: Session, text: string, flowId: string | null): void {
+    s.queued = s.queued === undefined ? { text, flowId, ts: nowIso() } : { text: `${s.queued.text}\n\n${text}`, flowId, ts: s.queued.ts };
+    this.touchSession(s, true);
+  }
+
+  editQueued(sessionId: string, text: string | null): void {
+    const s = this.sessions.get(sessionId);
+    if (s?.queued === undefined) return;
+    if (text === null || text.trim() === '') delete s.queued;
+    else s.queued = { ...s.queued, text: text.trim() };
+    this.touchSession(s, true);
+  }
+
+  async sendQueued(sessionId: string): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    const q = s?.queued;
+    if (s === undefined || q === undefined || this.chats.has(s.id)) return;
+    delete s.queued;
+    this.touchSession(s, true);
+    await this.send(s.id, q.text, q.flowId);
+  }
+
+  /** The reply ended: send what was queued, unless the reply failed or you stopped it. Then it waits for you. */
+  private afterReply(s: Session, status: AgentStatus): void {
+    if (s.queued === undefined || !this.sessions.has(s.id)) return;
+    if (status === 'done') {
+      void this.sendQueued(s.id).catch((err: unknown) => console.error(err));
+      return;
+    }
+    s.queued.held = status === 'error' ? 'error' : 'stopped';
+    this.touchSession(s, true);
   }
 
   private async startOrSay(s: Session, flow: Flow, objective: string, by: RunStarter): Promise<void> {
@@ -583,6 +621,7 @@ export class Controller {
       tools?.close();
       this.chats.delete(s.id);
       this.touchSession(s, true);
+      this.afterReply(s, item.status);
     }
   }
 

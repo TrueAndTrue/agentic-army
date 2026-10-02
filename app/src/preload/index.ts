@@ -17,6 +17,8 @@ const api: Api = {
   deleteSession: call('deleteSession') as Api['deleteSession'],
   setChat: call('setChat') as Api['setChat'],
   send: call('send') as Api['send'],
+  editQueued: call('editQueued') as Api['editQueued'],
+  sendQueued: call('sendQueued') as Api['sendQueued'],
   stop: call('stop') as Api['stop'],
   getRun: call('getRun') as Api['getRun'],
   answer: call('answer') as Api['answer'],

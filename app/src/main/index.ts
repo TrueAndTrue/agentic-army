@@ -141,6 +141,8 @@ void app.whenReady().then(async () => {
     // The reply streams back as events; the call itself returns as soon as the work is queued.
     void c.send(id, text, flowId).catch((err: unknown) => console.error(err));
   });
+  handle('editQueued', (id: string, text: string | null) => c.editQueued(id, text));
+  handle('sendQueued', (id: string) => c.sendQueued(id));
   handle('stop', (id: string) => c.stop(id));
   handle('getRun', (id: string) => c.getRun(id));
   handle('answer', (runId: string, qid: string, approve: boolean, text: string) => c.answer(runId, qid, approve, text));
