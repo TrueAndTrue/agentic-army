@@ -2,10 +2,12 @@ import { CheckCircle2, CircleAlert, Plus, RefreshCw, Trash2 } from 'lucide-react
 import { useEffect, useState } from 'react';
 
 import { effortsFor, fitEffort } from '../../../shared/models.ts';
-import { AGENT_ROLES, INVOKE_INFO, INVOKE_LEVELS, ROLE_INFO, type Harness, type InvokeLevel, type Settings, type StageDefault } from '../../../shared/types.ts';
+import { AGENT_ROLES, INVOKE_INFO, INVOKE_LEVELS, ROLE_INFO, SAVED_KEY, type Harness, type InvokeLevel, type Settings, type StageDefault } from '../../../shared/types.ts';
 import { DEFAULT_INVOKE_CEILING } from '../../../shared/flow.ts';
 import { ROLE_COLOR } from '../lib/format.ts';
 import { api, checkMachine, useStore } from '../lib/state.ts';
+import { Diagnostics } from './Diagnostics.tsx';
+import { SecretInput } from './SecretInput.tsx';
 import { Button, EffortOptions, Field, IconButton, Input, ModelOptions, Select } from './ui.tsx';
 import { UpdatesPanel } from './Updates.tsx';
 
@@ -111,7 +113,7 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, reads web searches for agents, and drives and guards the browser step. Every built-in flow uses it. The keys stay on this machine.">
+          <Section id="jev" title="Jev" note="TypeSafe's Jev answers the decision steps in flows, picks a flow in Auto, reads web searches for agents, and drives and guards the browser step. Every built-in flow uses it. The keys stay on this Mac, encrypted with a key macOS keeps in your Keychain.">
             <div className="space-y-3">
               <Field
                 label="TypeSafe API key"
@@ -125,7 +127,7 @@ export function SettingsView() {
                   </>
                 }
               >
-                <Input type="password" autoComplete="off" value={s.typesafe.apiKey} placeholder="Paste a key" onChange={(e) => setS({ ...s, typesafe: { ...s.typesafe, apiKey: e.target.value } })} />
+                <SecretInput label="TypeSafe API key" value={s.typesafe.apiKey} wasSaved={saved?.typesafe.apiKey === SAVED_KEY} placeholder="Paste a key" onChange={(v) => setS({ ...s, typesafe: { ...s.typesafe, apiKey: v } })} />
               </Field>
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Model">
@@ -158,7 +160,7 @@ export function SettingsView() {
                   </>
                 }
               >
-                <Input type="password" autoComplete="off" value={s.braveApiKey ?? ''} placeholder="Leave empty to use the public pages" onChange={(e) => setS({ ...s, braveApiKey: e.target.value })} />
+                <SecretInput label="Brave Search API key" value={s.braveApiKey} wasSaved={saved?.braveApiKey === SAVED_KEY} placeholder="Leave empty to use the public pages" onChange={(v) => setS({ ...s, braveApiKey: v })} />
               </Field>
             </div>
           </Section>
@@ -262,17 +264,22 @@ export function SettingsView() {
 
 
 
-          <Section title="Permissions" note="Every agent gets its role's tools and nothing more, and every role is denied your credentials and destructive commands. This setting decides how tightly the shell is scoped.">
-            <div className="space-y-2">
+          <Section
+            id="permissions"
+            title="Permissions"
+            note="Every agent gets its role's tools and nothing more. Every role is denied your credentials (~/.ssh, ~/.aws, .env files) and commands like npm publish and force pushes. A run works on its own branch, and your checkout changes only when you merge. This setting decides how far an agent's shell reaches."
+          >
+            <div className="space-y-3">
               {(['unguarded', 'guarded'] as const).map((p) => (
                 <label key={p} className="flex cursor-pointer items-start gap-2.5 text-[13px]">
-                  <input type="radio" className="mt-1 accent-[var(--brass)]" checked={s.posture === p} onChange={() => setS({ ...s, posture: p })} />
+                  <input type="radio" name="posture" className="mt-1 accent-[var(--brass)]" checked={s.posture === p} onChange={() => setS({ ...s, posture: p })} />
                   <span>
                     <span className="font-medium">{p === 'unguarded' ? 'Any shell command in the role' : 'Only listed shell commands'}</span>
-                    <span className="block text-[12px] text-muted">
+                    {p === 'unguarded' && <span className="ml-1.5 text-[11.5px] text-faint">the default</span>}
+                    <span className="block max-w-[620px] text-[12px] leading-relaxed text-muted">
                       {p === 'unguarded'
-                        ? 'An engineer may run any command; the deny list and write boundaries still hold. Best for real work.'
-                        : 'Every command must match the role’s allow list exactly. Safer, and some test runners will be refused.'}
+                        ? "Engineers and chats can install packages and run any command, and codex agents can use the network, so a codex reviewer can run tests that start a local server. Nothing sandboxes the shell: a claude agent's commands run with your access to this Mac. Use it in projects you would let a colleague work in."
+                        : "The shell runs only each role's listed commands: git, and the usual test, build and lint commands. codex agents get no network. An engineer cannot run npm install or a node script, and a codex reviewer fails any test that opens a port, so the built-in flows stop more often. It catches mistakes more than it stops a determined agent: npm test still runs whatever the project's test script says."}
                     </span>
                   </span>
                 </label>
@@ -300,6 +307,13 @@ export function SettingsView() {
 
           <Section id="updates" title="Updates" note="The app checks GitHub for a new version when it starts and every six hours, and downloads it in the background. It installs when you restart.">
             <UpdatesPanel />
+          </Section>
+          <Section
+            id="diagnostics"
+            title="Diagnostics"
+            note="When something goes wrong, copy this and send it to whoever is helping you. It has the app's and this Mac's versions, what the machine check found, counts of your projects and runs, and the end of the app's log. It never includes your keys, your messages or your files."
+          >
+            <Diagnostics />
           </Section>
         </div>
       </div>

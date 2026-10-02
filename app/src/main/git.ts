@@ -130,18 +130,61 @@ export async function runDiff(run: Run, projectPath: string): Promise<DiffResult
   return { stat: stat.replace(/^\n+/, '').trimEnd(), patch: truncated ? patch.slice(0, PATCH_LIMIT) : patch, truncated };
 }
 
-/** Merge the run's branch into the branch it was cut from, in the project checkout. */
-export async function mergeRun(run: Run, projectPath: string, message: string): Promise<{ ok: boolean; message: string }> {
-  if (run.branch === undefined) return { ok: false, message: 'This run changed no files, so there is nothing to merge.' };
+/**
+ * Commit what the run left in its worktree, then say why the branch cannot merge into your
+ * checkout right now, or null when it can. Returns the branch your checkout is on.
+ */
+async function readyToMerge(run: Run, projectPath: string, message: string): Promise<{ blocked: string } | { current: string | null }> {
+  if (run.branch === undefined) return { blocked: 'This run changed no files, so there is nothing to merge.' };
   if (run.worktreePath !== undefined && existsSync(run.worktreePath)) {
     await commitAll(run.worktreePath, message);
   }
   const current = await currentBranch(projectPath);
   if (run.baseRef !== undefined && current !== run.baseRef) {
-    return { ok: false, message: `Your checkout is on ${current ?? 'a detached HEAD'}, and this run branched from ${run.baseRef}. Switch back to ${run.baseRef} to merge.` };
+    return { blocked: `Your checkout is on ${current ?? 'a detached HEAD'}, and this run branched from ${run.baseRef}. Switch back to ${run.baseRef} to merge.` };
   }
   const dirty = (await git(['status', '--porcelain', '--untracked-files=no'], projectPath)).stdout.trim();
-  if (dirty !== '') return { ok: false, message: `Your checkout has uncommitted changes. Commit or stash them, then merge.` };
+  if (dirty !== '') return { blocked: `Your checkout has uncommitted changes. Commit or stash them, then merge.` };
+  return { current };
+}
+
+export interface MergePreview {
+  branch: string;
+  into: string;
+  /** Commits on the run branch that your branch does not have. */
+  commits: number;
+  stat: string;
+}
+
+/** What a merge of this run would bring into your checkout, or why it cannot merge. */
+export async function mergePreview(run: Run, projectPath: string, message: string): Promise<{ blocked: string } | MergePreview> {
+  const ready = await readyToMerge(run, projectPath, message);
+  if ('blocked' in ready) return ready;
+  const branch = run.branch!;
+  const into = ready.current ?? 'HEAD';
+  const count = await git(['rev-list', '--count', `${into}..${branch}`], projectPath);
+  const stat = await git(['diff', '--stat', `${into}...${branch}`], projectPath);
+  return { branch, into, commits: Number(count.stdout.trim()) || 0, stat: stat.stdout.replace(/^\n+/, '').trimEnd() };
+}
+
+/** The approval card for a merge, as Markdown. */
+export function mergeQuestion(p: MergePreview): { title: string; body: string } {
+  const commits = `${String(p.commits)} ${p.commits === 1 ? 'commit' : 'commits'}`;
+  return {
+    title: `Merge ${p.branch} into ${p.into}?`,
+    body:
+      `Merging brings ${commits} from \`${p.branch}\` into \`${p.into}\`, in your project folder.\n\n` +
+      (p.stat === '' ? '' : `\`\`\`\n${p.stat}\n\`\`\`\n\n`) +
+      'Merge brings it into your checkout now. Do not merge leaves your checkout as it is, and the work stays on the branch.',
+  };
+}
+
+/** Merge the run's branch into the branch it was cut from, in the project checkout. */
+export async function mergeRun(run: Run, projectPath: string, message: string): Promise<{ ok: boolean; message: string }> {
+  const ready = await readyToMerge(run, projectPath, message);
+  if ('blocked' in ready) return { ok: false, message: ready.blocked };
+  const current = ready.current;
+  if (run.branch === undefined) return { ok: false, message: 'This run changed no files, so there is nothing to merge.' };
   const r = await git(['merge', '--no-ff', '-m', message, run.branch], projectPath);
   if (r.code !== 0) {
     await git(['merge', '--abort'], projectPath);
@@ -157,8 +200,11 @@ export async function mergeRun(run: Run, projectPath: string, message: string): 
   return { ok: true, message: `Merged ${run.branch} into ${current ?? 'HEAD'}.` };
 }
 
-/** The Git node. */
-export async function gitNode(run: Run, config: GitConfig, message: string, projectPath: string): Promise<{ ok: boolean; output: string }> {
+/**
+ * The Git node. With `ask`, a merge shows what it would bring in and waits for your answer; a merge
+ * that cannot happen, or that brings in nothing, does not ask.
+ */
+export async function gitNode(run: Run, config: GitConfig, message: string, projectPath: string, ask?: (title: string, body: string) => Promise<boolean>): Promise<{ ok: boolean; output: string }> {
   if (run.worktreePath === undefined || !existsSync(run.worktreePath)) {
     return { ok: false, output: 'No node has written to the run workspace yet, so there is nothing for git to act on.' };
   }
@@ -170,6 +216,14 @@ export async function gitNode(run: Run, config: GitConfig, message: string, proj
     if (config.action === 'commit') {
       const made = await commitAll(run.worktreePath, message);
       return { ok: true, output: made ? `Committed on ${run.branch ?? 'the run branch'}: ${message}` : 'Nothing to commit.' };
+    }
+    if (ask !== undefined) {
+      const preview = await mergePreview(run, projectPath, message);
+      if ('blocked' in preview) return { ok: false, output: preview.blocked };
+      if (preview.commits > 0) {
+        const q = mergeQuestion(preview);
+        if (!(await ask(q.title, q.body))) return { ok: false, output: `You did not merge. Your checkout is as it was, and the work stays on ${preview.branch}.` };
+      }
     }
     const res = await mergeRun(run, projectPath, message);
     return { ok: res.ok, output: res.message };

@@ -24,13 +24,15 @@ import type {
   SessionSummary,
   Settings,
 } from '../shared/types.ts';
-import { killAllAgents, runAgent } from './agents.ts';
+import { SAVED_KEY } from '../shared/types.ts';
+import { findBin, killAllAgents, runAgent } from './agents.ts';
 import { pilot, type Page } from './browser/pilot.ts';
 import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/engine.ts';
 import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, projectHealth, runDiff, runShell, setUpGit } from './git.ts';
 import type { FlowBridge, ToolCaller, ToolDescription, ToolHandler } from './flowTools.ts';
 import { formatAnswer, webRead, webSearch, type WebDeps } from './websearch.ts';
 import { askJev, judge } from './jev.ts';
+import { log, logFile, redact } from './log.ts';
 import { modelCatalog } from './models.ts';
 import { Store } from './store.ts';
 import { BUILTIN_FLOWS } from './templates.ts';
@@ -47,6 +49,7 @@ export interface ControllerOptions {
 }
 
 const nowIso = () => new Date().toISOString();
+const errMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
 const TITLE_CHARS = 60;
 /** Runs an agent may have going at once in one session, so a loop of requests cannot fan out. */
 const MAX_AGENT_RUNS = 3;
@@ -134,7 +137,8 @@ export class Controller {
 
   constructor(opts: ControllerOptions) {
     this.store = opts.store;
-    this.emitRaw = opts.emit;
+    // Every settings event goes out with its keys masked; see forWindow.
+    this.emitRaw = (e) => opts.emit(e.type === 'settings' ? { ...e, settings: this.forWindow(e.settings) } : e);
     this.openPage = opts.openPage;
     this.webFetch = opts.fetch;
     this.settings = this.store.loadSettings();
@@ -202,7 +206,24 @@ export class Controller {
   }
 
   getState() {
-    return { projects: this.projectList(), sessions: this.summaries(), flows: this.flows(), settings: this.settings };
+    return { projects: this.projectList(), sessions: this.summaries(), flows: this.flows(), settings: this.forWindow(this.settings) };
+  }
+
+  /**
+   * Settings as the window gets them: each saved key is `SAVED_KEY`, never the key. The window
+   * only shows whether there is one, and Jev is tested from here, so it never needs the value,
+   * and a renderer bug or a devtools console cannot read it back out.
+   */
+  forWindow(s: Settings): Settings {
+    const mask = (k: string | undefined) => (k === undefined || k.trim() === '' ? k : SAVED_KEY);
+    const out: Settings = { ...s, typesafe: { ...s.typesafe, apiKey: mask(s.typesafe.apiKey) ?? '' } };
+    if (s.braveApiKey !== undefined) out.braveApiKey = mask(s.braveApiKey);
+    return out;
+  }
+
+  /** The keys this app holds, for the log to redact. */
+  secrets(): string[] {
+    return [this.settings.typesafe.apiKey, this.settings.braveApiKey ?? ''].filter((k) => k.trim() !== '');
   }
 
   /** The projects, each marked when its folder has gone. */
@@ -438,6 +459,7 @@ export class Controller {
       this.notice(s, `Jev sent this to "${flows.find((f) => f.id === pick)?.name ?? pick}" with confidence ${conf.toFixed(2)}.`);
       return { flowId: pick, confidence: conf };
     } catch (err) {
+      log.warn(`Jev could not route a message in Auto: ${errMessage(err)}`);
       this.notice(s, `Jev could not route this (${err instanceof Error ? err.message : String(err)}). Answering as a chat.`, 'warn');
       return null;
     }
@@ -514,9 +536,11 @@ export class Controller {
       }
       if (res.harnessTokens !== undefined) s.chat.harnessTokens = res.harnessTokens;
       else delete s.chat.harnessTokens;
+      if (item.status === 'error') log.warn(`A chat on ${model.label} (${model.harness}) ended with an error: ${item.error ?? 'no message'}`);
     } catch (err) {
       item.status = 'error';
       item.error = err instanceof Error ? err.message : String(err);
+      log.error(`A chat on ${model.label} (${model.harness}) could not run`, err);
     } finally {
       tools?.close();
       this.chats.delete(s.id);
@@ -587,14 +611,8 @@ export class Controller {
     const key = apiKey.trim();
     if (key === '') return { ok: false, message: 'Paste the key first.' };
     // A key already saved elsewhere, say from Settings in the meantime, is kept unless this one works.
-    const before = this.settings.typesafe.apiKey;
-    this.settings = { ...this.settings, typesafe: { ...this.settings.typesafe, apiKey: key } };
-    const test = await this.testJev();
-    if (!test.ok) {
-      this.settings = { ...this.settings, typesafe: { ...this.settings.typesafe, apiKey: before } };
-      return { ok: false, message: test.detail.replace(/ Paste a working key in Settings under Jev\.$/, '') };
-    }
-    this.saveSettings(this.settings);
+    const test = await this.setJevKey(key);
+    if (!test.ok) return { ok: false, message: test.detail.replace(/ Paste a working key in Settings under Jev\.$/, '') };
     const flow = this.flows().find((f) => f.id === item.flowId);
     if (flow === undefined) {
       item.status = 'dismissed';
@@ -642,12 +660,18 @@ export class Controller {
     const handle = startRun(run, this.engineDeps(s, project), (r) => this.touchRun(r));
     this.handles.set(run.id, handle);
     this.touchRun(run);
+    log.info(`Run ${run.id} started: "${flow.name}", by ${by.kind}.`);
     void handle.done.then(async (r) => {
+      const secs = Math.round((Date.parse(r.endedAt ?? nowIso()) - Date.parse(r.startedAt)) / 1000);
+      const line = `Run ${r.id} ("${r.flowName}") ended ${r.status} after ${String(secs)} s${r.error === undefined ? '.' : `: ${r.error}`}`;
+      if (r.status === 'failed') log.warn(line);
+      else log.info(line);
       this.handles.delete(r.id);
       this.workspaces.delete(r.id);
       try {
         await finalizeWorkspace(r, project.path);
       } catch (err) {
+        log.error(`Run ${r.id}: the worktree could not be cleaned up`, err);
         this.notice(s, `The run finished, but its worktree could not be cleaned up: ${err instanceof Error ? err.message : String(err)}`, 'warn');
       }
       if (by.kind === 'agent') {
@@ -795,6 +819,7 @@ export class Controller {
       if (str('query') === '') return { text: 'Give the search words in query.', isError: true };
       return { text: formatAnswer(await webSearch(str('query'), str('question') || str('query'), deps)) };
     } catch (err) {
+      log.warn(`${name} failed for an agent: ${errMessage(err)}`);
       return { text: err instanceof Error ? err.message : String(err), isError: true };
     }
   }
@@ -862,7 +887,7 @@ export class Controller {
         const web = cfg.web ?? cfg.role === 'scout';
         const tools = web && this.jevWeb() && this.bridge !== null ? this.bridge.open({ sessionId: s.id, model: model.label, flows: false, web: true, signal: req.signal }) : null;
         try {
-          return await runAgent({
+          const res = await runAgent({
             harness: model.harness,
             model: model.model,
             effort: fitEffort(model, cfg.effort ?? stage.effort),
@@ -879,13 +904,23 @@ export class Controller {
             signal: req.signal,
             onTurn: req.onTurn,
           });
+          if (res.turn.status === 'error') log.warn(`Run ${req.run.id}: "${cfg.label}" on ${model.label} (${model.harness}) ended with an error: ${res.turn.error ?? 'no message'}`);
+          return res;
+        } catch (err) {
+          log.error(`Run ${req.run.id}: "${cfg.label}" on ${model.label} (${model.harness}) could not run`, err);
+          throw err;
         } finally {
           tools?.close();
         }
       },
       search: async (req) => {
-        const a = await webSearch(req.query, req.question, { ...this.webDeps(), signal: req.signal, onProgress: req.onProgress });
-        return { output: formatAnswer(a), answered: a.answered, model: a.model, latencyMs: a.jevMs };
+        try {
+          const a = await webSearch(req.query, req.question, { ...this.webDeps(), signal: req.signal, onProgress: req.onProgress });
+          return { output: formatAnswer(a), answered: a.answered, model: a.model, latencyMs: a.jevMs };
+        } catch (err) {
+          if (!req.signal.aborted) log.warn(`A web search step failed: ${errMessage(err)}`);
+          throw err;
+        }
       },
       subflow: async (req) => {
         const flow = this.flows().find((f) => f.id === req.node.data.flowId);
@@ -912,6 +947,7 @@ export class Controller {
         try {
           return await judge(this.settings.typesafe, req.config, req.question, req.state, req.signal);
         } catch (err) {
+          if (!req.signal.aborted) log.warn(`Jev could not answer a decision step: ${errMessage(err)}`);
           // The next flow checks the key again instead of trusting an earlier yes.
           if ((err as { setup?: unknown }).setup === true) this.jevKnown = null;
           throw err;
@@ -919,7 +955,7 @@ export class Controller {
       },
 
       shell: (req) => runShell(req.command, req.cwd, req.timeoutMs, req.signal),
-      git: (req) => gitNode(req.run, req.config, req.message, project.path),
+      git: (req) => gitNode(req.run, req.config, req.message, project.path, req.ask),
       browser: async (req) => {
         const page = this.openPage(req.config.showWindow);
         try {
@@ -995,11 +1031,36 @@ export class Controller {
     this.emitRaw({ type: 'flows', flows: this.flows() });
   }
 
+  /** Save settings from the window. A key sent back as `SAVED_KEY` is the saved key, unchanged. */
   saveSettings(next: Settings): Settings {
-    this.settings = next;
-    this.store.saveSettings(next);
-    this.emitRaw({ type: 'settings', settings: next });
-    return next;
+    const keep = (sent: string | undefined, saved: string | undefined) => (sent === SAVED_KEY ? saved : sent);
+    const merged: Settings = { ...next, typesafe: { ...next.typesafe, apiKey: keep(next.typesafe.apiKey, this.settings.typesafe.apiKey) ?? '' } };
+    const brave = keep(next.braveApiKey, this.settings.braveApiKey);
+    if (brave === undefined) delete merged.braveApiKey;
+    else merged.braveApiKey = brave;
+    if (merged.posture !== this.settings.posture) log.info(`Permissions set to ${merged.posture}.`);
+    this.settings = merged;
+    this.store.saveSettings(merged);
+    this.emitRaw({ type: 'settings', settings: merged });
+    return this.forWindow(merged);
+  }
+
+  /**
+   * Check a key with one small question and keep it only if TypeSafe takes it. A key already saved
+   * stays in place until the new one works.
+   */
+  async setJevKey(apiKey: string): Promise<{ ok: boolean; detail: string }> {
+    const key = apiKey.trim();
+    if (key === '') return { ok: false, detail: 'Paste the key first.' };
+    const before = this.settings.typesafe.apiKey;
+    this.settings = { ...this.settings, typesafe: { ...this.settings.typesafe, apiKey: key } };
+    const test = await this.testJev();
+    if (!test.ok) {
+      this.settings = { ...this.settings, typesafe: { ...this.settings.typesafe, apiKey: before } };
+      return test;
+    }
+    this.saveSettings(this.settings);
+    return test;
   }
 
   /** Add the models claude and codex list that you have not been offered yet. */
@@ -1014,7 +1075,7 @@ export class Controller {
   refreshModels(): { settings: Settings; added: string[] } {
     const added = this.addListedModels();
     this.emitRaw({ type: 'settings', settings: this.settings });
-    return { settings: this.settings, added };
+    return { settings: this.forWindow(this.settings), added };
   }
 
   async doctor(): Promise<DoctorReport> {
@@ -1044,9 +1105,45 @@ export class Controller {
       return { ok: true, detail };
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
+      // No key at all is the normal first run, checked on every visit to Home; only a real failure is news.
+      if (key !== '') log.warn(`Jev check failed: ${detail}`);
       this.jevKnown = { key, ok: false, setup: (err as { setup?: unknown }).setup === true, detail };
       return { ok: false, detail };
     }
+  }
+
+  /**
+   * The report "Copy diagnostics" puts on the clipboard, for someone helping you. It says what the
+   * app and this Mac are, what it found, and what went wrong lately. It never holds a key, a
+   * prompt, a reply or a file's contents: the log never had them, and both halves are redacted
+   * again here in case a key turned up in an error message.
+   */
+  async diagnostics(about: string[]): Promise<string> {
+    const doc = await this.doctor();
+    const bin = (h: 'claude' | 'codex') => findBin(h, this.settings) ?? 'not found';
+    const key = this.settings.typesafe.apiKey.trim();
+    const runs = [...this.runs.values()];
+    const lines = [
+      'Agentic Army diagnostics',
+      `Made ${nowIso()}`,
+      '',
+      ...about,
+      '',
+      `claude: ${doc.claude.ok ? doc.claude.detail : 'not working'} at ${bin('claude')}${doc.claude.ok ? '' : ` (${doc.claude.detail})`}`,
+      `codex: ${doc.codex.ok ? doc.codex.detail : 'not working'} at ${bin('codex')}${doc.codex.ok ? '' : ` (${doc.codex.detail})`}`,
+      `git: ${doc.git.detail}`,
+      `TypeSafe key: ${key === '' ? 'not set' : doc.typesafe.ok ? 'set, and it works' : `set, and it does not work (${doc.typesafe.detail})`}`,
+      `Jev model: ${this.settings.typesafe.model} at ${this.settings.typesafe.baseUrl}`,
+      `Brave Search key: ${(this.settings.braveApiKey ?? '').trim() === '' ? 'not set' : 'set'}`,
+      `Permissions: ${this.settings.posture}`,
+      `Models: ${String(this.settings.models.length)}`,
+      `Projects: ${String(this.projects.length)}, sessions: ${String(this.sessions.size)}, runs: ${String(runs.length)} (${String(runs.filter((r) => r.status === 'failed').length)} failed)`,
+      `Running now: ${String(this.chats.size)} chats, ${String(this.handles.size)} runs`,
+      '',
+      'The last 200 lines of the log:',
+      ...(logFile()?.tail(200) ?? ['(no log file)']),
+    ];
+    return redact(lines.join('\n'), this.secrets());
   }
 
   /** Stop everything and write what is pending. */

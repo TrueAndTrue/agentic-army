@@ -381,3 +381,100 @@ describe('the flows that ship with the app', async () => {
     assert.match(done.result ?? '', /^Finished on branch army\/run-x\./);
   });
 });
+
+describe('a Git merge asks first', () => {
+  /** A fake git that asks when the engine hands it `ask`, the way the real one does after its preview. */
+  function asking(seen: { asked: number }): Partial<EngineDeps> {
+    return {
+      async git({ config, ask }) {
+        if (config.action === 'merge' && ask !== undefined) {
+          seen.asked += 1;
+          if (!(await ask('Merge army/run-x into main?', 'Merging brings 1 commit.'))) return { ok: false, output: 'You did not merge.' };
+        }
+        return { ok: true, output: 'Merged.' };
+      },
+    };
+  }
+
+  async function waitForQuestion(r: Run): Promise<void> {
+    while (r.pending.length === 0) await new Promise((res) => setTimeout(res, 1));
+  }
+
+  test('by default the run waits with a merge question, and a refusal leaves by fail', async () => {
+    const seen = { asked: 0 };
+    const f = flow(
+      [node('start', 'start'), node('merge', 'git', { action: 'merge' }), node('end', 'end', { template: 'merged' }), node('kept', 'end', { template: 'not merged', outcome: 'stopped' })],
+      [edge('start', 'out', 'merge'), edge('merge', 'out', 'end'), edge('merge', 'fail', 'kept')],
+    );
+    const r = createRun({ id: 'r1', flow: f, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(asking(seen)), () => {});
+    await waitForQuestion(r);
+    assert.equal(r.status, 'waiting');
+    assert.equal(r.pending[0]?.kind, 'merge');
+    assert.equal(r.pending[0]?.title, 'Merge army/run-x into main?');
+    handle.answer(r.pending[0]!.id, false, '');
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(done.result, 'not merged');
+    assert.equal(seen.asked, 1);
+  });
+
+  test('a flow saved before the setting existed asks too', async () => {
+    const seen = { asked: 0 };
+    const old = node('merge', 'git', { action: 'merge' });
+    delete (old.data as { askBeforeMerge?: boolean }).askBeforeMerge;
+    const r = createRun({ id: 'r1', flow: flow([node('start', 'start'), old, node('end', 'end')], [edge('start', 'out', 'merge'), edge('merge', 'out', 'end')]), sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(asking(seen)), () => {});
+    await waitForQuestion(r);
+    handle.answer(r.pending[0]!.id, true, '');
+    assert.equal((await handle.done).status, 'succeeded');
+    assert.equal(seen.asked, 1);
+  });
+
+  test('it does not ask right after your approval, or when the node opts out', async () => {
+    const seen = { asked: 0 };
+    const approved = flow(
+      [node('start', 'start'), node('ok', 'human', { prompt: 'Ship it?' }), node('merge', 'git', { action: 'merge' }), node('end', 'end')],
+      [edge('start', 'out', 'ok'), edge('ok', 'approve', 'merge'), edge('merge', 'out', 'end')],
+    );
+    const r = createRun({ id: 'r1', flow: approved, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(asking(seen)), () => {});
+    await waitForQuestion(r);
+    assert.equal(r.pending[0]?.kind, 'approve');
+    handle.answer(r.pending[0]!.id, true, '');
+    assert.equal((await handle.done).status, 'succeeded');
+    assert.equal(seen.asked, 0, 'one approval, not two in a row');
+
+    const optedOut = flow([node('start', 'start'), node('merge', 'git', { action: 'merge', askBeforeMerge: false }), node('end', 'end')], [edge('start', 'out', 'merge'), edge('merge', 'out', 'end')]);
+    assert.equal((await run(optedOut, deps(asking(seen)))).status, 'succeeded');
+    assert.equal(seen.asked, 0);
+
+    // A commit is not a merge, and never asks.
+    const commit = flow([node('start', 'start'), node('c', 'git', { action: 'commit' }), node('end', 'end')], [edge('start', 'out', 'c'), edge('c', 'out', 'end')]);
+    assert.equal((await run(commit, deps(asking(seen)))).status, 'succeeded');
+    assert.equal(seen.asked, 0);
+  });
+
+  test('stopping the run while the merge question waits stops it without merging', async () => {
+    let merged = false;
+    const f = flow([node('start', 'start'), node('merge', 'git', { action: 'merge' }), node('end', 'end')], [edge('start', 'out', 'merge'), edge('merge', 'out', 'end')]);
+    const r = createRun({ id: 'r1', flow: f, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(
+      r,
+      deps({
+        async git({ ask }) {
+          if (ask !== undefined && !(await ask('Merge?', ''))) return { ok: false, output: 'You did not merge.' };
+          merged = true;
+          return { ok: true, output: 'Merged.' };
+        },
+      }),
+      () => {},
+    );
+    await waitForQuestion(r);
+    handle.stop();
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(merged, false);
+    assert.equal(done.nodes['merge']?.status, 'stopped');
+  });
+});

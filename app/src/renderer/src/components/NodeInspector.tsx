@@ -228,7 +228,16 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
             </Select>
           </Field>
           {d.action !== 'diff' && <PromptField label="Commit message" value={d.message} onChange={(v) => s({ message: v })} flow={flow} self={node.id} rows={2} />}
-          {d.action === 'merge' && <p className="text-[12px] text-warn">This changes your checkout without asking. Put an approval before it if you want to look first.</p>}
+          {d.action === 'merge' && (
+            <>
+              <Toggle checked={d.askBeforeMerge !== false} onChange={(v) => s({ askBeforeMerge: v })} label="Ask me before merging" />
+              <p className={cx('text-[12px]', d.askBeforeMerge === false ? 'text-warn' : 'text-muted')}>
+                {d.askBeforeMerge === false
+                  ? 'This merges into your checkout without asking.'
+                  : 'The run pauses and shows the branch, the commits and the files that would change. Right after one of your approvals it does not ask again.'}
+              </p>
+            </>
+          )}
         </>
       );
       break;

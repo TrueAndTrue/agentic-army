@@ -18,6 +18,8 @@ const FIXTURES = resolve(APP, '../test/fixtures');
 export interface JevCall {
   state: unknown;
   questions: Record<string, { type: string; criteria?: unknown }>;
+  /** The Authorization header the app sent. */
+  auth?: string;
 }
 
 /** Answers every noul with `noul`, every choice with `choice(criteria)`, every score with 2. */
@@ -33,7 +35,7 @@ export function fakeJev(opts: { noul?: (id: string) => number; choice?: (id: str
         return;
       }
       const parsed = JSON.parse(body) as JevCall;
-      calls.push(parsed);
+      calls.push({ ...parsed, auth: req.headers.authorization ?? '' });
       const answers: Record<string, unknown> = {};
       for (const [id, q] of Object.entries(parsed.questions)) {
         if (q.type === 'noul') answers[id] = { type: 'noul', noul: opts.noul?.(id) ?? 0.9 };
@@ -112,11 +114,13 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
     cwd: APP,
     env:
       opts.live === true
-        ? { ...process.env, ARMY_APP_HOME: home, ARMY_APP_NO_QUIT_CONFIRM: '1', ...hidden, ...(opts.env ?? {}) }
+        ? { ...process.env, ARMY_APP_HOME: home, ARMY_APP_NO_QUIT_CONFIRM: '1', ARMY_APP_MOCK_KEYCHAIN: '1', ...hidden, ...(opts.env ?? {}) }
         : {
             ...process.env,
             ARMY_APP_HOME: home,
             ARMY_APP_NO_QUIT_CONFIRM: '1',
+            // Keys are encrypted with Chromium's stand-in Keychain, never your login Keychain.
+            ARMY_APP_MOCK_KEYCHAIN: '1',
             ...hidden,
             // The army's own home (config, archive) goes somewhere throwaway too.
             AGENTIC_ARMY_HOME: join(root, 'army-home'),

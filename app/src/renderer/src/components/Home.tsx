@@ -40,13 +40,9 @@ function JevKey() {
         e.preventDefault();
         setBusy(true);
         setError(null);
-        const before = settings.typesafe.apiKey;
-        await api().saveSettings({ ...settings, typesafe: { ...settings.typesafe, apiKey: key.trim() } });
-        const r = await api().testJev();
-        if (!r.ok) {
-          await api().saveSettings({ ...settings, typesafe: { ...settings.typesafe, apiKey: before } });
-          setError(r.detail.replace(/ Paste a working key in Settings under Jev\.$/, ''));
-        }
+        // The main process tests the key and keeps it only if it works; the window never holds a saved key.
+        const r = await api().setJevKey(key);
+        if (!r.ok) setError(r.detail.replace(/ Paste a working key in Settings under Jev\.$/, ''));
         await checkMachine(true);
         setBusy(false);
       }}

@@ -72,7 +72,11 @@ export interface EngineDeps {
   agent(req: AgentRequest): Promise<AgentResult>;
   judge(req: { config: DecideConfig; question: string; state: string; signal: AbortSignal }): Promise<Judgment>;
   shell(req: { command: string; cwd: string; timeoutMs: number; signal: AbortSignal }): Promise<{ code: number | null; output: string }>;
-  git(req: { run: Run; config: GitConfig; message: string; signal: AbortSignal }): Promise<{ ok: boolean; output: string }>;
+  /**
+   * `ask` is set when a merge must be approved first: the git side shows what would merge and
+   * resolves false on a refusal or a stop, the same way the browser guard asks.
+   */
+  git(req: { run: Run; config: GitConfig; message: string; signal: AbortSignal; ask?: (title: string, body: string) => Promise<boolean> }): Promise<{ ok: boolean; output: string }>;
   browser(req: BrowserRequest): Promise<{ ok: boolean; output: string }>;
   /** Search the web, with Jev picking the pages and the passages. */
   search(req: { query: string; question: string; signal: AbortSignal; onProgress(line: string): void }): Promise<SearchResult>;
@@ -219,7 +223,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
   const cwdFor = async (workspace: 'run' | 'project') =>
     workspace === 'project' ? deps.projectPath : await deps.workspace(run);
 
-  async function execute(node: FlowNode, input: string, visit: NodeVisit): Promise<Outcome> {
+  async function execute(node: FlowNode, input: string, visit: NodeVisit, from?: Activation['from']): Promise<Outcome> {
     const ctx = context(input, visit.n);
     switch (node.type) {
       case 'start':
@@ -305,7 +309,19 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
 
       case 'git': {
         const message = renderTemplate(node.data.message, ctx);
-        const res = await deps.git({ run, config: node.data, message, signal });
+        // A merge changes your checkout, so it asks first. Not when the step that sent the work
+        // here was your own approval: that was the question, and asking again is a second click
+        // for nothing. Flows saved before the setting existed have no value, and ask.
+        const justApproved = from?.node.type === 'human' && from.handle === 'approve';
+        const confirm = node.data.action === 'merge' && node.data.askBeforeMerge !== false && !justApproved;
+        const res = await deps.git({
+          run,
+          config: node.data,
+          message,
+          signal,
+          ...(confirm ? { ask: async (title: string, body: string) => (await ask(node.id, 'merge', title, body)).approve } : {}),
+        });
+        if (signal.aborted) throw new NodeFailure('Stopped.');
         visit.log = res.output;
         return { handle: res.ok ? 'out' : 'fail', output: res.ok && node.data.action !== 'diff' ? input : res.output };
       }
@@ -425,7 +441,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
     update();
     let outcome: Outcome;
     try {
-      outcome = await execute(node, act.input, visit);
+      outcome = await execute(node, act.input, visit, act.from);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       visit.error = message;
