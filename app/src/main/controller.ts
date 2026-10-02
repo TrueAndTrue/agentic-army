@@ -1121,12 +1121,13 @@ export class Controller {
     // A CLI installed since the app started is on the shell's PATH now, not on the app's.
     await refreshPath();
     const version = (bin: string, args: string[]) =>
-      new Promise<{ ok: boolean; detail: string }>((res) => {
+      new Promise<{ ok: boolean; detail: string; missing?: boolean }>((res) => {
         execFile(bin, args, { timeout: 10_000 }, (err, stdout, stderr) => {
           if (err === null) return res({ ok: true, detail: String(stdout).trim().split('\n')[0] ?? '' });
           const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
           const said = String(stderr).trim().split('\n')[0]?.slice(0, 160) ?? '';
-          res({ ok: false, detail: missing ? (bin.includes('/') ? `Not found at ${bin}.` : 'Not installed on this Mac.') : `"${bin} ${args.join(' ')}" failed.${said === '' ? '' : ` ${said}`}` });
+          if (missing) res({ ok: false, missing, detail: bin.includes('/') ? `Not found at ${bin}.` : 'Not installed on this Mac.' });
+          else res({ ok: false, detail: `"${bin} ${args.join(' ')}" failed.${said === '' ? '' : ` ${said}`}` });
         });
       });
     const [claude, codex, gitv, typesafe] = await Promise.all([

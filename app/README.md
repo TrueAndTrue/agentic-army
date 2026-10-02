@@ -299,8 +299,8 @@ what the turn would cost at API prices; the app still saves it but no longer sho
 
 ```sh
 npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends: 66 tests
-npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
+npm run e2e        # builds, then drives the real app window with Playwright: 19 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 19 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
 ```
 
@@ -317,6 +317,16 @@ a chat agent asking and you editing and approving, an agent starting one without
 given no tool when Settings says "Only you", and a Run flow node running Quick fix. In the agent
 tests the fake claude starts the app's MCP server from `--mcp-config` and calls `start_flow` over
 stdio, the same path real claude takes.
+
+Five more cover the first run and the session view. One starts the app as a clean Mac would, with
+`PATH=/usr/bin:/bin`, no login shell, an empty home folder and no CLIs, and checks that Home, a
+chat reply and a flow each say how to install what is missing; then it puts a `claude` in
+`~/.local/bin` and Check again finds it. The others check that sending in an older session leaves
+the sidebar's order alone, that a message sent mid-reply is queued, edited, kept across a reload,
+sent when the reply ends and held when one fails or is stopped, that code blocks are highlighted
+in both themes, and that at 900 px wide the run panel leaves the message box clear. The hidden test
+window does not resize, so that test narrows the page's viewport, which the layout follows the
+same way.
 
 `e2e/live/` holds the runs against the real tools. They cost money and need you logged in:
 

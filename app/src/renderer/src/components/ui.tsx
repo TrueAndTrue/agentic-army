@@ -151,13 +151,13 @@ const HARNESS_GROUP: Record<Harness, string> = { claude: 'Claude', codex: 'Codex
 
 /** The models as `<option>`s, grouped by the tool that runs them. */
 export function ModelOptions({ models }: { models: ModelEntry[] }) {
-  // A model whose CLI the last check did not find says so in the list, before you pick it.
+  // A model whose CLI the last check of this Mac did not find says so in the list, before you pick it.
   const doctor = useStore((s) => s.doctor);
   return (
     <>
       {(['claude', 'codex'] as const).map((h) => {
         const list = models.filter((m) => m.harness === h);
-        const missing = doctor !== null && !doctor[h].ok;
+        const missing = doctor?.[h].missing === true;
         return list.length === 0 ? null : (
           <optgroup key={h} label={missing ? `${HARNESS_GROUP[h]} (${h} is not installed)` : HARNESS_GROUP[h]}>
             {list.map((m) => (

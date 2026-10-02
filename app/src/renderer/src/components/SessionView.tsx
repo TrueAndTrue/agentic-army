@@ -4,7 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { flowCommand, jevSteps, parseFlowCommand } from '../../../shared/flow.ts';
 import { fitEffort } from '../../../shared/models.ts';
 import type { Flow, Project, ProjectHealth, Session, SessionItem, SetupFix } from '../../../shared/types.ts';
-import { api, checkMachine, getState, go, openSession, setState, useStore } from '../lib/state.ts';
+import { api, getState, go, openSession, setState, useStore } from '../lib/state.ts';
 import { AgentBlock } from './AgentBlock.tsx';
 import { FlowRequestCard } from './FlowRequestCard.tsx';
 import { LinkBase } from './Markdown.tsx';
@@ -243,7 +243,7 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
   const chatModel = settings?.models.find((m) => m.id === session.chat.modelId);
   const noJevKey = settings !== null && settings.typesafe.apiKey.trim() === '';
   const doctor = useStore((s) => s.doctor);
-  const chatMissing = chatModel !== undefined && doctor !== null && !doctor[chatModel.harness].ok;
+  const chatMissing = chatModel !== undefined && doctor?.[chatModel.harness].missing === true;
   const [showSetup, setShowSetup] = useState(false);
 
   // `/qu` lists the flows whose command starts that way; `/quick-fix add x` says what it will run.
@@ -543,10 +543,6 @@ export function SessionView({ id }: { id: string }) {
   const content = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const narrow = useNarrow();
-  // The composer warns before a send that cannot work, so it needs to know what this Mac has.
-  useEffect(() => {
-    void checkMachine();
-  }, []);
 
   // Follow the bottom while you are there: a reply streaming, a run card filling in, a new card.
   // Watching the content's size catches all of them, where counting items missed a card growing.

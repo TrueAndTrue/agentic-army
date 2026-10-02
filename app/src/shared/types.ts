@@ -508,8 +508,9 @@ export interface Run {
 // ------------------------------------------------------------------------------------------------
 
 export interface DoctorReport {
-  claude: { ok: boolean; detail: string };
-  codex: { ok: boolean; detail: string };
+  /** `missing` is set when the CLI is not there at all, as opposed to there but failing to run. */
+  claude: { ok: boolean; detail: string; missing?: boolean };
+  codex: { ok: boolean; detail: string; missing?: boolean };
   git: { ok: boolean; detail: string };
   typesafe: { ok: boolean; detail: string };
 }
