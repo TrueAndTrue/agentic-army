@@ -13,14 +13,14 @@ between agents and drives the browser node; it needs a TypeSafe key.
 ```sh
 cd app
 npm install
-npm run dev        # the app, with hot reload of the window
-npm run dist       # an unsigned app at release/mac-arm64/Agentic Army.app
-npm run install:mac  # builds it and copies it into /Applications, so Spotlight finds it
+npm run dev          # the app, with hot reload of the window
+npm run dist         # an unsigned app for Intel and Apple Silicon at release/mac-universal/Agentic Army.app
+npm run install:mac  # builds it, copies it into /Applications and ad hoc signs it, so Spotlight finds it
 ```
 
-The built app is not signed. The first time, open it with right-click, Open. It reads your login
-shell's PATH at startup, so an app opened from the Dock finds `claude`, `codex` and `git` the same
-way your terminal does.
+`npm run dist` takes about 15 s and never signs, even on a Mac with a Developer ID. The first time,
+open the app with right-click, Open. It reads your login shell's PATH at startup, so an app opened
+from the Dock finds `claude`, `codex` and `git` the same way your terminal does.
 
 Settings holds the TypeSafe key. If `TYPESAFE_API_KEY` is set in the environment the app starts
 from, the key is filled in from it.
@@ -262,9 +262,9 @@ what the turn would cost at API prices; the app still saves it but no longer sho
 ## Testing
 
 ```sh
-npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends: 66 tests
-npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
+npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends, updates: 74 tests
+npm run e2e        # builds, then drives the real app window with Playwright: 15 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 15 against the .app from npm run dist
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
 ```
 
@@ -350,7 +350,67 @@ What the earlier runs showed on 2026-09-24, with claude 2.1.281 and codex 0.154.
   not its held inspector tests or its question ladder. Those still live in `army campaign`.
 - **The browser types only what the goal says.** It cannot fill a form with details it was not
   given, and it does not log in to sites.
-- **No app icon and no signing.** The app uses Electron's default icon.
+- **No update from a local build.** Only a signed release can update itself. See "Releasing".
+
+## Updates
+
+A released copy checks GitHub Releases 15 s after it starts and every six hours. It downloads a new
+version in the background, and the sidebar shows "Version x is ready" above Flows. Restart installs
+it; so does the next quit. Settings, under Updates, shows the version and the updater's status, and
+has "Check for updates".
+
+The updater stays off in `npm run dev`, when `ARMY_APP_HIDDEN=1` (the e2e tests), and in a build
+whose feed is missing or still says `REPLACE_WITH_GITHUB_OWNER`. Settings says which. macOS installs
+an update only over an app signed with a certificate, so a copy that is ad hoc signed or unsigned
+still checks, but instead of downloading it says the new version is out and offers the download
+page. The app tells the two apart by running `codesign -dv` on its own bundle
+(`src/main/updateRules.ts`).
+
+## Releasing
+
+A release is a universal `.dmg` for people to download and a `.zip` the updater installs from, both
+signed with a Developer ID, notarized by Apple and attached to a GitHub release with
+`latest-mac.yml`.
+
+What the owner has to get once:
+
+1. Apple Developer Program membership at developer.apple.com. It costs $99 a year.
+2. A **Developer ID Application** certificate. Create it in Xcode under Settings, Accounts, Manage
+   Certificates, or on developer.apple.com, and keep it in the login keychain. For CI, export it as
+   a `.p12` with a password. An "Apple Development" certificate will not do.
+3. Your Team ID, from the Membership page.
+4. An app-specific password for your Apple ID, from account.apple.com under Sign-In and Security.
+   An App Store Connect API key works instead.
+5. A GitHub token that can write releases to the repo: a fine-grained token with Contents read and
+   write on that repo, or a classic token with `repo`.
+6. The repo's owner. Replace `REPLACE_WITH_GITHUB_OWNER` under `build.publish` in
+   `app/package.json` with the account or organization, and push the repo to GitHub as
+   `agentic-army`. A private repo also works for publishing, but the app cannot read its releases
+   without a token, so make it public or host releases in a public repo.
+
+Then, for each release:
+
+```sh
+cd app
+npm version 0.2.0 --no-git-tag-version   # the updater compares this version
+export GH_TOKEN=...
+export APPLE_ID=you@example.com APPLE_APP_SPECIFIC_PASSWORD=abcd-efgh-ijkl-mnop APPLE_TEAM_ID=ABCDE12345
+# or: export APPLE_API_KEY=/path/AuthKey_XXXX.p8 APPLE_API_KEY_ID=XXXX APPLE_API_ISSUER=<issuer uuid>
+# in CI, without the certificate in a keychain: export CSC_LINK=/path/cert.p12 CSC_KEY_PASSWORD=...
+npm run release
+```
+
+`npm run release` first checks all of the above and stops with a list of what is missing. Then it
+builds for Intel and Apple Silicon, signs with the hardened runtime and
+`build/entitlements.mac.plist`, notarizes, and uploads to a draft release on GitHub. Publish the
+draft on GitHub; copies already installed see it at their next check. With more than one Developer ID
+in the keychain, pick one with `-c.mac.identity="Name (TEAMID)"`.
+
+`npm run dist:release` makes the same `.dmg` and `.zip` in `release/` without publishing. It signs
+and notarizes when the certificate and variables are there, and otherwise leaves the app unsigned.
+
+The icon is `build/icon.svg`. After changing it, `npm run icon` renders `build/icon.png` and
+`build/icon.icns`.
 
 ## Layout
 

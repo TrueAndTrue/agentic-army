@@ -434,3 +434,30 @@ describe('the canvas', () => {
     });
   });
 });
+
+describe('updates', () => {
+  test('Settings shows the version and why updates are off; a downloaded update shows above Settings until closed', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      await l.page.getByRole('button', { name: 'Settings' }).click();
+      const status = l.page.getByRole('status', { name: 'Update status' });
+      // A dev build and a hidden test run both keep the updater off, and say so.
+      await status.getByText(/^Updates are off/).waitFor();
+      assert.equal(await l.page.getByRole('button', { name: 'Check for updates' }).isDisabled(), true);
+      const version = (await l.page.evaluate(() => window.api.updateStatus())).version;
+      await l.page.getByText(version, { exact: true }).waitFor();
+
+      // The window hears about a finished download the way the updater tells it.
+      await l.app.evaluate(({ BrowserWindow }, v) => {
+        BrowserWindow.getAllWindows()[0]!.webContents.send('army:event', { type: 'update', update: { version: v, state: 'ready', next: '9.9.9' } });
+      }, version);
+      await status.getByText('Version 9.9.9 is downloaded. Restart to update.').waitFor();
+      await l.page.getByRole('button', { name: 'Restart to update' }).waitFor();
+      const notice = l.page.getByText('Version 9.9.9 is ready');
+      await notice.waitFor();
+      await l.page.locator('#settings-updates').scrollIntoViewIfNeeded();
+      await shot(l.page, 'e2e-update-ready');
+      await l.page.getByRole('button', { name: 'Hide until the next version' }).click();
+      await notice.waitFor({ state: 'detached' });
+    });
+  });
+});

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2e34"/>
+      <stop offset="1" stop-color="#16181b"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="brass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ecc867"/>
+      <stop offset="1" stop-color="#b8902f"/>
+    </linearGradient>
+    <linearGradient id="brassLow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c49b3c"/>
+      <stop offset="1" stop-color="#94722a"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Apple's grid: a 824 body centred on the 1024 canvas, corner radius 185, room for the shadow. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)" filter="url(#shadow)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <!-- Two rank chevrons. The upper one is a flow: two agents feed a Jev decision at its point. -->
+  <path d="M 268 738 L 512 568 L 756 738" fill="none" stroke="url(#brassLow)" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 268 540 L 512 370 L 756 540" fill="none" stroke="url(#brass)" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="420" y="278" width="184" height="184" rx="30" transform="rotate(45 512 370)" fill="url(#brass)" stroke="#17191c" stroke-width="24"/>
+  <circle cx="268" cy="540" r="80" fill="#f3ead6" stroke="#17191c" stroke-width="24"/>
+  <circle cx="756" cy="540" r="80" fill="#f3ead6" stroke="#17191c" stroke-width="24"/>
+</svg>

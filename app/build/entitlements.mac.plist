@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  What the hardened runtime lets the app and its helpers do. Electron needs these two and nothing
+  else. V8 compiles JavaScript to machine code at run time, which needs JIT memory, and parts of
+  Chromium and V8 still map writable memory as executable. The app starts the claude, codex and git
+  you installed as child processes, and those run under their own signatures, so they need no
+  entitlement here. The app is not sandboxed, so it needs no network or file entitlements either.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+  </dict>
+</plist>

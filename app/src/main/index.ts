@@ -13,6 +13,7 @@ import { Controller } from './controller.ts';
 import { startFlowBridge } from './flowTools.ts';
 import { loginShellPath } from './git.ts';
 import { Store } from './store.ts';
+import { Updater } from './updater.ts';
 
 // A separate home keeps everything separate, the window's own storage included, so a second copy
 // of the app (or a test) never inherits the first one's state.
@@ -99,6 +100,8 @@ function handle<A extends unknown[], R>(name: string, fn: (...args: A) => R | Pr
 
 void app.whenReady().then(async () => {
   if (HIDDEN) app.dock?.hide();
+  // A packaged app takes its icon from the bundle; a dev run is Electron's own app, so set it here.
+  else if (!app.isPackaged) app.dock?.setIcon(join(__dirname, '../../build/icon.png'));
   if (process.platform === 'darwin') {
     const path = await loginShellPath();
     if (path !== null && path !== '') process.env['PATH'] = path;
@@ -158,6 +161,12 @@ void app.whenReady().then(async () => {
   handle('refreshModels', () => c.refreshModels());
   handle('testJev', () => c.testJev());
   handle('connectJev', (sessionId: string, itemId: string, apiKey: string | null) => c.connectJev(sessionId, itemId, apiKey));
+
+  const updater = new Updater((update) => emit({ type: 'update', update }));
+  handle('updateStatus', () => updater.get());
+  handle('checkForUpdates', () => updater.check());
+  handle('installUpdate', () => updater.install());
+  updater.start();
 
   // macOS naps a background app and the agents it started with it: a claude turn stalled mid-request
   // every time the window was not in front. Hold the app awake while anything is working.

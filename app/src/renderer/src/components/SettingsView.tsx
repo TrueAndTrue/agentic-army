@@ -7,6 +7,7 @@ import { DEFAULT_INVOKE_CEILING } from '../../../shared/flow.ts';
 import { ROLE_COLOR } from '../lib/format.ts';
 import { api, checkMachine, useStore } from '../lib/state.ts';
 import { Button, EffortOptions, Field, IconButton, Input, ModelOptions, Select } from './ui.tsx';
+import { UpdatesPanel } from './Updates.tsx';
 
 function Section({ id, title, children, note }: { id?: string; title: string; note?: string; children: React.ReactNode }) {
   return (
@@ -295,6 +296,10 @@ export function SettingsView() {
                 <Input className="font-mono text-[12px]" value={s.codexBin} placeholder="codex" onChange={(e) => setS({ ...s, codexBin: e.target.value })} />
               </Field>
             </div>
+          </Section>
+
+          <Section id="updates" title="Updates" note="The app checks GitHub for a new version when it starts and every six hours, and downloads it in the background. It installs when you restart.">
+            <UpdatesPanel />
           </Section>
         </div>
       </div>

@@ -512,7 +512,24 @@ export type AppEvent =
   | { type: 'run'; run: Run }
   | { type: 'flows'; flows: Flow[] }
   | { type: 'settings'; settings: Settings }
-  | { type: 'projects'; projects: Project[] };
+  | { type: 'projects'; projects: Project[] }
+  | { type: 'update'; update: UpdateStatus };
+
+/**
+ * Where the updater stands. `off` covers dev runs, test runs and builds with no feed. `manual` is a
+ * newer version this copy cannot install itself, because macOS updates only a signed app.
+ */
+export type UpdateStatus = { version: string } & UpdateState;
+
+export type UpdateState =
+  | { state: 'off'; reason: string }
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'current'; checkedAt: number }
+  | { state: 'downloading'; next: string; percent: number }
+  | { state: 'ready'; next: string }
+  | { state: 'manual'; next: string; reason: string; url: string }
+  | { state: 'error'; reason: string };
 
 export interface Api {
   getState(): Promise<{
@@ -551,5 +568,10 @@ export interface Api {
   /** Read claude's and codex's model lists again and add any model not offered before. */
   refreshModels(): Promise<{ settings: Settings; added: string[] }>;
   testJev(): Promise<{ ok: boolean; detail: string }>;
+  updateStatus(): Promise<UpdateStatus>;
+  /** Check the feed now. Resolves with the status once the check has started. */
+  checkForUpdates(): Promise<UpdateStatus>;
+  /** Quit and relaunch on the downloaded version. */
+  installUpdate(): Promise<void>;
   onEvent(listener: (event: AppEvent) => void): () => void;
 }

@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { ago } from '../lib/format.ts';
 import { addProjectFlow, api, getState, go, newSession, openSession, setState, useStore } from '../lib/state.ts';
 import { cx, Dot, IconButton } from './ui.tsx';
+import { UpdateNotice } from './Updates.tsx';
 
 export function Sidebar() {
   const projects = useStore((s) => s.projects);
@@ -117,6 +118,7 @@ export function Sidebar() {
       </nav>
 
       <div className="shrink-0 space-y-px border-t border-line p-2">
+        <UpdateNotice />
         <button
           onClick={() => go({ kind: 'flows', flowId: null })}
           className={cx('flex h-8 w-full items-center gap-2 rounded-md px-2 text-[13px]', view.kind === 'flows' ? 'bg-hover text-text' : 'text-muted hover:bg-hover hover:text-text')}

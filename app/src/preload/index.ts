@@ -34,6 +34,9 @@ const api: Api = {
   projectHealth: call('projectHealth') as Api['projectHealth'],
   openLink: call('openLink') as Api['openLink'],
   setUpGit: call('setUpGit') as Api['setUpGit'],
+  updateStatus: call('updateStatus') as Api['updateStatus'],
+  checkForUpdates: call('checkForUpdates') as Api['checkForUpdates'],
+  installUpdate: call('installUpdate') as Api['installUpdate'],
   onEvent(listener) {
     const fn = (_e: unknown, ev: AppEvent) => listener(ev);
     ipcRenderer.on('army:event', fn);

@@ -107,7 +107,7 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
   // Set ARMY_E2E_SHOW=1 to watch the window; by default it runs hidden and never takes focus.
   const hidden: Record<string, string> = process.env['ARMY_E2E_SHOW'] === '1' ? {} : { ARMY_APP_HIDDEN: '1' };
   const app = await electron.launch({
-    executablePath: packaged ? join(APP, 'release/mac-arm64/Agentic Army.app/Contents/MacOS/Agentic Army') : (require('electron') as unknown as string),
+    executablePath: packaged ? join(APP, 'release/mac-universal/Agentic Army.app/Contents/MacOS/Agentic Army') : (require('electron') as unknown as string),
     args: packaged ? [] : [join(APP, 'out/main/index.js')],
     cwd: APP,
     env:

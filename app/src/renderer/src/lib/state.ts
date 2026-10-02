@@ -5,7 +5,7 @@
 
 import { useSyncExternalStore } from 'react';
 
-import type { AppEvent, Api, DoctorReport, Flow, Project, Run, Session, SessionSummary, Settings } from '../../../shared/types.ts';
+import type { AppEvent, Api, DoctorReport, Flow, Project, Run, Session, SessionSummary, Settings, UpdateStatus } from '../../../shared/types.ts';
 
 declare global {
   interface Window {
@@ -38,6 +38,9 @@ export interface State {
   doctorAt: number;
   /** A short message at the bottom of the window, for errors with nowhere else to go. */
   toast: { text: string; tone: 'info' | 'error' } | null;
+  /** The updater's latest status, and the version whose "ready" notice you closed. */
+  update: UpdateStatus | null;
+  updateDismissed: string | null;
 }
 
 let state: State = {
@@ -54,6 +57,8 @@ let state: State = {
   doctor: null,
   doctorAt: 0,
   toast: null,
+  update: null,
+  updateDismissed: null,
 };
 
 let checking: Promise<DoctorReport> | null = null;
@@ -138,6 +143,9 @@ export async function boot(): Promise<void> {
   applyTheme(initial.settings);
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(getState().settings));
   api().onEvent(onEvent);
+  void api()
+    .updateStatus()
+    .then((update) => setState((s) => ({ update: s.update ?? update })));
   if (lastView?.kind === 'session') await openSession(lastView.id);
 }
 
@@ -161,6 +169,9 @@ function onEvent(ev: AppEvent): void {
       break;
     case 'projects':
       setState({ projects: ev.projects });
+      break;
+    case 'update':
+      setState({ update: ev.update });
       break;
   }
 }
