@@ -67,7 +67,12 @@ with Send now beside it. The main process keeps the queue with the session, so i
 window reloading and the app restarting. A flow, or a slash command, does not wait: it runs beside
 the chat.
 
-Stop, next to the send button, stops everything running in the session (Esc does the same). Quitting the app while
+Stop, next to the send button, stops everything running in the session (Esc does the same).
+
+Open run, on a run card, shows the run's map, steps and changes in a panel. In a window wider
+than 1180 px it sits beside the thread. In a narrower one it lies over the thread but stops above
+the message box, so you can keep writing while you read the run. The message box grows to fit its
+text again whenever its width changes. Quitting the app while
 agents work asks first, then stops them and kills their processes.
 
 ## Starting a flow

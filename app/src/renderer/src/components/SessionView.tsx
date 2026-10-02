@@ -10,7 +10,7 @@ import { FlowRequestCard } from './FlowRequestCard.tsx';
 import { LinkBase } from './Markdown.tsx';
 import { NeedsJevCard } from './NeedsJevCard.tsx';
 import { RunCard } from './RunCard.tsx';
-import { RunPanel } from './RunPanel.tsx';
+import { RunPanel, useNarrow } from './RunPanel.tsx';
 import { SetupHelp } from './SetupHelp.tsx';
 import { Button, cx, EffortOptions, IconButton, Kbd, ModelOptions, PillSelect } from './ui.tsx';
 
@@ -219,12 +219,22 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
     store(TARGET_KEY + session.id, t);
   };
 
+  // The box fits its text. A narrower window wraps the same text onto more lines, so the width
+  // counts too: without it, opening the run panel cut the draft's last line off under the pickers.
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (el === null) return;
+    const ro = new ResizeObserver(([e]) => setWidth(Math.round(e?.contentRect.width ?? 0)));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   useLayoutEffect(() => {
     const el = ref.current;
     if (el === null) return;
     el.style.height = '0px';
     el.style.height = `${Math.min(el.scrollHeight, 260)}px`;
-  }, [text]);
+  }, [text, width]);
   useEffect(() => ref.current?.focus(), []);
 
   const flowExists = target === 'chat' || target === 'auto' || flows.some((f) => f.id === target);
@@ -532,6 +542,7 @@ export function SessionView({ id }: { id: string }) {
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  const narrow = useNarrow();
   // The composer warns before a send that cannot work, so it needs to know what this Mac has.
   useEffect(() => {
     void checkMachine();
@@ -554,63 +565,67 @@ export function SessionView({ id }: { id: string }) {
 
   if (session === undefined) return <div className="flex flex-1 items-center justify-center text-faint">Loading…</div>;
   const busy = summary?.busy ?? false;
+  const showPanel = panelRun !== undefined && panelRun.sessionId === session.id;
 
   return (
     <LinkBase.Provider value={project?.path}>
       <div className="relative flex min-w-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          <header className="drag flex h-12 shrink-0 items-center gap-3 border-b border-line px-5">
-            <Title session={session} />
-            {project !== undefined && (
-              <span className="shrink-0 font-mono text-[11.5px] text-faint" title={project.path}>
-                {shortPath(project.path)}
-              </span>
-            )}
-            <div className="no-drag ml-auto flex items-center">
-              <IconButton
-                label="Delete this session"
-                onClick={() => {
-                  if (!window.confirm('Delete this session? Its runs are stopped and their record removed. Branches stay in git.')) return;
-                  // Land on the next session in the same project, not on the home screen.
-                  const next = getState().sessions.find((x) => x.id !== session.id && x.projectId === session.projectId) ?? getState().sessions.find((x) => x.id !== session.id);
-                  void api().deleteSession(session.id);
-                  setState({ panelRunId: null });
-                  if (next !== undefined) void openSession(next.id);
-                  else go({ kind: 'home' });
-                }}
-              >
-                <Trash2 size={14} />
-              </IconButton>
-            </div>
-          </header>
-          <div
-            ref={scroller}
-            className="min-h-0 flex-1 overflow-y-auto"
-            onScroll={(e) => {
-              const el = e.currentTarget;
-              pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-            }}
-          >
-            <div ref={content} className="mx-auto max-w-[820px] space-y-5 px-6 py-6">
-              {session.items.length === 0 && (
-                <div className="pt-[12vh] text-center">
-                  <h2 className="text-[20px] font-semibold tracking-tight">What should we work on{project !== undefined ? ` in ${project.name}` : ''}?</h2>
-                  <p className="mx-auto mt-2 max-w-[460px] text-[13px] leading-relaxed text-muted">
-                    Chat with one agent in this folder, or open the menu under the box (it says Chat) to run a flow: a team of agents that works on its own branch until you merge. Type{' '}
-                    <Kbd>/</Kbd> to list the flows.
-                  </p>
-                  {project !== undefined && <ProjectCheck project={project} />}
-                </div>
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <header className="drag flex h-12 shrink-0 items-center gap-3 border-b border-line px-5">
+              <Title session={session} />
+              {project !== undefined && (
+                <span className="shrink-0 font-mono text-[11.5px] text-faint" title={project.path}>
+                  {shortPath(project.path)}
+                </span>
               )}
-              {session.items.map((item) => (
-                <Item key={item.id} item={item} sessionId={session.id} />
-              ))}
-              {session.queued !== undefined && <QueuedMessage key={session.queued.ts} session={session} />}
+              <div className="no-drag ml-auto flex items-center">
+                <IconButton
+                  label="Delete this session"
+                  onClick={() => {
+                    if (!window.confirm('Delete this session? Its runs are stopped and their record removed. Branches stay in git.')) return;
+                    // Land on the next session in the same project, not on the home screen.
+                    const next = getState().sessions.find((x) => x.id !== session.id && x.projectId === session.projectId) ?? getState().sessions.find((x) => x.id !== session.id);
+                    void api().deleteSession(session.id);
+                    setState({ panelRunId: null });
+                    if (next !== undefined) void openSession(next.id);
+                    else go({ kind: 'home' });
+                  }}
+                >
+                  <Trash2 size={14} />
+                </IconButton>
+              </div>
+            </header>
+            <div
+              ref={scroller}
+              className="min-h-0 flex-1 overflow-y-auto"
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+              }}
+            >
+              <div ref={content} className="mx-auto max-w-[820px] space-y-5 px-6 py-6">
+                {session.items.length === 0 && (
+                  <div className="pt-[12vh] text-center">
+                    <h2 className="text-[20px] font-semibold tracking-tight">What should we work on{project !== undefined ? ` in ${project.name}` : ''}?</h2>
+                    <p className="mx-auto mt-2 max-w-[460px] text-[13px] leading-relaxed text-muted">
+                      Chat with one agent in this folder, or open the menu under the box (it says Chat) to run a flow: a team of agents that works on its own branch until you merge. Type{' '}
+                      <Kbd>/</Kbd> to list the flows.
+                    </p>
+                    {project !== undefined && <ProjectCheck project={project} />}
+                  </div>
+                )}
+                {session.items.map((item) => (
+                  <Item key={item.id} item={item} sessionId={session.id} />
+                ))}
+                {session.queued !== undefined && <QueuedMessage key={session.queued.ts} session={session} />}
+              </div>
             </div>
+            {showPanel && narrow && <RunPanel run={panelRun} overlay />}
           </div>
           <Composer key={session.id} session={session} busy={busy} />
         </main>
-        {panelRun !== undefined && panelRun.sessionId === session.id && <RunPanel run={panelRun} />}
+        {showPanel && !narrow && <RunPanel run={panelRun} />}
       </div>
     </LinkBase.Provider>
   );

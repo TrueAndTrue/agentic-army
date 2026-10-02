@@ -273,6 +273,38 @@ describe('first run', () => {
   });
 });
 
+describe('narrow window', () => {
+  test('with a run open at 900 wide, the panel lies over the thread and the message box stays usable', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
+      await openSession(l);
+      await send(l, 'Add multiply', 'Quick fix');
+      await runToEnd(l);
+      await l.page.getByRole('button', { name: 'Open run' }).click();
+      // The hidden test window keeps the size it was made with, so the page's viewport stands in for
+      // the window: the layout's media queries follow it the same way.
+      await l.page.setViewportSize({ width: 900, height: 700 });
+      const panel = l.page.getByRole('complementary', { name: 'Run' });
+      await panel.getByRole('button', { name: 'changes', exact: true }).click();
+      await panel.getByRole('button', { name: 'Merge into main' }).waitFor();
+      const box = l.page.getByRole('textbox', { name: 'Message' });
+      const p = (await panel.boundingBox())!;
+      const b = (await box.boundingBox())!;
+      assert.ok(p.x + p.width <= 900 && p.x >= 264, `the panel sits inside the session area: ${JSON.stringify(p)}`);
+      assert.ok(p.y + p.height <= b.y, `the panel ends above the message box: panel ${JSON.stringify(p)}, box ${JSON.stringify(b)}`);
+      // Nothing lies over the box: a click in its middle lands on it.
+      const onTop = await l.page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.getAttribute('aria-label'), { x: b.x + b.width / 2, y: b.y + b.height / 2 });
+      assert.equal(onTop, 'Message');
+      await shot(l.page, 'e2e-narrow-900');
+      await l.page.getByLabel('Where this message goes').selectOption({ label: 'Chat' });
+      await box.fill('Written with the run open');
+      await l.page.keyboard.press('Enter');
+      await l.page.getByText('echo:Written with the run open').waitFor();
+      await panel.getByRole('button', { name: 'Close run panel' }).click();
+      await panel.waitFor({ state: 'detached' });
+    });
+  });
+});
+
 describe('models', () => {
   test("codex's own model list is on offer, and each model shows and gets only the efforts it takes", async () => {
     const probe = join(mkdtempSync(join(tmpdir(), 'army-probe-')), 'codex-argv.json');
