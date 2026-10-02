@@ -41,6 +41,10 @@ window's own storage moves with it, so two homes never share state.
 
 ## Sessions
 
+The sidebar lists each project's sessions newest first, by when you made them. Sending a message
+does not move a row, so the list stays put under the cursor; the time beside each row is its last
+activity.
+
 Each message goes where the picker under the box says:
 
 - **Chat** sends it to one agent in the project folder, on the model, effort and permission you

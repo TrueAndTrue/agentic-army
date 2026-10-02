@@ -202,6 +202,7 @@ export class Controller {
           id: s.id,
           projectId: s.projectId,
           title: s.title,
+          createdAt: s.createdAt,
           updatedAt: s.updatedAt,
           busy: this.chats.has(s.id) || runs.some((r) => r?.status === 'running' || r?.status === 'waiting'),
           waiting: runs.some((r) => r?.status === 'waiting') || s.items.some((i) => (i.kind === 'flow-request' || i.kind === 'needs-jev') && i.status === 'pending'),
@@ -326,6 +327,8 @@ export class Controller {
     // An untouched session in the project is the new session: pressing + twice makes one, not two.
     const empty = [...this.sessions.values()].find((x) => x.projectId === projectId && x.items.length === 0 && x.title === 'New session' && x.archived !== true);
     if (empty !== undefined) {
+      // It was never used, so it counts as made now: the sidebar lists sessions newest first.
+      empty.createdAt = nowIso();
       empty.updatedAt = nowIso();
       this.touchSession(empty, true);
       return empty;

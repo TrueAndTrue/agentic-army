@@ -106,6 +106,24 @@ describe('sessions', () => {
     });
   });
 
+  test('the sidebar keeps its order when you send in an older session', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      await openSession(l);
+      await send(l, 'First session');
+      await until(async () => (await agentItems(l.page))[0]?.status === 'done', 20000, 'the first reply');
+      await l.page.getByRole('button', { name: 'New session in calc' }).click();
+      await send(l, 'Second session');
+      const rows = l.page.getByRole('navigation').getByRole('listitem');
+      await until(async () => (await rows.allTextContents()).length === 2 && (await rows.allTextContents()).every((t) => !t.startsWith('New session')), 10000, 'two named sessions');
+      const order = async () => (await rows.allTextContents()).map((t) => t.replace(/(now|\d+[smhd]( ago)?)$/, '').trim());
+      assert.deepEqual(await order(), ['Second session', 'First session']);
+      await l.page.getByRole('navigation').getByRole('button', { name: /^First session/ }).click();
+      await send(l, 'Back in the first one');
+      await l.page.getByText('echo:Back in the first one').waitFor();
+      assert.deepEqual(await order(), ['Second session', 'First session'], 'sending did not move the open session to the top');
+    });
+  });
+
   test('Stop ends a running reply, and quitting leaves no agent process behind', async () => {
     await withApp({ jevUrl, claudeMode: 'slow' }, async (l) => {
       await openSession(l);

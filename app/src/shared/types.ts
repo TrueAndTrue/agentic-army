@@ -220,6 +220,7 @@ export interface SessionSummary {
   id: string;
   projectId: string;
   title: string;
+  createdAt: string;
   updatedAt: string;
   busy: boolean;
   /** A run in this session is waiting on you. */
