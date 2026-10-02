@@ -90,21 +90,24 @@ function Question({ run, q }: { run: Run; q: PendingQuestion }) {
       <div className="max-h-[320px] overflow-y-auto pr-1">
         <Markdown text={q.body} className="text-[12.5px]" />
       </div>
-      <TextArea
-        className="mt-2.5 font-sans text-[12.5px]"
-        rows={2}
-        placeholder={q.kind === 'guard' ? 'Optional note' : 'Optional note. On a rejection, say what to change; it goes back with the work.'}
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-      />
+      {/* A merge goes ahead or it does not; there is nobody to send a note back to. */}
+      {q.kind !== 'merge' && (
+        <TextArea
+          className="mt-2.5 font-sans text-[12.5px]"
+          rows={2}
+          placeholder={q.kind === 'guard' ? 'Optional note' : 'Optional note. On a rejection, say what to change; it goes back with the work.'}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      )}
       <div className="mt-2 flex flex-wrap gap-2">
         <Button tone="primary" disabled={busy} onClick={() => void answer(true)}>
-          {q.kind === 'guard' ? 'Allow' : 'Approve'}
+          {q.kind === 'guard' ? 'Allow' : q.kind === 'merge' ? 'Merge' : 'Approve'}
         </Button>
         <Button disabled={busy} onClick={() => void answer(false)}>
-          {q.kind === 'guard' ? 'Refuse' : note.trim() === '' ? 'Reject' : 'Send back with note'}
+          {q.kind === 'guard' ? 'Refuse' : q.kind === 'merge' ? 'Do not merge' : note.trim() === '' ? 'Reject' : 'Send back with note'}
         </Button>
-        {q.kind === 'approve' && run.branch !== undefined && (
+        {q.kind !== 'guard' && run.branch !== undefined && (
           <Button tone="quiet" onClick={() => setState({ panelRunId: run.id, panelTab: 'changes' })}>
             <GitMerge size={14} /> See the changes
           </Button>

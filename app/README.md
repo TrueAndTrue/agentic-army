@@ -22,8 +22,13 @@ The built app is not signed. The first time, open it with right-click, Open. It 
 shell's PATH at startup, so an app opened from the Dock finds `claude`, `codex` and `git` the same
 way your terminal does.
 
-Settings holds the TypeSafe key. If `TYPESAFE_API_KEY` is set in the environment the app starts
-from, the key is filled in from it.
+Settings holds the TypeSafe key and the optional Brave Search key. Both are encrypted in
+`settings.json` with Electron's safeStorage, whose own key macOS keeps in your login Keychain. A
+key an older version saved in the clear is encrypted the first time the new version starts. A key
+the app cannot decrypt, say from a settings file copied off another Mac, counts as no key: the
+log says so, and the usual "add a key" card and Settings field take over. The window never gets a
+saved key, only the word that one is saved, and the main process tests and saves a new one. If
+`TYPESAFE_API_KEY` is set in the environment the app starts from, it fills in a missing key.
 
 Everything the app keeps lives in `~/Library/Application Support/agentic-army-app/army`: settings,
 projects, sessions, flows and runs as JSON files. Set `ARMY_APP_HOME` to use another folder; the
@@ -119,7 +124,7 @@ that never settles.
 | Command | Runs a shell command in the run's branch or the project folder. Exit 0 is pass. | pass, fail |
 | Web search | Searches the web and has Jev pick the pages and the passages that answer. The output is those passages with their links. | found, unanswered |
 | Browser | A page Jev clicks and types on toward a goal, with a guard on risky actions. For forms and sites that need clicking; a Web search step is the way to look something up. The window stays hidden unless you turn on "Show the browser window". | done, failed |
-| Git | Shows the diff, commits the run branch, or merges it into your branch. | out, fail |
+| Git | Shows the diff, commits the run branch, or merges it into your branch. A merge asks you first (see below). | out, fail |
 | Run flow | Runs another flow with an objective from a template, waits for it, and passes its result on. | done, failed |
 | Join | Waits until every node connected into it has delivered, then passes all their outputs on together. | out |
 | End | The run's result, from a template. | none |
@@ -127,6 +132,19 @@ that never settles.
 Prompts are templates. `{{objective}}` is your message, `{{input}}` is what the previous node passed
 on, `{{visit}}` counts visits to this node, `{{branch}}` is the run's branch, and
 `{{nodes.<name>}}` is the last output of any node, by its name in lowercase with underscores.
+
+### A merge asks first
+
+A Git node set to merge changes your checkout, so by default the run pauses with a card: the
+branch, the branch it goes into, how many commits it brings and the files it changes, with Merge
+and Do not merge. Do not merge leaves by the node's fail output, with your checkout as it was and
+the work still on the run branch. A merge that cannot happen (your checkout is on another branch
+or has uncommitted changes) fails without asking, and one that brings nothing does not ask.
+
+The card does not show when the step right before the merge was one of your approvals, so you
+never approve twice in a row. "Ask me before merging" in the node's panel turns the card off.
+Flows saved before the setting existed ask. No built-in flow merges by itself; you merge those
+from the run's Changes tab.
 
 ### Roles and permissions
 
@@ -143,8 +161,21 @@ the rules.
 | Validator | Read and the test runners. No edits. | CAPTAIN·VALIDATOR |
 
 Every role is denied your credentials (`~/.ssh`, `~/.aws`, `.env` files, keys) and the army's own
-home, `~/.agentic-army`. Settings chooses how tightly the shell is scoped: any command in the role,
-or only the listed ones.
+home, `~/.agentic-army`. Settings, under Permissions, chooses how far the shell reaches:
+
+- **Any shell command in the role**, the default. Engineers and chats run any command, and codex
+  agents have the network. claude's shell has no sandbox, so its commands run with your access.
+- **Only listed shell commands.** The shell takes each role's listed commands only (git and the
+  usual test, build and lint commands), and codex runs with `network_access=false`.
+
+The default stays at any command because the listed-only setting breaks the built-in flows more
+than it protects. Measured on 2026-10-02 with claude 2.1.287 and codex 0.154.0: a Haiku engineer
+under the listed-only setting was refused `npm install` and `node -e`, and a GPT-5.5 reviewer
+running `npm test` on a suite that opens a port got `EPERM listen`, where both passed under the
+default. The Reviewer and Validator stages default to codex, so every Build and review and Quick
+fix on such a project would fail review. It also does not stop a determined agent: an engineer
+can edit `package.json` and `npm test` runs whatever it says. What does hold under both settings
+is the deny list, the run's own branch, your approvals, and the merge card.
 
 ### Models at each stage
 
@@ -259,17 +290,34 @@ on claude, how full the context was after the last request. codex reports a runn
 whole conversation, so the app subtracts the total it saw last turn. claude's dollar figure is
 what the turn would cost at API prices; the app still saves it but no longer shows it.
 
+## Logs and diagnostics
+
+The main process writes `logs/main.log` in the app's home folder: when the app started (its
+version, Electron, macOS), uncaught errors and rejected promises, a window renderer that crashed,
+agents that failed to start or ended with an error, each run's end with its status, and Jev and
+web search failures. It holds no keys, prompts, replies or file contents. Every line passes
+through a redactor that removes the configured keys and anything shaped like one (`sk-...`,
+bearer tokens, `api_key=...`). At 1 MB the file rotates to `main.1.log`, keeping three.
+
+Settings, under Diagnostics, has "Copy diagnostics", which puts a plain-text report on the
+clipboard: the app, Electron and macOS versions and the Mac's chip, claude's and codex's versions
+and paths, whether a TypeSafe key is set and works, the permission setting, how many models,
+projects, sessions and runs there are, and the last 200 lines of the log, redacted again. "Open
+logs folder" opens the folder in Finder.
+
 ## Testing
 
 ```sh
-npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends: 66 tests
-npm run e2e        # builds, then drives the real app window with Playwright: 14 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 14 against the built .app
+npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends, keys at rest, the log: 80 tests
+npm run e2e        # builds, then drives the real app window with Playwright: 16 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 16 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
 ```
 
 The test window stays hidden and out of the Dock, so a run does not take focus while you work.
-The app does this when `ARMY_APP_HIDDEN=1`; it keeps painting, so screenshots still work.
+The app does this when `ARMY_APP_HIDDEN=1`; it keeps painting, so screenshots still work. The
+tests also set `ARMY_APP_MOCK_KEYCHAIN=1`, which encrypts keys with Chromium's stand-in Keychain,
+so a test run never adds an item to your login Keychain.
 
 The end-to-end tests launch the app against a throwaway home and project, the engine's fake
 `claude` and `codex` (`../test/fixtures`), and a fake Jev server. They cover a chat that resumes
@@ -278,7 +326,10 @@ main flow's two approvals and its review loop, a rejected plan going back with i
 with no key asking for one in the thread (refusing a bad key, then starting with a good one), a flow drawn on the canvas by dragging connections, codex's model
 list and per-model efforts, and every way to start a flow: a slash command, Run on the Flows page,
 a chat agent asking and you editing and approving, an agent starting one without asking, an agent
-given no tool when Settings says "Only you", and a Run flow node running Quick fix. In the agent
+given no tool when Settings says "Only you", and a Run flow node running Quick fix. Two more check
+that a key saved in Settings is encrypted on disk and still works after a restart (with no key in
+the diagnostics or the log), and that a Git merge step waits on its card, leaves the checkout
+alone when you decline, and merges when you approve. In the agent
 tests the fake claude starts the app's MCP server from `--mcp-config` and calls `start_flow` over
 stdio, the same path real claude takes.
 

@@ -237,7 +237,9 @@ describe('flows', () => {
       await card.getByRole('textbox', { name: 'TypeSafe API key' }).fill('good-key');
       await card.getByRole('button', { name: 'Connect and start' }).click();
       await l.page.getByText('Jev is connected. Quick fix started.').waitFor();
-      assert.equal(await l.page.evaluate(async () => (await window.api.getState()).settings.typesafe.apiKey), 'good-key');
+      // The window learns there is a key, never the key.
+      assert.equal(await l.page.evaluate(async () => (await window.api.getState()).settings.typesafe.apiKey), '(saved)');
+      assert.equal(jev.calls.at(-1)?.auth, 'Bearer good-key');
       await until(async () => (await lastRun(l))?.status === 'succeeded', 60000, 'the run to finish');
       await l.page.getByText(/Review passed\s*Jev: yes, 90% sure/).waitFor();
     });
@@ -431,6 +433,109 @@ describe('the canvas', () => {
       const r = await runToEnd(l);
       assert.equal(r.status, 'succeeded', r.error);
       assert.match(r.result ?? '', /Summarise the calculator/);
+    });
+  });
+});
+
+describe('safe to hand over', () => {
+  test('a key saved in Settings is encrypted on disk, survives a restart, and still works', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'army-e2e-'));
+    const home = join(root, 'home');
+    const settingsFile = join(home, 'settings.json');
+    // The harness writes the key in the clear, the way older versions saved it.
+    await withApp({ jevUrl, root }, async (l) => {
+      await until(async () => !readFileSync(settingsFile, 'utf8').includes('fake-key'), 10000, 'the old plain key to be encrypted');
+      assert.match(readFileSync(settingsFile, 'utf8'), /"apiKey": "encrypted:/);
+
+      await l.page.getByRole('button', { name: 'Settings', exact: true }).first().click();
+      const field = l.page.getByLabel('TypeSafe API key', { exact: true });
+      assert.equal(await field.inputValue(), '', 'the window shows no key, only that one is saved');
+      assert.match((await field.getAttribute('placeholder')) ?? '', /^Saved, and encrypted in your Keychain/);
+      await field.fill('round-trip-key');
+      await l.page.getByRole('button', { name: 'Save and test' }).click();
+      await l.page.getByText(/^jev-fake answered in \d+ ms$/).waitFor();
+      assert.equal(jev.calls.at(-1)?.auth, 'Bearer round-trip-key');
+      const text = readFileSync(settingsFile, 'utf8');
+      assert.doesNotMatch(text, /round-trip-key/);
+      assert.match(text, /"apiKey": "encrypted:/);
+      await shot(l.page, 'e2e-settings-key-saved');
+    });
+
+    await withApp({ jevUrl, root, home }, async (l) => {
+      assert.equal(await l.page.evaluate(async () => (await window.api.getState()).settings.typesafe.apiKey), '(saved)');
+      const r = await l.page.evaluate(() => window.api.testJev());
+      assert.equal(r.ok, true, r.detail);
+      assert.equal(jev.calls.at(-1)?.auth, 'Bearer round-trip-key');
+      assert.doesNotMatch(readFileSync(settingsFile, 'utf8'), /round-trip-key/);
+
+      // The report has what support needs and none of the keys.
+      const report = await l.page.evaluate(() => window.api.diagnostics());
+      assert.match(report, /^Agentic Army diagnostics$/m);
+      assert.match(report, /^App: \S+/m);
+      assert.match(report, /^macOS: \S+ on (arm64|x64)$/m);
+      assert.match(report, /^TypeSafe key: set, and it works$/m);
+      assert.match(report, /^Permissions: unguarded$/m);
+      assert.match(report, /^Projects: 0, sessions: 0, runs: 0/m);
+      assert.match(report, /INFO  Started\./);
+      assert.match(report, /Moved the keys in settings\.json into encrypted storage/);
+      assert.doesNotMatch(report, /round-trip-key|fake-key/);
+      assert.ok(existsSync(join(home, 'logs', 'main.log')));
+      assert.doesNotMatch(readFileSync(join(home, 'logs', 'main.log'), 'utf8'), /round-trip-key|fake-key/);
+      await l.page.getByRole('button', { name: 'Settings', exact: true }).first().click();
+      await l.page.getByRole('button', { name: 'Copy diagnostics' }).waitFor();
+      await l.page.getByRole('button', { name: 'Open logs folder' }).waitFor();
+      await l.page.locator('#settings-permissions').scrollIntoViewIfNeeded();
+      await shot(l.page, 'e2e-settings-permissions');
+      await l.page.locator('#settings-diagnostics').scrollIntoViewIfNeeded();
+      await shot(l.page, 'e2e-settings-diagnostics');
+    });
+  });
+
+  test('a Git merge step shows what it would merge and waits; declining leaves the checkout alone', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
+      const project = await openSession(l);
+      // Saved the way a flow from before the setting looks: the git node has no askBeforeMerge.
+      await l.page.evaluate(() =>
+        window.api.saveFlow({
+          id: 'build-and-merge',
+          name: 'Build and merge',
+          description: 'An engineer builds it and the branch merges.',
+          invoke: 'you',
+          updatedAt: '',
+          nodes: [
+            { id: 'start', type: 'start', position: { x: 0, y: 0 }, data: { label: 'Start' } },
+            { id: 'build', type: 'agent', position: { x: 200, y: 0 }, data: { label: 'Build', role: 'engineer', modelId: null, effort: null, prompt: '{{objective}}', workspace: 'run', keepContext: false, maxVisits: 2 } },
+            { id: 'merge', type: 'git', position: { x: 400, y: 0 }, data: { label: 'Merge to main', action: 'merge', message: 'flow: {{objective}}' } },
+            { id: 'end', type: 'end', position: { x: 600, y: 0 }, data: { label: 'Done', template: 'Merged.' } },
+          ],
+          edges: [
+            { id: 'e1', source: 'start', sourceHandle: 'out', target: 'build' },
+            { id: 'e2', source: 'build', sourceHandle: 'out', target: 'merge' },
+            { id: 'e3', source: 'merge', sourceHandle: 'out', target: 'end' },
+          ],
+        }),
+      );
+
+      await send(l, 'Add multiply', 'Build and merge');
+      const card = l.page.getByText(/^Merge army\/run-\w+ into main\?$/);
+      await card.waitFor({ timeout: 30000 });
+      const waiting = (await lastRun(l))!;
+      assert.equal(waiting.status, 'waiting');
+      assert.equal(waiting.pending[0]?.kind, 'merge');
+      assert.match(waiting.pending[0]?.body ?? '', /Merging brings \d+ commits? from `army\/run-\w+` into `main`/);
+      assert.match(waiting.pending[0]?.body ?? '', /engineer-work\.txt \| 2 \+\+/);
+      assert.equal(existsSync(join(project, 'engineer-work.txt')), false, 'nothing merged while it waits');
+      await shot(l.page, 'e2e-merge-asks');
+      await l.page.getByRole('button', { name: 'Do not merge' }).click();
+      await until(async () => (await lastRun(l))?.status === 'failed', 15000, 'the declined run to end');
+      assert.match((await lastRun(l))!.nodes['merge']!.visits[0]!.output ?? '', /^You did not merge\. Your checkout is as it was/);
+      assert.equal(existsSync(join(project, 'engineer-work.txt')), false);
+
+      await send(l, 'Add multiply again', 'Build and merge');
+      await until(async () => (await lastRun(l))?.id !== waiting.id && (await lastRun(l))?.pending[0]?.kind === 'merge', 30000, 'the second merge question');
+      await l.page.getByRole('button', { name: 'Merge', exact: true }).click();
+      await until(async () => (await lastRun(l))?.status === 'succeeded', 15000, 'the merge to finish');
+      assert.equal(readFileSync(join(project, 'engineer-work.txt'), 'utf8'), 'engineer was here\nand edited it\n');
     });
   });
 });

@@ -226,7 +226,7 @@ export function defaultNodeData(type: NodeType): FlowNode['data'] {
     case 'shell':
       return { label: 'Run tests', command: 'npm test', workspace: 'run', timeoutSec: 600, maxVisits: 5 };
     case 'git':
-      return { label: 'Commit', action: 'commit', message: 'flow: {{objective}}' };
+      return { label: 'Commit', action: 'commit', message: 'flow: {{objective}}', askBeforeMerge: true };
     case 'search':
       return { label: 'Web search', query: '{{input}}', question: '', threshold: 0.5 };
     case 'browser':

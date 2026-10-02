@@ -41,6 +41,12 @@ export interface StageDefault {
   effort: Effort;
 }
 
+/**
+ * What the window gets in place of a saved key. The key itself never leaves the main process: the
+ * window only needs to know there is one, and a key it sends back as this value is kept as it was.
+ */
+export const SAVED_KEY = '(saved)';
+
 export interface Settings {
   models: ModelEntry[];
   /** The model each role gets when a node does not name one. */
@@ -53,7 +59,11 @@ export interface Settings {
    * public results pages, which turn a program away after many searches in a row.
    */
   braveApiKey?: string;
-  /** `unguarded` keeps each role's tools but drops argv scoping on the shell. */
+  /**
+   * `unguarded` keeps each role's tools but drops argv scoping on the shell, and lets codex agents
+   * use the network. `guarded` holds the shell to each role's listed commands and turns codex's
+   * network off.
+   */
   posture: 'guarded' | 'unguarded';
   claudeBin: string;
   codexBin: string;
@@ -280,6 +290,11 @@ export interface GitConfig {
   label: string;
   action: 'diff' | 'commit' | 'merge';
   message: string;
+  /**
+   * A merge changes your checkout, so it pauses the run and shows you what would merge first.
+   * Only `false` turns that off; flows saved before this existed ask.
+   */
+  askBeforeMerge?: boolean;
 }
 export interface BrowserConfig {
   label: string;
@@ -452,7 +467,8 @@ export type RunStatus = 'running' | 'waiting' | 'succeeded' | 'failed' | 'stoppe
 export interface PendingQuestion {
   id: string;
   nodeId: string;
-  kind: 'approve' | 'guard';
+  /** `approve` is a Your approval step, `guard` a risky browser action, `merge` a Git merge. */
+  kind: 'approve' | 'guard' | 'merge';
   title: string;
   body: string;
 }
@@ -551,5 +567,12 @@ export interface Api {
   /** Read claude's and codex's model lists again and add any model not offered before. */
   refreshModels(): Promise<{ settings: Settings; added: string[] }>;
   testJev(): Promise<{ ok: boolean; detail: string }>;
+  /** Check a TypeSafe key with one small question and save it only if TypeSafe takes it. */
+  setJevKey(apiKey: string): Promise<{ ok: boolean; detail: string }>;
+  /** The plain-text report Settings copies under Diagnostics, keys and prompts left out. */
+  diagnostics(): Promise<string>;
+  /** Put the diagnostics report on the clipboard and return it. */
+  copyDiagnostics(): Promise<string>;
+  openLogs(): Promise<void>;
   onEvent(listener: (event: AppEvent) => void): () => void;
 }

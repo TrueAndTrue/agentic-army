@@ -2,8 +2,8 @@
  * Electron main: one window, the controller, and the IPC bridge between them.
  */
 
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, powerSaveBlocker, session, shell } from 'electron';
-import { existsSync } from 'node:fs';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, powerSaveBlocker, safeStorage, session, shell } from 'electron';
+import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -12,11 +12,60 @@ import { ElectronPage } from './browser/page.ts';
 import { Controller } from './controller.ts';
 import { startFlowBridge } from './flowTools.ts';
 import { loginShellPath } from './git.ts';
-import { Store } from './store.ts';
+import { FileLog, log, setLogFile } from './log.ts';
+import { Store, type Secrets } from './store.ts';
 
 // A separate home keeps everything separate, the window's own storage included, so a second copy
 // of the app (or a test) never inherits the first one's state.
 if (process.env['ARMY_APP_HOME'] !== undefined) app.setPath('userData', join(process.env['ARMY_APP_HOME'], 'chromium'));
+// The e2e suite encrypts keys with Chromium's stand-in Keychain, so a test run never adds an item
+// to your login Keychain.
+if (process.env['ARMY_APP_MOCK_KEYCHAIN'] === '1') app.commandLine.appendSwitch('use-mock-keychain');
+
+/** Where the app keeps everything. */
+const home = () => process.env['ARMY_APP_HOME'] ?? join(app.getPath('userData'), 'army');
+
+// The log starts before anything else, so a crash during startup is in it. The controller adds the
+// keys to redact once it has loaded them.
+let secretsToRedact: () => string[] = () => [];
+const logs = new FileLog(join(home(), 'logs'), { secrets: () => secretsToRedact() });
+setLogFile(logs);
+// A monitor only watches: Electron still shows its error dialog as it did before the log existed.
+process.on('uncaughtExceptionMonitor', (err) => log.error('Uncaught exception in the main process', err));
+process.on('unhandledRejection', (reason) => log.error('Unhandled promise rejection in the main process', reason));
+
+/**
+ * The app's version. A development build runs `electron out/main/index.js`, where Electron finds
+ * no package.json and reports its own version instead, so that one is read from the file.
+ */
+function appVersion(): string {
+  if (app.isPackaged) return app.getVersion();
+  try {
+    return `${(JSON.parse(readFileSync(join(__dirname, '../../package.json'), 'utf8')) as { version: string }).version} (development build)`;
+  } catch {
+    return 'unknown (development build)';
+  }
+}
+
+/** What a support report says about the app and the Mac, one line each. */
+function about(): string[] {
+  return [
+    `App: ${appVersion()}`,
+    `Electron: ${process.versions.electron ?? '?'}, Chromium ${process.versions.chrome ?? '?'}, Node ${process.versions.node}`,
+    `macOS: ${process.getSystemVersion()} on ${process.arch}`,
+    `Home: ${home().replace(app.getPath('home'), '~')}`,
+  ];
+}
+
+/**
+ * Keys in settings.json are encrypted with safeStorage, which on macOS keeps its own key in the
+ * login Keychain under the app's name. Only once the app is ready: before that it is not usable.
+ */
+const keychain: Secrets = {
+  available: () => safeStorage.isEncryptionAvailable(),
+  encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
+  decrypt: (sealed) => safeStorage.decryptString(Buffer.from(sealed, 'base64')),
+};
 
 let win: BrowserWindow | null = null;
 /**
@@ -98,23 +147,26 @@ function handle<A extends unknown[], R>(name: string, fn: (...args: A) => R | Pr
 }
 
 void app.whenReady().then(async () => {
+  log.info(['Started.', ...about()].join(' '));
   if (HIDDEN) app.dock?.hide();
   if (process.platform === 'darwin') {
     const path = await loginShellPath();
     if (path !== null && path !== '') process.env['PATH'] = path;
   }
-  const root = process.env['ARMY_APP_HOME'] ?? join(app.getPath('userData'), 'army');
+  const root = home();
   // Web searches go through Chromium's network stack, in a session of their own with no link to the
   // app window's or the browser step's cookies.
   const web = session.fromPartition('persist:army-web');
   const webFetch = ((input: string | URL | Request, init?: RequestInit) => web.fetch(input as string, init)) as typeof fetch;
-  controller = new Controller({ store: new Store(root), emit, openPage: (show) => new ElectronPage(show && !HIDDEN), fetch: webFetch });
+  controller = new Controller({ store: new Store(root, { secrets: keychain }), emit, openPage: (show) => new ElectronPage(show && !HIDDEN), fetch: webFetch });
   const c = controller;
+  secretsToRedact = () => c.secrets();
   // Chat agents reach the start_flow tool through this. If it cannot start, chats still work.
   try {
     c.attachBridge(await startFlowBridge(root, c.flowTools));
   } catch (err) {
     console.error('The start_flow tool is unavailable:', err);
+    log.error('The start_flow tool is unavailable', err);
   }
   nativeTheme.themeSource = c.settings.theme;
 
@@ -139,7 +191,10 @@ void app.whenReady().then(async () => {
   handle('setChat', (id: string, chat: Partial<Session['chat']>) => c.setChat(id, chat));
   handle('send', (id: string, text: string, flowId: string | null) => {
     // The reply streams back as events; the call itself returns as soon as the work is queued.
-    void c.send(id, text, flowId).catch((err: unknown) => console.error(err));
+    void c.send(id, text, flowId).catch((err: unknown) => {
+      console.error(err);
+      log.error('Sending a message failed', err);
+    });
   });
   handle('stop', (id: string) => c.stop(id));
   handle('getRun', (id: string) => c.getRun(id));
@@ -157,6 +212,16 @@ void app.whenReady().then(async () => {
   handle('doctor', () => c.doctor());
   handle('refreshModels', () => c.refreshModels());
   handle('testJev', () => c.testJev());
+  handle('setJevKey', (key: string) => c.setJevKey(key));
+  handle('diagnostics', () => c.diagnostics(about()));
+  handle('copyDiagnostics', async () => {
+    const text = await c.diagnostics(about());
+    clipboard.writeText(text);
+    return text;
+  });
+  handle('openLogs', async () => {
+    await shell.openPath(logs.dir);
+  });
   handle('connectJev', (sessionId: string, itemId: string, apiKey: string | null) => c.connectJev(sessionId, itemId, apiKey));
 
   // macOS naps a background app and the agents it started with it: a claude turn stalled mid-request
@@ -172,6 +237,12 @@ void app.whenReady().then(async () => {
   }, 1000).unref();
 
   createWindow();
+  app.on('render-process-gone', (_e, contents, details) => {
+    log.error(`The window's renderer stopped: ${details.reason}, exit code ${String(details.exitCode)}${contents === win?.webContents ? '' : ' (not the main window)'}`);
+  });
+  app.on('child-process-gone', (_e, details) => {
+    if (details.reason !== 'clean-exit') log.warn(`A ${details.type} process stopped: ${details.reason}, exit code ${String(details.exitCode)}`);
+  });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -195,6 +266,7 @@ app.on('before-quit', (e) => {
   }
   e.preventDefault();
   quitting = true;
+  log.info('Quitting.');
   void controller.shutdown().finally(() => app.quit());
 });
 
