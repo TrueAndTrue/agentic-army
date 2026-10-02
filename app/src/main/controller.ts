@@ -23,8 +23,9 @@ import type {
   SessionItem,
   SessionSummary,
   Settings,
+  SetupFix,
 } from '../shared/types.ts';
-import { killAllAgents, runAgent } from './agents.ts';
+import { findBin, killAllAgents, runAgent } from './agents.ts';
 import { pilot, type Page } from './browser/pilot.ts';
 import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/engine.ts';
 import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, projectHealth, runDiff, runShell, setUpGit } from './git.ts';
@@ -32,6 +33,7 @@ import type { FlowBridge, ToolCaller, ToolDescription, ToolHandler } from './flo
 import { formatAnswer, webRead, webSearch, type WebDeps } from './websearch.ts';
 import { askJev, judge } from './jev.ts';
 import { modelCatalog } from './models.ts';
+import { addUsualDirs, refreshPath } from './setup.ts';
 import { Store } from './store.ts';
 import { BUILTIN_FLOWS } from './templates.ts';
 
@@ -103,6 +105,11 @@ const WEB_NOTE =
 
 const TRANSCRIPT_CHARS = 16_000;
 
+/** Whether a flow works in a worktree on its own branch, which needs a repository with a commit. */
+function writesOnBranch(flow: Flow): boolean {
+  return flow.nodes.some((n) => (n.type === 'agent' || n.type === 'shell') && n.data.workspace === 'run') || flow.nodes.some((n) => n.type === 'git');
+}
+
 /** The thread as text, newest last, cut from the front to fit. Empty when nothing was said yet. */
 function transcriptOf(items: SessionItem[], models: ModelEntry[]): string {
   const lines: string[] = [];
@@ -135,6 +142,7 @@ export class Controller {
   constructor(opts: ControllerOptions) {
     this.store = opts.store;
     this.emitRaw = opts.emit;
+    addUsualDirs();
     this.openPage = opts.openPage;
     this.webFetch = opts.fetch;
     this.settings = this.store.loadSettings();
@@ -286,8 +294,8 @@ export class Controller {
     this.touchSession(s, true);
   }
 
-  private notice(s: Session, text: string, tone: 'info' | 'warn' | 'error' = 'info'): void {
-    this.push(s, { kind: 'notice', id: newId('n'), ts: nowIso(), text, tone });
+  private notice(s: Session, text: string, tone: 'info' | 'warn' | 'error' = 'info', fix?: SetupFix[]): void {
+    this.push(s, { kind: 'notice', id: newId('n'), ts: nowIso(), text, tone, ...(fix === undefined || fix.length === 0 ? {} : { fix }) });
   }
 
   // ----------------------------------------------------------------------------------------------
@@ -408,9 +416,60 @@ export class Controller {
   }
 
   private async startOrSay(s: Session, flow: Flow, objective: string, by: RunStarter): Promise<void> {
+    const blocked = await this.blockers(s, flow);
+    if (blocked !== null) return this.notice(s, blocked.text, 'error', blocked.fix);
     if (await this.askForJev(s, flow, objective, by)) return;
     const res = this.startFlow(s, flow, objective, by);
     if (typeof res === 'string') this.notice(s, res, 'error');
+  }
+
+  /**
+   * The CLIs this flow's agent steps run on that this Mac does not have, each with its steps. A
+   * flow with a missing CLI would run until that step and fail there, after the others were paid for.
+   */
+  private missingClis(flow: Flow): { harness: 'claude' | 'codex'; steps: string[]; byStage: boolean }[] {
+    const out = new Map<'claude' | 'codex', { harness: 'claude' | 'codex'; steps: string[]; byStage: boolean }>();
+    for (const n of flow.nodes) {
+      if (n.type !== 'agent') continue;
+      const cfg = n.data;
+      const model = this.model(cfg.modelId ?? this.settings.stageDefaults[cfg.role].modelId);
+      if (findBin(model.harness, this.settings) !== null) continue;
+      const entry = out.get(model.harness) ?? { harness: model.harness, steps: [], byStage: true };
+      entry.steps.push(cfg.label);
+      if (cfg.modelId !== undefined) entry.byStage = false;
+      out.set(model.harness, entry);
+    }
+    return [...out.values()];
+  }
+
+  /** Why this flow cannot start on this machine and in this folder, said with the fix, or null. */
+  private async blockers(s: Session, flow: Flow): Promise<{ text: string; fix: SetupFix[] } | null> {
+    const project = this.projects.find((p) => p.id === s.projectId);
+    if (project === undefined || !existsSync(project.path)) return null;
+    const lines: string[] = [];
+    const fix: SetupFix[] = [];
+    const quote = (xs: string[]) => xs.map((x) => `"${x}"`).join(', ');
+    for (const m of this.missingClis(flow)) {
+      const one = m.steps.length === 1;
+      let line = `${quote(m.steps)} ${one ? 'runs' : 'run'} on ${m.harness}, which is not installed.`;
+      if (m.harness === 'codex') {
+        line += m.byStage
+          ? ` Install it, or pick a claude model for ${one ? 'that stage' : 'those stages'} in Settings under "Models at each stage".`
+          : ` Install it, or give ${one ? 'that step' : 'those steps'} a claude model on the flow's canvas.`;
+      }
+      lines.push(line);
+      fix.push(m.harness);
+    }
+    // Only a flow that works on its own branch needs a repository; a web lookup does not.
+    if (writesOnBranch(flow)) {
+      const h = await projectHealth(project.path);
+      if (h.git !== 'ok') {
+        lines.push(h.git === 'none' ? `${project.name} is not a git repository, and this flow works on a branch of its own.` : `${project.name} has no commits yet, so this flow has nothing to branch from.`);
+        fix.push('repo');
+      }
+    }
+    if (lines.length === 0) return null;
+    return { text: `${flow.name} did not start. ${lines.join(' ')}`, fix };
   }
 
   /** Jev picks between chatting and each flow, by the flow's description. */
@@ -632,8 +691,7 @@ export class Controller {
     // card, as it starts, not under it once it has finished without them.
     void projectHealth(project.path).then((h) => {
       // Only a flow that works on a branch leaves your uncommitted work out; a web lookup does not care.
-      const branches = flow.nodes.some((n) => (n.type === 'agent' || n.type === 'shell') && n.data.workspace === 'run') || flow.nodes.some((n) => n.type === 'git');
-      if (h.dirty === 0 || parent !== undefined || !branches) return;
+      if (h.dirty === 0 || parent !== undefined || !writesOnBranch(flow)) return;
       const at = s.items.indexOf(runItem);
       const text = `${h.dirty} ${h.dirty === 1 ? 'file has' : 'files have'} uncommitted changes, and this run starts from your last commit, so it will not see ${h.dirty === 1 ? 'it' : 'them'}. Commit first if the run needs ${h.dirty === 1 ? 'it' : 'them'}.`;
       s.items.splice(at < 0 ? s.items.length : at, 0, { kind: 'notice', id: newId('n'), ts: nowIso(), text, tone: 'warn' });
@@ -1018,11 +1076,15 @@ export class Controller {
   }
 
   async doctor(): Promise<DoctorReport> {
+    // A CLI installed since the app started is on the shell's PATH now, not on the app's.
+    await refreshPath();
     const version = (bin: string, args: string[]) =>
       new Promise<{ ok: boolean; detail: string }>((res) => {
         execFile(bin, args, { timeout: 10_000 }, (err, stdout, stderr) => {
-          if (err !== null) res({ ok: false, detail: `Not found or failed to run "${bin}". ${String(stderr).trim().slice(0, 120)}` });
-          else res({ ok: true, detail: String(stdout).trim().split('\n')[0] ?? '' });
+          if (err === null) return res({ ok: true, detail: String(stdout).trim().split('\n')[0] ?? '' });
+          const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+          const said = String(stderr).trim().split('\n')[0]?.slice(0, 160) ?? '';
+          res({ ok: false, detail: missing ? (bin.includes('/') ? `Not found at ${bin}.` : 'Not installed on this Mac.') : `"${bin} ${args.join(' ')}" failed.${said === '' ? '' : ` ${said}`}` });
         });
       });
     const [claude, codex, gitv, typesafe] = await Promise.all([

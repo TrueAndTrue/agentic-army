@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -117,6 +117,48 @@ describe('sessions', () => {
       await until(async () => (await agentItems(l.page)).length === 2 && fakeAgents() > 0, 10000, 'the second agent');
     });
     await until(async () => fakeAgents() === 0, 10000, 'every agent to be gone after quit');
+  });
+});
+
+describe('first run', () => {
+  test('on a Mac with no claude, every dead end says how to install it, and Check again finds it once it is there', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'army-e2e-'));
+    const userHome = join(root, 'user');
+    mkdirSync(userHome);
+    // A clean Mac: only the system folders on PATH, no login shell to read a longer one from, an
+    // empty home folder, and no fake CLIs.
+    const env = { PATH: '/usr/bin:/bin', SHELL: '/nonexistent', HOME: userHome, ARMY_CLAUDE_BIN: '', ARMY_CODEX_BIN: '' };
+    await withApp({ jevUrl, root, env }, async (l) => {
+      const claudeRow = l.page.getByLabel('How to install claude');
+      await claudeRow.getByText('curl -fsSL https://claude.ai/install.sh | bash').waitFor();
+      await l.page.getByLabel('How to install codex').getByText('npm install -g @openai/codex').waitFor();
+      await l.page.getByText('The Reviewer and Validator stages run on a GPT model').waitFor();
+      await shot(l.page, 'e2e-first-run-home');
+
+      // A folder that is not a repository: chat says how to install claude, a flow says what it lacks.
+      const folder = join(root, 'notes');
+      mkdirSync(folder);
+      writeFileSync(join(folder, 'todo.md'), '- milk\n');
+      await l.page.evaluate((path) => window.api.addProject(path), folder);
+      await l.page.getByRole('button', { name: 'New session in notes' }).click();
+      await l.page.getByText('claude is not installed on this Mac, so Sonnet 5 cannot answer yet.').waitFor();
+      await send(l, 'What is in todo.md?');
+      await l.page.getByText('claude is not installed on this Mac, or the app cannot find it.').waitFor();
+      await l.page.getByRole('main').getByLabel('How to install claude').waitFor();
+      await send(l, 'add a line', 'Quick fix');
+      await l.page.getByText(/^Quick fix did not start\. "Build" runs on claude, which is not installed\. "Review" runs on codex/).waitFor();
+      await l.page.getByRole('button', { name: 'Start a git repository here' }).waitFor();
+      assert.equal(await lastRun(l), null, 'nothing started');
+      await shot(l.page, 'e2e-first-run-flow-blocked');
+
+      // Claude Code's installer puts claude in ~/.local/bin. Check again finds it there without a restart.
+      mkdirSync(join(userHome, '.local/bin'), { recursive: true });
+      writeFileSync(join(userHome, '.local/bin/claude'), '#!/bin/sh\necho "2.1.281 (Claude Code)"\n');
+      chmodSync(join(userHome, '.local/bin/claude'), 0o755);
+      const help = l.page.getByRole('main').getByLabel('How to install claude').first();
+      await help.getByRole('button', { name: 'Check again' }).click();
+      await help.getByText('Found 2.1.281 (Claude Code).').waitFor();
+    });
   });
 });
 

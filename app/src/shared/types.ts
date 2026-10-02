@@ -147,7 +147,15 @@ export interface AgentTurn {
   costUsd?: number;
   tokens?: TokenCount;
   error?: string;
+  /** The CLI this turn needed and could not find, so the window can say how to install it. */
+  missing?: Harness;
 }
+
+/**
+ * Something this Mac or project lacks, that a notice can offer to fix: a CLI to install, or a
+ * folder that needs a git repository before a flow can branch from it.
+ */
+export type SetupFix = Harness | 'git' | 'repo';
 
 export type SessionItem =
   | { kind: 'user'; id: string; ts: string; text: string; flowId?: string }
@@ -182,7 +190,7 @@ export type SessionItem =
       status: 'pending' | 'started' | 'dismissed';
       runId?: string;
     }
-  | { kind: 'notice'; id: string; ts: string; text: string; tone: 'info' | 'warn' | 'error' };
+  | { kind: 'notice'; id: string; ts: string; text: string; tone: 'info' | 'warn' | 'error'; fix?: SetupFix[] };
 
 export interface Session {
   id: string;

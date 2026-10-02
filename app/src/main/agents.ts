@@ -246,8 +246,9 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
         status: 'error',
         error:
           set === ''
-            ? `${input.harness} is not installed, or not on your PATH. Install it and log in, or set its path in Settings under This machine.`
-            : `${input.harness} is not at ${set}. Fix the path in Settings under This machine.`,
+            ? `${input.harness} is not installed on this Mac, or the app cannot find it.`
+            : `${input.harness} is not at ${set}. Fix the path in Settings under Appearance and tools.`,
+        missing: input.harness,
       },
     };
   }

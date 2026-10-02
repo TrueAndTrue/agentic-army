@@ -19,7 +19,7 @@ export type View =
   | { kind: 'home' }
   | { kind: 'session'; id: string }
   | { kind: 'flows'; flowId: string | null }
-  | { kind: 'settings'; section?: 'jev' | 'models' | 'machine' };
+  | { kind: 'settings'; section?: 'jev' | 'models' | 'machine' | 'stages' | 'tools' };
 
 export interface State {
   ready: boolean;

@@ -3,14 +3,15 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 import { flowCommand, jevSteps, parseFlowCommand } from '../../../shared/flow.ts';
 import { fitEffort } from '../../../shared/models.ts';
-import type { Flow, Project, ProjectHealth, Session, SessionItem } from '../../../shared/types.ts';
-import { api, getState, go, openSession, setState, useStore } from '../lib/state.ts';
+import type { Flow, Project, ProjectHealth, Session, SessionItem, SetupFix } from '../../../shared/types.ts';
+import { api, checkMachine, getState, go, openSession, setState, useStore } from '../lib/state.ts';
 import { AgentBlock } from './AgentBlock.tsx';
 import { FlowRequestCard } from './FlowRequestCard.tsx';
 import { LinkBase } from './Markdown.tsx';
 import { NeedsJevCard } from './NeedsJevCard.tsx';
 import { RunCard } from './RunCard.tsx';
 import { RunPanel } from './RunPanel.tsx';
+import { SetupHelp } from './SetupHelp.tsx';
 import { Button, cx, EffortOptions, IconButton, Kbd, ModelOptions, PillSelect } from './ui.tsx';
 
 /** `~/code/app` for a path under home, and only the last few folders of a long one. */
@@ -42,6 +43,24 @@ function UserBubble({ text, flow }: { text: string; flow: Flow | undefined }) {
   );
 }
 
+/** Something stopped a flow before it started, with the way to fix each part right under it. */
+function FixNotice({ text, fix, sessionId }: { text: string; fix: SetupFix[]; sessionId: string }) {
+  const project = useStore((s) => s.projects.find((p) => p.id === s.sessionById[sessionId]?.projectId));
+  return (
+    <div className="mx-auto max-w-[620px] rounded-lg border border-bad/40 bg-bad/10 px-3.5 py-3 text-[12.5px]">
+      <p className="selectable text-bad">{text}</p>
+      {fix.map((f) =>
+        f === 'repo' ? (
+          project !== undefined && <ProjectCheck key={f} project={project} inline />
+        ) : (
+          <SetupHelp key={f} tool={f} className="mt-2.5" />
+        ),
+      )}
+      <p className="mt-2.5 text-[12px] text-muted">Then send your message again.</p>
+    </div>
+  );
+}
+
 function Item({ item, sessionId }: { item: SessionItem; sessionId: string }) {
   const settings = useStore((s) => s.settings);
   const run = useStore((s) => (item.kind === 'run' ? s.runById[item.runId] : undefined));
@@ -61,6 +80,7 @@ function Item({ item, sessionId }: { item: SessionItem; sessionId: string }) {
     case 'needs-jev':
       return <NeedsJevCard sessionId={sessionId} item={item} />;
     case 'notice':
+      if (item.fix !== undefined) return <FixNotice text={item.text} fix={item.fix} sessionId={sessionId} />;
       return (
         <div className={cx('selectable mx-auto max-w-[620px] text-center text-[12px] whitespace-pre-wrap', item.tone === 'error' ? 'text-bad' : item.tone === 'warn' ? 'text-warn' : 'text-faint')}>{item.text}</div>
       );
@@ -124,6 +144,9 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
   const toChat = effectiveTarget === 'chat' || effectiveTarget === 'auto';
   const chatModel = settings?.models.find((m) => m.id === session.chat.modelId);
   const noJevKey = settings !== null && settings.typesafe.apiKey.trim() === '';
+  const doctor = useStore((s) => s.doctor);
+  const chatMissing = chatModel !== undefined && doctor !== null && !doctor[chatModel.harness].ok;
+  const [showSetup, setShowSetup] = useState(false);
 
   // `/qu` lists the flows whose command starts that way; `/quick-fix add x` says what it will run.
   const typing = /^\/([a-z0-9-]*)$/i.exec(text);
@@ -185,6 +208,15 @@ function Composer({ session, busy }: { session: Session; busy: boolean }) {
         </div>
       )}
       {hint !== null && <div className="mb-1.5 px-1 text-[12px] text-warn">{hint}</div>}
+      {hint === null && toChat && chatMissing && (
+        <div className="mb-1.5 px-1 text-[12px] text-warn">
+          {chatModel?.harness} is not installed on this Mac, so {chatModel?.label} cannot answer yet.{' '}
+          <button className="text-muted underline decoration-line-strong underline-offset-2 hover:text-text" onClick={() => setShowSetup((v) => !v)}>
+            {showSetup ? 'Hide' : 'How to install it'}
+          </button>
+          {showSetup && chatModel !== undefined && <SetupHelp tool={chatModel.harness} className="mt-1.5 rounded-lg border border-line bg-panel px-3 py-2.5" />}
+        </div>
+      )}
       {hint === null && noJevKey && !toChat && flows.some((f) => f.id === effectiveTarget && usesJev(f)) && (
         <div className="mb-1.5 px-1 text-[12px] text-muted">This flow uses Jev. There is no TypeSafe key yet, so it will ask you for one first.</div>
       )}
@@ -347,7 +379,7 @@ function Title({ session }: { session: Session }) {
 }
 
 /** What stands between this project and a flow, said where you start one, with the fix beside it. */
-function ProjectCheck({ project }: { project: Project }) {
+function ProjectCheck({ project, inline = false }: { project: Project; inline?: boolean }) {
   const [health, setHealth] = useState<ProjectHealth | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -369,12 +401,12 @@ function ProjectCheck({ project }: { project: Project }) {
       ? `${project.name} is not a git repository. Chat works, but flows need git: each run works on its own branch so your files stay as they are until you merge.`
       : health.git === 'no-commits'
         ? `${project.name} has no commits yet, so a flow has nothing to branch from.`
-        : health.dirty > 0
+        : health.dirty > 0 && !inline
           ? `${health.dirty} ${health.dirty === 1 ? 'file has' : 'files have'} changes you have not committed. A flow starts from your last commit, so it will not see ${health.dirty === 1 ? 'it' : 'them'}.`
           : null;
   if (note === null && msg === null) return null;
   return (
-    <div className="mx-auto mt-6 max-w-[480px] rounded-lg border border-line bg-panel px-3.5 py-3 text-left text-[12.5px] leading-relaxed">
+    <div className={cx('text-left text-[12.5px] leading-relaxed', inline ? 'mt-2.5' : 'mx-auto mt-6 max-w-[480px] rounded-lg border border-line bg-panel px-3.5 py-3')}>
       {note !== null && (
         <div className="flex items-start gap-2.5">
           <GitBranch size={15} className="mt-0.5 shrink-0 text-warn" />
@@ -409,6 +441,10 @@ export function SessionView({ id }: { id: string }) {
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  // The composer warns before a send that cannot work, so it needs to know what this Mac has.
+  useEffect(() => {
+    void checkMachine();
+  }, []);
 
   // Follow the bottom while you are there: a reply streaming, a run card filling in, a new card.
   // Watching the content's size catches all of them, where counting items missed a card growing.

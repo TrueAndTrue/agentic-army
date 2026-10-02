@@ -4,6 +4,7 @@ import { useContext, useState } from 'react';
 import type { AgentTurn, ToolCall } from '../../../shared/types.ts';
 import { tokenDetail, tokenLine } from '../lib/format.ts';
 import { CopyButton, LinkBase, Markdown } from './Markdown.tsx';
+import { SetupHelp } from './SetupHelp.tsx';
 import { cx } from './ui.tsx';
 
 /** The CLI's own plumbing: loading a tool is not work the person asked for. */
@@ -95,7 +96,10 @@ export function AgentBody({ turn, compact }: { turn: AgentTurn; compact?: boolea
         </div>
       )}
       {turn.status === 'error' && (
-        <div className="selectable mt-2 rounded-md border border-bad/40 bg-bad/10 px-3 py-2 text-[12.5px] text-bad">{turn.error ?? 'The agent failed.'}</div>
+        <div className="mt-2 rounded-md border border-bad/40 bg-bad/10 px-3 py-2 text-[12.5px]">
+          <p className="selectable text-bad">{turn.error ?? 'The agent failed.'}</p>
+          {turn.missing !== undefined && <SetupHelp tool={turn.missing} after={compact === true ? 'After that, run the flow again.' : 'After that, send your message again.'} className="mt-2" />}
+        </div>
       )}
       {turn.status === 'stopped' && <div className="mt-2 text-[12px] text-faint">Stopped{turn.error !== undefined ? `: ${turn.error}` : '.'}</div>}
     </div>

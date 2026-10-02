@@ -6,6 +6,7 @@ import { AGENT_ROLES, INVOKE_INFO, INVOKE_LEVELS, ROLE_INFO, type Harness, type 
 import { DEFAULT_INVOKE_CEILING } from '../../../shared/flow.ts';
 import { ROLE_COLOR } from '../lib/format.ts';
 import { api, checkMachine, useStore } from '../lib/state.ts';
+import { SetupHelp } from './SetupHelp.tsx';
 import { Button, EffortOptions, Field, IconButton, Input, ModelOptions, Select } from './ui.tsx';
 
 function Section({ id, title, children, note }: { id?: string; title: string; note?: string; children: React.ReactNode }) {
@@ -23,7 +24,8 @@ function Check({ label, r }: { label: string; r: { ok: boolean; detail: string }
     <div className="flex items-start gap-2 text-[12.5px]">
       {r === undefined ? <span className="mt-1 h-3 w-3 rounded-full border border-line" /> : r.ok ? <CheckCircle2 size={15} className="mt-px text-ok" /> : <CircleAlert size={15} className="mt-px text-bad" />}
       <span className="w-20 shrink-0 font-medium">{label}</span>
-      <span className="selectable min-w-0 text-muted">{r?.detail ?? 'Checking…'}</span>
+      {/* The Jev key field is right below, so "add it in Settings" would send you where you are. */}
+      <span className="selectable min-w-0 text-muted">{r?.detail.replace(/ (Jev needs one; add it in Settings under Jev|Paste a working key in Settings under Jev)\.$/, '') ?? 'Checking…'}</span>
     </div>
   );
 }
@@ -104,8 +106,11 @@ export function SettingsView() {
                 <RefreshCw size={12} className={checking ? 'animate-spin' : undefined} /> Check again
               </button>
               <Check label="claude" r={doctor?.claude} />
+              {doctor?.claude.ok === false && <SetupHelp tool="claude" className="ml-[110px] max-w-[460px] pb-1" />}
               <Check label="codex" r={doctor?.codex} />
+              {doctor?.codex.ok === false && <SetupHelp tool="codex" className="ml-[110px] max-w-[460px] pb-1" />}
               <Check label="git" r={doctor?.git} />
+              {doctor?.git.ok === false && <SetupHelp tool="git" className="ml-[110px] max-w-[460px] pb-1" />}
               <Check label="Jev" r={doctor?.typesafe} />
             </div>
           </Section>
@@ -161,7 +166,7 @@ export function SettingsView() {
               </Field>
             </div>
           </Section>
-          <Section title="Models at each stage" note="What an agent node uses when it does not name its own model. Change a stage here and every flow that relies on the default follows.">
+          <Section id="stages" title="Models at each stage" note="What an agent node uses when it does not name its own model. Change a stage here and every flow that relies on the default follows.">
             <div className="space-y-2">
               {AGENT_ROLES.map((r) =>
                 stageRow(
@@ -279,7 +284,7 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section title="Appearance and tools">
+          <Section id="tools" title="Appearance and tools">
             <div className="grid grid-cols-3 gap-3">
               <Field label="Theme">
                 <Select value={s.theme} onChange={(e) => setS({ ...s, theme: e.target.value as Settings['theme'] })}>

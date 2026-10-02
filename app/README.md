@@ -20,7 +20,17 @@ npm run install:mac  # builds it and copies it into /Applications, so Spotlight 
 
 The built app is not signed. The first time, open it with right-click, Open. It reads your login
 shell's PATH at startup, so an app opened from the Dock finds `claude`, `codex` and `git` the same
-way your terminal does.
+way your terminal does. It also looks in `~/.local/bin` (where Claude Code's installer puts
+`claude`), `/opt/homebrew/bin` and `/usr/local/bin`.
+
+On a Mac without them, Home lists what is missing with the command that installs each one, a
+button that opens Terminal, and "Check again", which reads the shell's PATH again so a CLI you
+just installed is found without a restart. The same help shows wherever the missing tool stops
+you: under a chat reply that could not start, in Settings, and in the model pickers, which mark a
+model "needs codex" when codex is not there. A flow checks before it starts, before it asks for a
+Jev key: if one of its agent steps runs on a CLI this Mac lacks, or it works on a branch and the
+folder is not a git repository with a commit, it does not start and the thread says which steps
+and how to fix each one.
 
 Settings holds the TypeSafe key. If `TYPESAFE_API_KEY` is set in the environment the app starts
 from, the key is filled in from it.
