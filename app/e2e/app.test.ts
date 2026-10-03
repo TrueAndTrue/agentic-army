@@ -620,6 +620,53 @@ describe('the canvas', () => {
       assert.match(r.result ?? '', /Summarise the calculator/);
     });
   });
+
+  test('the inspector says what a node receives and passes on, the canvas shows what it reads, and a run step says where its input came from', async () => {
+    await withApp({ jevUrl, claudeMode: 'work' }, async (l) => {
+      await openSession(l);
+      await l.page.getByRole('button', { name: 'Flows', exact: true }).click();
+      await l.page.getByRole('button', { name: /^Build and review/ }).first().click();
+      const node = (label: string) => l.page.locator('.react-flow__node').filter({ hasText: new RegExp(`^${label}`) });
+      await node('Build').click();
+      const receives = l.page.getByRole('region', { name: 'Receives' });
+      const passes = l.page.getByRole('region', { name: 'Passes on' });
+      await receives.waitFor();
+      for (const from of ['Approve plan', 'Review passed', 'Sign off']) await receives.getByText(from, { exact: true }).waitFor();
+      await receives.getByText(/Whichever arrives/).waitFor();
+      await passes.getByText('Review', { exact: true }).waitFor();
+      await passes.getByText(/nothing, so the run fails with the error/).waitFor();
+      // Build reads Plan, Review and Sign off through {{nodes.x}}: three dashed lines into it.
+      assert.equal(await l.page.locator('.react-flow__edge.reads-edge').count(), 3);
+      await l.page.getByTestId('reads-as').first().getByText("Review's reply").waitFor();
+      await shot(l.page, 'e2e-dataflow-build');
+
+      await node('Review passed').click();
+      await receives.getByText('Review', { exact: true }).waitFor();
+      assert.equal(await receives.getByText(/Whichever arrives/).count(), 0, 'one way in');
+      for (const to of ['Validate', 'Build']) await passes.getByText(to, { exact: true }).waitFor();
+      assert.equal(await l.page.locator('.react-flow__edge.reads-edge').count(), 0);
+
+      await l.page.locator('.react-flow__pane').click({ position: { x: 30, y: 30 } });
+      assert.equal(await l.page.locator('.react-flow__edge.reads-edge').count(), 0, 'nothing selected, no reads lines');
+      await shot(l.page, 'e2e-dataflow-rest');
+
+      await l.page.getByRole('button', { name: 'Sessions' }).click();
+      await send(l, 'Add multiply', 'Quick fix');
+      const r = await runToEnd(l);
+      assert.equal(r.status, 'succeeded', r.error);
+      assert.deepEqual(r.nodes['review']?.visits[0]?.from, [{ nodeId: 'build', handle: 'out' }]);
+      assert.match(r.nodes['review']?.visits[0]?.sent ?? '', /^The task was: Add multiply/);
+      await l.page.getByRole('button', { name: 'Open run' }).click();
+      const panel = l.page.getByRole('complementary', { name: 'Run' });
+      await panel.getByRole('button', { name: 'steps', exact: true }).click();
+      const review = panel.locator(`#step-${r.id}-review`);
+      await review.getByText(/^Received from Build/).waitFor();
+      await review.getByText('What it was given').click();
+      await review.getByText(/^The task was: Add multiply/).waitFor();
+      await review.getByText(/Passed on by/).waitFor();
+      await shot(l.page, 'e2e-dataflow-run-steps');
+    });
+  });
 });
 
 describe('updates', () => {

@@ -92,6 +92,26 @@ describe('validation', () => {
     const f = flow([node('start', 'start'), node('x', 'agent', { label: 'Build' }), node('y', 'agent', { label: 'build' })], []);
     assert.ok(validateFlow(f).some((p) => p.level === 'error' && p.message.includes('named')));
   });
+
+  test('reading a node that never runs first warns that it is empty, and a loop back is fine', () => {
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('plan', 'agent', { prompt: 'Plan. Tests said: {{nodes.tests}}' }),
+        node('build', 'agent', { prompt: 'Build. Review said: {{nodes.review}}. Me before: {{nodes.build}}' }),
+        node('review', 'agent', { prompt: 'Review {{input}}' }),
+        node('tests', 'shell', { command: 'npm test' }),
+        node('end', 'end', { template: '{{nodes.plan}}' }),
+      ],
+      [edge('start', 'out', 'plan'), edge('plan', 'out', 'build'), edge('build', 'out', 'review'), edge('review', 'out', 'tests'), edge('tests', 'fail', 'build'), edge('tests', 'pass', 'end')],
+    );
+    const warnings = validateFlow(f).filter((p) => p.level === 'warn');
+    assert.deepEqual(
+      warnings.map((p) => [p.nodeId, p.message]),
+      [['plan', '"plan" reads {{nodes.tests}}, but "tests" never runs before it, so that is always empty.']],
+      'build reads review and itself through the tests loop, which is fine',
+    );
+  });
 });
 
 describe('running a flow', () => {
@@ -476,5 +496,93 @@ describe('a Git merge asks first', () => {
     assert.equal(done.status, 'stopped');
     assert.equal(merged, false);
     assert.equal(done.nodes['merge']?.status, 'stopped');
+  });
+});
+
+describe('what each step was given, and where its input came from', () => {
+  test('every kind of step records what it used, with its templates filled in', async () => {
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('plan', 'agent', { prompt: 'Plan {{objective}}' }),
+        node('ok', 'decide', { question: 'Is {{objective}} planned?', state: 'Plan: {{input}}' }),
+        node('look', 'search', { query: 'how to {{objective}}', question: 'What is {{objective}}?' }),
+        node('web', 'browser', { goal: 'find {{objective}}' }),
+        node('test', 'shell', { command: 'npm test -- {{visit}}' }),
+        node('sub', 'flow', { flowId: 'other', objective: 'child: {{objective}}' }),
+        node('commit', 'git', { action: 'commit', message: 'flow: {{objective}}' }),
+        node('diff', 'git', { action: 'diff' }),
+        node('end', 'end', { template: 'done' }),
+      ],
+      [
+        edge('start', 'out', 'plan'),
+        edge('plan', 'out', 'ok'),
+        edge('ok', 'yes', 'look'),
+        edge('look', 'found', 'web'),
+        edge('web', 'done', 'test'),
+        edge('test', 'pass', 'sub'),
+        edge('sub', 'done', 'commit'),
+        edge('commit', 'out', 'diff'),
+        edge('diff', 'out', 'end'),
+      ],
+    );
+    const r = await run(f, deps(), 'add multiply');
+    assert.equal(r.status, 'succeeded', r.error);
+    const visit = (id: string) => r.nodes[id]?.visits[0];
+    assert.equal(visit('plan')?.sent, 'Plan add multiply');
+    assert.equal(visit('ok')?.sent, 'Is add multiply planned?\n\nPlan: plan did: Plan add multiply');
+    assert.equal(visit('look')?.sent, 'how to add multiply\n\nWhat is add multiply?');
+    assert.equal(visit('web')?.sent, 'find add multiply');
+    assert.equal(visit('test')?.sent, 'npm test -- 1');
+    assert.equal(visit('sub')?.sent, 'child: add multiply');
+    assert.equal(visit('commit')?.sent, 'flow: add multiply');
+    assert.equal(visit('diff')?.sent, undefined, 'a diff takes no message');
+    assert.equal(visit('start')?.sent, undefined);
+    assert.equal(visit('start')?.from, undefined, 'Start is where the run begins');
+    assert.deepEqual(visit('plan')?.from, [{ nodeId: 'start', handle: 'out' }]);
+    assert.deepEqual(visit('look')?.from, [{ nodeId: 'ok', handle: 'yes' }]);
+    assert.deepEqual(visit('end')?.from, [{ nodeId: 'diff', handle: 'out' }]);
+  });
+
+  test('a search with no question of its own records just the query', async () => {
+    const f = flow([node('start', 'start'), node('look', 'search', { query: '{{objective}}', question: '' }), node('end', 'end')], [edge('start', 'out', 'look'), edge('look', 'found', 'end')]);
+    const r = await run(f, deps(), 'rust async');
+    assert.equal(r.nodes['look']?.visits[0]?.sent, 'rust async');
+  });
+
+  test('an approval records what you were shown, and the step after it knows it came by reject', async () => {
+    const f = flow(
+      [node('start', 'start'), node('gate', 'human', { prompt: 'Ship {{objective}}?' }), node('yes', 'end'), node('no', 'end', { template: '{{input}}' })],
+      [edge('start', 'out', 'gate'), edge('gate', 'approve', 'yes'), edge('gate', 'reject', 'no')],
+    );
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'v2' });
+    const h = startRun(r, deps(), () => {});
+    while (h.run.pending.length === 0) await new Promise((res) => setTimeout(res, 2));
+    h.answer(h.run.pending[0]!.id, false, 'not yet');
+    const done = await h.done;
+    assert.equal(done.nodes['gate']?.visits[0]?.sent, 'Ship v2?');
+    assert.deepEqual(done.nodes['no']?.visits[0]?.from, [{ nodeId: 'gate', handle: 'reject' }]);
+  });
+
+  test('a Join lists every node it waited for, and an error path names the error output', async () => {
+    const f = flow(
+      [node('start', 'start'), node('a', 'agent'), node('b', 'shell', { command: 'false' }), node('join', 'join'), node('end', 'end')],
+      [edge('start', 'out', 'a'), edge('start', 'out', 'b'), edge('a', 'error', 'join'), edge('b', 'fail', 'join'), edge('join', 'out', 'end')],
+    );
+    const r = await run(
+      f,
+      deps({
+        async agent() {
+          throw new Error('boom');
+        },
+        shell: async () => ({ code: 1, output: 'no' }),
+      }),
+    );
+    assert.equal(r.status, 'succeeded', r.error);
+    assert.deepEqual(r.nodes['join']?.visits[0]?.from, [
+      { nodeId: 'a', handle: 'error' },
+      { nodeId: 'b', handle: 'fail' },
+    ]);
+    assert.deepEqual(r.nodes['end']?.visits[0]?.from, [{ nodeId: 'join', handle: 'out' }]);
   });
 });

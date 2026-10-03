@@ -1,36 +1,150 @@
 import { Plus, Trash2 } from 'lucide-react';
 
+import { canRunBefore, inputSources, outputName, previewTemplate, sends, VAR_INFO, varName } from '../../../shared/dataflow.ts';
 import { MAX_FLOW_DEPTH, slug } from '../../../shared/flow.ts';
 import { fitEffort } from '../../../shared/models.ts';
-import { AGENT_ROLES, ROLE_INFO, type Flow, type FlowNode, type NodeConfigs, type Settings } from '../../../shared/types.ts';
+import { AGENT_ROLES, outputHandles, ROLE_INFO, type Flow, type FlowNode, type NodeConfigs, type Settings } from '../../../shared/types.ts';
 import { TYPE_LABEL } from '../lib/format.ts';
 import { useStore } from '../lib/state.ts';
 import { EffortOptions, Field, IconButton, Input, ModelOptions, Select, TextArea, Toggle, cx } from './ui.tsx';
 
 type Patch<T> = (p: Partial<T>) => void;
 
-function Vars({ flow, self, onInsert }: { flow: Flow; self: string; onInsert(v: string): void }) {
-  const names = ['objective', 'input', 'visit', 'branch', ...flow.nodes.filter((n) => n.id !== self && n.type !== 'start').map((n) => `nodes.${slug(n.data.label)}`)];
+function Vars({ flow, self, onInsert }: { flow: Flow; self: FlowNode; onInsert(v: string): void }) {
+  const builtins = (['objective', 'input', 'visit', 'branch'] as const).map((n) => ({ name: n, title: VAR_INFO[n], empty: false }));
+  const others = flow.nodes
+    .filter((n) => n.id !== self.id && n.type !== 'start')
+    .map((n) => {
+      const name = varName(n);
+      return canRunBefore(flow, n.id, self.id)
+        ? { name, title: `${outputName(flow, n)}. ${sends(n, 'out')} Empty until "${n.data.label}" has run.`, empty: false }
+        : { name, title: `"${n.data.label}" never runs before this node, so {{${name}}} is always empty here.`, empty: true };
+    });
+  // What this node can actually read comes first; the rest would read empty, so it goes last.
+  const names = [...builtins, ...others.filter((o) => !o.empty), ...others.filter((o) => o.empty)];
   return (
     <div className="flex flex-wrap gap-1">
       {names.map((n) => (
-        <button key={n} type="button" onClick={() => onInsert(`{{${n}}}`)} className="rounded border border-line bg-raised px-1.5 py-px font-mono text-[10.5px] text-muted hover:border-brass hover:text-text">
-          {`{{${n}}}`}
+        <button
+          key={n.name}
+          type="button"
+          title={n.title}
+          onClick={() => onInsert(`{{${n.name}}}`)}
+          className={cx('rounded border border-line bg-raised px-1.5 py-px font-mono text-[10.5px] text-muted hover:border-brass hover:text-text', n.empty && 'opacity-45')}
+        >
+          {`{{${n.name}}}`}
         </button>
       ))}
     </div>
   );
 }
 
-const VAR_HINT = 'Click a name to add it. {{input}} is what the previous node passed on; {{nodes.name}} is the last output of any node.';
+const VAR_HINT = 'Click a name to add it. Hover one to see what it holds here.';
 
-function PromptField({ label, value, onChange, flow, self, rows = 7 }: { label: string; value: string; onChange(v: string): void; flow: Flow; self: string; rows?: number }) {
+/** The template with each variable as what it stands for, so you can read the prompt the way it will run. */
+function ReadsAs({ template, flow, node }: { template: string; flow: Flow; node: FlowNode }) {
+  const segments = previewTemplate(template, flow, node);
+  if (!segments.some((s) => s.kind === 'var')) return null;
+  return (
+    <div data-testid="reads-as" className="max-h-36 overflow-y-auto rounded-md border border-dashed border-line px-2 py-1.5 text-[11.5px] leading-[1.7] whitespace-pre-wrap text-muted">
+      <span className="mr-1.5 text-[11px] font-medium text-faint">Reads as</span>
+      {segments.map((s, i) =>
+        s.kind === 'text' ? (
+          <span key={i}>{s.text}</span>
+        ) : (
+          <span
+            key={i}
+            title={`${s.raw}: ${s.info}`}
+            className={cx('rounded px-1 py-px text-[11px] whitespace-nowrap', s.empty ? 'bg-bad/10 text-bad' : 'bg-brass-soft text-text')}
+          >
+            {s.label}
+            {s.empty && ' (empty)'}
+          </span>
+        ),
+      )}
+    </div>
+  );
+}
+
+function PromptField({ label, value, onChange, flow, self, rows = 7 }: { label: string; value: string; onChange(v: string): void; flow: Flow; self: FlowNode; rows?: number }) {
   return (
     <div className="space-y-1.5">
       <Field label={label} hint={VAR_HINT}>
         <TextArea rows={rows} value={value} onChange={(e) => onChange(e.target.value)} />
       </Field>
       <Vars flow={flow} self={self} onInsert={(v) => onChange(value + (value.endsWith(' ') || value.endsWith('\n') || value === '' ? '' : ' ') + v)} />
+      <ReadsAs template={value} flow={flow} node={self} />
+    </div>
+  );
+}
+
+function HandleTag({ handle }: { handle: string }) {
+  return <code className="rounded bg-hover px-1 py-px font-mono text-[10.5px] text-muted">{handle}</code>;
+}
+
+/** What arrives in this node as {{input}}, and what it passes on by each output. */
+function DataFlow({ node, flow }: { node: FlowNode; flow: Flow }) {
+  const { mode, sources } = inputSources(flow, node);
+  const outs = outputHandles(node);
+  const main = sends(node, outs[0] ?? 'out');
+  const targets = (h: string) => flow.edges.filter((e) => e.source === node.id && e.sourceHandle === h).map((e) => flow.nodes.find((n) => n.id === e.target)?.data.label ?? e.target);
+  return (
+    <div className="space-y-3 rounded-md border border-line bg-raised px-2.5 py-2.5 text-[12px] leading-snug">
+      <section aria-label="Receives">
+        <div className="mb-1 flex items-baseline gap-1.5">
+          <span className="text-[12px] font-medium text-text">Receives</span>
+          <span className="font-mono text-[10.5px] text-faint">{'{{input}}'}</span>
+        </div>
+        {mode === 'none' ? (
+          <p className="text-warn">Nothing connects into this node, so it never runs.</p>
+        ) : (
+          <>
+            {mode === 'any' && <p className="mb-1.5 text-faint">Whichever arrives. Each arrival runs this node once, with what it brought.</p>}
+            {mode === 'all' && <p className="mb-1.5 text-faint">All of them, once every one has arrived, each under its node's name.</p>}
+            <ul className="space-y-1.5">
+              {sources.map((s) => (
+                <li key={`${s.node.id}.${s.handle}`}>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate font-medium text-text">{s.node.data.label}</span>
+                    <HandleTag handle={s.handle} />
+                  </div>
+                  <div className="text-[11.5px] text-faint">
+                    {/* A decision passes on what it was given; say what that is. */}
+                    {s.node.type !== 'start' && !s.name.startsWith(`${s.node.data.label}'s`) &&<span className="text-muted">That is {s.name}. </span>}
+                    {s.sends}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </section>
+      <section aria-label="Passes on" className="border-t border-line pt-2.5">
+        <div className="mb-1 text-[12px] font-medium text-text">Passes on</div>
+        <p className="mb-1.5 text-[11.5px] text-faint">{main}</p>
+        {outs.length > 0 && (
+          <ul className="space-y-1">
+            {outs.map((h) => {
+              const to = targets(h);
+              const other = sends(node, h);
+              return (
+                <li key={h}>
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                    <HandleTag handle={h} />
+                    <span className="text-faint">to</span>
+                    {to.length === 0 ? (
+                      <span className={node.type === 'agent' && h === 'error' ? 'text-faint' : 'text-warn'}>{node.type === 'agent' && h === 'error' ? 'nothing, so the run fails with the error' : 'nothing, so the run stops there'}</span>
+                    ) : (
+                      <span className="min-w-0 font-medium text-text">{to.join(', ')}</span>
+                    )}
+                  </div>
+                  {other !== main && <div className="text-[11.5px] text-faint">{other}</div>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
     </div>
   );
 }
@@ -104,7 +218,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
           <Field label="Works in" hint={d.workspace === 'run' ? 'Its own branch, shared by every node in the run. Your checkout is untouched until you merge.' : ROLE_INFO[d.role].writes ? 'Your project folder directly. An engineer here edits your checkout.' : 'Your project folder, read only for this role.'}>
             <Segmented value={d.workspace} onChange={(v) => s({ workspace: v })} options={[{ v: 'run', label: 'Run branch' }, { v: 'project', label: 'Project folder' }]} />
           </Field>
-          <PromptField label="Prompt" value={d.prompt} onChange={(v) => s({ prompt: v })} flow={flow} self={node.id} rows={9} />
+          <PromptField label="Prompt" value={d.prompt} onChange={(v) => s({ prompt: v })} flow={flow} self={node} rows={9} />
           <Toggle checked={d.web ?? d.role === 'scout'} onChange={(v) => s({ web: v })} label="Can search the web" />
           <Toggle checked={d.keepContext} onChange={(v) => s({ keepContext: v })} label="Continue the same conversation on a repeat visit" />
           <Field label="Most visits in one run" hint="A loop through this node stops the run when it reaches this.">
@@ -128,7 +242,8 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
           <Field label="Question">
             <TextArea rows={3} className="font-sans text-[12.5px]" value={d.question} onChange={(e) => s({ question: e.target.value })} />
           </Field>
-          <PromptField label="What Jev reads" value={d.state} onChange={(v) => s({ state: v })} flow={flow} self={node.id} rows={3} />
+          <ReadsAs template={d.question} flow={flow} node={node} />
+          <PromptField label="What Jev reads" value={d.state} onChange={(v) => s({ state: v })} flow={flow} self={node} rows={3} />
           {d.mode === 'yesno' && (
             <Field label={`Yes at or above ${Math.round(d.threshold * 100)}%`} hint="Raise it when a wrong yes is costly.">
               <input type="range" min={0.05} max={0.95} step={0.05} value={d.threshold} onChange={(e) => s({ threshold: Number(e.target.value) })} className="w-full accent-[var(--brass)]" />
@@ -187,7 +302,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
       body = (
         <>
           <p className="text-[12.5px] leading-relaxed text-muted">The run pauses and the session shows this with Approve and Reject. A note you add travels on with the work.</p>
-          <PromptField label="What you are shown" value={d.prompt} onChange={(v) => s({ prompt: v })} flow={flow} self={node.id} rows={5} />
+          <PromptField label="What you are shown" value={d.prompt} onChange={(v) => s({ prompt: v })} flow={flow} self={node} rows={5} />
         </>
       );
       break;
@@ -200,6 +315,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
           <Field label="Command" hint="Runs in your login shell. Exit code 0 leaves by pass, anything else by fail.">
             <Input className="font-mono text-[12px]" value={d.command} onChange={(e) => s({ command: e.target.value })} />
           </Field>
+          <ReadsAs template={d.command} flow={flow} node={node} />
           <Field label="Runs in">
             <Segmented value={d.workspace} onChange={(v) => s({ workspace: v })} options={[{ v: 'run', label: 'Run branch' }, { v: 'project', label: 'Project folder' }]} />
           </Field>
@@ -227,7 +343,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
               <option value="merge">Merge the run branch into your branch</option>
             </Select>
           </Field>
-          {d.action !== 'diff' && <PromptField label="Commit message" value={d.message} onChange={(v) => s({ message: v })} flow={flow} self={node.id} rows={2} />}
+          {d.action !== 'diff' && <PromptField label="Commit message" value={d.message} onChange={(v) => s({ message: v })} flow={flow} self={node} rows={2} />}
           {d.action === 'merge' && (
             <>
               <Toggle checked={d.askBeforeMerge !== false} onChange={(v) => s({ askBeforeMerge: v })} label="Ask me before merging" />
@@ -250,8 +366,8 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
           <p className="rounded-md border border-brass/40 bg-brass-soft px-2.5 py-2 text-[12px] leading-relaxed text-muted">
             Searches the web over plain HTTP; nothing opens on screen. Jev opens the likeliest three results and picks the passages that answer. The output is those passages with their links, for the next step to answer from.
           </p>
-          <PromptField label="Search for" value={d.query} onChange={(v) => s({ query: v })} flow={flow} self={node.id} rows={2} />
-          <PromptField label="Question to answer" value={d.question} onChange={(v) => s({ question: v })} flow={flow} self={node.id} rows={2} />
+          <PromptField label="Search for" value={d.query} onChange={(v) => s({ query: v })} flow={flow} self={node} rows={2} />
+          <PromptField label="Question to answer" value={d.question} onChange={(v) => s({ question: v })} flow={flow} self={node} rows={2} />
           <p className="-mt-1 text-[11.5px] text-faint">Leave it empty to use the search words.</p>
           <Field label={`Found when Jev is ${Math.round(d.threshold * 100)}% sure or more`} hint="Below that, the step leaves by unanswered.">
             <input type="range" min={0.1} max={0.9} step={0.05} value={d.threshold} onChange={(e) => s({ threshold: Number(e.target.value) })} className="w-full accent-[var(--brass)]" />
@@ -268,7 +384,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
           <p className="rounded-md border border-brass/40 bg-brass-soft px-2.5 py-2 text-[12px] leading-relaxed text-muted">
             A Chromium page that Jev drives, for sites that need clicking and typing. To look something up, a Web search step is faster. Each step the page becomes a list of actions and Jev picks one. It only types phrases taken from the goal, quoted or after "search for".
           </p>
-          <PromptField label="Goal" value={d.goal} onChange={(v) => s({ goal: v })} flow={flow} self={node.id} rows={3} />
+          <PromptField label="Goal" value={d.goal} onChange={(v) => s({ goal: v })} flow={flow} self={node} rows={3} />
           <Field label="Start page">
             <Input value={d.startUrl} onChange={(e) => s({ startUrl: e.target.value })} />
           </Field>
@@ -303,7 +419,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
                 ))}
             </Select>
           </Field>
-          <PromptField label="Its objective" value={d.objective} onChange={(v) => s({ objective: v })} flow={flow} self={node.id} rows={4} />
+          <PromptField label="Its objective" value={d.objective} onChange={(v) => s({ objective: v })} flow={flow} self={node} rows={4} />
           <p className="text-[12px] leading-relaxed text-faint">
             You put this step here, so it runs whatever the other flow's "Who can start this" says. Flows can run flows {String(MAX_FLOW_DEPTH)} deep; a deeper one fails instead of starting.
           </p>
@@ -316,7 +432,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
       const s = set<'end'>(d);
       body = (
         <>
-          <PromptField label="Result" value={d.template} onChange={(v) => s({ template: v })} flow={flow} self={node.id} rows={4} />
+          <PromptField label="Result" value={d.template} onChange={(v) => s({ template: v })} flow={flow} self={node} rows={4} />
           <Field label="A run that ends here counts as" hint="Use Failed for an end like &quot;Tests failed&quot;, so the run shows red instead of a green Finished.">
             <Select value={d.outcome ?? 'success'} onChange={(e) => s({ outcome: e.target.value as 'success' | 'failure' | 'stopped' })}>
               <option value="success">Finished</option>
@@ -341,6 +457,7 @@ export function NodeInspector({ node, flow, settings, onChange, onDelete }: { no
       <Field label="Name" hint={`Other nodes read its output as {{nodes.${slug(node.data.label) || 'name'}}}.`}>
         <Input value={node.data.label} onChange={(e) => onChange({ ...node.data, label: e.target.value } as FlowNode['data'])} />
       </Field>
+      {node.type !== 'start' && <DataFlow node={node} flow={flow} />}
       {body}
     </div>
   );

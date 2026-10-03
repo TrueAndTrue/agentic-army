@@ -55,7 +55,29 @@ export function templateNames(template: string): string[] {
   return [...template.matchAll(TEMPLATE_RE)].map((m) => m[1] ?? '');
 }
 
-function templatesOf(node: FlowNode): string[] {
+/** The node a `{{nodes.<name>}}` names, by id or by label slug, the way the engine files outputs. */
+export function nodeByName(flow: Flow, name: string): FlowNode | undefined {
+  return flow.nodes.find((n) => n.id === name) ?? flow.nodes.find((n) => slug(n.data.label) === name);
+}
+
+/**
+ * Whether some path of connections leads from `a` to `b`, so `a` can have run by the time `b`
+ * does. With `a` and `b` the same node, whether a loop comes back to it.
+ */
+export function canRunBefore(flow: Flow, a: string, b: string): boolean {
+  const seen = new Set<string>();
+  const stack = flow.edges.filter((e) => e.source === a).map((e) => e.target);
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (id === b) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const e of flow.edges) if (e.source === id) stack.push(e.target);
+  }
+  return false;
+}
+
+export function templatesOf(node: FlowNode): string[] {
   switch (node.type) {
     case 'agent':
       return [node.data.prompt];
@@ -143,7 +165,20 @@ export function validateFlow(flow: Flow, knownModelIds?: ReadonlySet<string>, kn
     for (const t of templatesOf(n)) {
       for (const name of templateNames(t)) {
         if (['objective', 'input', 'visit', 'branch'].includes(name)) continue;
-        if (name.startsWith('nodes.') && names.has(name.slice(6))) continue;
+        if (name.startsWith('nodes.') && names.has(name.slice(6))) {
+          const read = nodeByName(flow, name.slice(6));
+          if (read !== undefined && !canRunBefore(flow, read.id, n.id)) {
+            problems.push({
+              level: 'warn',
+              nodeId: n.id,
+              message:
+                read.id === n.id
+                  ? `"${n.data.label}" reads {{${name}}}, its own output, but nothing loops back to it, so that is always empty.`
+                  : `"${n.data.label}" reads {{${name}}}, but "${read.data.label}" never runs before it, so that is always empty.`,
+            });
+          }
+          continue;
+        }
         problems.push({ level: 'warn', nodeId: n.id, message: `"${n.data.label}" uses {{${name}}}, which nothing provides.` });
       }
     }

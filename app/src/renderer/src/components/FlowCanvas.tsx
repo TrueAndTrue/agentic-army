@@ -3,10 +3,11 @@
  * editor and the live run map both use these, so a node looks the same in both places.
  */
 
-import { Handle, Position, type Edge, type Node, type NodeChange, type NodeProps } from '@xyflow/react';
+import { BaseEdge, EdgeLabelRenderer, EdgeText, getSmoothStepPath, Handle, Position, useInternalNode, type Edge, type EdgeProps, type Node, type NodeChange, type NodeProps } from '@xyflow/react';
 import { Bot, Flag, GitBranch, Globe, Merge, Play, Search, Split, Terminal, UserCheck, Workflow } from 'lucide-react';
 import { memo, useCallback, useRef, useState } from 'react';
 
+import { outputName, readsFrom, sends } from '../../../shared/dataflow.ts';
 import { outputHandles, hasInput, ROLE_INFO, type Flow, type FlowNode, type NodeRunStatus, type NodeType, type Settings } from '../../../shared/types.ts';
 import { NODE_STATUS_COLOR, ROLE_COLOR, TYPE_COLOR, TYPE_LABEL } from '../lib/format.ts';
 import { getState } from '../lib/state.ts';
@@ -170,6 +171,11 @@ function ArmyNodeView(props: NodeProps<ArmyFlowNode>) {
       )}
       {/* A loop comes back in over the top, so its line runs above the row instead of behind it. */}
       {hasInput(node.type) && <Handle id="back" type="target" position={Position.Top} className="!h-1.5 !w-1.5 !border-0 !bg-transparent" style={{ top: -1 }} />}
+      {/* Where the dashed "reads" lines start and end. Nothing can be connected here by hand. */}
+      <Handle id="reads-out" type="source" position={Position.Bottom} isConnectable={false} className="!pointer-events-none !h-1 !w-1 !border-0 !bg-transparent" style={{ left: '35%', bottom: -1 }} />
+      {hasInput(node.type) && (
+        <Handle id="reads-in" type="target" position={Position.Bottom} isConnectable={false} className="!pointer-events-none !h-1 !w-1 !border-0 !bg-transparent" style={{ left: '65%', bottom: -1 }} />
+      )}
     </div>
   );
 }
@@ -185,26 +191,127 @@ export function toRfNodes(flow: Flow, settings: Settings | null, extra?: (n: Flo
   }));
 }
 
-export function toRfEdges(flow: Flow, animated?: (targetId: string) => boolean): Edge[] {
+interface DataEdgeData extends Record<string, unknown> {
+  /** What travels along it, such as "Scout's reply". */
+  name: string;
+  sends: string;
+  hover: boolean;
+}
+
+/** A connection on the edit canvas. Hovering it shows what travels along it. */
+function DataEdge(props: EdgeProps<Edge<DataEdgeData>>) {
+  const { sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, label, markerEnd, style, interactionWidth } = props;
+  const options = (props as { pathOptions?: { borderRadius?: number; offset?: number } }).pathOptions ?? {};
+  const [path, labelX, labelY] = getSmoothStepPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, ...options });
+  return (
+    <>
+      <BaseEdge
+        path={path}
+        labelX={labelX}
+        labelY={labelY}
+        {...(label === undefined ? {} : { label, labelBgPadding: [4, 2] as [number, number], labelBgBorderRadius: 4 })}
+        {...(markerEnd === undefined ? {} : { markerEnd })}
+        {...(style === undefined ? {} : { style })}
+        {...(interactionWidth === undefined ? {} : { interactionWidth })}
+      />
+      {data?.hover === true && (
+        <EdgeLabelRenderer>
+          <div
+            className="pointer-events-none absolute z-10 w-max max-w-[230px] rounded-md border border-line-strong bg-panel px-2 py-1.5 text-[11.5px] leading-snug shadow-[0_4px_14px_rgba(0,0,0,0.3)]"
+            style={{ transform: `translate(-50%, -100%) translate(${labelX}px, ${labelY - 10}px)` }}
+          >
+            <div className="font-medium text-text">{data.name}</div>
+            <div className="text-muted">{data.sends}</div>
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
+}
+
+/** A dashed line from a node the selected one reads through {{nodes.x}}. It is not a connection: nothing runs along it. */
+function ReadsEdge({ source, target }: EdgeProps) {
+  // A straight line from border to border. Routed through the handles, it looped under the
+  // nodes and crossed half the flow to reach a neighbour.
+  const s = useInternalNode(source);
+  const t = useInternalNode(target);
+  if (s === undefined || t === undefined) return null;
+  const box = (n: NonNullable<typeof s>) => {
+    const w = n.measured.width ?? 200;
+    const h = n.measured.height ?? 80;
+    return { cx: n.internals.positionAbsolute.x + w / 2, cy: n.internals.positionAbsolute.y + h / 2, w, h };
+  };
+  const a = box(s);
+  const b = box(t);
+  const edgeOf = (r: typeof a, toward: typeof a) => {
+    const dx = toward.cx - r.cx;
+    const dy = toward.cy - r.cy;
+    const k = Math.min(dx === 0 ? Infinity : r.w / 2 / Math.abs(dx), dy === 0 ? Infinity : r.h / 2 / Math.abs(dy));
+    return { x: r.cx + dx * k, y: r.cy + dy * k };
+  };
+  const p1 = edgeOf(a, b);
+  const p2 = edgeOf(b, a);
+  const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+  const tip = (d: number, turn: number) => `${p2.x - d * Math.cos(angle + turn)},${p2.y - d * Math.sin(angle + turn)}`;
+  return (
+    <>
+      <path d={`M ${p1.x},${p1.y} L ${p2.x},${p2.y}`} fill="none" stroke="var(--brass)" strokeWidth={1.4} strokeDasharray="5 4" opacity={0.85} />
+      <polygon points={`${p2.x},${p2.y} ${tip(8, 0.4)} ${tip(8, -0.4)}`} fill="var(--brass)" opacity={0.85} />
+      <EdgeText x={(p1.x + p2.x) / 2} y={(p1.y + p2.y) / 2} label="reads" labelStyle={{ fill: 'var(--brass)', fontSize: 10 }} labelBgPadding={[4, 2]} labelBgBorderRadius={4} />
+    </>
+  );
+}
+
+export const edgeTypes = { data: DataEdge, reads: ReadsEdge };
+
+export function toRfEdges(flow: Flow, animated?: (targetId: string) => boolean, hovered?: string | null): Edge[] {
   const at = new Map(flow.nodes.map((n) => [n.id, n.position]));
+  const byId = new Map(flow.nodes.map((n) => [n.id, n]));
   let loops = 0;
   return flow.edges.map((e) => {
     // A connection that goes back (to a node left of its source) is a loop. It enters from the top
     // and each loop gets its own height, so two loops never share one line.
     const back = (at.get(e.target)?.x ?? 0) < (at.get(e.source)?.x ?? 0) + 40;
     const offset = back ? 34 + 16 * loops++ : 22;
+    const source = byId.get(e.source);
+    const data: DataEdgeData = {
+      name: source === undefined ? '' : outputName(flow, source, e.sourceHandle),
+      sends: source === undefined ? '' : sends(source, e.sourceHandle),
+      hover: hovered === e.id,
+    };
     return {
       id: e.id,
       source: e.source,
       sourceHandle: e.sourceHandle,
       target: e.target,
       targetHandle: back ? 'back' : 'in',
-      type: 'smoothstep',
+      type: 'data',
+      data,
       pathOptions: { borderRadius: 14, offset },
-      ...(back ? { label: e.sourceHandle, labelBgPadding: [4, 2] as [number, number], labelBgBorderRadius: 4 } : {}),
+      ...(back ? { label: e.sourceHandle } : {}),
       animated: animated?.(e.target) ?? false,
     };
   }) as Edge[];
+}
+
+/** The "reads" lines into the selected node, one from each node its templates name. */
+export function readsEdges(flow: Flow, selected: string | null): Edge[] {
+  const node = selected === null ? undefined : flow.nodes.find((n) => n.id === selected);
+  if (node === undefined || !hasInput(node.type)) return [];
+  return readsFrom(flow, node).map((src) => ({
+    id: `reads:${src.id}->${node.id}`,
+    source: src.id,
+    sourceHandle: 'reads-out',
+    target: node.id,
+    targetHandle: 'reads-in',
+    type: 'reads',
+    className: 'reads-edge',
+    selectable: false,
+    focusable: false,
+    deletable: false,
+    // Over the nodes: under them, a line that crosses a node vanishes halfway.
+    zIndex: 2000,
+  }));
 }
 
 /** Edges for the top-to-bottom run map: curves going down, loops around the left side. */

@@ -17,7 +17,7 @@ import { DEFAULT_INVOKE_CEILING, defaultNodeData, flowCommand, invokeLevel, newI
 import { INVOKE_INFO, INVOKE_LEVELS, NODE_TYPES, type Flow, type FlowNode, type InvokeLevel, type NodeType } from '../../../shared/types.ts';
 import { TYPE_LABEL } from '../lib/format.ts';
 import { api, go, newFlowSession, useStore } from '../lib/state.ts';
-import { nodeColor, nodeTypes, toRfEdges, toRfNodes, TYPE_ICON, useMeasured } from './FlowCanvas.tsx';
+import { edgeTypes, nodeColor, nodeTypes, readsEdges, toRfEdges, toRfNodes, TYPE_ICON, useMeasured } from './FlowCanvas.tsx';
 import { NodeInspector } from './NodeInspector.tsx';
 import { Button, cx, Field, Input, PillSelect, Select, TextArea } from './ui.tsx';
 
@@ -88,7 +88,9 @@ function Canvas({ draft, setDraft, selected, setSelected }: { draft: Flow; setDr
     [draft, settings, problems, selected],
   );
   const shown = measured.withMeasured(nodes);
-  const edges = useMemo(() => toRfEdges(draft), [draft]);
+  const [hoverEdge, setHoverEdge] = useState<string | null>(null);
+  // The dashed "reads" lines show only for the selected node, so a flow at rest stays plain.
+  const edges = useMemo(() => [...toRfEdges(draft, undefined, hoverEdge), ...readsEdges(draft, selected)], [draft, hoverEdge, selected]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -193,6 +195,9 @@ function Canvas({ draft, setDraft, selected, setSelected }: { draft: Flow; setDr
           nodes={shown}
           edges={edges}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          onEdgeMouseEnter={(_e, edge) => edge.type === 'data' && setHoverEdge(edge.id)}
+          onEdgeMouseLeave={() => setHoverEdge(null)}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
@@ -222,6 +227,11 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
   const [draft, setDraftRaw] = useState<Flow | null>(current);
   const [dirty, setDirty] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const inspector = useRef<HTMLElement>(null);
+  // A newly picked node opens at the top, where it says what it receives and passes on.
+  useEffect(() => {
+    inspector.current?.scrollTo({ top: 0 });
+  }, [selected]);
 
   useEffect(() => {
     setDraftRaw(current === null ? null : structuredClone(current));
@@ -400,7 +410,7 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
             <ReactFlowProvider>
               <Canvas key={draft.id} draft={draft} setDraft={setDraft} selected={selected} setSelected={setSelected} />
             </ReactFlowProvider>
-            <aside className="w-[340px] shrink-0 overflow-y-auto border-l border-line bg-panel p-4">
+            <aside ref={inspector} className="w-[340px] shrink-0 overflow-y-auto border-l border-line bg-panel p-4">
               {node !== null && settings !== null ? (
                 <NodeInspector
                   node={node}

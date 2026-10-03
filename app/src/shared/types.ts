@@ -436,6 +436,17 @@ export interface NodeVisit {
   startedAt: string;
   endedAt?: string;
   input: string;
+  /**
+   * Where the input came from: the node and the output it left by. A Join lists every node it
+   * waited for. Absent for Start, and on runs from before this was recorded.
+   */
+  from?: { nodeId: string; handle: string }[];
+  /**
+   * What the step actually used, with its templates filled in: an agent's prompt, Jev's question
+   * and what it read, a command, a search, a goal, an objective, a commit message, what you were
+   * shown. Absent on runs from before this was recorded.
+   */
+  sent?: string;
   output?: string;
   handle?: string;
   /** Agent nodes. */

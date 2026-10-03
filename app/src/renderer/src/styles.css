@@ -368,6 +368,10 @@ input {
 .react-flow__edge.animated path {
   stroke: var(--run);
 }
+/* The dashed "reads" lines picture the templates. They are not connections, so nothing on them takes a click. */
+.react-flow__edge.reads-edge {
+  pointer-events: none;
+}
 
 @keyframes pulse-ring {
   0% {

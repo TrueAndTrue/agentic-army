@@ -2,7 +2,7 @@ import { Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, 
 import { GitMerge, RefreshCw, X } from 'lucide-react';
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 
-import type { DiffResult, FlowNode, Judgment, NodeVisit, Run } from '../../../shared/types.ts';
+import type { DiffResult, Flow, FlowNode, Judgment, NodeVisit, Run } from '../../../shared/types.ts';
 import { duration, NODE_STATUS_COLOR, RUN_STATUS_COLOR, RUN_STATUS_LABEL, tokenDetail, tokenLine } from '../lib/format.ts';
 import { api, setState, useStore } from '../lib/state.ts';
 import { AgentBody } from './AgentBlock.tsx';
@@ -122,19 +122,41 @@ function JevBlock({ node, j }: { node: FlowNode; j: Judgment }) {
   );
 }
 
-function VisitView({ node, visit }: { node: FlowNode; visit: NodeVisit }) {
+function HandleName({ name }: { name: string }) {
+  return <code className="rounded bg-hover px-1 py-px font-mono text-[11px] text-muted">{name}</code>;
+}
+
+/** Where the input came from, as "Scout (out)", joined for a Join. */
+function receivedFrom(flow: Flow, visit: NodeVisit): React.ReactNode {
+  return (visit.from ?? []).map((f, i) => (
+    <span key={`${f.nodeId}.${f.handle}`}>
+      {i > 0 && ', '}
+      <span className="font-medium text-text">{flow.nodes.find((n) => n.id === f.nodeId)?.data.label ?? f.nodeId}</span> <HandleName name={f.handle} />
+    </span>
+  ));
+}
+
+function VisitView({ node, visit, flow }: { node: FlowNode; visit: NodeVisit; flow: Flow }) {
+  const to = visit.handle === undefined ? [] : flow.edges.filter((e) => e.source === node.id && e.sourceHandle === visit.handle).map((e) => flow.nodes.find((n) => n.id === e.target)?.data.label ?? e.target);
+  // Runs from before `from` was recorded only know the input itself.
+  const from = visit.from !== undefined && visit.from.length > 0;
   return (
     <div className="space-y-2.5">
       <div className="flex items-center gap-2 text-[11.5px] text-faint">
         <span>Visit {visit.n}</span>
         <span>{duration(visit.startedAt, visit.endedAt)}</span>
-        {visit.handle !== undefined && visit.handle !== '' && <span className="rounded bg-raised px-1.5 py-px font-mono text-muted">→ {visit.handle}</span>}
         {tokenLine(visit.turn?.tokens) !== '' && <span title={tokenDetail(visit.turn?.tokens)}>{tokenLine(visit.turn?.tokens)}</span>}
       </div>
-      {node.type !== 'start' && visit.input.trim() !== '' && (
+      {node.type !== 'start' && (from || visit.input.trim() !== '') && (
         <details className="group rounded-md border border-line bg-raised">
-          <summary className="cursor-pointer px-2.5 py-1.5 text-[12px] text-muted">Input</summary>
-          <pre className="selectable max-h-60 overflow-auto px-2.5 pb-2 font-mono text-[11.5px] whitespace-pre-wrap text-muted">{visit.input}</pre>
+          <summary className="cursor-pointer px-2.5 py-1.5 text-[12px] text-muted">{from ? <>Received from {receivedFrom(flow, visit)}</> : 'Input'}</summary>
+          <pre className="selectable max-h-60 overflow-auto px-2.5 pb-2 font-mono text-[11.5px] whitespace-pre-wrap text-muted">{visit.input.trim() === '' ? '(empty)' : visit.input}</pre>
+        </details>
+      )}
+      {visit.sent !== undefined && (
+        <details className="rounded-md border border-line bg-raised">
+          <summary className="cursor-pointer px-2.5 py-1.5 text-[12px] text-muted">What it was given</summary>
+          <pre className="selectable max-h-72 overflow-auto px-2.5 pb-2 font-mono text-[11.5px] whitespace-pre-wrap text-muted">{visit.sent}</pre>
         </details>
       )}
       {visit.turn !== undefined && <AgentBody turn={visit.turn} compact />}
@@ -165,6 +187,13 @@ function VisitView({ node, visit }: { node: FlowNode; visit: NodeVisit }) {
             <Markdown text={visit.output} className="text-[12.5px]" />
           </div>
         </details>
+      )}
+      {node.type === 'end' && visit.handle !== undefined && <div className="text-[12px] text-muted">This became the run's result.</div>}
+      {node.type !== 'end' && visit.handle !== undefined && visit.handle !== '' && (
+        <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-muted">
+          Passed on by <HandleName name={visit.handle} />
+          {to.length === 0 ? <span className="text-warn">to nothing, so the run stopped here</span> : <>to <span className="font-medium text-text">{to.join(', ')}</span></>}
+        </div>
       )}
     </div>
   );
@@ -204,7 +233,7 @@ function Steps({ run, focus }: { run: Run; focus: string | null }) {
             </h3>
             <div className="space-y-3 border-l border-line pl-3">
               {st.visits.map((v) => (
-                <VisitView key={v.n} node={n} visit={v} />
+                <VisitView key={v.n} node={n} visit={v} flow={run.flow} />
               ))}
             </div>
           </section>

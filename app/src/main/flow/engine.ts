@@ -107,6 +107,8 @@ interface Activation {
   input: string;
   /** The node and the output that sent the work here, to name the cause when a loop runs out. */
   from?: { node: FlowNode; handle: string };
+  /** A Join's inputs: every node it waited for, and the output each left by. */
+  joined?: { nodeId: string; handle: string }[];
 }
 
 interface Outcome {
@@ -161,7 +163,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
   const outputs: Record<string, string> = {};
   const harnessSessions = new Map<string, string>();
   const harnessTokens = new Map<string, TokenCount>();
-  const joinArrivals = new Map<string, Map<string, string>>();
+  const joinArrivals = new Map<string, Map<string, { output: string; handle: string }>>();
   const waiters = new Map<string, (answer: { approve: boolean; text: string }) => void>();
   const queue: Activation[] = [];
   const inFlight = new Set<Promise<void>>();
@@ -232,6 +234,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
       case 'agent': {
         const cfg: AgentConfig = node.data;
         const prompt = renderTemplate(cfg.prompt, ctx);
+        visit.sent = prompt;
         const cwd = await cwdFor(cfg.workspace);
         const resume = cfg.keepContext ? harnessSessions.get(node.id) : undefined;
         const tokensBefore = resume === undefined ? undefined : harnessTokens.get(node.id);
@@ -274,6 +277,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         const cfg = node.data;
         const question = renderTemplate(cfg.question, ctx);
         const state = renderTemplate(cfg.state.trim() === '' ? '{{input}}' : cfg.state, ctx);
+        visit.sent = `${question}\n\n${state}`;
         const judgment = await deps.judge({ config: cfg, question, state, signal });
         visit.judgment = { ...judgment, question };
         let handle = judgment.answer;
@@ -287,6 +291,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
 
       case 'human': {
         const body = renderTemplate(node.data.prompt, ctx);
+        visit.sent = body;
         const answer = await ask(node.id, 'approve', node.data.label, body);
         if (signal.aborted) throw new NodeFailure('Stopped.');
         const note = answer.text.trim();
@@ -299,6 +304,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
       case 'shell': {
         const cfg = node.data;
         const command = renderTemplate(cfg.command, ctx);
+        visit.sent = command;
         const cwd = await cwdFor(cfg.workspace);
         const res = await deps.shell({ command, cwd, timeoutMs: cfg.timeoutSec * 1000, signal });
         visit.log = `$ ${command}\n${res.output}`;
@@ -309,6 +315,8 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
 
       case 'git': {
         const message = renderTemplate(node.data.message, ctx);
+        // A diff takes no message, so there is nothing it was given.
+        if (node.data.action !== 'diff') visit.sent = message;
         // A merge changes your checkout, so it asks first. Not when the step that sent the work
         // here was your own approval: that was the question, and asking again is a second click
         // for nothing. Flows saved before the setting existed have no value, and ask.
@@ -330,6 +338,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
         const cfg = node.data;
         const query = renderTemplate(cfg.query, ctx);
         const question = cfg.question.trim() === '' ? query : renderTemplate(cfg.question, ctx);
+        visit.sent = question === query ? query : `${query}\n\n${question}`;
         visit.log = '';
         const res = await deps.search({
           query,
@@ -358,10 +367,12 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
       case 'browser': {
         const cfg = node.data;
         visit.steps = [];
+        const goal = renderTemplate(cfg.goal, ctx);
+        visit.sent = goal;
         const res = await deps.browser({
           run,
           config: cfg,
-          goal: renderTemplate(cfg.goal, ctx),
+          goal,
           startUrl: renderUrlTemplate(cfg.startUrl, ctx),
           signal,
           onStep(step) {
@@ -375,6 +386,7 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
 
       case 'flow': {
         const objective = renderTemplate(node.data.objective, ctx);
+        visit.sent = objective;
         const res = await deps.subflow({ run, node, objective, signal });
         if (res.runId !== undefined) visit.log = `Run ${res.runId}`;
         return { handle: res.ok ? 'done' : 'failed', output: res.output };
@@ -396,17 +408,18 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
       if (target === undefined) continue;
       if (target.type === 'join') {
         const sources = new Set(flow.edges.filter((x) => x.target === target.id).map((x) => x.source));
-        const arrivals = joinArrivals.get(target.id) ?? new Map<string, string>();
-        arrivals.set(node.id, outcome.output);
+        const arrivals = joinArrivals.get(target.id) ?? new Map<string, { output: string; handle: string }>();
+        arrivals.set(node.id, { output: outcome.output, handle: outcome.handle });
         joinArrivals.set(target.id, arrivals);
         const state = run.nodes[target.id];
         if (state !== undefined && state.status === 'idle') state.status = 'waiting';
         if ([...sources].every((s) => arrivals.has(s))) {
           joinArrivals.delete(target.id);
           const combined = [...sources]
-            .map((s) => `## ${byId.get(s)?.data.label ?? s}\n\n${arrivals.get(s) ?? ''}`)
+            .map((s) => `## ${byId.get(s)?.data.label ?? s}\n\n${arrivals.get(s)?.output ?? ''}`)
             .join('\n\n');
-          queue.push({ nodeId: target.id, input: combined });
+          const joined = [...sources].map((s) => ({ nodeId: s, handle: arrivals.get(s)?.handle ?? '' }));
+          queue.push({ nodeId: target.id, input: combined, joined });
         }
       } else {
         queue.push({ nodeId: target.id, input: outcome.output, from: { node, handle: outcome.handle } });
@@ -435,7 +448,8 @@ export function startRun(run: Run, deps: EngineDeps, onUpdate: (run: Run) => voi
       update();
       return;
     }
-    const visit: NodeVisit = { n, startedAt: nowIso(), input: act.input };
+    const from = act.joined ?? (act.from === undefined ? undefined : [{ nodeId: act.from.node.id, handle: act.from.handle }]);
+    const visit: NodeVisit = { n, startedAt: nowIso(), input: act.input, ...(from === undefined ? {} : { from }) };
     state.visits.push(visit);
     state.status = 'running';
     update();
