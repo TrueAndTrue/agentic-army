@@ -585,7 +585,7 @@ describe('the canvas', () => {
     await withApp({ jevUrl }, async (l) => {
       await openSession(l);
       await l.page.getByRole('button', { name: 'Flows', exact: true }).click();
-      await l.page.getByRole('button', { name: 'New flow' }).click();
+      await l.page.getByRole('button', { name: 'Blank flow' }).click();
       await l.page.getByRole('button', { name: 'Agent', exact: true }).click();
       const node = (label: string) => l.page.locator('.react-flow__node').filter({ hasText: label });
       await l.page.getByLabel('Name', { exact: true }).fill('Summarise');
@@ -618,6 +618,54 @@ describe('the canvas', () => {
       const r = await runToEnd(l);
       assert.equal(r.status, 'succeeded', r.error);
       assert.match(r.result ?? '', /Summarise the calculator/);
+    });
+  });
+});
+
+describe('draft with AI', () => {
+  test('the AI asks, takes an option and your own words, shows the draft, and opens it in the editor', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      const page = l.page;
+      await page.getByRole('button', { name: 'Flows', exact: true }).click();
+      await page.getByRole('button', { name: 'Draft with AI' }).click();
+      await page.getByRole('textbox', { name: 'What the flow should do' }).fill('Fix the login bug');
+      await shot(page, 'e2e-draft-objective');
+      await page.getByRole('button', { name: /Continue/ }).click();
+
+      await page.getByRole('heading', { name: 'What kind of work is this?' }).waitFor({ timeout: 20000 });
+      await page.getByRole('radio', { name: /Fix a bug/ }).click();
+      await page.getByRole('button', { name: /^Next/ }).click();
+
+      await page.getByRole('heading', { name: 'How should the work be checked?' }).waitFor({ timeout: 20000 });
+      await page.getByText('The work is: Fix a bug.').waitFor();
+      // An earlier answer takes you back to its question, as you answered it.
+      await page.getByRole('button', { name: /What kind of work is this\?\s*Fix a bug/ }).click();
+      await page.getByRole('heading', { name: 'What kind of work is this?' }).waitFor();
+      assert.equal(await page.getByRole('radio', { name: /Fix a bug/ }).getAttribute('aria-checked'), 'true');
+      await page.keyboard.press('Enter');
+
+      await page.getByRole('heading', { name: 'How should the work be checked?' }).waitFor({ timeout: 20000 });
+      await page.getByRole('textbox', { name: 'Something else' }).fill('Run npm test, three tries at most');
+      assert.equal(await page.getByRole('button', { name: /^Next/ }).isEnabled(), true, 'your own words are enough to go on');
+      await shot(page, 'e2e-draft-question');
+      await page.keyboard.press('Enter');
+
+      await page.getByRole('heading', { name: 'Fix with tests' }).waitFor({ timeout: 20000 });
+      await page.getByText('Built from your answers: Fix a bug / Run npm test, three tries at most.').waitFor();
+      const preview = page.getByLabel('Preview of the drafted flow');
+      await until(async () => (await preview.locator('.react-flow__node').count()) === 4, 5000, 'the four nodes in the preview');
+      assert.equal(await preview.locator('.react-flow__edge').count(), 4);
+      await shot(page, 'e2e-draft-preview');
+      assert.equal(await page.evaluate(async () => (await window.api.getState()).flows.some((f) => f.name === 'Fix with tests')), false, 'nothing is saved before you open it');
+
+      await page.getByRole('button', { name: /Open in editor/ }).click();
+      await page.locator('header').getByText('Fix with tests').waitFor();
+      await page.locator('.react-flow__node').filter({ hasText: 'Fix the bug' }).waitFor();
+      await page.getByText('No problems. This flow can run.').waitFor();
+      await page.getByRole('button', { name: 'Flows', exact: true }).click();
+      const card = page.getByRole('listitem').filter({ hasText: 'Fix with tests' });
+      await card.getByText('Fix the bug').waitFor();
+      await card.getByText('Run tests').waitFor();
     });
   });
 });

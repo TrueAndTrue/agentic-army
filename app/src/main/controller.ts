@@ -4,9 +4,11 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 
+import { armyHome } from '../../../src/config/paths.ts';
+import type { DraftReply, DraftRequest } from '../shared/draft.ts';
 import { flowCommand, jevSteps, MAX_FLOW_DEPTH, mayStart, newId, parseFlowCommand, slug } from '../shared/flow.ts';
 import { fitEffort, mergeCatalog } from '../shared/models.ts';
 import type {
@@ -33,6 +35,7 @@ import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/eng
 import { ensureWorkspace, finalizeWorkspace, gitNode, mergeRun, projectHealth, runDiff, runShell, setUpGit } from './git.ts';
 import type { FlowBridge, ToolCaller, ToolDescription, ToolHandler } from './flowTools.ts';
 import { formatAnswer, webRead, webSearch, type WebDeps } from './websearch.ts';
+import { draft, type Ask } from './drafter.ts';
 import { askJev, judge } from './jev.ts';
 import { log, logFile, redact } from './log.ts';
 import { modelCatalog } from './models.ts';
@@ -53,6 +56,8 @@ export interface ControllerOptions {
 
 const nowIso = () => new Date().toISOString();
 const errMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
+/** A draft you stopped. Not a failure, so it is not logged as one. */
+class DraftStopped extends Error {}
 const TITLE_CHARS = 60;
 /** Runs an agent may have going at once in one session, so a loop of requests cannot fan out. */
 const MAX_AGENT_RUNS = 3;
@@ -142,6 +147,7 @@ export class Controller {
   private readonly workspaces = new Map<string, Promise<string>>();
   private readonly throttles = new Map<string, NodeJS.Timeout>();
   private bridge: FlowBridge | null = null;
+  private draftCtl: AbortController | null = null;
 
   constructor(opts: ControllerOptions) {
     this.store = opts.store;
@@ -1113,6 +1119,68 @@ export class Controller {
   }
 
   // ----------------------------------------------------------------------------------------------
+  // Drafting a flow with AI
+  // ----------------------------------------------------------------------------------------------
+
+  /**
+   * The next question, or the drafted flow. One draft at a time: a new request stops the one
+   * before it, whose answer nobody is waiting for any more.
+   */
+  async draftFlow(req: DraftRequest): Promise<DraftReply> {
+    this.draftCtl?.abort();
+    const ctl = new AbortController();
+    this.draftCtl = ctl;
+    const model = this.model(this.settings.chatDefault.modelId);
+    // An empty folder of its own, so the model has nothing to read and nothing to change.
+    const cwd = join(armyHome(), 'drafts');
+    const ask: Ask = async (prompt, instructions, signal) => {
+      mkdirSync(cwd, { recursive: true });
+      const res = await runAgent({
+        harness: model.harness,
+        model: model.model,
+        effort: fitEffort(model, 'low'),
+        role: 'planner',
+        web: false,
+        cwd,
+        prompt,
+        instructions,
+        label: 'draft',
+        brief: false,
+        settings: this.settings,
+        signal,
+        onTurn: () => {},
+      });
+      if (res.turn.status === 'stopped') throw new DraftStopped();
+      // The drafter uses the model new chats start on, so that is the setting to change.
+      if (res.turn.missing !== undefined) throw new Error(`${res.turn.error ?? `${res.turn.missing} is not installed.`} Drafting uses the model new chats start on, ${model.label}. Install ${res.turn.missing}, or pick another model for new chats in Settings.`);
+      if (res.turn.status !== 'done') throw new Error(res.turn.error ?? `${model.label} ended without an answer.`);
+      return res.turn.final ?? res.turn.text;
+    };
+    const flows = this.flows();
+    try {
+      const reply = await draft(req, ask, {
+        signal: ctl.signal,
+        context: {
+          models: this.settings.models.map((m) => ({ id: m.id, label: m.label, ...(m.description === undefined ? {} : { description: m.description }) })),
+          flows: flows.map((f) => ({ id: f.id, name: f.name, description: f.description })),
+        },
+      });
+      if (reply.kind === 'flow') log.info(`Drafted a flow with ${String(reply.flow.nodes.length)} nodes after ${String(req.answers.length)} answers, ${String(reply.problems.length)} problems left.`);
+      return reply;
+    } catch (err) {
+      if (err instanceof DraftStopped || ctl.signal.aborted) return { kind: 'error', message: 'Stopped.' };
+      log.warn(`Drafting a flow on ${model.label} (${model.harness}) failed: ${errMessage(err)}`);
+      return { kind: 'error', message: errMessage(err) };
+    } finally {
+      if (this.draftCtl === ctl) this.draftCtl = null;
+    }
+  }
+
+  stopDraft(): void {
+    this.draftCtl?.abort();
+  }
+
+  // ----------------------------------------------------------------------------------------------
   // Flows and settings
   // ----------------------------------------------------------------------------------------------
 
@@ -1255,6 +1323,7 @@ export class Controller {
   async shutdown(): Promise<void> {
     this.bridge?.stop();
     for (const c of this.chats.values()) c.abort();
+    this.draftCtl?.abort();
     const cut = [...this.handles.keys()];
     const waits = [...this.handles.values()].map((h) => {
       h.stop();
@@ -1275,6 +1344,6 @@ export class Controller {
   }
 
   busy(): boolean {
-    return this.chats.size > 0 || this.handles.size > 0;
+    return this.chats.size > 0 || this.handles.size > 0 || this.draftCtl !== null;
   }
 }

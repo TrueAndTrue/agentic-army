@@ -28,6 +28,8 @@ const api: Api = {
   mergeRun: call('mergeRun') as Api['mergeRun'],
   saveFlow: call('saveFlow') as Api['saveFlow'],
   deleteFlow: call('deleteFlow') as Api['deleteFlow'],
+  draftFlow: call('draftFlow') as Api['draftFlow'],
+  stopDraft: call('stopDraft') as Api['stopDraft'],
   saveSettings: call('saveSettings') as Api['saveSettings'],
   doctor: call('doctor') as Api['doctor'],
   refreshModels: call('refreshModels') as Api['refreshModels'],

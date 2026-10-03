@@ -163,6 +163,51 @@ const sessionId = sessionIdIndex === -1 ? 'no-session' : (argv[sessionIdIndex + 
 
 const say = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 
+/**
+ * The desktop app's flow drafter, known by the first line of its system text. Whatever the mode,
+ * it gets what the real model would send: a question until the prompt holds two answers, then a
+ * small flow whose summary repeats the last answer, so a test can see its answers went through.
+ */
+const appendAt = argv.indexOf('--append-system-prompt');
+const drafting = appendAt !== -1 && (argv[appendAt + 1] ?? '').startsWith('You draft flows for Agentic Army');
+
+function draftReply(text) {
+  const answers = [...text.matchAll(/^\s*A: (.*)$/gm)].map((m) => m[1]);
+  if (answers.length === 0) {
+    return `I need to know the kind of work first.\n\n${JSON.stringify({
+      kind: 'question',
+      question: 'What kind of work is this?',
+      why: 'It decides which agents the flow needs.',
+      options: [{ label: 'Fix a bug', detail: 'Something is broken and needs a tested fix' }, { label: 'Build a feature' }, { label: 'Answer a question' }],
+      multi: false,
+      understanding: 'You want a flow for the objective you gave.',
+    })}`;
+  }
+  if (answers.length === 1) {
+    return '```json\n' + JSON.stringify({
+      kind: 'question',
+      question: 'How should the work be checked?',
+      why: 'This decides whether the flow loops.',
+      options: [{ label: 'Run the tests' }, { label: 'A reviewer agent' }],
+      multi: true,
+      understanding: `The work is: ${answers[0]}.`,
+    }) + '\n```';
+  }
+  return `Here is the flow.\n${JSON.stringify({
+    kind: 'flow',
+    name: 'Fix with tests',
+    description: 'A bug fixed on its own branch, with the tests run until they pass.',
+    summary: `Built from your answers: ${answers.join(' / ')}.`,
+    nodes: [
+      { id: 'start', type: 'start', label: 'Start' },
+      { id: 'fix', type: 'agent', label: 'Fix the bug', role: 'engineer', keepContext: true, prompt: 'Fix: {{objective}}\n\n{{nodes.run_tests}}' },
+      { id: 'tests', type: 'shell', label: 'Run tests', command: 'npm test', maxVisits: 3 },
+      { id: 'done', type: 'end', label: 'Done', template: '{{nodes.fix_the_bug}}' },
+    ],
+    edges: [['start', 'out', 'fix'], ['fix', 'out', 'tests'], ['tests', 'pass', 'done'], ['tests', 'fail', 'fix']],
+  })}`;
+}
+
 // Record the argv and environment THIS PROCESS ACTUALLY RECEIVED. The auth guards assert on this
 // file, not on what buildClaudeArgs returned — the point is to check what reached execve.
 process.stderr.write('ARGV ' + JSON.stringify(argv) + '\n');
@@ -1019,7 +1064,7 @@ rl.on('line', (line) => {
     // Deliver the reply, THEN start the clock on the result. Without partial messages that is one
     // `assistant` line and the timer is armed in the same tick, exactly as it always was — but it
     // is now THIS turn's timer, not a single shared one a later turn can stamp on.
-    streamText(`echo:${text}`, () => {
+    streamText(drafting ? draftReply(text) : `echo:${text}`, () => {
       if (mode === 'work') {
         const steps = stepsFor(text);
         for (const step of steps) runStep(step);

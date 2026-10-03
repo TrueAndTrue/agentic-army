@@ -1,6 +1,7 @@
 import { MessagesSquare, Settings as Cog, X } from 'lucide-react';
 import { useEffect } from 'react';
 
+import { FlowDrafter } from './components/FlowDrafter.tsx';
 import { FlowEditor } from './components/FlowEditor.tsx';
 import { Home } from './components/Home.tsx';
 import { SessionView } from './components/SessionView.tsx';
@@ -46,7 +47,7 @@ export function App() {
       )}
       {view.kind === 'home' && <Home />}
       {view.kind === 'session' && <SessionView id={view.id} />}
-      {view.kind === 'flows' && <FlowEditor flowId={view.flowId} />}
+      {view.kind === 'flows' && (view.draft === true ? <FlowDrafter /> : <FlowEditor flowId={view.flowId} />)}
       {view.kind === 'settings' && <SettingsView />}
       <Toast />
     </div>

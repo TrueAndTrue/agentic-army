@@ -161,6 +161,26 @@ Prompts are templates. `{{objective}}` is your message, `{{input}}` is what the 
 on, `{{visit}}` counts visits to this node, `{{branch}}` is the run's branch, and
 `{{nodes.<name>}}` is the last output of any node, by its name in lowercase with underscores.
 
+### Draft with AI
+
+Draft with AI on the Flows page builds a flow from a conversation. You say what the flow should
+do, and the model new chats start on asks one multiple-choice question at a time: who checks the
+work, what needs your approval, what happens when the tests fail. Pick an option, type your own
+answer, or press You pick to leave it to the model. Build it now skips the rest of the questions,
+and after eight answers the model drafts the flow without being asked.
+
+The draft shows on a read-only canvas with the model's summary. Nothing is saved until you press
+Open in editor. Click an earlier answer to go back to that question; the answers after it are
+dropped. Each turn is a fresh planner turn with no tools, run in an empty `drafts` folder in the
+army home, with the objective and every answer so far in its prompt.
+
+The model ends each reply with one JSON object, a question or a compact flow spec, and
+`src/main/drafter.ts` turns the spec into a flow. It fills in defaults, gives the nodes new ids,
+drops connections from outputs a node does not have, points `{{nodes.x}}` at labels when the
+model used its own ids, and lays the nodes out left to right from Start. When the checks find
+problems, the model gets them back and two tries to fix them. Whatever is left shows under the
+draft for you to fix in the editor.
+
 ### A merge asks first
 
 A Git node set to merge changes your checkout, so by default the run pauses with a card: the
@@ -345,9 +365,9 @@ logs folder" opens the folder in Finder.
 ## Testing
 
 ```sh
-npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends, updates, keys at rest, the log, setup help, sidebar order: 88 tests
-npm run e2e        # builds, then drives the real app window with Playwright: 22 tests
-ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 22 against the built .app
+npm test           # engine, Jev, web search, browser pilot, permissions, models, tokens, who may start a flow, how a run ends, updates, keys at rest, the log, setup help, sidebar order, drafting a flow with AI: 108 tests
+npm run e2e        # builds, then drives the real app window with Playwright: 23 tests
+ARMY_E2E_PACKAGED=1 node --test e2e/app.test.ts   # the same 23 against the built .app
 ARMY_E2E_SHOW=1 npm run e2e                        # the same, with the window on screen
 ```
 
@@ -360,7 +380,8 @@ The end-to-end tests launch the app against a throwaway home and project, the en
 `claude` and `codex` (`../test/fixtures`), and a fake Jev server. They cover a chat that resumes
 after a restart, Stop, quitting without leaving agent processes behind, Quick fix to a merge, the
 main flow's two approvals and its review loop, a rejected plan going back with its note, a Jev flow
-with no key asking for one in the thread (refusing a bad key, then starting with a good one), a flow drawn on the canvas by dragging connections, codex's model
+with no key asking for one in the thread (refusing a bad key, then starting with a good one), a flow drawn on the canvas by dragging connections, a flow drafted with AI through two
+questions and opened in the editor, codex's model
 list and per-model efforts, and every way to start a flow: a slash command, Run on the Flows page,
 a chat agent asking and you editing and approving, an agent starting one without asking, an agent
 given no tool when Settings says "Only you", and a Run flow node running Quick fix. Two more check
