@@ -10,7 +10,7 @@ import {
   type EdgeChange,
   type NodeChange,
 } from '@xyflow/react';
-import { ChevronLeft, Copy, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
+import { ChevronLeft, Copy, Play, Plus, RotateCcw, Save, Sparkles, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
 import { DEFAULT_INVOKE_CEILING, defaultNodeData, flowCommand, invokeLevel, newId, validateFlow } from '../../../shared/flow.ts';
@@ -281,14 +281,17 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
           <header className="drag flex h-12 shrink-0 items-center border-b border-line px-6">
             <span className="text-[13.5px] font-semibold">Flows</span>
             <Button
-              tone="primary"
+              tone="quiet"
               className="ml-auto"
               onClick={async () => {
                 const f = await api().saveFlow(blankFlow());
                 open(f.id);
               }}
             >
-              <Plus size={14} /> New flow
+              <Plus size={14} /> Blank flow
+            </Button>
+            <Button tone="primary" onClick={() => go({ kind: 'flows', flowId: null, draft: true })}>
+              <Sparkles size={14} /> Draft with AI
             </Button>
           </header>
           <div className="min-h-0 flex-1 overflow-y-auto">

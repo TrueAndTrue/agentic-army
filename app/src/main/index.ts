@@ -7,6 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import type { DraftRequest } from '../shared/draft.ts';
 import type { AppEvent, Flow, Session, Settings } from '../shared/types.ts';
 import { ElectronPage } from './browser/page.ts';
 import { Controller } from './controller.ts';
@@ -210,6 +211,8 @@ void app.whenReady().then(async () => {
   handle('mergeRun', (id: string) => c.mergeRun(id));
   handle('saveFlow', (f: Flow) => c.saveFlow(f));
   handle('deleteFlow', (id: string) => c.deleteFlow(id));
+  handle('draftFlow', (req: DraftRequest) => c.draftFlow(req));
+  handle('stopDraft', () => c.stopDraft());
   handle('saveSettings', (s: Settings) => {
     nativeTheme.themeSource = s.theme;
     return c.saveSettings(s);

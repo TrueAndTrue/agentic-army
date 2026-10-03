@@ -3,6 +3,8 @@
  * imports from Node or from the DOM, so every side can read it.
  */
 
+import type { DraftReply, DraftRequest } from './draft.ts';
+
 export type Harness = 'claude' | 'codex';
 export const EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type Effort = (typeof EFFORTS)[number];
@@ -609,6 +611,10 @@ export interface Api {
   mergeRun(runId: string): Promise<{ ok: boolean; message: string }>;
   saveFlow(flow: Flow): Promise<Flow>;
   deleteFlow(id: string): Promise<void>;
+  /** The next question toward a drafted flow, or the flow itself. Nothing is saved until you open it. */
+  draftFlow(req: DraftRequest): Promise<DraftReply>;
+  /** Stop the draft in progress. Its request then resolves with an error that says Stopped. */
+  stopDraft(): Promise<void>;
   saveSettings(settings: Settings): Promise<Settings>;
   doctor(): Promise<DoctorReport>;
   /** Read claude's and codex's model lists again and add any model not offered before. */
