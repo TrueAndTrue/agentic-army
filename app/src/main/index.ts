@@ -4,13 +4,15 @@
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, powerSaveBlocker, safeStorage, session, shell } from 'electron';
 import { existsSync, readFileSync } from 'node:fs';
-import { isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { readFile, stat, writeFile } from 'node:fs/promises';
+import { basename, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import type { DraftRequest } from '../shared/draft.ts';
 import type { AppEvent, Flow, Session, Settings } from '../shared/types.ts';
 import { ElectronPage } from './browser/page.ts';
 import { Controller } from './controller.ts';
+import { flowFileName, flowFileText } from './flowFile.ts';
 import { startFlowBridge } from './flowTools.ts';
 import { loginShellPath } from './git.ts';
 import { FileLog, log, setLogFile } from './log.ts';
@@ -93,7 +95,8 @@ function createWindow(): void {
     title: 'Agentic Army',
     backgroundColor: dark ? '#15171a' : '#f6f6f4',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    trafficLightPosition: { x: 16, y: 16 },
+    // Centred in the 48 px header row: 18 + 12 / 2 = 24.
+    trafficLightPosition: { x: 18, y: 18 },
     webPreferences: {
       // A hidden window still has to run its timers and paint, or the tests driving it stall.
       backgroundThrottling: !HIDDEN,
@@ -211,6 +214,25 @@ void app.whenReady().then(async () => {
   handle('mergeRun', (id: string) => c.mergeRun(id));
   handle('saveFlow', (f: Flow) => c.saveFlow(f));
   handle('deleteFlow', (id: string) => c.deleteFlow(id));
+  handle('exportFlow', async (flow: Flow, to: 'file' | 'clipboard') => {
+    if (to === 'clipboard') {
+      clipboard.writeText(flowFileText(flow));
+      return { ok: true, message: 'Copied. Paste it to whoever you are sending it to; they import it from the Flows page.' };
+    }
+    const pick = await dialog.showSaveDialog(win!, { title: 'Save the flow as a file', defaultPath: flowFileName(flow), filters: [{ name: 'Flow', extensions: ['json'] }] });
+    if (pick.canceled || pick.filePath === undefined) return { ok: false, message: '' };
+    await writeFile(pick.filePath, flowFileText(flow));
+    return { ok: true, message: `Saved ${basename(pick.filePath)}.` };
+  });
+  handle('pickFlowFile', async () => {
+    const pick = await dialog.showOpenDialog(win!, { title: 'Import a flow', properties: ['openFile'], filters: [{ name: 'Flow', extensions: ['json'] }] });
+    const path = pick.filePaths[0];
+    if (pick.canceled || path === undefined) return null;
+    // A flow file is a few kilobytes. Anything far bigger is not one, and is not read into the window.
+    if ((await stat(path)).size > 2_000_000) return { error: 'That file is too big to be a flow.' };
+    return { text: await readFile(path, 'utf8') };
+  });
+  handle('readFlow', (text: string) => c.readFlow(text));
   handle('draftFlow', (req: DraftRequest) => c.draftFlow(req));
   handle('stopDraft', () => c.stopDraft());
   handle('saveSettings', (s: Settings) => {

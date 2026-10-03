@@ -388,7 +388,7 @@ function Side({ understanding, answers, onRevisit }: { understanding: string; an
   );
 }
 
-function Preview({ flow }: { flow: Flow }) {
+export function Preview({ flow }: { flow: Flow }) {
   const settings = useStore((s) => s.settings);
   const nodes = useMemo(() => toRfNodes(flow, settings), [flow, settings]);
   const edges = useMemo(() => toRfEdges(flow), [flow]);

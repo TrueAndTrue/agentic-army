@@ -717,6 +717,38 @@ describe('draft with AI', () => {
   });
 });
 
+describe('sharing flows', () => {
+  test('a flow copied as text imports as a new flow, after a review of what it runs, and only you can start it', async () => {
+    await withApp({ jevUrl }, async (l) => {
+      const page = l.page;
+      await page.getByRole('button', { name: 'Flows', exact: true }).click();
+      await page.getByText('Quick fix', { exact: true }).first().click();
+      await page.getByRole('button', { name: 'Share' }).click();
+      await page.getByRole('button', { name: 'Copy as text' }).click();
+      await page.getByRole('status').getByText(/Copied/).waitFor();
+      const text = await l.app.evaluate(({ clipboard }) => clipboard.readText());
+      assert.match(text, /"format": "agentic-army-flow"/);
+
+      await page.getByRole('button', { name: 'Flows', exact: true }).first().click();
+      await page.getByRole('button', { name: 'Import' }).click();
+      await page.getByRole('textbox', { name: 'Flow text' }).fill('not a flow');
+      await page.getByRole('button', { name: 'Read it' }).click();
+      await page.getByRole('alert').getByText(/not a flow file/).waitFor();
+      await page.getByRole('textbox', { name: 'Flow text' }).fill(text);
+      await page.getByRole('button', { name: 'Read it' }).click();
+      await page.getByRole('heading', { name: 'Quick fix (imported)' }).waitFor();
+      await page.getByText('What it can do on this Mac').waitFor();
+      await page.getByText(/An engineer that edits files and runs commands on the run branch/).first().waitFor();
+      await page.getByText(/Only you can start it for now/).waitFor();
+      await shot(page, 'e2e-import-review');
+      await page.getByRole('button', { name: 'Add to my flows' }).click();
+      await page.getByText('Quick fix (imported)').first().waitFor();
+      const saved = (await page.evaluate(() => (window as unknown as { api: { getState(): Promise<{ flows: { name: string; invoke?: string }[] }> } }).api.getState())).flows.find((f) => f.name === 'Quick fix (imported)');
+      assert.equal(saved?.invoke, 'you');
+    });
+  });
+});
+
 describe('updates', () => {
   test('Settings shows the version and why updates are off; a downloaded update shows above Settings until closed', async () => {
     await withApp({ jevUrl }, async (l) => {

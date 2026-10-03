@@ -3,6 +3,7 @@ import { useEffect } from 'react';
 
 import { FlowDrafter } from './components/FlowDrafter.tsx';
 import { FlowEditor } from './components/FlowEditor.tsx';
+import { FlowImport } from './components/FlowImport.tsx';
 import { Home } from './components/Home.tsx';
 import { SessionView } from './components/SessionView.tsx';
 import { SettingsView } from './components/SettingsView.tsx';
@@ -32,7 +33,7 @@ export function App() {
     <div className="flex h-full">
       {view.kind !== 'flows' && <Sidebar />}
       {view.kind === 'flows' && (
-        <div className="flex h-full w-[64px] shrink-0 flex-col border-r border-line bg-panel">
+        <div className="flex h-full w-[84px] shrink-0 flex-col border-r border-line bg-panel">
           <div className="drag h-12" />
           <BackButton />
           <button
@@ -47,7 +48,7 @@ export function App() {
       )}
       {view.kind === 'home' && <Home />}
       {view.kind === 'session' && <SessionView id={view.id} />}
-      {view.kind === 'flows' && (view.draft === true ? <FlowDrafter /> : <FlowEditor flowId={view.flowId} />)}
+      {view.kind === 'flows' && (view.draft === true ? <FlowDrafter /> : view.import === true ? <FlowImport /> : <FlowEditor flowId={view.flowId} />)}
       {view.kind === 'settings' && <SettingsView />}
       <Toast />
     </div>

@@ -42,9 +42,13 @@ export class JevError extends Error {
 /** The error text TypeSafe sent, without the JSON around it. */
 function reason(text: string): string {
   try {
-    const parsed = JSON.parse(text) as { error?: unknown; message?: unknown; detail?: unknown };
-    const said = parsed.error ?? parsed.message ?? parsed.detail;
-    if (typeof said === 'string') return said;
+    // FastAPI nests it: {"detail": {"error_type": ..., "message": "Cannot authenticate ..."}}.
+    let said: unknown = JSON.parse(text);
+    for (let i = 0; i < 3 && typeof said === 'object' && said !== null; i += 1) {
+      const o = said as { error?: unknown; message?: unknown; detail?: unknown };
+      said = o.message ?? o.detail ?? o.error;
+    }
+    if (typeof said === 'string') return said.replace(/\.$/, '');
   } catch {
     /* not JSON: use it as it is */
   }

@@ -2,7 +2,6 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  MiniMap,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
@@ -10,7 +9,7 @@ import {
   type EdgeChange,
   type NodeChange,
 } from '@xyflow/react';
-import { ChevronLeft, Copy, Play, Plus, RotateCcw, Save, Sparkles, Trash2 } from 'lucide-react';
+import { ChevronLeft, Copy, FileDown, Share, Play, Plus, RotateCcw, Save, Sparkles, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 
 import { DEFAULT_INVOKE_CEILING, defaultNodeData, flowCommand, invokeLevel, newId, validateFlow } from '../../../shared/flow.ts';
@@ -213,7 +212,6 @@ function Canvas({ draft, setDraft, selected, setSelected }: { draft: Flow; setDr
         >
           <Background variant={BackgroundVariant.Dots} gap={20} size={1.3} color="var(--canvas-dot)" />
           <Controls />
-          <MiniMap pannable zoomable nodeColor={(n) => nodeColor((n.data as { node: FlowNode }).node)} maskColor="color-mix(in srgb, var(--bg) 70%, transparent)" />
         </ReactFlow>
       </div>
     </div>
@@ -280,9 +278,11 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
         <div className="flex min-w-0 flex-1 flex-col">
           <header className="drag flex h-12 shrink-0 items-center border-b border-line px-6">
             <span className="text-[13.5px] font-semibold">Flows</span>
+            <Button tone="quiet" className="ml-auto" onClick={() => go({ kind: 'flows', flowId: null, import: true })}>
+              <FileDown size={14} /> Import
+            </Button>
             <Button
               tone="quiet"
-              className="ml-auto"
               onClick={async () => {
                 const f = await api().saveFlow(blankFlow());
                 open(f.id);
@@ -382,6 +382,7 @@ export function FlowEditor({ flowId }: { flowId: string | null }) {
                   <RotateCcw size={13} /> Reset
                 </Button>
               )}
+              <ShareMenu flow={draft} />
               <Button
                 tone="quiet"
                 onClick={async () => {
@@ -484,5 +485,59 @@ function InvokeHint({ flow, ceiling }: { flow: Flow; ceiling: InvokeLevel }) {
       {INVOKE_INFO[own].summary} You can always start it yourself, or type <code className="font-mono">/{flowCommand(flow)}</code> in a session.
       {held && <span className="text-warn"> Settings allows at most "{INVOKE_INFO[ceiling].label}", so that is what applies.</span>}
     </>
+  );
+}
+
+/**
+ * Flows live on this Mac. Sharing one is a file, or the same text on the clipboard, that the other
+ * person imports from the Flows page.
+ */
+function ShareMenu({ flow }: { flow: Flow }) {
+  const [open, setOpen] = useState(false);
+  const [said, setSaid] = useState('');
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current !== null && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener('mousedown', close);
+    return () => window.removeEventListener('mousedown', close);
+  }, [open]);
+  const share = async (to: 'file' | 'clipboard') => {
+    const res = await api().exportFlow(flow, to);
+    setSaid(res.message);
+  };
+  return (
+    <div ref={ref} className="relative">
+      <Button
+        tone="quiet"
+        aria-expanded={open}
+        onClick={() => {
+          setSaid('');
+          setOpen((o) => !o);
+        }}
+      >
+        <Share size={13} /> Share
+      </Button>
+      {open && (
+        <div role="dialog" aria-label="Share this flow" className="absolute top-9 right-0 z-30 w-[300px] rounded-lg border border-line-strong bg-raised p-3 shadow-[0_8px_24px_rgba(0,0,0,0.3)]">
+          <p className="text-[12.5px] leading-relaxed text-muted">
+            Send this flow to someone as a file. They import it from the Flows page and see what it runs before it is saved.
+          </p>
+          <div className="mt-3 flex gap-2">
+            <Button tone="primary" onClick={() => void share('file')}>
+              Save as file
+            </Button>
+            <Button onClick={() => void share('clipboard')}>Copy as text</Button>
+          </div>
+          {said !== '' && (
+            <p role="status" className="mt-2 text-[12px] text-ok">
+              {said}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

@@ -605,8 +605,8 @@ export function SessionView({ id }: { id: string }) {
                   <div className="pt-[12vh] text-center">
                     <h2 className="text-[20px] font-semibold tracking-tight">What should we work on{project !== undefined ? ` in ${project.name}` : ''}?</h2>
                     <p className="mx-auto mt-2 max-w-[460px] text-[13px] leading-relaxed text-muted">
-                      Chat with one agent in this folder, or open the menu under the box (it says Chat) to run a flow: a team of agents that works on its own branch until you merge. Type{' '}
-                      <Kbd>/</Kbd> to list the flows.
+                      Chat with one agent in this folder. To hand the work to a team of agents on its own branch, pick a flow from the Chat menu under the box, or type{' '}
+                      <Kbd>/</Kbd>.
                     </p>
                     {project !== undefined && <ProjectCheck project={project} />}
                   </div>

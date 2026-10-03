@@ -316,7 +316,7 @@ const COUNT = new Set(['maxVisits', 'maxSteps', 'timeoutSec', 'cut']);
  * One node's fields: each one the spec gives that fits the default's type, and the default for the
  * rest. Anything the node type does not have is dropped.
  */
-function nodeData(type: NodeType, raw: Record<string, unknown>, ctx: DraftContext): FlowNode['data'] {
+export function nodeData(type: NodeType, raw: Record<string, unknown>, ctx: DraftContext): FlowNode['data'] {
   const base = defaultNodeData(type) as unknown as Record<string, unknown>;
   const out: Record<string, unknown> = { ...base };
   for (const [key, def] of Object.entries(base)) {

@@ -611,6 +611,12 @@ export interface Api {
   mergeRun(runId: string): Promise<{ ok: boolean; message: string }>;
   saveFlow(flow: Flow): Promise<Flow>;
   deleteFlow(id: string): Promise<void>;
+  /** Save a flow as a file you can send, or copy the same text. `ok: false` with no message is a cancel. */
+  exportFlow(flow: Flow, to: 'file' | 'clipboard'): Promise<{ ok: boolean; message: string }>;
+  /** Ask for a flow file. Null when you cancel. */
+  pickFlowFile(): Promise<{ text: string } | { error: string } | null>;
+  /** Read a flow file's text into a flow that is not saved yet, with what changed on the way in. */
+  readFlow(text: string): Promise<{ ok: true; flow: Flow; notes: string[] } | { ok: false; message: string }>;
   /** The next question toward a drafted flow, or the flow itself. Nothing is saved until you open it. */
   draftFlow(req: DraftRequest): Promise<DraftReply>;
   /** Stop the draft in progress. Its request then resolves with an error that says Stopped. */

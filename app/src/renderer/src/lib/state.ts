@@ -18,8 +18,8 @@ export const api = (): Api => window.api;
 export type View =
   | { kind: 'home' }
   | { kind: 'session'; id: string }
-  /** `draft` opens Draft with AI in place of the list. */
-  | { kind: 'flows'; flowId: string | null; draft?: boolean }
+  /** `draft` opens Draft with AI in place of the list, `import` the import screen. */
+  | { kind: 'flows'; flowId: string | null; draft?: boolean; import?: boolean }
   | { kind: 'settings'; section?: 'jev' | 'models' | 'machine' | 'stages' | 'tools' };
 
 export interface State {

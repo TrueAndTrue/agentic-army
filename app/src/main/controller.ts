@@ -29,6 +29,7 @@ import type {
   SetupFix,
 } from '../shared/types.ts';
 import { SAVED_KEY } from '../shared/types.ts';
+import { readFlowFile, type ReadFlow } from './flowFile.ts';
 import { findBin, killAllAgents, runAgent } from './agents.ts';
 import { pilot, type Page } from './browser/pilot.ts';
 import { createRun, startRun, type EngineDeps, type RunHandle } from './flow/engine.ts';
@@ -1191,6 +1192,15 @@ export class Controller {
     this.store.saveFlow(saved);
     this.emitRaw({ type: 'flows', flows: this.flows() });
     return saved;
+  }
+
+  /** Read a flow someone sent: the file's text in, a flow that is not saved yet out. */
+  readFlow(text: string): ReadFlow {
+    return readFlowFile(text, {
+      models: this.settings.models.map((m) => ({ id: m.id, label: m.label })),
+      flows: this.flows().map((f) => ({ id: f.id, name: f.name, description: f.description })),
+      names: this.flows().map((f) => f.name),
+    });
   }
 
   deleteFlow(id: string): void {
