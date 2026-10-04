@@ -15,7 +15,7 @@ cd app
 npm install
 npm run dev          # the app, with hot reload of the window
 npm run dist         # an unsigned app for Intel and Apple Silicon at release/mac-universal/Agentic Army.app
-npm run install:mac  # builds it, copies it into /Applications and ad hoc signs it, so Spotlight finds it
+npm run install:mac  # builds it, copies it into /Applications, ad hoc signs it, and deletes the build copy so macOS knows one app
 ```
 
 `npm run dist` takes about 15 s and never signs, even on a Mac with a Developer ID. The first time,

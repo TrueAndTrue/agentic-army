@@ -117,12 +117,13 @@ export async function launch(opts: { jevUrl?: string; claudeMode?: string; env?:
   const fakeClaude = wrap('claude', 'fake-claude.mjs', '2.1.281 (Claude Code)');
   const fakeCodex = wrap('codex', 'fake-codex.mjs', 'codex-cli 0.154.0');
   const require = createRequire(import.meta.url);
-  // ARMY_E2E_PACKAGED=1 runs the same tests against the built .app instead of the dev build.
+  // ARMY_E2E_PACKAGED=1 runs the same tests against the installed app instead of the dev build.
+  // `npm run install:mac` deletes the build in release/, so the one in /Applications is the one to test.
   const packaged = process.env['ARMY_E2E_PACKAGED'] === '1';
   // Set ARMY_E2E_SHOW=1 to watch the window; by default it runs hidden and never takes focus.
   const hidden: Record<string, string> = process.env['ARMY_E2E_SHOW'] === '1' ? {} : { ARMY_APP_HIDDEN: '1' };
   const app = await electron.launch({
-    executablePath: packaged ? join(APP, 'release/mac-universal/Agentic Army.app/Contents/MacOS/Agentic Army') : (require('electron') as unknown as string),
+    executablePath: packaged ? '/Applications/Agentic Army.app/Contents/MacOS/Agentic Army' : (require('electron') as unknown as string),
     args: packaged ? [] : [join(APP, 'out/main/index.js')],
     cwd: APP,
     env:
