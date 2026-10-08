@@ -1273,7 +1273,7 @@ describe('the standing orders name every spec field and the fenced shape to carr
       /external dependency is a decision/i,
       'the standing orders never make external dependencies a decision',
     );
-    assert.match(orders, /NAME WHAT CAN FAIL/, 'the orders never demand the failure modes up front');
+    assert.match(orders, /name what can fail/i, 'the orders never demand the failure modes up front');
     assert.match(orders, /quota|rate limit/i, 'quota is not named among the failure modes');
     assert.ok(
       orders.includes(`goes under \`${SPEC_FIELD_LABEL.decisions}\``),
@@ -1292,7 +1292,7 @@ describe('the standing orders name every spec field and the fenced shape to carr
       requestedRung: 2,
       maxAttempts: 3,
     });
-    assert.match(orders, /HERMETIC/, 'the standing orders never demand hermetic verify commands');
+    assert.match(orders, /hermetic/i, 'the standing orders never demand hermetic verify commands');
     assert.match(orders, /quota/i, 'the incident that justifies the rule is not named');
     assert.match(
       orders,

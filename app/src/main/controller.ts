@@ -839,7 +839,12 @@ export class Controller {
         },
         {
           name: 'read_page',
-          description: "Read one public web page and have Jev pick the passages that answer your question. Returns them in the page's own words, and how sure Jev is.",
+          description:
+            'Read one public web page and have Jev, a fast judgment model, pick the passages that answer your question. ' +
+            "Returns up to six passages in the page's own words, with the page's link and how sure Jev is that they answer it. " +
+            'Use it on a URL you already have, such as one the person gave you or a jev_search result; to find pages, use jev_search. ' +
+            'Only public http and https pages can be read: localhost, private network addresses, and non-text files such as PDFs and images are refused, ' +
+            'and a page larger than about 3 MB or slower than 10 seconds fails. A page it cannot read comes back as an error that says why.',
           inputSchema: {
             type: 'object',
             properties: {
