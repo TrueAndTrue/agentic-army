@@ -4760,8 +4760,33 @@ describe('no fixture carries the environment of the machine that recorded it', (
     );
   });
 
+  /**
+   * Names a fixture uses ON PURPOSE, which the detector cannot tell from a recording's leak. Each
+   * entry is one file and one exact finding, with the reason, and it goes stale (and fails below)
+   * the moment that file stops containing it.
+   */
+  const LEAK_ALLOWED: ReadonlyArray<{ file: string; kind: LeakKind; found: string; why: string }> = [
+    {
+      file: 'test/fixtures/fake-claude.mjs',
+      kind: 'mcp-tool',
+      found: 'mcp__army',
+      why: "the desktop app's own start_flow server, which `start-flow` mode checks is allowed exactly as claude would. Written by hand, not recorded.",
+    },
+  ];
+  const allowedLeak = (leak: Leak) => LEAK_ALLOWED.some((a) => a.file === leak.file && a.kind === leak.kind && a.found === leak.found);
+
+  it('no leak exemption has gone stale', () => {
+    const all = read.flatMap((entry) => leaksIn(entry.relative, entry.text));
+    for (const a of LEAK_ALLOWED) {
+      assert.ok(
+        all.some((leak) => leak.file === a.file && leak.kind === a.kind && leak.found === a.found),
+        `stale exemption: nothing in ${a.file} is a ${a.kind} "${a.found}" any more. Delete it from LEAK_ALLOWED.`,
+      );
+    }
+  });
+
   it('no fixture in the tree carries recorder-environment leakage', () => {
-    const leaks = read.flatMap((entry) => leaksIn(entry.relative, entry.text));
+    const leaks = read.flatMap((entry) => leaksIn(entry.relative, entry.text)).filter((leak) => !allowedLeak(leak));
     assert.deepEqual(
       leaks.map((leak) => `${leak.file}:${leak.line}  [${leak.kind}]  ${leak.found}`),
       [],

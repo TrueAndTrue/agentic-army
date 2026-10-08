@@ -46,8 +46,11 @@ export type HarnessId = (typeof HARNESS_IDS)[number];
  * one is not guaranteed. The test that separates the two cases: if the reason for the lower
  * class is a fact about the BUDGET, it is forbidden; if it is a fact about the measured OUTCOME
  * under a guaranteed input, it is a default.
+ *
+ * `max` and `ultra` came with codex 0.154's GPT-6 and GPT-5.6 models, which list them per model in
+ * `~/.codex/models_cache.json`. claude's `--effort` stops at `max`.
  */
-export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 /**
@@ -77,6 +80,19 @@ export interface SubagentDefinition {
    * the ranks on this substrate hold no shell at all.
    */
   tools: string[];
+}
+
+/**
+ * An MCP server a soldier may call, started by the harness over stdio. The desktop app uses this
+ * to hand a chat agent its `start_flow` tool. `name` becomes the tool prefix (`mcp__<name>__...`
+ * in claude), so it is a plain identifier. Adding a server does not allow its tools: claude still
+ * needs `mcp__<name>` in `allow`.
+ */
+export interface McpServerSpec {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
 }
 
 /** Everything a spawner decides about a soldier before the process exists. */
@@ -115,6 +131,23 @@ export interface SoldierSpec {
    * single-task campaign is not.
    */
   sessionId: string;
+  /**
+   * Continue an earlier conversation instead of starting one. The value is the HARNESS's own id:
+   * the claude session id echoed on `system/init`, or the codex thread id from `thread.started`.
+   * When set, claude gets `--resume <id>` in place of `--session-id`, and codex runs
+   * `exec resume <id>`. The desktop app sets it so a chat survives a restart. Campaigns never set
+   * it, so a crashed soldier is still re-attempted fresh.
+   */
+  resumeSessionId?: string;
+  /** Extra MCP servers for this soldier. Campaigns never set it. */
+  mcpServers?: McpServerSpec[];
+  /**
+   * Standing instructions from the app, apart from the orders: claude gets them through
+   * `--append-system-prompt`, codex as `developer_instructions`. Text put in front of the orders
+   * reads as something the person said, and a model will quote it back as theirs. Campaigns never
+   * set it.
+   */
+  instructions?: string;
   /**
    * Path to a JSON Schema FILE (see `REPORT_SCHEMA_PATH` / `VERDICT_SCHEMA_PATH`).
    *

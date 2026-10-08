@@ -19,6 +19,8 @@
  *   abort-unknown   interrupt answered with an unrecognised terminal_reason
  *   work            USES TOOLS on its cwd, under the permission rules it was actually handed
  *   fanout          FIELDS NATIVE SUBAGENTS off its `--agents` roster, nested and forwarded
+ *   start-flow      STARTS the `army` MCP server from `--mcp-config` and calls its start_flow tool
+ *                   with the turn's text as the objective (flow from FAKE_FLOW, else the first)
  *
  * `--include-partial-messages` is orthogonal to the mode and is read off THIS PROCESS'S argv,
  * like the permission rules: token-level `stream_event` lines are emitted only if the adapter
@@ -149,6 +151,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -159,6 +162,51 @@ const sessionIdIndex = argv.indexOf('--session-id');
 const sessionId = sessionIdIndex === -1 ? 'no-session' : (argv[sessionIdIndex + 1] ?? 'no-session');
 
 const say = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+
+/**
+ * The desktop app's flow drafter, known by the first line of its system text. Whatever the mode,
+ * it gets what the real model would send: a question until the prompt holds two answers, then a
+ * small flow whose summary repeats the last answer, so a test can see its answers went through.
+ */
+const appendAt = argv.indexOf('--append-system-prompt');
+const drafting = appendAt !== -1 && (argv[appendAt + 1] ?? '').startsWith('You draft flows for Agentic Army');
+
+function draftReply(text) {
+  const answers = [...text.matchAll(/^\s*A: (.*)$/gm)].map((m) => m[1]);
+  if (answers.length === 0) {
+    return `I need to know the kind of work first.\n\n${JSON.stringify({
+      kind: 'question',
+      question: 'What kind of work is this?',
+      why: 'It decides which agents the flow needs.',
+      options: [{ label: 'Fix a bug', detail: 'Something is broken and needs a tested fix' }, { label: 'Build a feature' }, { label: 'Answer a question' }],
+      multi: false,
+      understanding: 'You want a flow for the objective you gave.',
+    })}`;
+  }
+  if (answers.length === 1) {
+    return '```json\n' + JSON.stringify({
+      kind: 'question',
+      question: 'How should the work be checked?',
+      why: 'This decides whether the flow loops.',
+      options: [{ label: 'Run the tests' }, { label: 'A reviewer agent' }],
+      multi: true,
+      understanding: `The work is: ${answers[0]}.`,
+    }) + '\n```';
+  }
+  return `Here is the flow.\n${JSON.stringify({
+    kind: 'flow',
+    name: 'Fix with tests',
+    description: 'A bug fixed on its own branch, with the tests run until they pass.',
+    summary: `Built from your answers: ${answers.join(' / ')}.`,
+    nodes: [
+      { id: 'start', type: 'start', label: 'Start' },
+      { id: 'fix', type: 'agent', label: 'Fix the bug', role: 'engineer', keepContext: true, prompt: 'Fix: {{objective}}\n\n{{nodes.run_tests}}' },
+      { id: 'tests', type: 'shell', label: 'Run tests', command: 'npm test', maxVisits: 3 },
+      { id: 'done', type: 'end', label: 'Done', template: '{{nodes.fix_the_bug}}' },
+    ],
+    edges: [['start', 'out', 'fix'], ['fix', 'out', 'tests'], ['tests', 'pass', 'done'], ['tests', 'fail', 'fix']],
+  })}`;
+}
 
 // Record the argv and environment THIS PROCESS ACTUALLY RECEIVED. The auth guards assert on this
 // file, not on what buildClaudeArgs returned — the point is to check what reached execve.
@@ -206,6 +254,51 @@ function flagList(name) {
 
 const allowRules = flagList('--allowedTools');
 const denyRules = flagList('--disallowedTools');
+
+/**
+ * `start-flow` mode: behave as claude does with an MCP server. Start it from the inline
+ * `--mcp-config` exactly as configured (command, args, env), speak JSON-RPC to it on stdio, and
+ * call `start_flow`. Refused, as `--permission-mode dontAsk` would, unless `mcp__army` is allowed.
+ */
+async function callStartFlow(objective) {
+  const at = argv.indexOf('--mcp-config');
+  if (at === -1) return 'start_flow is not available: no --mcp-config.';
+  if (!allowRules.includes('mcp__army') || denyRules.includes('mcp__army')) return 'start_flow was denied: mcp__army is not allowed.';
+  const server = JSON.parse(argv[at + 1]).mcpServers.army;
+  const child = spawn(server.command, server.args, { env: { ...process.env, ...server.env }, stdio: ['pipe', 'pipe', 'inherit'] });
+  const waiting = new Map();
+  let buf = '';
+  let next = 0;
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (d) => {
+    buf += d;
+    for (let k = buf.indexOf('\n'); k >= 0; k = buf.indexOf('\n')) {
+      const line = buf.slice(0, k).trim();
+      buf = buf.slice(k + 1);
+      if (line === '') continue;
+      const m = JSON.parse(line);
+      waiting.get(m.id)?.(m);
+    }
+  });
+  const rpc = (method, params) =>
+    new Promise((res) => {
+      next += 1;
+      waiting.set(next, res);
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: next, method, params }) + '\n');
+    });
+  try {
+    await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake-claude', version: '0' } });
+    const list = await rpc('tools/list', {});
+    const tool = list.result.tools.find((t) => t.name === 'start_flow');
+    if (tool === undefined) return `start_flow is not listed; the tools are: ${list.result.tools.map((t) => t.name).join(', ') || 'none'}.`;
+    const flow = process.env['FAKE_FLOW'] ?? tool.inputSchema.properties.flow.enum[0];
+    const res = await rpc('tools/call', { name: 'start_flow', arguments: { flow, objective, why: 'The fake agent was told to.' } });
+    return `${res.result.isError ? 'ERROR ' : ''}${res.result.content[0].text}`;
+  } finally {
+    child.stdin.end();
+    child.kill();
+  }
+}
 
 /**
  * Token-level streaming, read off argv for the same reason the permission rules are: if
@@ -971,7 +1064,7 @@ rl.on('line', (line) => {
     // Deliver the reply, THEN start the clock on the result. Without partial messages that is one
     // `assistant` line and the timer is armed in the same tick, exactly as it always was — but it
     // is now THIS turn's timer, not a single shared one a later turn can stamp on.
-    streamText(`echo:${text}`, () => {
+    streamText(drafting ? draftReply(text) : `echo:${text}`, () => {
       if (mode === 'work') {
         const steps = stepsFor(text);
         for (const step of steps) runStep(step);
@@ -989,6 +1082,13 @@ rl.on('line', (line) => {
           () => {},
           false,
         );
+      }
+      if (mode === 'start-flow') {
+        void callStartFlow(text).then(
+          (said) => streamText(`start_flow said: ${said}`, () => (timer = setTimeout(entry.finish, 5)), false),
+          (err) => streamText(`start_flow failed: ${String(err)}`, () => (timer = setTimeout(entry.finish, 5)), false),
+        );
+        return;
       }
       timer = setTimeout(entry.finish, SLOW_MODES.has(mode) ? 5000 : 5);
     });

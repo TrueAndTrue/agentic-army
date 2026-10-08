@@ -92,6 +92,15 @@ worked on first. From here on this README writes `army …`; substitute your col
 There is a fourth form and it is handled too: `npm run dev -- doctor` ends with
 ``Next: `npm run dev -- init` ``, `--` included, because without it npm eats the flags.
 
+## The desktop app
+
+`app/` is a Mac app on top of the same engine: projects and sessions in a sidebar, a chat with
+claude or codex in each session, and flows you draw on a canvas and run from any session. A flow
+wires agents with roles and models together with Jev decisions, your approvals, commands, git and a
+Jev-driven browser, and it can loop. The agents use the adapters and permission tables in `src/`;
+nothing is copied. `cd app && npm install && npm run dev` starts it, and `app/README.md` covers the
+nodes, what Jev does, the tests and what was run live.
+
 ## `army doctor`
 
 Every failure mode in this system is environmental, so `doctor` is the first thing to run when

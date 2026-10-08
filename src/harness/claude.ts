@@ -28,6 +28,7 @@ import { readFileSync } from 'node:fs';
 import type {
   CloseResult,
   HarnessAdapter,
+  McpServerSpec,
   ReasoningEffort,
   Soldier,
   SoldierEvent,
@@ -59,6 +60,9 @@ const CLAUDE_EFFORT: Record<ReasoningEffort, string> = {
   medium: 'medium',
   high: 'high',
   xhigh: 'xhigh',
+  max: 'max',
+  // claude has no level above max.
+  ultra: 'max',
 };
 
 export interface ClaudeArgsOptions {
@@ -135,11 +139,24 @@ export function buildAgentsJson(defs: readonly SubagentDefinition[]): string {
  * Build the argv for a duplex soldier. Pure, so the auth regression guards can assert on it
  * without spawning anything.
  */
+const MCP_NAME = /^[a-z][a-z0-9_]*$/;
+
+/** claude's `--mcp-config` value: `{"mcpServers": {name: {command, args, env}}}`, inline. */
+export function buildMcpJson(servers: McpServerSpec[]): string {
+  const out: Record<string, { type: 'stdio'; command: string; args: string[]; env: Record<string, string> }> = {};
+  for (const s of servers) {
+    if (!MCP_NAME.test(s.name)) throw new Error(`mcpServers: name must be a lowercase identifier, got ${JSON.stringify(s.name)}`);
+    out[s.name] = { type: 'stdio', command: s.command, args: s.args, env: s.env };
+  }
+  return JSON.stringify({ mcpServers: out });
+}
+
 export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions): string[] {
   const read = options?.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
 
   // Every spec field that reaches an argv value slot is validated before it gets there.
   assertUuid('sessionId', spec.sessionId);
+  if (spec.resumeSessionId !== undefined) assertUuid('resumeSessionId', spec.resumeSessionId);
   if (spec.model !== undefined) assertNotFlagLike('model', spec.model);
   spec.allow.forEach((v, i) => assertNotFlagLike(`allow[${String(i)}]`, v));
   spec.deny.forEach((v, i) => assertNotFlagLike(`deny[${String(i)}]`, v));
@@ -152,8 +169,10 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
     'stream-json',
     // stream-json is only accepted alongside --verbose on the -p path.
     '--verbose',
-    '--session-id',
-    spec.sessionId,
+    // A resumed conversation keeps the id it already has; a fresh one takes the supervisor's.
+    ...(spec.resumeSessionId === undefined
+      ? ['--session-id', spec.sessionId]
+      : ['--resume', spec.resumeSessionId]),
     // Forwards nested subagent messages carrying parent_tool_use_id at every depth — this is what
     // lets the UI reconstruct the org chart. Verified: the forwarded record also carries a
     // top-level `subagent_type`.
@@ -168,6 +187,14 @@ export function buildClaudeArgs(spec: SoldierSpec, options?: ClaudeArgsOptions):
 
   if (spec.model !== undefined && spec.model !== '') args.push('--model', spec.model);
   if (spec.effort !== undefined) args.push('--effort', CLAUDE_EFFORT[spec.effort]);
+  // `--mcp-config` is variadic too, so it goes BEFORE the tool lists: a flag always follows it, and
+  // its JSON can never be swallowed by `--allowedTools`.
+  if (spec.mcpServers !== undefined && spec.mcpServers.length > 0) args.push('--mcp-config', buildMcpJson(spec.mcpServers));
+  if (spec.instructions !== undefined && spec.instructions !== '') {
+    // A value that starts with a dash would be read as another flag.
+    if (spec.instructions.startsWith('-')) throw new Error('instructions must not start with "-"');
+    args.push('--append-system-prompt', spec.instructions);
+  }
   if (spec.allow.length > 0) args.push('--allowedTools', ...spec.allow);
   if (spec.deny.length > 0) args.push('--disallowedTools', ...spec.deny);
 

@@ -578,6 +578,24 @@ findings and says they are not decisions. `CampaignResult.recce` records what ha
 result screen prints it in the scout's own words when there are any. One scout, once, no retry, for
 the reason `runRecce` states.
 
+## Wave 8, the desktop app
+
+`app/` puts the design on a canvas. The three phases are no longer fixed code paths: they ship as a
+flow, "Build and review", made of nodes you can rewire. A scout and a planner read the code, you
+approve the plan or send it back with a note, an engineer builds on the run's own branch, a codex
+reviewer checks it, a Jev decision loops the work back until the review passes, a validator judges
+it against the objective, and you sign off. Each agent node takes its loadout from `permissionsFor`,
+so a Reviewer here is an INSPECTOR there, and the model at each stage is a setting rather than a
+constant.
+
+Two engine changes came with it. `SoldierSpec.resumeSessionId` lets a chat continue its claude or
+codex conversation across turns and restarts (`--resume`, `codex exec resume`); campaigns never set
+it. And the app passes the army home, not the user's home, as the protected region: an early build
+passed `homedir()`, which denied every project under it, and a test now fails if that comes back.
+
+What the app does not carry over is stated in `app/README.md`: the held inspector tests and the
+question ladder are still only in `army campaign`, and a flow stops when the app quits.
+
 ## One property, broken three times, now structural
 
 A line typed for one reader must never be delivered to a different one. It broke through the

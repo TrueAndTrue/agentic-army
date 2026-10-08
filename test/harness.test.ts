@@ -545,6 +545,94 @@ describe('claude argv', () => {
   });
 });
 
+describe('extra MCP servers (the desktop app hands a chat agent its start_flow tool)', () => {
+  const army = { name: 'army', command: '/Applications/X.app/Contents/MacOS/X', args: ['/home/mcp/army-flows.cjs'], env: { ELECTRON_RUN_AS_NODE: '1', ARMY_FLOW_TOKEN: 't"1' } };
+
+  test('claude gets them inline in --mcp-config, placed before the variadic tool lists', () => {
+    const a = buildClaudeArgs(spec({ mcpServers: [army], allow: ['Read', 'mcp__army'] }));
+    const i = a.indexOf('--mcp-config');
+    assert.ok(i > 0 && i < a.indexOf('--allowedTools'), a.join(' '));
+    assert.deepEqual(JSON.parse(a[i + 1]!), { mcpServers: { army: { type: 'stdio', command: army.command, args: army.args, env: army.env } } });
+    assert.equal(buildClaudeArgs(spec()).includes('--mcp-config'), false);
+  });
+
+  test('codex gets TOML overrides on both a fresh exec and exec resume', () => {
+    for (const extra of [{}, { resumeSessionId: 'thread-1' }]) {
+      const a = buildCodexArgs(spec({ harness: 'codex', mcpServers: [army], ...extra }), 'go');
+      assert.ok(a.includes(`mcp_servers.army.command="${army.command}"`));
+      assert.ok(a.includes(`mcp_servers.army.args=["/home/mcp/army-flows.cjs"]`));
+      assert.ok(a.includes('mcp_servers.army.env={ ELECTRON_RUN_AS_NODE = "1", ARMY_FLOW_TOKEN = "t\\"1" }'), a.join(' '));
+      assert.ok(a.indexOf('--') > a.indexOf(`mcp_servers.army.command="${army.command}"`), 'before the prompt');
+      assert.ok(a.includes('mcp_servers.army.default_tools_approval_mode="approve"'), 'exec cannot answer an approval prompt');
+    }
+  });
+
+  test('a server name or env key that could break out of its slot is refused', () => {
+    assert.throws(() => buildClaudeArgs(spec({ mcpServers: [{ ...army, name: 'a b' }] })), /lowercase identifier/);
+    assert.throws(() => buildCodexArgs(spec({ harness: 'codex', mcpServers: [{ ...army, name: 'x.y' }] }), 'go'), /lowercase identifier/);
+    assert.throws(() => buildCodexArgs(spec({ harness: 'codex', mcpServers: [{ ...army, env: { 'A=1,B': 'x' } }] }), 'go'), /not a variable name/);
+  });
+});
+
+describe('standing instructions (the desktop app tells a chat what start_flow starts)', () => {
+  const note = 'You can start flows.\nSay "done" when "done".';
+
+  test('claude gets --append-system-prompt, and nothing when there are none', () => {
+    const a = buildClaudeArgs(spec({ instructions: note }));
+    assert.equal(a[a.indexOf('--append-system-prompt') + 1], note);
+    assert.equal(buildClaudeArgs(spec()).includes('--append-system-prompt'), false);
+    assert.throws(() => buildClaudeArgs(spec({ instructions: '--bare' })), /must not start with "-"/);
+  });
+
+  test('codex gets developer_instructions as a TOML string, on exec and exec resume', () => {
+    for (const extra of [{}, { resumeSessionId: 'thread-1' }]) {
+      const a = buildCodexArgs(spec({ harness: 'codex', instructions: note, ...extra }), 'go');
+      assert.ok(a.includes(`developer_instructions=${JSON.stringify(note)}`), a.join(' '));
+      assert.ok(a.indexOf('--') > a.indexOf(`developer_instructions=${JSON.stringify(note)}`), 'before the prompt');
+    }
+    assert.equal(buildCodexArgs(spec({ harness: 'codex' }), 'go').some((x) => x.startsWith('developer_instructions')), false);
+  });
+});
+
+describe('web search (the desktop app answers from the web without opening a browser)', () => {
+  test('codex searches live when the allow list names WebSearch, on exec and exec resume', () => {
+    for (const extra of [{}, { resumeSessionId: 'thread-1' }]) {
+      const a = buildCodexArgs(spec({ harness: 'codex', allow: ['Read', 'WebSearch'], ...extra }), 'go');
+      assert.ok(a.includes('web_search="live"'), a.join(' '));
+    }
+    assert.ok(buildCodexArgs(spec({ harness: 'codex', allow: ['Read'] }), 'go').includes('web_search="disabled"'), 'without WebSearch, no cached search either');
+  });
+});
+
+describe('resuming a conversation (the desktop app keeps a chat across restarts)', () => {
+  const RESUME = '99999999-8888-7777-6666-555555555555';
+
+  test('claude swaps --session-id for --resume, and a fresh spec is untouched', () => {
+    const resumed = buildClaudeArgs(spec({ resumeSessionId: RESUME }));
+    assert.equal(resumed[resumed.indexOf('--resume') + 1], RESUME);
+    assert.equal(resumed.includes('--session-id'), false);
+    assert.equal(buildClaudeArgs(spec()).includes('--resume'), false);
+  });
+
+  test('claude refuses a resume id that is not a UUID', () => {
+    assert.throws(() => buildClaudeArgs(spec({ resumeSessionId: '--bare' })), /resumeSessionId must be a UUID/);
+  });
+
+  test('codex runs exec resume with the id and prompt after --, and keeps the sandbox', () => {
+    const args = buildCodexArgs(spec({ harness: 'codex', resumeSessionId: 'thread-1', model: 'gpt-5.5' }), 'next turn');
+    assert.deepEqual(args.slice(0, 2), ['exec', 'resume']);
+    assert.ok(args.includes('sandbox_mode="workspace-write"'));
+    assert.equal(args.includes('-C'), false);
+    assert.equal(args.includes('-s'), false);
+    assert.deepEqual(args.slice(-3), ['--', 'thread-1', 'next turn']);
+    assert.equal(args[args.indexOf('-m') + 1], 'gpt-5.5');
+  });
+
+  test('codex refuses a flag-like resume id', () => {
+    assert.throws(() => buildCodexArgs(spec({ harness: 'codex', resumeSessionId: '--last' }), 'x'), /resumeSessionId/);
+  });
+});
+
 describe('codex argv + env', () => {
   const args = buildCodexArgs(spec({ harness: 'codex' }), 'review the branch');
 
@@ -602,7 +690,8 @@ describe('codex argv + env', () => {
   });
 
   test('every ReasoningEffort produces a value codex actually accepts', () => {
-    const usable = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    // `ultra` measured on 2026-09-24 with codex 0.154: gpt-6-astra and gpt-5.6-sol answer at it.
+    const usable = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
     for (const effort of REASONING_EFFORTS) {
       const a = buildCodexArgs(spec({ harness: 'codex', effort }), 'go');
       const value = configOverride(a, 'model_reasoning_effort') ?? '';

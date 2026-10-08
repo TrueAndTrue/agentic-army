@@ -1,0 +1,99 @@
+{
+  "name": "agentic-army-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop harness for agentic-army: sessions, flows on a canvas, claude, codex and Jev.",
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.ts",
+    "e2e": "npm run build && node --test e2e/*.test.ts",
+    "dist": "npm run build && electron-builder --mac dir --universal --publish never -c.mac.identity=null",
+    "dist:release": "npm run build && electron-builder --mac --universal --publish never",
+    "release": "node scripts/release-check.ts && npm run build && electron-builder --mac --universal --publish always -c.forceCodeSigning=true",
+    "icon": "node scripts/icon.ts",
+    "live:chat": "node e2e/live/chat.ts",
+    "live:flow": "node e2e/live/flow.ts",
+    "live:jev": "node e2e/live/jev.ts",
+    "install:mac": "npm run dist && rm -rf \"/Applications/Agentic Army.app\" && ditto \"release/mac-universal/Agentic Army.app\" \"/Applications/Agentic Army.app\" && codesign --force --deep -s - \"/Applications/Agentic Army.app\" && node scripts/one-app.ts",
+    "live:agent-flow": "node e2e/live/agent-flow.ts"
+  },
+  "devDependencies": {
+    "@fontsource-variable/instrument-sans": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.13.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@xyflow/react": "^12.12.0",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "esbuild": "^0.28.2",
+    "highlight.js": "^11.12.0",
+    "lucide-react": "^1.48.0",
+    "playwright": "^1.63.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "smol-toml": "^1.9.0"
+  },
+  "build": {
+    "appId": "dev.agentic-army.desktop",
+    "productName": "Agentic Army",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**",
+      "package.json"
+    ],
+    "asar": true,
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "REPLACE_WITH_GITHUB_OWNER",
+        "repo": "agentic-army"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "type": "distribution",
+      "identity": "Developer ID Application",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSHighResolutionCapable": true
+      }
+    }
+  }
+}

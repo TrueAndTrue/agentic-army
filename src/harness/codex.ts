@@ -73,6 +73,8 @@ const CODEX_EFFORT: Record<ReasoningEffort, string> = {
   medium: 'medium',
   high: 'high',
   xhigh: 'xhigh',
+  max: 'max',
+  ultra: 'ultra',
 };
 
 export interface CodexArgsOptions {
@@ -378,10 +380,70 @@ export function assertCodexSpecArgSafe(spec: SoldierSpec): void {
   if (spec.model !== undefined) assertNotFlagLike('model', spec.model);
   if (spec.outputSchemaPath !== undefined) assertNotFlagLike('outputSchemaPath', spec.outputSchemaPath);
   assertNotFlagLike('cwd', spec.cwd);
+  if (spec.resumeSessionId !== undefined) assertNotFlagLike('resumeSessionId', spec.resumeSessionId);
+}
+
+/**
+ * MCP servers as `-c mcp_servers.<name>.*` overrides. Each value is TOML: a JSON string is a valid
+ * TOML basic string, a JSON array of strings a valid TOML array, and env is an inline table whose
+ * keys are checked to be bare TOML keys.
+ */
+export function codexMcpArgs(spec: SoldierSpec): string[] {
+  const out: string[] = [];
+  // Measured on codex 0.154: `-c developer_instructions="..."` is obeyed on exec, as a standing
+  // instruction rather than a user turn. A JSON string is a valid TOML basic string.
+  if (spec.instructions !== undefined && spec.instructions !== '') out.push('-c', `developer_instructions=${JSON.stringify(spec.instructions)}`);
+  // The allow list is claude's spelling of a loadout; `WebSearch` in it means codex searches too,
+  // and its absence means codex does not. Measured on codex 0.154: `web_search="live"` gives exec
+  // the Responses web_search tool, which runs on OpenAI's side, needs no approval, and reports as a
+  // `web_search` item with its query. Left unset, exec still searches a cached index, so a loadout
+  // without WebSearch says "disabled" rather than nothing.
+  out.push('-c', `web_search=${spec.allow.includes('WebSearch') ? '"live"' : '"disabled"'}`);
+  for (const s of spec.mcpServers ?? []) {
+    if (!/^[a-z][a-z0-9_]*$/.test(s.name)) throw new Error(`mcpServers: name must be a lowercase identifier, got ${JSON.stringify(s.name)}`);
+    const env = Object.entries(s.env).map(([k, v]) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`mcpServers.${s.name}.env: ${JSON.stringify(k)} is not a variable name`);
+      return `${k} = ${JSON.stringify(v)}`;
+    });
+    out.push(
+      '-c', `mcp_servers.${s.name}.command=${JSON.stringify(s.command)}`,
+      '-c', `mcp_servers.${s.name}.args=${JSON.stringify(s.args)}`,
+      '-c', `mcp_servers.${s.name}.env={ ${env.join(', ')} }`,
+      // exec runs with approval_policy=never, and codex refuses an MCP call that needs approval:
+      // "MCP tool call requires approval, but approval policy is never". Whoever passes a server
+      // here has decided its tools may run; approval, where there is any, happens behind the tool.
+      '-c', `mcp_servers.${s.name}.default_tools_approval_mode="approve"`,
+    );
+  }
+  return out;
 }
 
 export function buildCodexArgs(spec: SoldierSpec, prompt: string, options?: CodexArgsOptions): string[] {
   assertCodexSpecArgSafe(spec);
+
+  // `exec resume` accepts a narrower flag set than `exec`: no `-C`, no `-s`, no `--color`. The
+  // process cwd is already `spec.cwd`, and the sandbox mode goes in as a `-c` override so the
+  // resumed turn is confined exactly like the first one.
+  if (spec.resumeSessionId !== undefined) {
+    const resumed = [
+      'exec',
+      'resume',
+      '--json',
+      '--skip-git-repo-check',
+      '-c',
+      'sandbox_mode="workspace-write"',
+    ];
+    resumed.push(...(options?.confinement ?? codexConfinement(spec)).args);
+    if (options?.outputPath !== undefined) resumed.push('-o', options.outputPath);
+    if (spec.outputSchemaPath !== undefined && spec.outputSchemaPath !== '') {
+      resumed.push('--output-schema', spec.outputSchemaPath);
+    }
+    if (spec.model !== undefined && spec.model !== '') resumed.push('-m', spec.model);
+    if (spec.effort !== undefined) resumed.push('-c', `model_reasoning_effort=${CODEX_EFFORT[spec.effort]}`);
+    resumed.push(...codexMcpArgs(spec));
+    resumed.push('--', spec.resumeSessionId, prompt);
+    return resumed;
+  }
 
   const args = [
     'exec',
@@ -422,6 +484,7 @@ export function buildCodexArgs(spec: SoldierSpec, prompt: string, options?: Code
   if (spec.effort !== undefined) {
     args.push('-c', `model_reasoning_effort=${CODEX_EFFORT[spec.effort]}`);
   }
+  args.push(...codexMcpArgs(spec));
 
   // `--` before the positional prompt, ALWAYS.
   //

@@ -19,11 +19,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { parseTrialSpec } from '../src/trial/spec.ts';
+import { parseTrialSpec, TRIAL_EFFORTS } from '../src/trial/spec.ts';
 import { renderTrialResult } from '../src/trial/report.ts';
 import { parseTrialArgs, trialCommand } from '../src/command/trial.ts';
 import type { TrialCommandDeps } from '../src/command/trial.ts';
-import { REASONING_EFFORTS } from '../src/contracts/harness.ts';
 import type {
   ArmMetrics,
   ArmResult,
@@ -118,7 +117,7 @@ require_clean = true
     assert.ok(spec.checks.every((c) => typeof c.id === 'string' && c.id.length > 0));
   });
 
-  it('five default arms in effort order, one per REASONING_EFFORTS level', () => {
+  it('five default arms in effort order, one per TRIAL_EFFORTS level', () => {
     const toml = `
 title = "defaults"
 seed = "./seed"
@@ -128,7 +127,7 @@ orders = "do the thing"
     const { spec } = parseTrialSpec(toml, specPath, '/tmp/out');
     assert.deepEqual(
       spec.arms.map((a) => a.id),
-      [...REASONING_EFFORTS],
+      [...TRIAL_EFFORTS],
     );
     assert.ok(spec.arms.every((a) => a.ordersLabel === 'default'));
     assert.ok(spec.arms.every((a) => a.orders === 'do the thing'));
@@ -154,7 +153,7 @@ orders = "make the tests pass"
     const { spec } = parseTrialSpec(toml, specPath, '/tmp/out');
 
     assert.equal(spec.arms.length, 10);
-    const expectedIds = REASONING_EFFORTS.flatMap((e) => [`${e}-complete`, `${e}-thin`]);
+    const expectedIds = TRIAL_EFFORTS.flatMap((e) => [`${e}-complete`, `${e}-thin`]);
     assert.deepEqual(
       spec.arms.map((a) => a.id),
       expectedIds,

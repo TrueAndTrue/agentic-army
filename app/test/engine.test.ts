@@ -1,0 +1,588 @@
+import assert from 'node:assert/strict';
+import { describe, test } from 'node:test';
+
+import { createRun, startRun, type EngineDeps } from '../src/main/flow/engine.ts';
+import { defaultNodeData, renderTemplate, validateFlow } from '../src/shared/flow.ts';
+import type { Flow, FlowEdge, FlowNode, Judgment, NodeType, Run } from '../src/shared/types.ts';
+
+function node<T extends NodeType>(id: string, type: T, data: Partial<FlowNode['data']> = {}): FlowNode {
+  return { id, type, position: { x: 0, y: 0 }, data: { ...defaultNodeData(type), label: id, ...data } } as FlowNode;
+}
+
+function edge(source: string, sourceHandle: string, target: string): FlowEdge {
+  return { id: `${source}.${sourceHandle}->${target}`, source, sourceHandle, target };
+}
+
+function flow(nodes: FlowNode[], edges: FlowEdge[]): Flow {
+  return { id: 'f', name: 'test', description: '', nodes, edges, updatedAt: '' };
+}
+
+interface FakeLog {
+  agentPrompts: { node: string; prompt: string; resume?: string }[];
+  shells: string[];
+}
+
+function deps(over: Partial<EngineDeps> = {}, log: FakeLog = { agentPrompts: [], shells: [] }): EngineDeps {
+  return {
+    projectPath: '/project',
+    async workspace() {
+      return '/worktree';
+    },
+    async agent(req) {
+      log.agentPrompts.push({ node: req.node.id, prompt: req.prompt, ...(req.resume ? { resume: req.resume } : {}) });
+      return { turn: { text: `${req.node.id} did: ${req.prompt.split('\n')[0]}`, tools: [], status: 'done', costUsd: 0.01, tokens: { input: 100, cached: 60, output: 7, context: 107 } }, harnessSessionId: `s-${req.node.id}` };
+    },
+    async judge({ config }): Promise<Judgment> {
+      return { mode: config.mode, answer: config.mode === 'yesno' ? 'yes' : (config.options[0]?.key ?? 'a'), probabilities: {}, confidence: 0.9, value: 0.9 };
+    },
+    async shell({ command }) {
+      log.shells.push(command);
+      return { code: 0, output: 'ok' };
+    },
+    async git() {
+      return { ok: true, output: 'committed' };
+    },
+    async browser() {
+      return { ok: true, output: 'browsed' };
+    },
+    async search({ query, onProgress }) {
+      onProgress(`searched ${query}`);
+      return { output: `passages about ${query}`, answered: query.includes('nothing') ? 0.1 : 0.9, model: 'jev', latencyMs: 1 };
+    },
+    async subflow({ objective }) {
+      return { ok: true, output: `sub-run did: ${objective}`, runId: 'child' };
+    },
+    ...over,
+  };
+}
+
+async function run(f: Flow, d: EngineDeps, objective = 'add multiply'): Promise<Run> {
+  const r = createRun({ id: 'r1', flow: f, sessionId: 's', projectId: 'p', objective });
+  return startRun(r, d, () => {}).done;
+}
+
+describe('templates', () => {
+  test('fill objective, input, visit and named nodes; unknown names render empty', () => {
+    const out = renderTemplate('{{objective}}|{{input}}|{{visit}}|{{nodes.plan}}|{{nodes.nope}}|{{what}}', {
+      objective: 'O',
+      input: 'I',
+      visit: 2,
+      nodes: { plan: 'P' },
+    });
+    assert.equal(out, 'O|I|2|P||');
+  });
+});
+
+describe('validation', () => {
+  test('a flow with no start, a dangling handle and an empty prompt is refused', () => {
+    const f = flow([node('a', 'agent', { prompt: ' ' }), node('b', 'end')], [edge('a', 'nope', 'b')]);
+    const errors = validateFlow(f).filter((p) => p.level === 'error').map((p) => p.message);
+    assert.ok(errors.some((m) => m.includes('Start')));
+    assert.ok(errors.some((m) => m.includes('no "nope" output')));
+    assert.ok(errors.some((m) => m.includes('no prompt')));
+  });
+
+  test('the engine refuses to start a flow with errors and says why', async () => {
+    const r = await run(flow([node('end', 'end')], []), deps());
+    assert.equal(r.status, 'failed');
+    assert.match(r.error ?? '', /Start/);
+  });
+
+  test('two nodes with the same name are an error, since templates address them by name', () => {
+    const f = flow([node('start', 'start'), node('x', 'agent', { label: 'Build' }), node('y', 'agent', { label: 'build' })], []);
+    assert.ok(validateFlow(f).some((p) => p.level === 'error' && p.message.includes('named')));
+  });
+
+  test('reading a node that never runs first warns that it is empty, and a loop back is fine', () => {
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('plan', 'agent', { prompt: 'Plan. Tests said: {{nodes.tests}}' }),
+        node('build', 'agent', { prompt: 'Build. Review said: {{nodes.review}}. Me before: {{nodes.build}}' }),
+        node('review', 'agent', { prompt: 'Review {{input}}' }),
+        node('tests', 'shell', { command: 'npm test' }),
+        node('end', 'end', { template: '{{nodes.plan}}' }),
+      ],
+      [edge('start', 'out', 'plan'), edge('plan', 'out', 'build'), edge('build', 'out', 'review'), edge('review', 'out', 'tests'), edge('tests', 'fail', 'build'), edge('tests', 'pass', 'end')],
+    );
+    const warnings = validateFlow(f).filter((p) => p.level === 'warn');
+    assert.deepEqual(
+      warnings.map((p) => [p.nodeId, p.message]),
+      [['plan', '"plan" reads {{nodes.tests}}, but "tests" never runs before it, so that is always empty.']],
+      'build reads review and itself through the tests loop, which is fine',
+    );
+  });
+});
+
+describe('running a flow', () => {
+  test('a straight line passes each output on and ends with the End template', async () => {
+    const log: FakeLog = { agentPrompts: [], shells: [] };
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('plan', 'agent', { prompt: 'Plan {{objective}}' }),
+        node('build', 'agent', { prompt: 'Build from: {{input}}' }),
+        node('end', 'end', { template: 'Plan was: {{nodes.plan}}' }),
+      ],
+      [edge('start', 'out', 'plan'), edge('plan', 'out', 'build'), edge('build', 'out', 'end')],
+    );
+    const r = await run(f, deps({}, log));
+    assert.equal(r.status, 'succeeded');
+    assert.deepEqual(log.agentPrompts.map((p) => p.prompt), ['Plan add multiply', 'Build from: plan did: Plan add multiply']);
+    assert.equal(r.result, 'Plan was: plan did: Plan add multiply');
+    assert.equal(r.costUsd, 0.02);
+    assert.deepEqual(r.tokens, { input: 200, cached: 120, output: 14 }, 'two agents added up, with no context: each had its own');
+    assert.deepEqual(r.tokens, { input: 200, cached: 120, output: 14 }, 'two agents added up, with no context: each had its own');
+    assert.equal(r.nodes['build']?.status, 'done');
+  });
+
+  test('a loop runs until the decision says yes, feeding the review back each time', async () => {
+    const log: FakeLog = { agentPrompts: [], shells: [] };
+    let reviews = 0;
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('build', 'agent', { prompt: 'Build. Feedback: {{input}}', keepContext: true, maxVisits: 5 }),
+        node('check', 'decide', { mode: 'yesno' }),
+        node('end', 'end'),
+      ],
+      [edge('start', 'out', 'build'), edge('build', 'out', 'check'), edge('check', 'yes', 'end'), edge('check', 'no', 'build')],
+    );
+    const r = await run(
+      f,
+      deps(
+        {
+          async judge({ config }) {
+            reviews += 1;
+            const yes = reviews >= 3;
+            return { mode: config.mode, answer: yes ? 'yes' : 'no', probabilities: {}, confidence: 1, value: yes ? 0.9 : 0.1 };
+          },
+        },
+        log,
+      ),
+    );
+    assert.equal(r.status, 'succeeded');
+    assert.equal(r.nodes['build']?.visits.length, 3);
+    // keepContext: the second and third visits resume the first conversation.
+    assert.equal(log.agentPrompts[0]?.resume, undefined);
+    assert.equal(log.agentPrompts[1]?.resume, 's-build');
+    assert.equal(log.agentPrompts[2]?.resume, 's-build');
+  });
+
+  test('a loop that never settles stops at the visit limit, and the run names the decision that kept sending it back', async () => {
+    const f = flow(
+      [node('start', 'start'), node('build', 'agent', { maxVisits: 2 }), node('check', 'decide', { mode: 'yesno' })],
+      [edge('start', 'out', 'build'), edge('build', 'out', 'check'), edge('check', 'no', 'build')],
+    );
+    const r = await run(
+      f,
+      deps({ judge: async ({ config }) => ({ mode: config.mode, answer: 'no', probabilities: {}, confidence: 1, value: 0 }) }),
+    );
+    assert.equal(r.status, 'failed');
+    assert.match(r.error ?? '', /Jev answered "no" at "check" each time, sending the work back to "build"\. It ran 2 times, its limit/);
+    assert.notEqual(r.nodes['build']?.status, 'failed', 'build did its job each time; the loop is what ran out');
+  });
+
+  test('parallel branches meet at a Join, which fires once with both outputs', async () => {
+    const f = flow(
+      [node('start', 'start'), node('a', 'agent'), node('b', 'agent'), node('join', 'join'), node('end', 'end')],
+      [edge('start', 'out', 'a'), edge('start', 'out', 'b'), edge('a', 'out', 'join'), edge('b', 'out', 'join'), edge('join', 'out', 'end')],
+    );
+    let concurrent = 0;
+    let peak = 0;
+    const r = await run(
+      f,
+      deps({
+        async agent(req) {
+          concurrent += 1;
+          peak = Math.max(peak, concurrent);
+          await new Promise((res) => setTimeout(res, 20));
+          concurrent -= 1;
+          return { turn: { text: `${req.node.id} out`, tools: [], status: 'done' } };
+        },
+      }),
+    );
+    assert.equal(peak, 2);
+    assert.equal(r.nodes['join']?.visits.length, 1);
+    assert.match(r.result ?? '', /## a\n\na out/);
+    assert.match(r.result ?? '', /## b\n\nb out/);
+  });
+
+  test('a Choice routes on the option Jev picked, and low confidence takes unsure', async () => {
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('route', 'decide', { mode: 'choice', options: [{ key: 'bug', description: '' }, { key: 'feature', description: '' }], minConfidence: 0.6 }),
+        node('fix', 'end', { template: 'fix' }),
+        node('build', 'end', { template: 'build' }),
+        node('ask', 'end', { template: 'ask' }),
+      ],
+      [edge('start', 'out', 'route'), edge('route', 'bug', 'fix'), edge('route', 'feature', 'build'), edge('route', 'unsure', 'ask')],
+    );
+    const sure = await run(f, deps({ judge: async () => ({ mode: 'choice', answer: 'feature', probabilities: { feature: 0.9 }, confidence: 0.8 }) }));
+    assert.equal(sure.result, 'build');
+    const unsure = await run(f, deps({ judge: async () => ({ mode: 'choice', answer: 'bug', probabilities: { bug: 0.5 }, confidence: 0.3 }) }));
+    assert.equal(unsure.result, 'ask');
+  });
+
+  test('an agent failure takes the error edge when one is wired, and fails the run when not', async () => {
+    const failing = deps({ agent: async () => ({ turn: { text: '', tools: [], status: 'error', error: 'rate limited' } }) });
+    const wired = flow(
+      [node('start', 'start'), node('build', 'agent'), node('recover', 'end', { template: 'recovered: {{input}}' })],
+      [edge('start', 'out', 'build'), edge('build', 'error', 'recover')],
+    );
+    const a = await run(wired, failing);
+    assert.equal(a.status, 'succeeded');
+    assert.match(a.result ?? '', /recovered: build failed: rate limited/);
+
+    const bare = flow([node('start', 'start'), node('build', 'agent'), node('end', 'end')], [edge('start', 'out', 'build'), edge('build', 'out', 'end')]);
+    const b = await run(bare, failing);
+    assert.equal(b.status, 'failed');
+    assert.match(b.error ?? '', /"build" failed: rate limited/);
+  });
+
+  test('a shell node routes on the exit code and passes the output on', async () => {
+    const f = flow(
+      [node('start', 'start'), node('test', 'shell', { command: 'npm test' }), node('ok', 'end', { template: 'green' }), node('bad', 'end', { template: 'red: {{input}}' })],
+      [edge('start', 'out', 'test'), edge('test', 'pass', 'ok'), edge('test', 'fail', 'bad')],
+    );
+    const r = await run(f, deps({ shell: async () => ({ code: 1, output: '1 failing' }) }));
+    assert.match(r.result ?? '', /^red: Command: `npm test`\nExit code: 1\n\n```\n1 failing/);
+  });
+
+  test('a web search leaves by found or unanswered on Jev\'s verdict, and keeps it as a judgment', async () => {
+    for (const [objective, end] of [['zod version', 'answer: passages about zod version'], ['nothing at all', 'no luck']] as const) {
+      const f = flow(
+        [node('start', 'start'), node('web', 'search', { query: '{{objective}}' }), node('ok', 'end', { template: 'answer: {{input}}' }), node('no', 'end', { template: 'no luck' })],
+        [edge('start', 'out', 'web'), edge('web', 'found', 'ok'), edge('web', 'unanswered', 'no')],
+      );
+      const r = await run(f, deps(), objective);
+      assert.equal(r.result, end);
+      const visit = r.nodes['web']?.visits[0];
+      assert.equal(visit?.judgment?.answer, end === 'no luck' ? 'no' : 'yes');
+      assert.match(visit?.log ?? '', /^searched /);
+    }
+  });
+});
+
+describe('how a run ends', () => {
+  const failing = deps({ shell: async () => ({ code: 1, output: '1 failing' }) });
+
+  test('an output with nothing connected fails the run and says where, instead of a green finish', async () => {
+    const f = flow([node('start', 'start'), node('test', 'shell', { command: 'npm test' }), node('ok', 'end', { template: 'green' })], [edge('start', 'out', 'test'), edge('test', 'pass', 'ok')]);
+    const r = await run(f, failing);
+    assert.equal(r.status, 'failed');
+    assert.match(r.error ?? '', /"test" took its "fail" path, and nothing is connected there/);
+    assert.equal(r.result, undefined);
+  });
+
+  test('an End marked as a failure fails the run, and one marked stopped stops it, each with its message', async () => {
+    const f = (outcome: 'failure' | 'stopped') =>
+      flow(
+        [node('start', 'start'), node('test', 'shell', { command: 'npm test' }), node('ok', 'end', { template: 'green' }), node('bad', 'end', { template: 'Tests failed.', outcome })],
+        [edge('start', 'out', 'test'), edge('test', 'pass', 'ok'), edge('test', 'fail', 'bad')],
+      );
+    const failed = await run(f('failure'), failing);
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.result, 'Tests failed.');
+    assert.equal(failed.error, undefined);
+    assert.equal((await run(f('stopped'), failing)).status, 'stopped');
+  });
+
+  test('a stopped run has no result, rather than showing its own objective as one', async () => {
+    const f = flow([node('start', 'start'), node('gate', 'human', { prompt: 'ok?' }), node('ok', 'end', { template: 'done' })], [edge('start', 'out', 'gate'), edge('gate', 'approve', 'ok')]);
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'my objective' });
+    const handle = startRun(r, deps(), () => {});
+    while (r.pending.length === 0) await new Promise((res) => setTimeout(res, 1));
+    handle.stop();
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(done.result, undefined);
+  });
+});
+
+describe('a person in the loop', () => {
+  test('the run waits on an approval, and a rejection carries the note onward', async () => {
+    const f = flow(
+      [node('start', 'start'), node('gate', 'human', { prompt: 'Ship {{input}}?' }), node('yes', 'end', { template: 'shipped' }), node('no', 'end', { template: '{{input}}' })],
+      [edge('start', 'out', 'gate'), edge('gate', 'approve', 'yes'), edge('gate', 'reject', 'no')],
+    );
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'v2' });
+    const seen: string[] = [];
+    const handle = startRun(r, deps(), (x) => seen.push(x.status));
+    while (r.pending.length === 0) await new Promise((res) => setTimeout(res, 1));
+    assert.equal(r.status, 'waiting');
+    assert.equal(r.pending[0]?.body, 'Ship v2?');
+    assert.equal(handle.answer('nope', true, ''), false);
+    handle.answer(r.pending[0]!.id, false, 'needs a changelog');
+    const done = await handle.done;
+    assert.equal(done.status, 'succeeded');
+    assert.equal(done.result, 'v2\n\nFrom the person reviewing: needs a changelog');
+    assert.ok(seen.includes('waiting'));
+  });
+
+  test('stop ends a waiting run as stopped, not failed', async () => {
+    const f = flow([node('start', 'start'), node('gate', 'human'), node('end', 'end')], [edge('start', 'out', 'gate'), edge('gate', 'approve', 'end')]);
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(), () => {});
+    while (r.pending.length === 0) await new Promise((res) => setTimeout(res, 1));
+    handle.stop();
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(done.nodes['gate']?.status, 'stopped');
+    assert.equal(done.pending.length, 0);
+  });
+
+  test('stop reaches a running agent through its signal', async () => {
+    const f = flow([node('start', 'start'), node('build', 'agent'), node('end', 'end')], [edge('start', 'out', 'build'), edge('build', 'out', 'end')]);
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'x' });
+    let aborted = false;
+    const handle = startRun(
+      r,
+      deps({
+        agent: (req) =>
+          new Promise((resolve) => {
+            req.signal.addEventListener('abort', () => {
+              aborted = true;
+              resolve({ turn: { text: '', tools: [], status: 'stopped' } });
+            });
+          }),
+      }),
+      () => {},
+    );
+    await new Promise((res) => setTimeout(res, 5));
+    handle.stop();
+    const done = await handle.done;
+    assert.equal(aborted, true);
+    assert.equal(done.status, 'stopped');
+    assert.equal(done.nodes['end']?.visits.length, 0);
+  });
+});
+
+describe('the flows that ship with the app', async () => {
+  const { BUILTIN_FLOWS } = await import('../src/main/templates.ts');
+  for (const f of BUILTIN_FLOWS) {
+    test(`"${f.name}" has no errors and no warnings`, () => {
+      assert.deepEqual(validateFlow(f), []);
+    });
+  }
+
+  test('"Build and review" loops back to Build on a failed review and finishes on a passing one', async () => {
+    const f = BUILTIN_FLOWS.find((x) => x.id === 'builtin-main-flow')!;
+    let reviews = 0;
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'add divide' });
+    const handle = startRun(
+      r,
+      deps({
+        async workspace(run) {
+          run.branch = 'army/run-x';
+          return '/wt';
+        },
+        async judge({ config }) {
+          reviews += 1;
+          const yes = reviews > 1;
+          return { mode: config.mode, answer: yes ? 'yes' : 'no', probabilities: {}, confidence: 1, value: yes ? 1 : 0 };
+        },
+      }),
+      () => {},
+    );
+    for (let answered = 0; answered < 2; ) {
+      await new Promise((res) => setTimeout(res, 1));
+      const q = r.pending[0];
+      if (q !== undefined) {
+        handle.answer(q.id, true, '');
+        answered += 1;
+      }
+    }
+    const done = await handle.done;
+    assert.equal(done.status, 'succeeded');
+    assert.equal(done.nodes['build']?.visits.length, 2);
+    assert.equal(done.nodes['review']?.visits.length, 2);
+    assert.match(done.result ?? '', /^Finished on branch army\/run-x\./);
+  });
+});
+
+describe('a Git merge asks first', () => {
+  /** A fake git that asks when the engine hands it `ask`, the way the real one does after its preview. */
+  function asking(seen: { asked: number }): Partial<EngineDeps> {
+    return {
+      async git({ config, ask }) {
+        if (config.action === 'merge' && ask !== undefined) {
+          seen.asked += 1;
+          if (!(await ask('Merge army/run-x into main?', 'Merging brings 1 commit.'))) return { ok: false, output: 'You did not merge.' };
+        }
+        return { ok: true, output: 'Merged.' };
+      },
+    };
+  }
+
+  async function waitForQuestion(r: Run): Promise<void> {
+    while (r.pending.length === 0) await new Promise((res) => setTimeout(res, 1));
+  }
+
+  test('by default the run waits with a merge question, and a refusal leaves by fail', async () => {
+    const seen = { asked: 0 };
+    const f = flow(
+      [node('start', 'start'), node('merge', 'git', { action: 'merge' }), node('end', 'end', { template: 'merged' }), node('kept', 'end', { template: 'not merged', outcome: 'stopped' })],
+      [edge('start', 'out', 'merge'), edge('merge', 'out', 'end'), edge('merge', 'fail', 'kept')],
+    );
+    const r = createRun({ id: 'r1', flow: f, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(asking(seen)), () => {});
+    await waitForQuestion(r);
+    assert.equal(r.status, 'waiting');
+    assert.equal(r.pending[0]?.kind, 'merge');
+    assert.equal(r.pending[0]?.title, 'Merge army/run-x into main?');
+    handle.answer(r.pending[0]!.id, false, '');
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(done.result, 'not merged');
+    assert.equal(seen.asked, 1);
+  });
+
+  test('a flow saved before the setting existed asks too', async () => {
+    const seen = { asked: 0 };
+    const old = node('merge', 'git', { action: 'merge' });
+    delete (old.data as { askBeforeMerge?: boolean }).askBeforeMerge;
+    const r = createRun({ id: 'r1', flow: flow([node('start', 'start'), old, node('end', 'end')], [edge('start', 'out', 'merge'), edge('merge', 'out', 'end')]), sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(asking(seen)), () => {});
+    await waitForQuestion(r);
+    handle.answer(r.pending[0]!.id, true, '');
+    assert.equal((await handle.done).status, 'succeeded');
+    assert.equal(seen.asked, 1);
+  });
+
+  test('it does not ask right after your approval, or when the node opts out', async () => {
+    const seen = { asked: 0 };
+    const approved = flow(
+      [node('start', 'start'), node('ok', 'human', { prompt: 'Ship it?' }), node('merge', 'git', { action: 'merge' }), node('end', 'end')],
+      [edge('start', 'out', 'ok'), edge('ok', 'approve', 'merge'), edge('merge', 'out', 'end')],
+    );
+    const r = createRun({ id: 'r1', flow: approved, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(r, deps(asking(seen)), () => {});
+    await waitForQuestion(r);
+    assert.equal(r.pending[0]?.kind, 'approve');
+    handle.answer(r.pending[0]!.id, true, '');
+    assert.equal((await handle.done).status, 'succeeded');
+    assert.equal(seen.asked, 0, 'one approval, not two in a row');
+
+    const optedOut = flow([node('start', 'start'), node('merge', 'git', { action: 'merge', askBeforeMerge: false }), node('end', 'end')], [edge('start', 'out', 'merge'), edge('merge', 'out', 'end')]);
+    assert.equal((await run(optedOut, deps(asking(seen)))).status, 'succeeded');
+    assert.equal(seen.asked, 0);
+
+    // A commit is not a merge, and never asks.
+    const commit = flow([node('start', 'start'), node('c', 'git', { action: 'commit' }), node('end', 'end')], [edge('start', 'out', 'c'), edge('c', 'out', 'end')]);
+    assert.equal((await run(commit, deps(asking(seen)))).status, 'succeeded');
+    assert.equal(seen.asked, 0);
+  });
+
+  test('stopping the run while the merge question waits stops it without merging', async () => {
+    let merged = false;
+    const f = flow([node('start', 'start'), node('merge', 'git', { action: 'merge' }), node('end', 'end')], [edge('start', 'out', 'merge'), edge('merge', 'out', 'end')]);
+    const r = createRun({ id: 'r1', flow: f, sessionId: 's', projectId: 'p', objective: 'x' });
+    const handle = startRun(
+      r,
+      deps({
+        async git({ ask }) {
+          if (ask !== undefined && !(await ask('Merge?', ''))) return { ok: false, output: 'You did not merge.' };
+          merged = true;
+          return { ok: true, output: 'Merged.' };
+        },
+      }),
+      () => {},
+    );
+    await waitForQuestion(r);
+    handle.stop();
+    const done = await handle.done;
+    assert.equal(done.status, 'stopped');
+    assert.equal(merged, false);
+    assert.equal(done.nodes['merge']?.status, 'stopped');
+  });
+});
+
+describe('what each step was given, and where its input came from', () => {
+  test('every kind of step records what it used, with its templates filled in', async () => {
+    const f = flow(
+      [
+        node('start', 'start'),
+        node('plan', 'agent', { prompt: 'Plan {{objective}}' }),
+        node('ok', 'decide', { question: 'Is {{objective}} planned?', state: 'Plan: {{input}}' }),
+        node('look', 'search', { query: 'how to {{objective}}', question: 'What is {{objective}}?' }),
+        node('web', 'browser', { goal: 'find {{objective}}' }),
+        node('test', 'shell', { command: 'npm test -- {{visit}}' }),
+        node('sub', 'flow', { flowId: 'other', objective: 'child: {{objective}}' }),
+        node('commit', 'git', { action: 'commit', message: 'flow: {{objective}}' }),
+        node('diff', 'git', { action: 'diff' }),
+        node('end', 'end', { template: 'done' }),
+      ],
+      [
+        edge('start', 'out', 'plan'),
+        edge('plan', 'out', 'ok'),
+        edge('ok', 'yes', 'look'),
+        edge('look', 'found', 'web'),
+        edge('web', 'done', 'test'),
+        edge('test', 'pass', 'sub'),
+        edge('sub', 'done', 'commit'),
+        edge('commit', 'out', 'diff'),
+        edge('diff', 'out', 'end'),
+      ],
+    );
+    const r = await run(f, deps(), 'add multiply');
+    assert.equal(r.status, 'succeeded', r.error);
+    const visit = (id: string) => r.nodes[id]?.visits[0];
+    assert.equal(visit('plan')?.sent, 'Plan add multiply');
+    assert.equal(visit('ok')?.sent, 'Is add multiply planned?\n\nPlan: plan did: Plan add multiply');
+    assert.equal(visit('look')?.sent, 'how to add multiply\n\nWhat is add multiply?');
+    assert.equal(visit('web')?.sent, 'find add multiply');
+    assert.equal(visit('test')?.sent, 'npm test -- 1');
+    assert.equal(visit('sub')?.sent, 'child: add multiply');
+    assert.equal(visit('commit')?.sent, 'flow: add multiply');
+    assert.equal(visit('diff')?.sent, undefined, 'a diff takes no message');
+    assert.equal(visit('start')?.sent, undefined);
+    assert.equal(visit('start')?.from, undefined, 'Start is where the run begins');
+    assert.deepEqual(visit('plan')?.from, [{ nodeId: 'start', handle: 'out' }]);
+    assert.deepEqual(visit('look')?.from, [{ nodeId: 'ok', handle: 'yes' }]);
+    assert.deepEqual(visit('end')?.from, [{ nodeId: 'diff', handle: 'out' }]);
+  });
+
+  test('a search with no question of its own records just the query', async () => {
+    const f = flow([node('start', 'start'), node('look', 'search', { query: '{{objective}}', question: '' }), node('end', 'end')], [edge('start', 'out', 'look'), edge('look', 'found', 'end')]);
+    const r = await run(f, deps(), 'rust async');
+    assert.equal(r.nodes['look']?.visits[0]?.sent, 'rust async');
+  });
+
+  test('an approval records what you were shown, and the step after it knows it came by reject', async () => {
+    const f = flow(
+      [node('start', 'start'), node('gate', 'human', { prompt: 'Ship {{objective}}?' }), node('yes', 'end'), node('no', 'end', { template: '{{input}}' })],
+      [edge('start', 'out', 'gate'), edge('gate', 'approve', 'yes'), edge('gate', 'reject', 'no')],
+    );
+    const r = createRun({ id: 'r', flow: f, sessionId: 's', projectId: 'p', objective: 'v2' });
+    const h = startRun(r, deps(), () => {});
+    while (h.run.pending.length === 0) await new Promise((res) => setTimeout(res, 2));
+    h.answer(h.run.pending[0]!.id, false, 'not yet');
+    const done = await h.done;
+    assert.equal(done.nodes['gate']?.visits[0]?.sent, 'Ship v2?');
+    assert.deepEqual(done.nodes['no']?.visits[0]?.from, [{ nodeId: 'gate', handle: 'reject' }]);
+  });
+
+  test('a Join lists every node it waited for, and an error path names the error output', async () => {
+    const f = flow(
+      [node('start', 'start'), node('a', 'agent'), node('b', 'shell', { command: 'false' }), node('join', 'join'), node('end', 'end')],
+      [edge('start', 'out', 'a'), edge('start', 'out', 'b'), edge('a', 'error', 'join'), edge('b', 'fail', 'join'), edge('join', 'out', 'end')],
+    );
+    const r = await run(
+      f,
+      deps({
+        async agent() {
+          throw new Error('boom');
+        },
+        shell: async () => ({ code: 1, output: 'no' }),
+      }),
+    );
+    assert.equal(r.status, 'succeeded', r.error);
+    assert.deepEqual(r.nodes['join']?.visits[0]?.from, [
+      { nodeId: 'a', handle: 'error' },
+      { nodeId: 'b', handle: 'fail' },
+    ]);
+    assert.deepEqual(r.nodes['end']?.visits[0]?.from, [{ nodeId: 'join', handle: 'out' }]);
+  });
+});
